@@ -1244,6 +1244,9 @@ pub enum ApiBackend {
     Responses,
     /// Use the Anthropic Messages API (/v1/messages)
     Messages,
+    /// Use Google's AI Studio API (models/{model}:generateContent and :streamGenerateContent)
+    #[serde(alias = "ai_studio", alias = "gemini", alias = "google")]
+    GoogleAiStudio,
 }
 
 /// First-party provider contract selected by a model catalog entry.
@@ -1346,6 +1349,8 @@ pub struct ProviderBackends {
     pub chat_completions: bool,
     pub responses: Option<ResponsesDialect>,
     pub messages: bool,
+    #[serde(default)]
+    pub google_ai_studio: bool,
 }
 
 impl ProviderBackends {
@@ -1354,6 +1359,7 @@ impl ProviderBackends {
             ApiBackend::ChatCompletions => self.chat_completions,
             ApiBackend::Responses => self.responses.is_some(),
             ApiBackend::Messages => self.messages,
+            ApiBackend::GoogleAiStudio => self.google_ai_studio,
         }
     }
 }
@@ -1469,6 +1475,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: Some(ResponsesDialect::Xai),
             messages: true,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::Xai),
@@ -1484,6 +1491,7 @@ impl ProviderProfile {
             chat_completions: false,
             responses: Some(ResponsesDialect::Codex),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::NativeCustomGrammar,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1502,6 +1510,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1521,6 +1530,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1540,6 +1550,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: Some(ResponsesDialect::DeepSeek),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1558,6 +1569,7 @@ impl ProviderProfile {
             chat_completions: false,
             responses: Some(ResponsesDialect::Meta),
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::FunctionEnvelope,
         hosted_tool_dialect: Some(HostedToolDialect::OpenAi),
@@ -1575,6 +1587,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: true,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1593,6 +1606,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1612,6 +1626,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1632,6 +1647,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1641,17 +1657,17 @@ impl ProviderProfile {
         xai_services: XaiServicePolicy::Denied,
     };
 
-    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions.
-    /// Gemini 3 models reason by default and accept ordinary client-side
-    /// function tools. This profile stays Chat-only: the official OpenAI
-    /// compatibility surface is `chat/completions`, not a first-class
-    /// Responses dialect. No hosted tools, native web search, or OAuth.
+    /// Google Gemini API / AI Studio OpenAI-compatible Chat Completions and
+    /// native Google AI Studio API. Gemini 3 models reason by default and
+    /// accept ordinary client-side function tools. No hosted tools, native
+    /// web search, or OAuth.
     pub const GEMINI: Self = Self {
         provider: ModelProvider::Gemini,
         backends: ProviderBackends {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: true,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1671,6 +1687,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: None,
             messages: false,
+            google_ai_studio: false,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -1693,6 +1710,7 @@ impl ProviderProfile {
             chat_completions: true,
             responses: Some(ResponsesDialect::OpenAi),
             messages: true,
+            google_ai_studio: true,
         },
         code_mode_transport: CodeModeTransport::Unsupported,
         hosted_tool_dialect: None,
@@ -2157,6 +2175,7 @@ mod tests {
                     chat_completions: true,
                     responses: Some(ResponsesDialect::Xai),
                     messages: true,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::Xai),
@@ -2173,6 +2192,7 @@ mod tests {
                     chat_completions: false,
                     responses: Some(ResponsesDialect::Codex),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::NativeCustomGrammar,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2189,6 +2209,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2205,6 +2226,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2221,6 +2243,7 @@ mod tests {
                     chat_completions: true,
                     responses: Some(ResponsesDialect::DeepSeek),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2237,6 +2260,7 @@ mod tests {
                     chat_completions: false,
                     responses: Some(ResponsesDialect::Meta),
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::FunctionEnvelope,
                 hosted_tools: Some(HostedToolDialect::OpenAi),
@@ -2253,6 +2277,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: true,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2269,6 +2294,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2285,6 +2311,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2301,6 +2328,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2317,6 +2345,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: true,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2333,6 +2362,7 @@ mod tests {
                     chat_completions: true,
                     responses: None,
                     messages: false,
+                    google_ai_studio: false,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2352,6 +2382,7 @@ mod tests {
                     chat_completions: true,
                     responses: Some(ResponsesDialect::OpenAi),
                     messages: true,
+                    google_ai_studio: true,
                 },
                 code_mode_transport: CodeModeTransport::Unsupported,
                 hosted_tools: None,
@@ -2392,6 +2423,7 @@ mod tests {
                 ApiBackend::ChatCompletions,
                 ApiBackend::Responses,
                 ApiBackend::Messages,
+                ApiBackend::GoogleAiStudio,
             ] {
                 assert_eq!(
                     profile.supports_backend(&backend),
@@ -2427,6 +2459,7 @@ mod tests {
                 ApiBackend::ChatCompletions,
                 ApiBackend::Responses,
                 ApiBackend::Messages,
+                ApiBackend::GoogleAiStudio,
             ] {
                 let supported = provider == ModelProvider::Xai && backend == ApiBackend::Responses;
                 assert_eq!(

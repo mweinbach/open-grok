@@ -9,6 +9,7 @@
 pub mod conversation;
 pub mod doom_loop;
 pub mod error;
+pub mod google_ai_studio;
 pub mod messages;
 pub mod provider_error;
 pub mod serde_helpers;

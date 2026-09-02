@@ -5641,9 +5641,531 @@ impl From<crate::messages::MessagesResponse> for ConversationItem {
     }
 }
 
+pub fn build_google_ai_studio_request(
+    req: &ConversationRequest,
+) -> crate::google_ai_studio::GenerateContentRequest {
+    use crate::google_ai_studio::{
+        Blob, Content, FunctionCallingConfig, FunctionCallingMode, FunctionDeclaration,
+        GenerateContentRequest, GenerationConfig, Part, ThinkingConfig, Tool, ToolConfig,
+    };
+    use std::collections::HashMap;
+
+    let mut system_parts: Vec<Part> = Vec::new();
+    let mut contents: Vec<Content> = Vec::new();
+    let mut tool_call_names: HashMap<String, String> = HashMap::new();
+
+    let content_parts_to_ai_studio_parts = |parts: &[ContentPart]| -> Vec<Part> {
+        parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => Part::text(text.as_ref().to_owned()),
+                ContentPart::Image { url } => {
+                    if let Some(rest) = url.strip_prefix("data:") {
+                        if let Some((header, data)) = rest.split_once(',') {
+                            let mime_type = header
+                                .strip_suffix(";base64")
+                                .unwrap_or("image/png")
+                                .to_string();
+                            Part {
+                                inline_data: Some(Blob {
+                                    mime_type,
+                                    data: data.to_string(),
+                                }),
+                                ..Default::default()
+                            }
+                        } else {
+                            Part::text(format!("[invalid image: {url}]"))
+                        }
+                    } else {
+                        Part::text(format!("[image: {url}]"))
+                    }
+                }
+            })
+            .collect()
+    };
+
+    let mut pending_user_parts: Vec<Part> = Vec::new();
+
+    let flush_user_parts = |pending: &mut Vec<Part>, contents: &mut Vec<Content>| {
+        if !pending.is_empty() {
+            contents.push(Content::user(std::mem::take(pending)));
+        }
+    };
+
+    for item in &req.items {
+        match item {
+            ConversationItem::System(s) => {
+                system_parts.push(Part::text(s.content.as_ref().to_owned()));
+            }
+            ConversationItem::User(u) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let parts = content_parts_to_ai_studio_parts(&u.content);
+                contents.push(Content::user(parts));
+            }
+            ConversationItem::Assistant(a) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let mut parts = Vec::new();
+                if !a.content.is_empty() {
+                    parts.push(Part::text(a.content.as_ref().to_owned()));
+                }
+                for tc in &a.tool_calls {
+                    tool_call_names.insert(tc.id.to_string(), tc.name.clone());
+                    let args = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::json!({}));
+                    parts.push(Part {
+                        function_call: Some(crate::google_ai_studio::FunctionCall {
+                            name: tc.name.clone(),
+                            args,
+                            id: Some(tc.id.to_string()),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                if !parts.is_empty() {
+                    contents.push(Content::model(parts));
+                }
+            }
+            ConversationItem::ToolResult(t) => {
+                let name = tool_call_names
+                    .get(&t.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| t.tool_call_id.clone());
+                let response = match serde_json::from_str::<serde_json::Value>(&t.content) {
+                    Ok(val @ serde_json::Value::Object(_)) => val,
+                    _ => serde_json::json!({ "output": t.content.as_ref() }),
+                };
+                pending_user_parts.push(Part {
+                    function_response: Some(crate::google_ai_studio::FunctionResponse {
+                        name,
+                        response,
+                        id: Some(t.tool_call_id.clone()),
+                    }),
+                    ..Default::default()
+                });
+                for img in &t.images {
+                    if let ContentPart::Image { url } = img {
+                        if let Some(rest) = url.strip_prefix("data:") {
+                            if let Some((header, data)) = rest.split_once(',') {
+                                let mime_type = header
+                                    .strip_suffix(";base64")
+                                    .unwrap_or("image/png")
+                                    .to_string();
+                                pending_user_parts.push(Part {
+                                    inline_data: Some(Blob {
+                                        mime_type,
+                                        data: data.to_string(),
+                                    }),
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            ConversationItem::CustomToolOutput(output) => {
+                let name = output.name.clone().unwrap_or_else(|| {
+                    tool_call_names
+                        .get(&output.call_id)
+                        .cloned()
+                        .unwrap_or_else(|| output.call_id.clone())
+                });
+                let response = serde_json::json!({ "output": output.text_content() });
+                pending_user_parts.push(Part {
+                    function_response: Some(crate::google_ai_studio::FunctionResponse {
+                        name,
+                        response,
+                        id: Some(output.call_id.clone()),
+                    }),
+                    ..Default::default()
+                });
+            }
+            ConversationItem::BackendToolCall(b) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                contents.push(Content::model(vec![Part::text(b.text_summary())]));
+            }
+            ConversationItem::Reasoning(r) => {
+                flush_user_parts(&mut pending_user_parts, &mut contents);
+                let text = reasoning_item_text(r);
+                if !text.is_empty() {
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part {
+                            thought: Some(true),
+                            text: Some(text),
+                            ..Default::default()
+                        }],
+                    });
+                }
+            }
+        }
+    }
+
+    flush_user_parts(&mut pending_user_parts, &mut contents);
+
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(Content {
+            role: None,
+            parts: system_parts,
+        })
+    };
+
+    let tools = if req.tools.is_empty() {
+        None
+    } else {
+        Some(vec![Tool {
+            function_declarations: Some(
+                req.tools
+                    .iter()
+                    .map(|t| FunctionDeclaration {
+                        name: t.name.clone(),
+                        description: t.description.clone(),
+                        parameters: Some(t.parameters.clone()),
+                    })
+                    .collect(),
+            ),
+        }])
+    };
+
+    let tool_config = req.tool_choice.as_ref().map(|tc| ToolConfig {
+        function_calling_config: Some(match tc {
+            ConversationToolChoice::Auto => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Auto),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Required => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Any),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Function(name) => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Any),
+                allowed_function_names: Some(vec![name.clone()]),
+            },
+            ConversationToolChoice::None => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::None),
+                allowed_function_names: None,
+            },
+            ConversationToolChoice::Custom(_) => FunctionCallingConfig {
+                mode: Some(FunctionCallingMode::Auto),
+                allowed_function_names: None,
+            },
+        }),
+    });
+
+    let thinking_config = req.reasoning_effort.map(|effort| {
+        let budget = match effort {
+            crate::ReasoningEffort::None => Some(0),
+            crate::ReasoningEffort::Minimal => Some(1024),
+            crate::ReasoningEffort::Low => Some(2048),
+            crate::ReasoningEffort::Medium => Some(8192),
+            crate::ReasoningEffort::High
+            | crate::ReasoningEffort::Xhigh
+            | crate::ReasoningEffort::Max
+            | crate::ReasoningEffort::Ultra => Some(16384),
+        };
+        ThinkingConfig {
+            thinking_budget: budget,
+            include_thoughts: Some(true),
+        }
+    });
+
+    let generation_config = if req.temperature.is_some()
+        || req.top_p.is_some()
+        || req.max_output_tokens.is_some()
+        || thinking_config.is_some()
+    {
+        Some(GenerationConfig {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            max_output_tokens: req.max_output_tokens,
+            thinking_config,
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    GenerateContentRequest {
+        contents,
+        system_instruction,
+        tools,
+        tool_config,
+        generation_config,
+        safety_settings: None,
+    }
+}
+
+impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationItem {
+    fn from(resp: crate::google_ai_studio::GenerateContentResponse) -> Self {
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+
+        if let Some(candidate) = resp.candidates.into_iter().next() {
+            if let Some(c) = candidate.content {
+                for part in c.parts {
+                    if part.thought == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part.text {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&text);
+                    }
+                    if let Some(fc) = part.function_call {
+                        let id = fc.id.unwrap_or_else(|| {
+                            format!("call_{}_{}", tool_calls.len(), fc.name)
+                        });
+                        tool_calls.push(ToolCall {
+                            id: Arc::<str>::from(id),
+                            name: fc.name,
+                            arguments: Arc::<str>::from(fc.args.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        ConversationItem::Assistant(AssistantItem {
+            content: Arc::<str>::from(content),
+            tool_calls,
+            model_id: resp.model_version,
+            model_fingerprint: None,
+            reasoning_effort: None,
+        })
+    }
+}
+
+impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationResponse {
+    fn from(resp: crate::google_ai_studio::GenerateContentResponse) -> Self {
+        use crate::google_ai_studio::FinishReason;
+
+        let model = resp.model_version.clone().unwrap_or_default();
+        let usage = resp.usage_metadata.as_ref().map(|u| TokenUsage {
+            prompt_tokens: u.prompt_token_count.unwrap_or(0),
+            completion_tokens: u.candidates_token_count.unwrap_or(0),
+            total_tokens: u.total_token_count.unwrap_or(0),
+            reasoning_tokens: 0,
+            cached_prompt_tokens: u.cached_content_token_count.unwrap_or(0),
+            cache_creation_prompt_tokens: 0,
+        });
+
+        let mut content = String::new();
+        let mut tool_calls = Vec::new();
+        let mut stop_reason = StopReason::Stop;
+
+        if let Some(candidate) = resp.candidates.into_iter().next() {
+            if let Some(finish_reason) = candidate.finish_reason {
+                stop_reason = match finish_reason {
+                    FinishReason::Stop => StopReason::Stop,
+                    FinishReason::MaxTokens => StopReason::Length,
+                    FinishReason::Safety
+                    | FinishReason::Blocklist
+                    | FinishReason::ProhibitedContent
+                    | FinishReason::Spii
+                    | FinishReason::ImageSafety => StopReason::ContentFilter,
+                    _ => StopReason::Stop,
+                };
+            }
+            if let Some(c) = candidate.content {
+                for part in c.parts {
+                    if part.thought == Some(true) {
+                        continue;
+                    }
+                    if let Some(text) = part.text {
+                        if !content.is_empty() {
+                            content.push('\n');
+                        }
+                        content.push_str(&text);
+                    }
+                    if let Some(fc) = part.function_call {
+                        let id = fc.id.unwrap_or_else(|| {
+                            format!("call_{}_{}", tool_calls.len(), fc.name)
+                        });
+                        tool_calls.push(ToolCall {
+                            id: Arc::<str>::from(id),
+                            name: fc.name,
+                            arguments: Arc::<str>::from(fc.args.to_string()),
+                        });
+                    }
+                }
+            }
+        }
+
+        let items = vec![ConversationItem::Assistant(AssistantItem {
+            content: Arc::<str>::from(content),
+            tool_calls,
+            model_id: Some(model),
+            model_fingerprint: None,
+            reasoning_effort: None,
+        })];
+
+        ConversationResponse {
+            items,
+            usage,
+            stop_reason: Some(stop_reason),
+            cost_usd_ticks: None,
+            message_chunks_emitted: 0,
+            doom_loop_signals: Vec::new(),
+            stop_message: None,
+            message_id: None,
+            raw_stop_reason: None,
+            stop_sequence: None,
+        }
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod google_ai_studio_tests {
+    use super::*;
+    use crate::google_ai_studio::{
+        Candidate, Content, FinishReason, FunctionCallingMode, GenerateContentResponse,
+        Part, UsageMetadata,
+    };
+    use crate::{
+        ConversationRequest, ConversationToolChoice, ReasoningEffort, StopReason, ToolSpec,
+    };
+
+    #[test]
+    fn build_request_maps_system_user_assistant_and_tools() {
+        let request = ConversationRequest {
+            items: vec![
+                ConversationItem::system("You are a helpful assistant."),
+                ConversationItem::user("Hello!"),
+                ConversationItem::Assistant(AssistantItem {
+                    content: Arc::<str>::from("Calling a tool"),
+                    tool_calls: vec![ToolCall {
+                        id: Arc::<str>::from("call_1"),
+                        name: "bash".to_string(),
+                        arguments: Arc::<str>::from(r#"{"cmd":"echo hi"}"#),
+                    }],
+                    model_id: None,
+                    model_fingerprint: None,
+                    reasoning_effort: None,
+                }),
+                ConversationItem::tool_result("call_1", r#"{"stdout":"hi"}"#),
+            ],
+            tools: vec![ToolSpec {
+                name: "bash".to_string(),
+                description: Some("Execute a bash command".to_string()),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" }
+                    }
+                }),
+            }],
+            tool_choice: Some(ConversationToolChoice::Auto),
+            reasoning_effort: Some(ReasoningEffort::High),
+            temperature: Some(0.7),
+            max_output_tokens: Some(4096),
+            ..Default::default()
+        };
+
+        let mapped = build_google_ai_studio_request(&request);
+
+        // System instruction
+        assert_eq!(
+            mapped.system_instruction,
+            Some(Content {
+                role: None,
+                parts: vec![Part::text("You are a helpful assistant.")],
+            })
+        );
+
+        // Contents
+        assert_eq!(mapped.contents.len(), 3);
+        assert_eq!(mapped.contents[0].role, Some("user".to_string()));
+        assert_eq!(mapped.contents[0].parts, vec![Part::text("Hello!")]);
+
+        assert_eq!(mapped.contents[1].role, Some("model".to_string()));
+        assert_eq!(mapped.contents[1].parts.len(), 2);
+        assert_eq!(
+            mapped.contents[1].parts[0],
+            Part::text("Calling a tool")
+        );
+        assert_eq!(
+            mapped.contents[1].parts[1].function_call.as_ref().unwrap().name,
+            "bash"
+        );
+
+        assert_eq!(mapped.contents[2].role, Some("user".to_string()));
+        assert_eq!(mapped.contents[2].parts.len(), 1);
+        let fn_resp = mapped.contents[2].parts[0].function_response.as_ref().unwrap();
+        assert_eq!(fn_resp.name, "bash");
+        assert_eq!(fn_resp.response, serde_json::json!({ "stdout": "hi" }));
+
+        // Tools
+        let tools = mapped.tools.expect("tools present");
+        assert_eq!(tools.len(), 1);
+        let decls = tools[0].function_declarations.as_ref().unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name, "bash");
+
+        // Tool config
+        let tool_config = mapped.tool_config.expect("tool_config present");
+        assert_eq!(
+            tool_config.function_calling_config.unwrap().mode,
+            Some(FunctionCallingMode::Auto)
+        );
+
+        // Generation config
+        let gen_config = mapped.generation_config.expect("gen_config present");
+        assert_eq!(gen_config.temperature, Some(0.7));
+        assert_eq!(gen_config.max_output_tokens, Some(4096));
+        let thinking = gen_config.thinking_config.expect("thinking present");
+        assert_eq!(thinking.thinking_budget, Some(16384));
+        assert_eq!(thinking.include_thoughts, Some(true));
+    }
+
+    #[test]
+    fn response_converts_to_conversation_response() {
+        let wire = GenerateContentResponse {
+            candidates: vec![Candidate {
+                content: Some(Content {
+                    role: Some("model".to_string()),
+                    parts: vec![
+                        Part {
+                            thought: Some(true),
+                            text: Some("Internal thought...".to_string()),
+                            ..Default::default()
+                        },
+                        Part::text("Final answer."),
+                        Part::function_call("read_file", serde_json::json!({ "path": "file.txt" })),
+                    ],
+                }),
+                finish_reason: Some(FinishReason::Stop),
+                finish_message: None,
+                index: Some(0),
+            }],
+            usage_metadata: Some(UsageMetadata {
+                prompt_token_count: Some(15),
+                candidates_token_count: Some(25),
+                total_token_count: Some(40),
+                cached_content_token_count: Some(5),
+            }),
+            model_version: Some("gemini-2.5-flash".to_string()),
+        };
+
+        let resp = ConversationResponse::from(wire);
+        assert_eq!(resp.items.len(), 1);
+        let assistant = resp.assistant().expect("assistant item");
+        assert_eq!(assistant.content.as_ref(), "Final answer.");
+        assert_eq!(assistant.tool_calls.len(), 1);
+        assert_eq!(assistant.tool_calls[0].name, "read_file");
+        assert_eq!(resp.stop_reason, Some(StopReason::Stop));
+
+        let usage = resp.usage.expect("usage present");
+        assert_eq!(usage.prompt_tokens, 15);
+        assert_eq!(usage.completion_tokens, 25);
+        assert_eq!(usage.total_tokens, 40);
+        assert_eq!(usage.cached_prompt_tokens, 5);
+    }
+}
 
 #[cfg(test)]
 mod compaction_item_bridge_tests {
@@ -5883,6 +6405,7 @@ mod tests {
             crate::ApiBackend::ChatCompletions,
             crate::ApiBackend::Responses,
             crate::ApiBackend::Messages,
+            crate::ApiBackend::GoogleAiStudio,
         ] {
             let on_wire = match backend {
                 crate::ApiBackend::Responses => {
@@ -5902,6 +6425,13 @@ mod tests {
                     let mapped = build_messages_request(&request());
                     serde_json::to_value(&mapped)
                         .expect("messages request serializes")
+                        .get("prompt_cache_key")
+                        .is_some()
+                }
+                crate::ApiBackend::GoogleAiStudio => {
+                    let mapped = build_google_ai_studio_request(&request());
+                    serde_json::to_value(&mapped)
+                        .expect("google ai studio request serializes")
                         .get("prompt_cache_key")
                         .is_some()
                 }
