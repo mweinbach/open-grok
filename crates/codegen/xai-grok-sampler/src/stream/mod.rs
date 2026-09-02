@@ -11,10 +11,12 @@
 pub mod chat_completions;
 pub mod collect;
 pub mod display_citations;
+pub mod google_ai_studio;
 pub mod messages;
 pub mod responses;
 
 pub use chat_completions::stream_chat_completions;
 pub use collect::collect_response;
+pub use google_ai_studio::stream_google_ai_studio;
 pub use messages::stream_messages;
 pub use responses::{stream_responses, stream_responses_with_client_custom_tools};

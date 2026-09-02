@@ -1500,6 +1500,17 @@ impl SamplingClient {
                     })?;
                     headers.insert(HeaderName::from_static("x-api-key"), header_value);
                 }
+                AuthScheme::XGoogApiKey => {
+                    let header_value = HeaderValue::from_str(api_key).map_err(|_| {
+                        tracing::debug!(
+                            "Invalid api_key: cannot be converted to a valid HTTP header"
+                        );
+                        SamplingError::auth_unknown(
+                            "Invalid api_key: cannot be converted to a valid HTTP header",
+                        )
+                    })?;
+                    headers.insert(HeaderName::from_static("x-goog-api-key"), header_value);
+                }
                 AuthScheme::Bearer => {
                     let bearer = format!("Bearer {}", api_key);
                     let header_value = HeaderValue::from_str(&bearer).map_err(|_| {
@@ -1673,12 +1684,18 @@ impl SamplingClient {
             if resolved.is_some() || resolver.fail_closed_on_missing() {
                 headers.remove(AUTHORIZATION);
                 headers.remove(HeaderName::from_static("x-api-key"));
+                headers.remove(HeaderName::from_static("x-goog-api-key"));
             }
             if let Some(resolved) = resolved {
                 match self.defaults.auth_scheme {
                     AuthScheme::XApiKey => {
                         if let Ok(value) = HeaderValue::from_str(&resolved.bearer) {
                             headers.insert(HeaderName::from_static("x-api-key"), value);
+                        }
+                    }
+                    AuthScheme::XGoogApiKey => {
+                        if let Ok(value) = HeaderValue::from_str(&resolved.bearer) {
+                            headers.insert(HeaderName::from_static("x-goog-api-key"), value);
                         }
                     }
                     AuthScheme::Bearer => {
@@ -1718,6 +1735,7 @@ impl SamplingClient {
             has_bearer_resolver = self.bearer_resolver.is_some(),
             has_authorization_header = headers.get(AUTHORIZATION).is_some(),
             has_x_api_key_header = headers.get(HeaderName::from_static("x-api-key")).is_some(),
+            has_x_goog_api_key_header = headers.get(HeaderName::from_static("x-goog-api-key")).is_some(),
         );
         let sent_bearer = Self::sent_fragment_from_headers(&headers, &self.defaults.auth_scheme);
         if let Some(injector) = &self.header_injector {
@@ -1737,12 +1755,15 @@ impl SamplingClient {
     }
 
     /// Tail fragment of the credential in `headers` — `x-api-key`
-    /// (Messages-API scheme) or `Authorization` — per
+    /// (Messages-API scheme), `x-goog-api-key` (Google AI Studio), or `Authorization` — per
     /// [`crate::attribution::BEARER_SUFFIX_LEN`].
     fn sent_fragment_from_headers(headers: &HeaderMap, scheme: &AuthScheme) -> Option<String> {
         let raw = match scheme {
             AuthScheme::XApiKey => headers
                 .get(HeaderName::from_static("x-api-key"))
+                .and_then(|v| v.to_str().ok()),
+            AuthScheme::XGoogApiKey => headers
+                .get(HeaderName::from_static("x-goog-api-key"))
                 .and_then(|v| v.to_str().ok()),
             AuthScheme::Bearer => headers
                 .get(AUTHORIZATION)
@@ -1800,6 +1821,7 @@ impl SamplingClient {
         let auth_prefix = self.current_sent_bearer_suffix();
         let auth_type = match (&self.defaults.auth_scheme, &auth_prefix) {
             (AuthScheme::XApiKey, Some(_)) => "x-api-key",
+            (AuthScheme::XGoogApiKey, Some(_)) => "x-goog-api-key",
             (AuthScheme::Bearer, Some(_)) => "bearer",
             (_, None) => "none",
         };
@@ -1844,6 +1866,22 @@ impl SamplingClient {
 
     fn endpoint(&self, path: &str) -> String {
         self.endpoint.url_for_path(path)
+    }
+
+    fn google_ai_studio_endpoint(&self, model: &str, stream: bool) -> String {
+        let action = if stream {
+            ":streamGenerateContent?alt=sse"
+        } else {
+            ":generateContent"
+        };
+        let base = self.base_url.trim_end_matches('/');
+        let base = base.strip_suffix("/openai").unwrap_or(base).trim_end_matches('/');
+        let model_path = if model.starts_with("models/") {
+            format!("{model}{action}")
+        } else {
+            format!("models/{model}{action}")
+        };
+        format!("{base}/{model_path}")
     }
 
     async fn acquire_provider_request_permit(&self) -> Option<OwnedSemaphorePermit> {
@@ -3452,6 +3490,150 @@ impl SamplingClient {
         Ok((events, model_metadata))
     }
 
+    pub async fn create_google_ai_studio_stream(
+        &self,
+        request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| self.defaults.model.clone());
+        let url = self.google_ai_studio_endpoint(&model, true);
+        let wire_req =
+            xai_grok_sampling_types::conversation::build_google_ai_studio_request(&request);
+
+        let SentRequest {
+            builder,
+            sent_bearer,
+        } = self.post(&url);
+
+        let http_request = builder
+            .header(ACCEPT, HeaderValue::from_static("text/event-stream"))
+            .json(&wire_req);
+
+        let built_request = http_request.build().map_err(|e| {
+            tracing::error!("Failed to build HTTP request: {}", e);
+            SamplingError::Http(e)
+        })?;
+
+        tracing::debug!(
+            url = %built_request.url(),
+            method = %built_request.method(),
+            "Sending Google AI Studio stream request"
+        );
+        Self::log_request_headers(&built_request, "google_ai_studio");
+
+        let response = self.http.execute(built_request).await.map_err(|e| {
+            tracing::debug!("HTTP request failed: {}", e);
+            record_stream_request_failure(&e);
+            e
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                self.record_401_attribution(
+                    crate::attribution::SamplingConsumer::GoogleAiStudioStream,
+                    sent_bearer.as_deref(),
+                );
+                let body = response.bytes().await.unwrap_or_default();
+                let server_message = user_facing_api_error_message(status, body.as_ref());
+                return Err(auth_rejected(
+                    format!("Unauthorized (401) from {url}: {server_message}"),
+                    sent_bearer.as_deref(),
+                ));
+            }
+            let model_metadata = extract_model_metadata(response.headers());
+            let retry_after_secs = extract_retry_after(response.headers());
+            let should_retry = extract_should_retry(response.headers());
+            let bytes = response.bytes().await?;
+            let message = user_facing_api_error_message(status, bytes.as_ref());
+            tracing::error!(
+                status = %status,
+                error_message = %message,
+                body_preview = %Self::body_preview(bytes.as_ref()),
+                model_id = %model,
+                "Google AI Studio API error"
+            );
+            return Err(SamplingError::Api {
+                status,
+                message,
+                model_metadata,
+                retry_after_secs,
+                should_retry,
+                error_code: parse_error_code(bytes.as_ref()),
+            });
+        }
+
+        let model_metadata = extract_model_metadata(response.headers());
+
+        const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+        let mut is_first = true;
+        let byte_stream = response.bytes_stream().map(move |result| {
+            result.map(|bytes| {
+                if is_first {
+                    is_first = false;
+                    if bytes.starts_with(UTF8_BOM) {
+                        return bytes.slice(UTF8_BOM.len()..);
+                    }
+                }
+                bytes
+            })
+        });
+
+        let event_stream = byte_stream.eventsource();
+
+        let events = event_stream
+            .scan(false, |had_transport_error, event_res| {
+                if *had_transport_error {
+                    return std::future::ready(None);
+                }
+                let item = match event_res {
+                    Ok(event) => {
+                        let data = &event.data;
+                        if data == "[DONE]" {
+                            return std::future::ready(None);
+                        }
+
+                        tracing::info!(
+                            target: crate::sampling_log::TARGET,
+                            event = "sse_chunk",
+                            backend = "google_ai_studio",
+                            data = %data,
+                        );
+
+                        if let Some(stream_error) = try_parse_stream_error(data) {
+                            Some(Err(stream_error))
+                        } else {
+                            Some(
+                                serde_json::from_str::<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>(data).map_err(
+                                    |e| {
+                                        tracing::error!(
+                                            error = %e,
+                                            raw_data = %data,
+                                            "Failed to deserialize GenerateContentResponse from stream"
+                                        );
+                                        SamplingError::Serialization(e)
+                                    },
+                                ),
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        *had_transport_error = true;
+                        Some(Err(SamplingError::EventStreamError(e.to_string())))
+                    }
+                };
+                std::future::ready(item)
+            })
+            .boxed();
+
+        Ok((events, model_metadata))
+    }
+
     // =========================================================================
     // Unified Conversation API
     // =========================================================================
@@ -3766,6 +3948,19 @@ impl SamplingClient {
         self.create_message_stream(wrapper).await
     }
 
+    /// Send a conversation request using the Google AI Studio API (streaming).
+    pub async fn conversation_stream_google_ai_studio(
+        &self,
+        mut request: ConversationRequest,
+    ) -> Result<(
+        BoxStream<'static, Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>>,
+        Option<ResponseModelMetadata>,
+    )> {
+        self.apply_conversation_defaults(&mut request)?;
+        self.project_function_backend_conversation(&mut request)?;
+        self.create_google_ai_studio_stream(request).await
+    }
+
     /// Send a conversation request using the Anthropic Messages API (non-streaming).
     ///
     /// Converts the `ConversationRequest` to Messages API format internally.
@@ -3842,6 +4037,12 @@ impl SamplingClient {
             ApiBackend::Messages => {
                 let (raw, meta) = self.conversation_stream_messages(request).await?;
                 let events = crate::stream::stream_messages(raw, meta, request_id, idle_timeout);
+                crate::stream::collect_response(events).await
+            }
+            ApiBackend::GoogleAiStudio => {
+                let (raw, meta) = self.conversation_stream_google_ai_studio(request).await?;
+                let events =
+                    crate::stream::stream_google_ai_studio(raw, meta, request_id, idle_timeout);
                 crate::stream::collect_response(events).await
             }
         };
@@ -6924,5 +7125,47 @@ mod tests {
             event,
             rs::ResponseStreamEvent::ResponseOutputTextDelta(_)
         ));
+    }
+
+    #[test]
+    fn google_ai_studio_endpoint_formatting() {
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Gemini;
+        cfg.api_backend = ApiBackend::GoogleAiStudio;
+        cfg.auth_scheme = AuthScheme::XGoogApiKey;
+        cfg.base_url = "https://generativelanguage.googleapis.com/v1beta/openai".to_string();
+        let client = SamplingClient::new(cfg).unwrap();
+
+        assert_eq!(
+            client.google_ai_studio_endpoint("gemini-2.5-flash", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            client.google_ai_studio_endpoint("gemini-2.5-flash", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            client.google_ai_studio_endpoint("models/gemini-2.5-pro", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn google_ai_studio_auth_scheme_and_header() {
+        let mut cfg = minimal_config();
+        cfg.provider = ModelProvider::Gemini;
+        cfg.api_backend = ApiBackend::GoogleAiStudio;
+        cfg.auth_scheme = AuthScheme::XGoogApiKey;
+        cfg.api_key = Some("test-goog-key-123".to_string());
+        cfg.base_url = "https://generativelanguage.googleapis.com/v1beta".to_string();
+        let client = SamplingClient::new(cfg).unwrap();
+
+        let req = client.post("https://generativelanguage.googleapis.com/v1beta/test");
+        let built = req.builder.build().unwrap();
+        assert_eq!(
+            built.headers().get("x-goog-api-key").unwrap(),
+            "test-goog-key-123"
+        );
+        assert!(built.headers().get(reqwest::header::AUTHORIZATION).is_none());
     }
 }

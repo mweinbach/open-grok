@@ -22,6 +22,8 @@ pub enum AuthScheme {
     #[default]
     Bearer,
     XApiKey,
+    #[serde(alias = "x_goog_api_key", alias = "goog_api_key", alias = "google")]
+    XGoogApiKey,
 }
 
 /// Truthful, session-scoped execution policy exposed to the Codex provider.

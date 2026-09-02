@@ -44,6 +44,10 @@ pub enum SamplingConsumer {
     Messages,
     /// `alpha/search`: provider-authenticated standalone web search.
     StandaloneWebSearch,
+    /// `streamGenerateContent`: Google AI Studio streaming API.
+    GoogleAiStudioStream,
+    /// `generateContent`: Google AI Studio non-streaming API.
+    GoogleAiStudio,
 }
 
 impl SamplingConsumer {
@@ -60,6 +64,8 @@ impl SamplingConsumer {
             Self::MessagesStream => "messages_stream",
             Self::Messages => "messages",
             Self::StandaloneWebSearch => "standalone_web_search",
+            Self::GoogleAiStudioStream => "google_ai_studio_stream",
+            Self::GoogleAiStudio => "google_ai_studio",
         }
     }
 }
