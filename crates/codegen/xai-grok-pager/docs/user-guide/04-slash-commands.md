@@ -457,10 +457,13 @@ Create, edit, and delete personas. A subagent can apply a persona to shape how i
 
 Log in or re-authenticate with xAI without leaving the session. Add `codex` to
 connect an independent OpenAI Codex OAuth account without changing xAI auth.
+API-key providers use the same command with the provider name, for example
+`/login openrouter`. See [Authentication](02-authentication.md).
 
 ```
 /login
 /login codex
+/login openrouter
 ```
 
 ### `/logout`

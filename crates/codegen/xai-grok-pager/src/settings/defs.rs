@@ -1478,7 +1478,7 @@ pub fn default_settings() -> Vec<SettingMeta> {
             category: SettingCategory::Models,
             owner: SettingOwner::Shell,
             label: "OpenRouter models",
-            description: "Choose which discovered OpenRouter models appear in model settings and are available to subagents.",
+            description: "Choose which discovered OpenRouter text models appear in model settings and are available to subagents. Only selected models are enabled.",
             keywords: &[
                 "openrouter",
                 "open",

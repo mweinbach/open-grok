@@ -1011,6 +1011,71 @@ fn default_reasoning_effort_only_stamps_supporting_model() {
 }
 
 #[test]
+fn openrouter_catalog_requires_explicit_enabled_models() {
+    use xai_grok_sampling_types::ModelProvider;
+
+    for (enabled, selected) in [
+        (vec![], false),
+        (vec!["openrouter:vendor/reasoner".to_string()], true),
+        (vec!["vendor/reasoner".to_string()], true),
+        (vec!["openrouter:vendor/other".to_string()], false),
+    ] {
+        let mut cfg = config::Config::default();
+        cfg.models.openrouter_enabled_models = enabled;
+        cfg.config_models.insert(
+            "openrouter:vendor/reasoner".to_string(),
+            config::ConfigModelOverride {
+                model: Some("vendor/reasoner".to_string()),
+                provider: Some(ModelProvider::OpenRouter),
+                ..Default::default()
+            },
+        );
+        cfg.config_models.insert(
+            "unrelated".to_string(),
+            config::ConfigModelOverride {
+                provider: Some(ModelProvider::Custom),
+                ..Default::default()
+            },
+        );
+        let catalog = resolve_model_catalog(&cfg, None);
+        assert_eq!(catalog.contains_key("openrouter:vendor/reasoner"), selected);
+        assert!(catalog.contains_key("unrelated"));
+    }
+}
+
+#[test]
+fn openrouter_persisted_reasoning_effort_obeys_advertised_menu() {
+    use xai_grok_sampling_types::{ModelProvider, ReasoningEffortOption};
+
+    for (effort, expected) in [
+        (ReasoningEffort::Low, Some(ReasoningEffort::Low)),
+        (ReasoningEffort::Max, None),
+    ] {
+        let mut cfg = config::Config::default();
+        let id = "openrouter:vendor/reasoner";
+        cfg.models.default = Some(id.to_string());
+        cfg.models.default_reasoning_effort = Some(effort);
+        cfg.models.openrouter_enabled_models = vec![id.to_string()];
+        cfg.config_models.insert(
+            id.to_string(),
+            config::ConfigModelOverride {
+                provider: Some(ModelProvider::OpenRouter),
+                reasoning_efforts: vec![ReasoningEffortOption {
+                    id: "low".to_string(),
+                    value: ReasoningEffort::Low,
+                    label: "Low".to_string(),
+                    description: None,
+                    default: false,
+                }],
+                ..Default::default()
+            },
+        );
+        let catalog = resolve_model_catalog(&cfg, None);
+        assert_eq!(catalog[id].info.reasoning_effort, expected);
+    }
+}
+
+#[test]
 fn reasoning_effort_override_skips_models_that_do_not_offer_level() {
     use indexmap::IndexMap;
     use xai_grok_sampling_types::ReasoningEffortOption;

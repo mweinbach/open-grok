@@ -847,6 +847,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openrouter_reasoning_wire_fields_do_not_duplicate_tokens() {
+        let chunk = |delta: serde_json::Value| {
+            serde_json::from_value::<ChatCompletionChunk>(serde_json::json!({
+                "id": "chunk-or",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "anthropic/claude-sonnet-4",
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": null
+                }]
+            }))
+            .expect("OpenRouter reasoning delta deserializes")
+        };
+
+        let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
+            Ok(chunk(serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": null,
+                "reasoning": "gateway",
+                "reasoning_details": [{"type": "reasoning.text", "text": "gateway"}]
+            }))),
+            Ok(chunk(serde_json::json!({
+                "reasoning_content": " thoughts",
+                "reasoning": " duplicate thoughts"
+            }))),
+            Ok(text_chunk("done")),
+            Ok(final_chunk(FinishReason::Stop)),
+        ];
+        let raw = stream::iter(chunks).boxed();
+        let events = collect(stream_chat_completions(
+            raw,
+            None,
+            rid(),
+            Duration::from_secs(60),
+        ))
+        .await;
+
+        let reasoning_tokens: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                SamplingEvent::ChannelToken {
+                    channel: SamplingChannel::Reasoning,
+                    text,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning_tokens, vec!["gateway", " thoughts"]);
+        match events.last().expect("terminal event") {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = response
+                    .reasoning_items()
+                    .next()
+                    .expect("reasoning sibling");
+                let rs::SummaryPart::SummaryText(text) = &reasoning.summary[0];
+                assert_eq!(text.text, "gateway thoughts");
+                assert_eq!(response.assistant_text(), "done");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn tool_call_stream_emits_deltas_and_assembles_final_call() {
         // First chunk has id + name + part of arguments.
         let chunk1 = make_chunk(vec![ChatChunkDelta {

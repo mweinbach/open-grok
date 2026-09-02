@@ -139,7 +139,7 @@ async fn apply_with_resolved_tool_policy(
     if let Some(eff) = effort_override {
         if agent
             .models_manager
-            .model_supports_reasoning_effort(model_id.0.as_ref())
+            .model_accepts_reasoning_effort(model_id.0.as_ref(), eff)
         {
             tracing::info!(
                 session_id = %session_id.0,
@@ -152,7 +152,7 @@ async fn apply_with_resolved_tool_policy(
                 session_id = %session_id.0,
                 model_id = %model_id.0,
                 effort = %eff,
-                "set_session_model: ignoring reasoning_effort override — model does not support it"
+                "set_session_model: ignoring reasoning_effort override — model does not accept it"
             );
         }
     }

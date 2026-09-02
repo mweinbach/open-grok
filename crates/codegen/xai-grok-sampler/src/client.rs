@@ -1955,6 +1955,16 @@ impl SamplingClient {
             .then_some(self.defaults.reasoning_effort)
             .flatten()
             .map(|default| request.reasoning_effort.unwrap_or(default));
+        // These fields are OpenRouter's wire projection, not shared reasoning
+        // defaults. Clear them even on a reused or directly supplied request
+        // before any other provider sees the body. Model names and URLs do
+        // not grant gateway-specific wire capabilities.
+        if self.defaults.provider != ModelProvider::OpenRouter {
+            request.reasoning = None;
+            for message in &mut request.messages {
+                message.reasoning = None;
+            }
+        }
         self.provider_adapter.sanitize_chat_request(&mut request);
         if let Some(reasoning_effort) = fireworks_reasoning_effort {
             request.reasoning_effort = Some(reasoning_effort);
@@ -4544,6 +4554,7 @@ mod tests {
             search_parameters: None,
             response_format: None,
             reasoning_effort: None,
+            reasoning: None,
             thinking: None,
             service_tier: None,
             x_grok_conv_id: None,
@@ -4740,6 +4751,58 @@ mod tests {
             .apply_defaults(unsupported_input)
             .expect("unsupported Fireworks defaults");
         assert_eq!(unsupported_request.reasoning_effort, None);
+    }
+
+    #[test]
+    fn openrouter_reasoning_wire_fields_are_provider_scoped() {
+        use xai_grok_sampling_types::ChatReasoningConfig;
+
+        for provider in [
+            ModelProvider::Xai,
+            ModelProvider::Kimi,
+            ModelProvider::Fireworks,
+            ModelProvider::DeepSeek,
+            ModelProvider::OpenCodeGo,
+            ModelProvider::Wafer,
+            ModelProvider::Zai,
+            ModelProvider::Runinfra,
+            ModelProvider::Gemini,
+            ModelProvider::OpenRouter,
+            ModelProvider::Custom,
+        ] {
+            let mut config = minimal_config();
+            config.provider = provider;
+            // Identical gateway-looking metadata must not determine policy.
+            config.model = "anthropic/claude-sonnet-4".to_owned();
+            config.base_url = "https://openrouter.ai/api/v1".to_owned();
+            let client = SamplingClient::new(config).expect("Chat Completions client");
+            let mut assistant = ChatRequestMessage::assistant(
+                "answer",
+                "anthropic/claude-sonnet-4",
+                Some("portable thoughts".to_owned()),
+            );
+            assistant.reasoning = Some("gateway thoughts".to_owned());
+            let mut request =
+                ChatCompletionRequest::new("anthropic/claude-sonnet-4", vec![assistant]);
+            request.reasoning = Some(ChatReasoningConfig::effort(ReasoningEffort::High));
+            let request = client.apply_defaults(request).expect("provider defaults");
+            let wire = serde_json::to_value(request).expect("serializes");
+            if provider == ModelProvider::OpenRouter {
+                assert_eq!(wire["reasoning"]["effort"], "high");
+                assert_eq!(wire["messages"][0]["reasoning"], "gateway thoughts");
+                assert!(wire["messages"][0].get("reasoning_content").is_none());
+            } else {
+                assert!(wire.get("reasoning").is_none(), "{provider:?}");
+                assert!(
+                    wire["messages"][0].get("reasoning").is_none(),
+                    "{provider:?}"
+                );
+                assert_eq!(
+                    wire["messages"][0]["reasoning_content"], "portable thoughts",
+                    "{provider:?}"
+                );
+            }
+        }
     }
 
     #[test]

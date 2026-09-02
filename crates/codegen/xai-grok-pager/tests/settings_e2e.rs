@@ -1570,6 +1570,12 @@ fn seed_openrouter_model_catalog(state: &mut SettingsModalState) {
             name: "OpenAI: GPT-4o".to_string(),
             api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
         },
+        xai_grok_shell::openrouter_models::OpenRouterModelDescriptor {
+            key: "openrouter:meta-llama/llama-3.1-8b-instruct".to_string(),
+            id: "meta-llama/llama-3.1-8b-instruct".to_string(),
+            name: "Llama 3.1 8B".to_string(),
+            api_backend: xai_grok_shell::sampling::ApiBackend::ChatCompletions,
+        },
     ];
     state.pager_snapshot.openrouter_enabled_models.clear();
 }
@@ -1594,7 +1600,7 @@ fn enter_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
                 if models == &["openai/gpt-4o".to_string()]
         ),
-        "Space on a discovered OpenRouter model must enable it, got {out:?}",
+        "Space on a discovered OpenRouter model must enable only it, got {out:?}",
     );
 
     let out = handle_settings_key(&mut s, &press(KeyCode::Esc));
@@ -1640,8 +1646,44 @@ fn mouse_click_on_openrouter_models_opens_sub_sheet_and_toggles_enabled() {
             SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { ref models })
                 if models == &["openai/gpt-4o".to_string()]
         ),
-        "click on a discovered OpenRouter model must enable it, got {out:?}",
+        "click on a discovered OpenRouter model must enable only it, got {out:?}",
     );
+}
+
+#[test]
+fn openrouter_model_selections_stay_explicit_and_allow_disabling_last_model() {
+    let mut s = make_state();
+    seed_openrouter_model_catalog(&mut s);
+    navigate_to(&mut s, "openrouter_models");
+    let out = handle_settings_key(&mut s, &press(KeyCode::Enter));
+    assert!(matches!(out, SettingsKeyOutcome::Changed));
+
+    let toggle_and_refresh = |state: &mut SettingsModalState, expected: &[&str]| {
+        let out = handle_settings_key(state, &press(KeyCode::Char(' ')));
+        let SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { models }) = out else {
+            panic!("OpenRouter toggle must update enabled models, got {out:?}");
+        };
+        assert_eq!(models, expected);
+        // Runtime dispatch refreshes the modal snapshot after each action.
+        state.pager_snapshot.openrouter_enabled_models = models;
+    };
+
+    toggle_and_refresh(&mut s, &["openai/gpt-4o"]);
+    toggle_and_refresh(&mut s, &[]);
+
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    toggle_and_refresh(&mut s, &["meta-llama/llama-3.1-8b-instruct"]);
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Up));
+    // Selecting the full catalog must persist both ids, not an empty sentinel.
+    toggle_and_refresh(
+        &mut s,
+        &["meta-llama/llama-3.1-8b-instruct", "openai/gpt-4o"],
+    );
+    toggle_and_refresh(&mut s, &["meta-llama/llama-3.1-8b-instruct"]);
+    let _ = handle_settings_key(&mut s, &press(KeyCode::Down));
+    toggle_and_refresh(&mut s, &[]);
+    // After the last model is disabled, a new toggle enables only that model.
+    toggle_and_refresh(&mut s, &["meta-llama/llama-3.1-8b-instruct"]);
 }
 
 fn seed_custom_models(state: &mut SettingsModalState) {

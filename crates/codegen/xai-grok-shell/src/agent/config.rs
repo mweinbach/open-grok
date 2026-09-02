@@ -5158,7 +5158,13 @@ impl ModelInfo {
                 .reasoning_efforts
                 .iter()
                 .find(|opt| opt.default)
-                .or_else(|| self.reasoning_efforts.first())
+                .or_else(|| {
+                    // An unmarked OpenRouter menu leaves reasoning up to the
+                    // gateway. Its first option is not an advertised default.
+                    (self.provider != ModelProvider::OpenRouter)
+                        .then(|| self.reasoning_efforts.first())
+                        .flatten()
+                })
                 .map(|opt| opt.value);
             self.reasoning_effort = default;
         }
@@ -7774,6 +7780,12 @@ reasoning_effort = "low"
         .expect("store RunInfra key");
         store_provider_api_key(home.path(), ModelProvider::Gemini, "gemini-stored-secret")
             .expect("store Gemini key");
+        store_provider_api_key(
+            home.path(),
+            ModelProvider::OpenRouter,
+            "openrouter-stored-secret",
+        )
+        .expect("store OpenRouter key");
 
         let mut meta = test_model_entry(
             "meta:muse-spark-1.2",
@@ -7869,6 +7881,33 @@ reasoning_effort = "low"
                 .is_none()
         );
         assert!(!gemini_proxy.has_usable_provider_credentials_at(home.path()));
+
+        let mut openrouter = test_model_entry(
+            "openrouter:openai/gpt-4o",
+            crate::openrouter_models::OPENROUTER_API_BASE_URL,
+            None,
+            None,
+            None,
+        );
+        openrouter.info.provider = ModelProvider::OpenRouter;
+        openrouter.env_key = Some(EnvKeys::single(
+            crate::openrouter_models::OPENROUTER_API_KEY_ENV,
+        ));
+        let openrouter_creds = resolve_credentials_at_home(&openrouter, None, home.path());
+        assert_eq!(
+            openrouter_creds.api_key.as_deref(),
+            Some("openrouter-stored-secret")
+        );
+        assert!(openrouter.has_usable_provider_credentials_at(home.path()));
+
+        let mut openrouter_proxy = openrouter.clone();
+        openrouter_proxy.info.base_url = "https://proxy.example/v1".to_owned();
+        assert!(
+            resolve_credentials_at_home(&openrouter_proxy, None, home.path())
+                .api_key
+                .is_none()
+        );
+        assert!(!openrouter_proxy.has_usable_provider_credentials_at(home.path()));
     }
 
     #[test]
@@ -9899,6 +9938,36 @@ reasoning_effort = "low"
             .unwrap();
         assert_eq!(meta["supportsReasoningEffort"], true);
         assert_eq!(meta["reasoningEffort"], "medium");
+    }
+    #[test]
+    fn openrouter_reasoning_menu_preserves_gateway_default() {
+        for (advertised_default, explicit_effort, expected) in [
+            (false, None, None),
+            (true, None, Some(ReasoningEffort::Max)),
+            (true, Some(ReasoningEffort::Low), Some(ReasoningEffort::Low)),
+        ] {
+            let mut entry = test_model_entry("m", "https://test.api/v1", None, None, None);
+            entry.info.provider = ModelProvider::OpenRouter;
+            entry.info.reasoning_effort = explicit_effort;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "max".to_string(),
+                value: ReasoningEffort::Max,
+                label: "Max".to_string(),
+                description: None,
+                default: advertised_default,
+            }];
+            entry.info.derive_reasoning_effort_fields();
+            assert!(entry.info.supports_reasoning_effort);
+            assert_eq!(entry.info.reasoning_effort, expected);
+            let models = IndexMap::from([("m".to_string(), entry)]);
+            let acp_models = to_acp_model_info(&models);
+            let meta = acp_models.values().next().unwrap().meta.as_ref().unwrap();
+            assert_eq!(meta["supportsReasoningEffort"], true);
+            assert_eq!(
+                meta.get("reasoningEffort"),
+                expected.map(reasoning_effort_meta_value).as_ref()
+            );
+        }
     }
     #[test]
     fn acp_model_meta_omits_reasoning_when_unsupported() {
