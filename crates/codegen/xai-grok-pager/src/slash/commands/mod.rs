@@ -41,6 +41,7 @@ pub mod login;
 pub mod logout;
 pub mod loop_cmd;
 pub mod mcps;
+pub mod mission;
 pub mod model;
 pub mod multiline;
 pub mod new;
@@ -89,6 +90,7 @@ pub fn builtin_commands() -> Vec<Arc<dyn SlashCommand>> {
         Arc::new(settings_cmd::SettingsCommand),
         Arc::new(dashboard::DashboardCommand),
         Arc::new(workflows::WorkflowsCommand),
+        Arc::new(mission::MissionCommand),
         Arc::new(plugin::PluginsCommand),
         Arc::new(btw::BtwCommand),
         Arc::new(voice::VoiceCommand),
