@@ -1094,6 +1094,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "ui.mouse_reporting_toggle",
             "suggestions.enabled",
             "suggestions.ai_enabled",
+            "sandbox.profile",
             "sandbox.auto_allow_bash",
             "tools.respect_gitignore",
         ]

@@ -2,21 +2,22 @@
 
 Sandbox mode restricts what the agent process and its spawned commands can access on your filesystem and network using OS-level kernel primitives (Landlock on Linux, Seatbelt on macOS). The kernel enforces these limits for the process lifetime.
 
-New sessions use the `workspace` sandbox by default: the agent can read the
-system, but writes are limited to the current workspace, `~/.opengrok/`, and
-temporary directories. Pass `--sandbox off` or set `[sandbox] profile = "off"`
-only when unrestricted filesystem access is explicitly required.
+Sandbox mode is **off by default**. Run `/sandbox`, then enable **OS sandbox**
+to opt in to the `workspace` profile. Opening `/sandbox` alone does not enable it.
+The preference is saved for new sessions; restart Open Grok to apply it.
+When enabled, the agent can read the system, but writes are limited to the
+current workspace, `~/.opengrok/`, and temporary directories.
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run with the default workspace sandbox
+# Run without sandboxing (the default)
 open-grok
 
-# Explicitly disable sandboxing when unrestricted access is required
-open-grok --sandbox off
+# Explicitly enable the workspace sandbox for this launch
+open-grok --sandbox workspace
 
 # Read-only mode (read everywhere, write only to ~/.opengrok/ + temp dirs)
 open-grok --sandbox read-only
@@ -31,8 +32,8 @@ open-grok --sandbox strict
 
 | Profile               | FS Read            | FS Write                                       | Child Network | Use Case                          |
 | --------------------- | ------------------ | ---------------------------------------------- | ------------- | --------------------------------- |
-| `off`                 | Unrestricted       | Unrestricted                                   | Unrestricted  | Explicitly disable sandboxing     |
-| `workspace` (default) | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`      | Allowed       | Normal development                |
+| `off` (default)       | Unrestricted       | Unrestricted                                   | Unrestricted  | No sandbox                        |
+| `workspace`           | Everywhere         | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Allowed       | Opt-in workspace confinement      |
 | `devbox`              | Everywhere         | All top-level dirs except `/data`              | Allowed       | Disposable dev VMs                |
 | `read-only`           | Everywhere         | `~/.opengrok/` + `/tmp` + `/var/tmp`               | Blocked¹      | Exploration, code review          |
 | `strict`              | CWD + system paths | CWD + `~/.opengrok/` + `/tmp` + `/var/tmp`         | Blocked¹      | Untrusted code                    |
@@ -176,7 +177,7 @@ The sandbox is applied to the **entire Open Grok process** at startup using kern
 - `bash` commands, `grep` (rg) -- child processes inherit FS restrictions automatically
 - Network -- on Linux, child processes can be blocked via seccomp; on macOS this is a no-op
 
-When a non-`off` sandbox profile is selected (the default, CLI, `GROK_SANDBOX`,
+When a non-`off` sandbox profile is explicitly selected (CLI, `GROK_SANDBOX`,
 config, or a managed requirement):
 
 - The agent runs **in-process**, not through the shared leader, so tool calls stay in this process when the profile is enforced. If leader mode would otherwise have been on, a one-line note at startup says so
@@ -213,7 +214,13 @@ Profile resolution order for a **new** session:
 
 1. An explicit `--sandbox <profile>` flag or `GROK_SANDBOX` environment variable
 2. The `[sandbox] profile` in your config
-3. `workspace` (the secure default)
+3. `off` (no sandbox)
+
+Managed requirements take precedence over these choices. `/sandbox` saves
+`[sandbox] profile = "workspace"` when enabled and `profile = "off"` when disabled;
+it does not override CLI/environment choices or managed requirements. Disabling
+also requires restarting, and resumed sessions keep their saved profile. Start a
+new session after restarting to use the changed preference.
 
 ---
 

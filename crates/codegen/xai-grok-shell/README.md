@@ -2160,17 +2160,17 @@ telemetry event. It includes:
 
 Grok can restrict what the agent process and its spawned commands can access on
 your filesystem and network using OS-level kernel primitives (Landlock on Linux,
-Seatbelt on macOS). New sessions use the `workspace` sandbox by default; pass
-`--sandbox off` to explicitly disable it.
+Seatbelt on macOS). Sandboxing is off by default. Run `/sandbox`, enable
+**OS sandbox**, then restart Open Grok and start a new session to opt in.
 
 ### Quick Start
 
 ```bash
-# Run with the default workspace sandbox
+# Run without sandboxing (the default)
 open-grok
 
-# Explicitly disable sandboxing
-open-grok --sandbox off
+# Explicitly enable workspace sandboxing for this launch
+open-grok --sandbox workspace
 
 # Read-only mode (agent can read but not write anything)
 open-grok --sandbox read-only
@@ -2183,8 +2183,8 @@ open-grok --sandbox strict
 
 | Profile         | FS Read            | FS Write                  | Child Network | Use Case                 |
 | --------------- | ------------------ | ------------------------- | ------------- | ------------------------ |
-| `off`           | Unrestricted       | Unrestricted              | Unrestricted  | Explicitly disabled      |
-| `workspace` (default) | Everywhere   | CWD + `/tmp` + `~/.opengrok/` | Allowed       | Normal development       |
+| `off` (default) | Unrestricted       | Unrestricted              | Unrestricted  | No sandbox               |
+| `workspace`     | Everywhere         | CWD + `/tmp` + `~/.opengrok/` | Allowed       | Opt-in confinement       |
 | `read-only`     | Everywhere         | `~/.opengrok/` only           | Blocked       | Exploration, code review |
 | `strict`        | CWD + system paths | CWD + `/tmp` + `~/.opengrok/` | Blocked       | Untrusted code           |
 

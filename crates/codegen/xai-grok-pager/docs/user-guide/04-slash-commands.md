@@ -503,6 +503,13 @@ This setting doesn't touch `[features] telemetry`, `trace_upload`, or your exter
 
 Open the settings modal to view and change configuration interactively. Aliases: `/config`, `/preferences`, `/prefs`.
 
+### `/sandbox`
+
+Open Settings on **OS sandbox**. Sandboxing is off by default; opening this command
+does not enable it. Turn the setting on to select the `workspace` profile, then
+restart Open Grok and start a new session. Turn it off to save `off` for future
+sessions. Existing sessions retain their saved profile. See [Sandbox Mode](18-sandbox.md).
+
 ### `/timestamps`
 
 Toggle message timestamps on or off.

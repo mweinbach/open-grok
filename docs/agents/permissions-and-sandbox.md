@@ -314,8 +314,11 @@ Custom `deny` lists are kernel-enforced (read + write/rename); globs supported w
 - `SandboxManager::apply` is **irreversible** for the process lifetime; `install()` stores global state (`OnceLock`).
 - Profile for a **session** is persisted on the session summary (`sandbox_profile`).
 - On **resume**: saved profile is restored; a **different** `--sandbox` is **refused** (cannot widen or silently tighten mid-life of a session). Matching profile or omit flag is OK.
-- New session resolution: requirements → CLI / env → config → `workspace`.
-  An explicit `off` remains available; saved resume profiles still take priority
+- New session resolution: requirements → CLI / env → config → `off`.
+  `/sandbox` opens the restart-required OS sandbox setting without enabling it.
+  Its boolean UI maps to `[sandbox] profile = "workspace"` (on) or `"off"` (off),
+  through the local feature-setting persistence path; the profile stays a string
+  on disk. Saved resume profiles still take priority
   over the default so existing sessions do not silently change confinement.
 - Helpers: `is_active()`, `profile_name()`, `should_restrict_child_network()`, `should_auto_allow_bash()` (optional bash auto-approve when sandbox active + configured), violation log `~/.opengrok/sandbox-events.jsonl`.
 - `enforce` feature (default on Unix): without it, helpers still compile but enforcement is a no-op.

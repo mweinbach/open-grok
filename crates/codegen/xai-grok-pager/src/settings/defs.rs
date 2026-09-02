@@ -2867,6 +2867,21 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: false,
         },
         SettingMeta {
+            key: "sandbox.profile",
+            category: SettingCategory::Advanced,
+            owner: SettingOwner::Shell,
+            label: "OS sandbox",
+            description: "Off by default. Enable the workspace sandbox for new sessions: \
+                          read everywhere, write only to the workspace, Open Grok state, \
+                          and temporary directories. Restart Open Grok to apply. Existing \
+                          sessions keep their saved profile; CLI, environment, and managed \
+                          profiles take precedence over this preference.",
+            keywords: &["sandbox", "workspace", "isolation", "permissions"],
+            kind: SettingKind::Bool { default: false },
+            restart_required: true,
+            hidden_in_minimal: false,
+        },
+        SettingMeta {
             key: "sandbox.auto_allow_bash",
             category: SettingCategory::Advanced,
             owner: SettingOwner::Shell,

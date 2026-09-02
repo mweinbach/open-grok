@@ -139,6 +139,7 @@ const ALL_SETTINGS_EXERCISED: &[&str] = &[
     "ui.mouse_reporting_toggle",
     "suggestions.enabled",
     "suggestions.ai_enabled",
+    "sandbox.profile",
     "sandbox.auto_allow_bash",
     "tools.respect_gitignore",
 ];
@@ -162,6 +163,7 @@ const LOCAL_FEATURE_FLAG_KEYS: &[(&str, bool)] = &[
     ("suggestions.enabled", false),
     ("suggestions.ai_enabled", false),
     ("sandbox.auto_allow_bash", false),
+    ("sandbox.profile", false),
     ("tools.respect_gitignore", false),
 ];
 
@@ -2885,6 +2887,7 @@ fn registry_kind_membership_through_pr_14() {
             "remember_tool_approvals",
             "respect_manual_folds",
             "sandbox.auto_allow_bash",
+            "sandbox.profile",
             "show_thinking_blocks",
             "show_timeline",
             "show_timestamps",
@@ -3200,6 +3203,7 @@ fn defaults_round_trip_through_registry() {
             "suggestions.enabled" => SettingValue::Bool(false),
             "suggestions.ai_enabled" => SettingValue::Bool(false),
             "sandbox.auto_allow_bash" => SettingValue::Bool(false),
+            "sandbox.profile" => SettingValue::Bool(false),
             "tools.respect_gitignore" => SettingValue::Bool(false),
             "recap_model" => SettingValue::String(String::new()),
             "memory_model" => SettingValue::String(String::new()),
