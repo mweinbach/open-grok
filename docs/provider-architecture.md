@@ -98,12 +98,13 @@ RunInfra is a plain OpenAI-compatible Chat Completions provider at
 client function tools. It has no Responses dialect, hosted tools, native web
 search, or xAI export path. Stored keys stay on `https://api.runinfra.ai`.
 
-Google Gemini (AI Studio) is a plain OpenAI-compatible Chat Completions
-provider at `https://generativelanguage.googleapis.com/v1beta/openai/`: it uses
-provider-local API-key auth (`GEMINI_API_KEY` / `GOOGLE_API_KEY`), enriches the
-curated four-model catalog from live `/models`, and exposes only standard
-client function tools. It has no Responses dialect, hosted tools, native web
-search, or xAI export path. Stored keys stay on
+Google Gemini (AI Studio) supports both OpenAI-compatible Chat Completions
+at `https://generativelanguage.googleapis.com/v1beta/openai/` and native Google AI Studio REST
+inference (`api_backend = "google_ai_studio"`) at `https://generativelanguage.googleapis.com/v1beta/`:
+it uses provider-local API-key auth (`GEMINI_API_KEY` / `GOOGLE_API_KEY`), enriches the
+curated four-model catalog from live `/models`, and exposes standard client function tools.
+It supports native thinking tokens and passes keys via `x-goog-api-key`. It has no Responses dialect,
+hosted tools, native web search, or xAI export path. Stored keys stay on
 `https://generativelanguage.googleapis.com`.
 
 ### Custom endpoint (user-supplied server address)
@@ -128,7 +129,8 @@ no `previous_response_id`, no cache-key affinity, no service tier, no
 cannot receive xAI or Codex encrypted reasoning history.
 
 Model discovery (`crates/codegen/xai-grok-shell/src/custom_providers.rs`) is
-`GET {base}/models` with `Authorization: Bearer` for both OpenAI formats and
+`GET {base}/models` with `Authorization: Bearer` for both OpenAI formats,
+`x-goog-api-key` for Google AI Studio, and
 `x-api-key` plus `anthropic-version` for Messages. It never follows a redirect,
 so a key cannot be forwarded to a host the user did not type, and every error
 excerpt is trimmed and key-redacted before it reaches the TUI. Discovery writes

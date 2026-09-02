@@ -58,17 +58,18 @@ default = "grok-4.5"
 
 ## Supported API Backends
 
-Grok supports three API backends. Set `api_backend` in your `[model.*]` config to choose which protocol the model uses:
+Grok supports four API backends. Set `api_backend` in your `[model.*]` config to choose which protocol the model uses:
 
 | Value | API | Default |
 |-------|-----|---------|
 | `"chat_completions"` | OpenAI Chat Completions (`/v1/chat/completions`) | Yes |
 | `"responses"` | OpenAI Responses (`/v1/responses`) | |
 | `"messages"` | Anthropic Messages (`/v1/messages`) | |
+| `"google_ai_studio"` | Google AI Studio REST (`/v1beta/models/{model}:streamGenerateContent`) | |
 
 When you omit `api_backend`, Grok uses `chat_completions`.
 
-To send provider-specific authentication or version headers -- for example, Anthropic's `x-api-key` -- use the `extra_headers` field described below. Grok sends those headers verbatim with every request to the endpoint.
+To send provider-specific authentication or version headers -- for example, Anthropic's `x-api-key` or Google's `x-goog-api-key` -- use `auth_scheme` or the `extra_headers` field described below. Grok sends those headers verbatim with every request to the endpoint.
 
 ---
 
@@ -519,6 +520,24 @@ extra_headers = { "x-api-key" = "sk-ant-...", "anthropic-version" = "2023-06-01"
 ```
 
 The `messages` backend uses the Anthropic Messages protocol. Anthropic authenticates with an `x-api-key` header rather than `Authorization: Bearer`, so pass your key through `extra_headers`, which Grok sends verbatim.
+
+### Google AI Studio (Gemini Native REST)
+
+Use Google's native AI Studio endpoint (`streamGenerateContent` and `generateContent`):
+
+```toml
+[model.gemini-2-5-pro]
+model = "gemini-2.5-pro"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+name = "Gemini 2.5 Pro (Native)"
+api_backend = "google_ai_studio"
+auth_scheme = "x_goog_api_key"
+api_key = "AIzaSy..."
+# or env_key = "GEMINI_API_KEY"
+context_window = 1048576
+```
+
+The `google_ai_studio` backend uses Google's native Gemini REST wire protocol rather than OpenAI compatibility mode. It supports thinking tokens, function calling, and passes API keys via the `x-goog-api-key` header.
 
 ### OpenAI (Chat Completions)
 
