@@ -847,22 +847,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openrouter_reasoning_alias_emits_reasoning_channel() {
-        let chunk: ChatCompletionChunk = serde_json::from_value(serde_json::json!({
-            "id": "chunk-or",
-            "object": "chat.completion.chunk",
-            "created": 0,
-            "model": "anthropic/claude-sonnet-4",
-            "choices": [{
-                "index": 0,
-                "delta": { "role": "assistant", "reasoning": "gateway thoughts" },
-                "finish_reason": null
-            }]
-        }))
-        .expect("OpenRouter reasoning delta deserializes");
+    async fn openrouter_reasoning_wire_fields_do_not_duplicate_tokens() {
+        let chunk = |delta: serde_json::Value| {
+            serde_json::from_value::<ChatCompletionChunk>(serde_json::json!({
+                "id": "chunk-or",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "anthropic/claude-sonnet-4",
+                "choices": [{
+                    "index": 0,
+                    "delta": delta,
+                    "finish_reason": null
+                }]
+            }))
+            .expect("OpenRouter reasoning delta deserializes")
+        };
 
         let chunks: Vec<Result<ChatCompletionChunk, SamplingError>> = vec![
-            Ok(chunk),
+            Ok(chunk(serde_json::json!({
+                "role": "assistant",
+                "reasoning_content": null,
+                "reasoning": "gateway",
+                "reasoning_details": [{"type": "reasoning.text", "text": "gateway"}]
+            }))),
+            Ok(chunk(serde_json::json!({
+                "reasoning_content": " thoughts",
+                "reasoning": " duplicate thoughts"
+            }))),
             Ok(text_chunk("done")),
             Ok(final_chunk(FinishReason::Stop)),
         ];
@@ -886,7 +897,19 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(reasoning_tokens, vec!["gateway thoughts"]);
+        assert_eq!(reasoning_tokens, vec!["gateway", " thoughts"]);
+        match events.last().expect("terminal event") {
+            SamplingEvent::Completed { response, .. } => {
+                let reasoning = response
+                    .reasoning_items()
+                    .next()
+                    .expect("reasoning sibling");
+                let rs::SummaryPart::SummaryText(text) = &reasoning.summary[0];
+                assert_eq!(text.text, "gateway thoughts");
+                assert_eq!(response.assistant_text(), "done");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
     }
 
     #[tokio::test]

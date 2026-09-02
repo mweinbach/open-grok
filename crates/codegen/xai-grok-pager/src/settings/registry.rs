@@ -191,11 +191,10 @@ pub fn dynamic_multi_select_choices(
                 canonical: model.id.clone(),
                 display: model.name.clone(),
                 description: model.id.clone(),
-                selected: snapshot.openrouter_enabled_models.is_empty()
-                    || snapshot
-                        .openrouter_enabled_models
-                        .iter()
-                        .any(|enabled| enabled == &model.id || enabled == &model.key),
+                selected: snapshot
+                    .openrouter_enabled_models
+                    .iter()
+                    .any(|enabled| enabled == &model.id || enabled == &model.key),
             })
             .collect(),
         DynamicMultiSelectSource::CustomModels => snapshot

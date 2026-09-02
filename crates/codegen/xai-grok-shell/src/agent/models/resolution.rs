@@ -470,13 +470,11 @@ fn resolve_model_catalog_with_live_provider_entries(
         .iter()
         .map(String::as_str)
         .collect::<std::collections::HashSet<_>>();
-    if !enabled_openrouter.is_empty() {
-        catalog.retain(|key, entry| {
-            entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
-                || enabled_openrouter.contains(key.as_str())
-                || enabled_openrouter.contains(entry.info.model.as_str())
-        });
-    }
+    catalog.retain(|key, entry| {
+        entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
+            || enabled_openrouter.contains(key.as_str())
+            || enabled_openrouter.contains(entry.info.model.as_str())
+    });
 
     if let Ok(Some(disabled)) = ModelGlobSet::compile(cfg.models.disabled_models.as_ref()) {
         let before = catalog.len();
@@ -516,11 +514,14 @@ fn resolve_model_catalog_with_live_provider_entries(
     }
 
     // Persisted default first; CLI override below wins when set.
-    // Only apply if the model supports reasoning effort.
+    // Only apply if the model supports reasoning effort. OpenRouter's live
+    // menu is authoritative, so a stale saved effort must not override it.
     if let Some(effort) = cfg.models.default_reasoning_effort
         && let Some(default_id) = cfg.models.default.as_deref()
         && let Some(entry) = catalog.get_mut(default_id)
         && entry.info.supports_reasoning_effort
+        && (entry.info.provider != xai_grok_sampling_types::ModelProvider::OpenRouter
+            || model_offers_reasoning_effort(&entry.info, effort))
     {
         entry.info.reasoning_effort = Some(effort);
     }

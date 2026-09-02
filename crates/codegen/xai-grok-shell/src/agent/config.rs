@@ -1166,8 +1166,8 @@ pub struct ModelsConfig {
     /// remote catalog is available only to the provider management UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub opencode_go_enabled_models: Vec<String>,
-    /// OpenRouter models explicitly enabled by the user. Empty means every
-    /// discovered text model from the live catalog is available.
+    /// OpenRouter models explicitly enabled by the user. Empty means the
+    /// remote catalog is available only to the provider management UI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub openrouter_enabled_models: Vec<String>,
     /// Fallback `agent_type` for models without a per-model override.
@@ -5158,7 +5158,13 @@ impl ModelInfo {
                 .reasoning_efforts
                 .iter()
                 .find(|opt| opt.default)
-                .or_else(|| self.reasoning_efforts.first())
+                .or_else(|| {
+                    // An unmarked OpenRouter menu leaves reasoning up to the
+                    // gateway. Its first option is not an advertised default.
+                    (self.provider != ModelProvider::OpenRouter)
+                        .then(|| self.reasoning_efforts.first())
+                        .flatten()
+                })
                 .map(|opt| opt.value);
             self.reasoning_effort = default;
         }
@@ -9932,6 +9938,36 @@ reasoning_effort = "low"
             .unwrap();
         assert_eq!(meta["supportsReasoningEffort"], true);
         assert_eq!(meta["reasoningEffort"], "medium");
+    }
+    #[test]
+    fn openrouter_reasoning_menu_preserves_gateway_default() {
+        for (advertised_default, explicit_effort, expected) in [
+            (false, None, None),
+            (true, None, Some(ReasoningEffort::Max)),
+            (true, Some(ReasoningEffort::Low), Some(ReasoningEffort::Low)),
+        ] {
+            let mut entry = test_model_entry("m", "https://test.api/v1", None, None, None);
+            entry.info.provider = ModelProvider::OpenRouter;
+            entry.info.reasoning_effort = explicit_effort;
+            entry.info.reasoning_efforts = vec![ReasoningEffortOption {
+                id: "max".to_string(),
+                value: ReasoningEffort::Max,
+                label: "Max".to_string(),
+                description: None,
+                default: advertised_default,
+            }];
+            entry.info.derive_reasoning_effort_fields();
+            assert!(entry.info.supports_reasoning_effort);
+            assert_eq!(entry.info.reasoning_effort, expected);
+            let models = IndexMap::from([("m".to_string(), entry)]);
+            let acp_models = to_acp_model_info(&models);
+            let meta = acp_models.values().next().unwrap().meta.as_ref().unwrap();
+            assert_eq!(meta["supportsReasoningEffort"], true);
+            assert_eq!(
+                meta.get("reasoningEffort"),
+                expected.map(reasoning_effort_meta_value).as_ref()
+            );
+        }
     }
     #[test]
     fn acp_model_meta_omits_reasoning_when_unsupported() {

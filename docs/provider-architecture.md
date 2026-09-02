@@ -69,10 +69,13 @@ OpenCode Go selects Chat Completions or Messages per model from canonical
 metadata rather than from provider identity alone.
 OpenRouter is a plain OpenAI-compatible Chat Completions gateway at
 `https://openrouter.ai/api/v1`: it uses provider-local API-key auth, discovers
-models from `GET /models?output_modalities=all`, and exposes every
-discovered text model in the picker (an optional enabled list can narrow
-it). Per-model reasoning menus use only `reasoning.supported_efforts`
+text-input/output, tool-capable models from `GET /models`, and exposes only
+explicitly enabled entries in the normal model picker. An empty enabled list
+keeps all discovered entries disabled. Per-model reasoning menus use only
+`reasoning.supported_efforts`
 from that payload (`null` = all gateway efforts; omitted = no selector).
+Absent or unsupported default efforts are left unset so gateway defaults apply;
+catalog ordering never silently selects the highest effort.
 Inference maps `reasoning_effort` onto OpenRouter's nested
 `reasoning` object, accepts `delta.reasoning` thinking tokens, and never
 inherits xAI request metadata, credentials, or exports. It has no native hosted

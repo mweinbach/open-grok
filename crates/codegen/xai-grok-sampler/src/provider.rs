@@ -624,7 +624,13 @@ impl ProviderAdapter for OpenRouterProvider {
     fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
         request.service_tier = None;
         request.thinking = None;
-        if let Some(effort) = request.reasoning_effort.take() {
+        let effort = request.reasoning_effort.take().or_else(|| {
+            request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.effort)
+        });
+        if let Some(effort) = effort {
             request.reasoning = Some(ChatReasoningConfig::effort(
                 normalize_openrouter_reasoning_effort(effort),
             ));
@@ -648,12 +654,14 @@ impl ProviderAdapter for CustomProvider {
     /// Keep the Chat Completions body to the portable OpenAI surface. The
     /// endpoint's actual grammar is unknown, so a strict server must never see
     /// Grok-internal routing (`service_tier`), a per-message model override, or
-    /// a provider-specific `thinking` extension.
+    /// provider-specific `thinking` / nested `reasoning` extensions.
     fn sanitize_chat_request(&self, request: &mut ChatCompletionRequest) {
         request.service_tier = None;
         request.thinking = None;
+        request.reasoning = None;
         for message in &mut request.messages {
             message.model_id = None;
+            message.reasoning = None;
         }
     }
 
@@ -2166,12 +2174,14 @@ mod tests {
     fn custom_chat_request_keeps_only_the_portable_openai_surface() {
         use xai_grok_sampling_types::types::{ChatRequestMessage, ToolDefinition};
 
-        let assistant = ChatRequestMessage::assistant("previous turn", "byo-model", None);
+        let mut assistant = ChatRequestMessage::assistant("previous turn", "byo-model", None);
+        assistant.reasoning = Some("gateway thoughts".to_owned());
         let mut request = ChatCompletionRequest::new("byo-model", vec![assistant]);
         request.temperature = Some(0.7);
         request.reasoning_effort = Some(ReasoningEffort::High);
         request.service_tier = Some("priority".to_owned());
         request.thinking = Some(ChatThinkingMode::enabled());
+        request.reasoning = Some(ChatReasoningConfig::effort(ReasoningEffort::High));
         request.tools = Some(vec![ToolDefinition::function(
             "lookup",
             Some("Look up a value"),
@@ -2194,6 +2204,8 @@ mod tests {
                 .all(|message| message.model_id.is_none())
         );
         let wire = serde_json::to_value(&request).expect("serializes");
+        assert!(wire.get("reasoning").is_none());
+        assert!(wire["messages"][0].get("reasoning").is_none());
         assert_eq!(wire["tools"][0]["type"], "function");
     }
 
@@ -2675,14 +2687,40 @@ mod tests {
         assert!(unset.reasoning.is_none());
         assert!(unset.reasoning_effort.is_none());
 
-        assert_eq!(
-            normalize_openrouter_reasoning_effort(ReasoningEffort::Ultra),
-            ReasoningEffort::Max
-        );
-        assert_eq!(
-            normalize_openrouter_reasoning_effort(ReasoningEffort::Xhigh),
-            ReasoningEffort::Xhigh
-        );
+        // Both the shared shorthand and explicitly supplied nested controls
+        // must use the gateway's effort vocabulary. The shorthand is
+        // authoritative when both forms are supplied.
+        for effort in [
+            ReasoningEffort::None,
+            ReasoningEffort::Minimal,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+            ReasoningEffort::Ultra,
+        ] {
+            let expected = if effort == ReasoningEffort::Ultra {
+                ReasoningEffort::Max
+            } else {
+                effort
+            };
+            for nested in [false, true] {
+                let mut request = ChatCompletionRequest::new("model", Vec::new());
+                request.reasoning = Some(ChatReasoningConfig::effort(if nested {
+                    effort
+                } else {
+                    ReasoningEffort::Medium
+                }));
+                if !nested {
+                    request.reasoning_effort = Some(effort);
+                }
+                provider_adapter(ModelProvider::OpenRouter).sanitize_chat_request(&mut request);
+                let wire = serde_json::to_value(request).expect("serializes");
+                assert!(wire.get("reasoning_effort").is_none());
+                assert_eq!(wire["reasoning"]["effort"], expected.as_str());
+            }
+        }
     }
 
     #[test]

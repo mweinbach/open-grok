@@ -477,13 +477,13 @@ or an xAI session as a substitute.
 
 OpenRouter is an isolated Chat Completions gateway at
 `https://openrouter.ai/api/v1`. Open Grok queries
-`GET /models?output_modalities=all` and adds every text-output model to the
-picker. Image and embedding-only models are omitted. An empty
-`openrouter_enabled_models` list keeps that full catalog; a non-empty list is
-an optional allowlist (Settings → Models → OpenRouter models).
+`GET /models` for text-input/output, tool-capable models. The
+`openrouter_enabled_models` list is an explicit opt-in allowlist; an empty
+list enables none. Select models in **Settings → Models → OpenRouter models**
+to make them available in the picker and to subagents.
 
-Set `OPENROUTER_API_KEY` (or connect it with `/login openrouter`) and pick a
-returned id. Reasoning menus use only that model's live `supported_efforts`
+Set `OPENROUTER_API_KEY` (or connect it with `/login openrouter`), enable a
+returned id, and select it. Reasoning menus use only that model's live `supported_efforts`
 array. Models that omit the field have no effort selector. To add an id that
 is not in the live list, use Settings or a `[model.*]` table with
 `provider = "openrouter"`:

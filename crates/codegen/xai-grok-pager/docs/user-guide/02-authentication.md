@@ -182,11 +182,11 @@ open-grok
 
 The default base URL is `https://openrouter.ai/api/v1`; override it with
 `OPENGROK_OPENROUTER_API_BASE_URL`. Stored keys are sent only to
-`https://openrouter.ai`. Open Grok queries `GET /models?output_modalities=all`
-and adds every text-output model to the picker. Image and embedding-only
-models are omitted. An empty Settings allowlist keeps the full live catalog;
-narrow it from **Settings → Models → OpenRouter models**. Reasoning menus use
-each model's live `supported_efforts` list; models that omit that field have
+`https://openrouter.ai`. Open Grok queries `GET /models` for models that accept
+text, produce text, and support tools. Enable the models you want from
+**Settings → Models → OpenRouter models**; an empty selection enables none.
+Only enabled models appear in the normal picker or subagent selection.
+Reasoning menus use each model's live `supported_efforts` list; models that omit that field have
 no effort selector. OpenRouter supports standard client function tools but no
 native hosted web search, Responses API, or OAuth. Its key and model catalog
 remain isolated from other providers and OpenRouter sessions cannot export

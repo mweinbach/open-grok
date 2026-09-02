@@ -405,11 +405,12 @@ pub enum FinishReason {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(from = "ChatResponseMessageWire")]
 pub struct ChatResponseMessage {
     pub role: Role,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCallResponse>,
@@ -417,6 +418,38 @@ pub struct ChatResponseMessage {
     pub tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citations: Option<Vec<String>>,
+}
+
+// Gateways can emit both names, including `reasoning_content: null` beside
+// `reasoning`. A serde alias treats that as a duplicate field and rejects the
+// entire response. Decode independently and apply the same nonempty-field
+// precedence used by ChatChunkDelta::reasoning_text.
+#[derive(Deserialize)]
+struct ChatResponseMessageWire {
+    role: Role,
+    content: Option<String>,
+    reasoning_content: Option<String>,
+    reasoning: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<ToolCallResponse>,
+    tool_call_id: Option<String>,
+    citations: Option<Vec<String>>,
+}
+
+impl From<ChatResponseMessageWire> for ChatResponseMessage {
+    fn from(message: ChatResponseMessageWire) -> Self {
+        Self {
+            role: message.role,
+            content: message.content,
+            reasoning_content: message
+                .reasoning_content
+                .filter(|text| !text.is_empty())
+                .or(message.reasoning),
+            tool_calls: message.tool_calls,
+            tool_call_id: message.tool_call_id,
+            citations: message.citations,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -551,9 +584,9 @@ pub struct ChatChunkDelta {
     pub role: Option<Role>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// DeepSeek/Kimi thinking tokens. OpenRouter sends the same payload as
-    /// `reasoning`; the alias keeps one accumulator for both wire names.
-    #[serde(default, alias = "reasoning", skip_serializing_if = "Option::is_none")]
+    /// DeepSeek/Kimi thinking tokens. Kept separate from OpenRouter's
+    /// `reasoning` so responses containing both fields remain valid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     /// OpenRouter's normalized reasoning delta field. OpenRouter streams
     /// thinking text as `delta.reasoning` (a plain string); `reasoning_content`
@@ -1253,8 +1286,8 @@ pub enum ModelProvider {
     )]
     Gemini,
     /// OpenRouter's OpenAI-compatible Chat Completions gateway
-    /// (`https://openrouter.ai/api/v1`). Models are populated from the live
-    /// catalog; an empty enabled list keeps every discovered text model.
+    /// (`https://openrouter.ai/api/v1`). Models are opt-in from the live
+    /// catalog, matching OpenCode Go.
     #[serde(alias = "open_router", alias = "open-router")]
     OpenRouter,
     /// A user-supplied server address speaking one of the three supported wire
@@ -2442,18 +2475,26 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_reasoning_alias_deserializes_into_reasoning_content() {
+    fn openrouter_reasoning_fields_deserialize_without_alias_collisions() {
         let delta: ChatChunkDelta = serde_json::from_value(json!({
             "role": "assistant",
             "reasoning": "gateway thoughts"
         }))
         .expect("OpenRouter delta.reasoning deserializes");
-        assert_eq!(delta.reasoning_content.as_deref(), Some("gateway thoughts"));
+        assert!(delta.reasoning_content.is_none());
+        assert_eq!(delta.reasoning.as_deref(), Some("gateway thoughts"));
+        assert_eq!(delta.reasoning_text(), "gateway thoughts");
 
         let message: ChatResponseMessage = serde_json::from_value(json!({
             "role": "assistant",
             "content": "answer",
-            "reasoning": "non-stream thoughts"
+            "reasoning": "non-stream thoughts",
+            "tool_calls": [{
+                "id": "call_lookup",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            }],
+            "citations": ["https://example.test/reference"]
         }))
         .expect("OpenRouter message.reasoning deserializes");
         assert_eq!(message.content.as_deref(), Some("answer"));
@@ -2461,6 +2502,29 @@ mod tests {
             message.reasoning_content.as_deref(),
             Some("non-stream thoughts")
         );
+        assert_eq!(message.tool_calls[0].function.name, "lookup");
+        assert_eq!(
+            message.citations.as_ref().unwrap()[0],
+            "https://example.test/reference"
+        );
+
+        for (content, expected) in [
+            (Some("preferred thoughts"), "preferred thoughts"),
+            (Some(""), "gateway thoughts"),
+            (None, "gateway thoughts"),
+        ] {
+            let wire = json!({
+                "role": "assistant",
+                "reasoning_content": content,
+                "reasoning": "gateway thoughts"
+            });
+            let delta: ChatChunkDelta = serde_json::from_value(wire.clone())
+                .expect("both delta reasoning fields deserialize");
+            assert_eq!(delta.reasoning_text(), expected);
+            let message: ChatResponseMessage =
+                serde_json::from_value(wire).expect("both message reasoning fields deserialize");
+            assert_eq!(message.reasoning_content.as_deref(), Some(expected));
+        }
     }
 
     #[test]

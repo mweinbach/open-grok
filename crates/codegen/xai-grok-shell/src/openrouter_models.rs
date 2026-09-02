@@ -1,9 +1,8 @@
 //! Provider-isolated OpenRouter model discovery.
 //!
 //! OpenRouter's `/models` endpoint is authoritative for availability,
-//! metadata, and per-model reasoning efforts. Every discovered text model
-//! enters the picker; `openrouter_enabled_models` is an optional allowlist
-//! (empty means all).
+//! metadata, and per-model reasoning efforts. Tool-capable text models stay
+//! in Settings until explicitly enabled; an empty enabled list enables none.
 
 use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 use anyhow::{Context, anyhow};
@@ -173,10 +172,9 @@ impl OpenRouterModelsClient {
     }
 
     async fn query_with_key(&self, api_key: &str) -> anyhow::Result<OpenRouterModelsCatalog> {
-        let models_url = format!(
-            "{}/models?output_modalities=all",
-            self.base_url.trim_end_matches('/')
-        );
+        // `/models` defaults to text output. Keep the local capability checks
+        // as well, including for explicitly configured compatible endpoints.
+        let models_url = format!("{}/models", self.base_url.trim_end_matches('/'));
         let models_response = self
             .http
             .get(&models_url)
@@ -273,32 +271,69 @@ impl OpenRouterModelsClient {
 }
 
 fn skip_reason(wire: &OpenRouterWireModel) -> Option<&'static str> {
+    if !has_text_input(wire) {
+        return Some("no text input");
+    }
     if !has_text_output(wire) {
         return Some("no text output");
     }
+    if !supports_tools(wire) {
+        return Some("does not advertise tool calling");
+    }
     None
+}
+
+fn has_text_input(wire: &OpenRouterWireModel) -> bool {
+    let Some(architecture) = wire.architecture.as_ref() else {
+        return true;
+    };
+    has_text_modality(
+        &architecture.input_modalities,
+        architecture.modality.as_deref().map(|modality| {
+            modality
+                .split_once("->")
+                .map_or(modality, |(input, _)| input)
+        }),
+    )
 }
 
 fn has_text_output(wire: &OpenRouterWireModel) -> bool {
     let Some(architecture) = wire.architecture.as_ref() else {
         return true;
     };
-    if !architecture.output_modalities.is_empty() {
-        return architecture
-            .output_modalities
+    has_text_modality(
+        &architecture.output_modalities,
+        architecture.modality.as_deref().map(|modality| {
+            modality
+                .split_once("->")
+                .map_or(modality, |(_, output)| output)
+        }),
+    )
+}
+
+fn has_text_modality(modalities: &[String], legacy_modality: Option<&str>) -> bool {
+    if !modalities.is_empty() {
+        return modalities
             .iter()
             .any(|modality| modality.eq_ignore_ascii_case("text"));
     }
-    match architecture.modality.as_deref() {
-        Some(modality) => {
-            let lower = modality.to_ascii_lowercase();
-            !lower.contains("embedding")
-                && !lower.contains("->image")
-                && !lower.contains("->audio")
-                && !lower.contains("->video")
-        }
-        None => true,
+    // Older compatible catalogs can omit architecture metadata. When a
+    // legacy modality is supplied, inspect the correct side of the arrow:
+    // audio->text cannot accept agent prompts, while text->text+image can.
+    legacy_modality.is_none_or(|modalities| {
+        modalities
+            .split('+')
+            .any(|modality| modality.trim().eq_ignore_ascii_case("text"))
+    })
+}
+
+fn supports_tools(wire: &OpenRouterWireModel) -> bool {
+    if wire.supported_parameters.is_empty() {
+        return true;
     }
+    wire.supported_parameters
+        .iter()
+        .any(|parameter| parameter.eq_ignore_ascii_case("tools"))
 }
 
 fn context_window(wire: &OpenRouterWireModel) -> NonZeroU64 {
@@ -358,10 +393,13 @@ fn default_effort(
     if mandatory {
         return parsed_default.filter(|effort| *effort != ReasoningEffort::None);
     }
-    if !reasoning.default_enabled.unwrap_or(false) {
-        return Some(ReasoningEffort::None);
+    match reasoning.default_enabled {
+        Some(false) => Some(ReasoningEffort::None),
+        Some(true) => parsed_default.filter(|effort| *effort != ReasoningEffort::None),
+        // A default effort describes how to enable reasoning; without an
+        // advertised on/off default, do not enable it on the user's behalf.
+        None => None,
     }
-    parsed_default.filter(|effort| *effort != ReasoningEffort::None)
 }
 
 fn effort_options(
@@ -374,17 +412,9 @@ fn effort_options(
             seen.push(value);
         }
     }
-    let marked = match default {
-        Some(effort) if seen.contains(&effort) => Some(effort),
-        Some(ReasoningEffort::None) => None,
-        Some(_) | None => {
-            if seen.contains(&ReasoningEffort::Medium) {
-                Some(ReasoningEffort::Medium)
-            } else {
-                seen.first().copied()
-            }
-        }
-    };
+    // An unsupported or absent default is not permission to select the
+    // highest advertised effort. Omitting effort preserves gateway defaults.
+    let marked = default.filter(|effort| seen.contains(effort));
     seen.into_iter()
         .map(|value| ReasoningEffortOption {
             id: value.as_str().to_owned(),
@@ -476,6 +506,8 @@ struct OpenRouterArchitecture {
     #[serde(default)]
     modality: Option<String>,
     #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
     output_modalities: Vec<String>,
 }
 
@@ -505,6 +537,7 @@ mod tests {
             context_length: context,
             architecture: Some(OpenRouterArchitecture {
                 modality: None,
+                input_modalities: vec!["text".to_owned()],
                 output_modalities: outputs.iter().map(|value| (*value).to_owned()).collect(),
             }),
             top_provider: Some(OpenRouterTopProvider {
@@ -561,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_keeps_every_text_model_and_enables_all_until_filtered() {
+    fn catalog_keeps_tool_capable_text_models_and_fails_closed_until_enabled() {
         let catalog = catalog_from(vec![
             with_reasoning(
                 wire(
@@ -613,10 +646,10 @@ mod tests {
             ),
         ]);
         let entries = catalog.entries();
-        assert_eq!(entries.len(), 3);
+        assert_eq!(entries.len(), 2);
         assert!(entries.contains_key("openrouter:google/gemini-3.5-flash"));
         assert!(entries.contains_key("openrouter:openai/gpt-4o"));
-        assert!(entries.contains_key("openrouter:meta-llama/llama-3.1-8b-instruct"));
+        assert!(!entries.contains_key("openrouter:meta-llama/llama-3.1-8b-instruct"));
         assert_eq!(
             entries["openrouter:google/gemini-3.5-flash"]
                 .info
@@ -675,13 +708,16 @@ mod tests {
                 .map(String::as_str),
             Some(OPENROUTER_HTTP_REFERER)
         );
-        assert_eq!(catalog.warnings().len(), 2);
+        assert_eq!(catalog.warnings().len(), 3);
 
         let cfg = crate::agent::config::Config::default();
-        let all = resolve_openrouter(&cfg, &catalog);
-        assert!(all.contains_key("openrouter:google/gemini-3.5-flash"));
-        assert!(all.contains_key("openrouter:openai/gpt-4o"));
-        assert!(all.contains_key("openrouter:meta-llama/llama-3.1-8b-instruct"));
+        let disabled = resolve_openrouter(&cfg, &catalog);
+        assert!(
+            disabled
+                .values()
+                .all(|entry| entry.info.provider != ModelProvider::OpenRouter),
+            "OpenRouter must default to no enabled models",
+        );
 
         let mut filtered = crate::agent::config::Config::default();
         filtered.models.openrouter_enabled_models = vec!["openai/gpt-4o".to_owned()];
@@ -689,6 +725,163 @@ mod tests {
         assert!(enabled.contains_key("openrouter:openai/gpt-4o"));
         assert!(!enabled.contains_key("openrouter:google/gemini-3.5-flash"));
         assert!(!enabled.contains_key("openrouter:meta-llama/llama-3.1-8b-instruct"));
+    }
+
+    #[test]
+    fn catalog_checks_text_input_and_output_independently() {
+        let cases = [
+            (
+                serde_json::json!({"input_modalities": ["audio"], "output_modalities": ["text"]}),
+                Some("no text input"),
+            ),
+            (
+                serde_json::json!({"input_modalities": ["text"], "output_modalities": ["image"]}),
+                Some("no text output"),
+            ),
+            (
+                serde_json::json!({"input_modalities": ["image", "TEXT"], "output_modalities": ["text", "image"]}),
+                None,
+            ),
+            (
+                serde_json::json!({"modality": "audio->text"}),
+                Some("no text input"),
+            ),
+            (
+                serde_json::json!({"modality": "text->embeddings"}),
+                Some("no text output"),
+            ),
+            (
+                serde_json::json!({"modality": "text+image->image+text"}),
+                None,
+            ),
+            // Explicit modality arrays take precedence over legacy metadata.
+            (
+                serde_json::json!({"input_modalities": ["audio"], "modality": "text->text"}),
+                Some("no text input"),
+            ),
+            (
+                serde_json::json!({"output_modalities": ["text"], "modality": "text->image"}),
+                None,
+            ),
+            // Preserve compatibility with catalogs that omit architecture.
+            (serde_json::json!({}), None),
+            (serde_json::Value::Null, None),
+        ];
+        for (architecture, expected) in cases {
+            let wire: OpenRouterWireModel = serde_json::from_value(serde_json::json!({
+                "id": "test/model",
+                "architecture": architecture,
+                "supported_parameters": ["tools"],
+            }))
+            .expect("architecture fixture");
+            assert_eq!(skip_reason(&wire), expected, "{architecture}");
+        }
+    }
+
+    #[test]
+    fn catalog_reasoning_metadata_never_invents_efforts_or_defaults() {
+        use ReasoningEffort::{High, Low, Medium, None as Off};
+        let cases = [
+            (serde_json::Value::Null, vec![], None),
+            (serde_json::json!({"mandatory": true}), vec![], None),
+            (serde_json::json!({"supported_efforts": []}), vec![], None),
+            (
+                serde_json::json!({"supported_efforts": ["ultra", "future"]}),
+                vec![],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "HIGH", "medium", "ultra", "future"], "default_enabled": true, "default_effort": "medium"}),
+                vec![High, Medium],
+                Some(Medium),
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["none", "low"], "default_enabled": false}),
+                vec![Off, Low],
+                Some(Off),
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "low"], "default_enabled": false}),
+                vec![High, Low],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "none"], "default_enabled": true, "default_effort": "none"}),
+                vec![High, Off],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "low"], "default_effort": "high"}),
+                vec![High, Low],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "low"], "default_enabled": true, "default_effort": "future"}),
+                vec![High, Low],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["high", "low"], "default_enabled": true, "default_effort": "medium"}),
+                vec![High, Low],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["none", "low"], "mandatory": true, "default_effort": "none"}),
+                vec![Low],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["none", "low"], "mandatory": true, "default_effort": "low"}),
+                vec![Low],
+                Some(Low),
+            ),
+            (
+                serde_json::json!({"supported_efforts": ["none"], "mandatory": true}),
+                vec![],
+                None,
+            ),
+            (
+                serde_json::json!({"supported_efforts": null}),
+                OPENROUTER_GATEWAY_EFFORTS.to_vec(),
+                None,
+            ),
+        ];
+        let mut cfg = crate::agent::config::Config::default();
+        cfg.models.openrouter_enabled_models = vec!["test/model".to_owned()];
+        for (reasoning, expected_values, expected_default) in cases {
+            let wire: OpenRouterWireModel = serde_json::from_value(serde_json::json!({
+                "id": "test/model",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "supported_parameters": ["tools", "reasoning"],
+                "reasoning": reasoning,
+            }))
+            .expect("reasoning fixture");
+            let catalog = catalog_from(vec![wire]);
+            let resolved = resolve_openrouter(&cfg, &catalog);
+            let info = &resolved["openrouter:test/model"].info;
+            assert_eq!(
+                info.reasoning_efforts
+                    .iter()
+                    .map(|option| option.value)
+                    .collect::<Vec<_>>(),
+                expected_values,
+                "{reasoning}",
+            );
+            assert_eq!(info.reasoning_effort, expected_default, "{reasoning}");
+            assert_eq!(
+                info.supports_reasoning_effort,
+                !expected_values.is_empty(),
+                "{reasoning}"
+            );
+            assert_eq!(
+                info.reasoning_efforts
+                    .iter()
+                    .filter(|option| option.default)
+                    .count(),
+                usize::from(expected_default.is_some()),
+                "{reasoning}",
+            );
+        }
     }
 
     #[test]

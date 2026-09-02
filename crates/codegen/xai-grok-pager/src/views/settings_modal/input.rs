@@ -420,12 +420,20 @@ fn toggle_dynamic_multi_select(
         });
     }
     if group_key == "openrouter_models" {
-        let enabled = toggle_openrouter_enabled_models(
-            &state.pager_snapshot.openrouter_models,
-            &state.pager_snapshot.openrouter_enabled_models,
-            &choice.canonical,
-            choice.selected,
-        );
+        let mut enabled = state.pager_snapshot.openrouter_enabled_models.clone();
+        enabled.retain(|value| {
+            value != &choice.canonical
+                && !state
+                    .pager_snapshot
+                    .openrouter_models
+                    .iter()
+                    .any(|model| model.id == choice.canonical && &model.key == value)
+        });
+        if !choice.selected {
+            enabled.push(choice.canonical.clone());
+        }
+        enabled.sort();
+        enabled.dedup();
         return SettingsKeyOutcome::Action(Action::SetOpenRouterEnabledModels { models: enabled });
     }
     if group_key != "opencode_go_models" {
@@ -446,42 +454,6 @@ fn toggle_dynamic_multi_select(
     enabled.sort();
     enabled.dedup();
     SettingsKeyOutcome::Action(Action::SetOpenCodeGoEnabledModels { models: enabled })
-}
-
-fn toggle_openrouter_enabled_models(
-    catalog: &[xai_grok_shell::openrouter_models::OpenRouterModelDescriptor],
-    current: &[String],
-    canonical: &str,
-    currently_selected: bool,
-) -> Vec<String> {
-    let listed =
-        |value: &str, model: &xai_grok_shell::openrouter_models::OpenRouterModelDescriptor| {
-            value == model.id || value == model.key
-        };
-    let mut enabled = if current.is_empty() {
-        catalog.iter().map(|model| model.id.clone()).collect()
-    } else {
-        current.to_vec()
-    };
-    enabled.retain(|value| {
-        value != canonical
-            && !catalog
-                .iter()
-                .any(|model| model.id == canonical && value == &model.key)
-    });
-    if !currently_selected {
-        enabled.push(canonical.to_owned());
-    }
-    enabled.sort();
-    enabled.dedup();
-    if !catalog.is_empty()
-        && catalog
-            .iter()
-            .all(|model| enabled.iter().any(|value| listed(value, model)))
-    {
-        enabled.clear();
-    }
-    enabled
 }
 
 pub(crate) fn custom_model_action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
