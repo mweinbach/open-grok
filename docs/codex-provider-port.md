@@ -95,12 +95,12 @@ outside this opt-in.
 Validation on Windows: package checks for shell and pager pass, as do the four
 context-store/schema/dispatch tests, 26 settings-registry tests, two portable
 login-environment parser tests, and 92 Codex regressions in MCP, pager, sampler,
-and sampling types. The five `session::acp_session::context_management::tests`
-compile but remain **unexecuted**: Windows Smart App Control blocks the shell
-test executable (error 4551), including outside the process sandbox. Run these
-five tests in an approved environment before marking turn-boundary, checkpoint,
-cancellation, and live-provider runtime verification complete. The local
-adapter does not change Windows application-control policy.
+and sampling types. During the v1.0.13-open-grok.88 release preflight, all five
+`session::acp_session::context_management::tests` also passed on Windows,
+covering checkpoint acknowledgment, concurrent human steering, fresh-window
+history, context budgets, and provider-switch revocation. The earlier Smart
+App Control execution block did not recur; no application-control policy was
+changed.
 
 ## Live model catalog
 
