@@ -68,6 +68,9 @@ pub(crate) fn is_code_mode_transport_meta(meta: Option<&acp::Meta>) -> bool {
 /// `agent_swarm` must hold the model turn until aggregation completes instead
 /// of yielding its enclosing cell and making the model poll it.
 pub(crate) fn is_code_mode_direct_only_tool(name: &str) -> bool {
+    if xai_grok_tools::implementations::codex::context_management::TOOL_NAMES.contains(&name) {
+        return true;
+    }
     matches!(
         name,
         "ask_user_question"

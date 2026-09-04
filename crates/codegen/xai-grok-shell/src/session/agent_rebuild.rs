@@ -152,6 +152,8 @@ fn standalone_web_search_active(
 /// derived — the spec lives behind an [`Arc`] and is shared by clone of
 /// that `Arc`.
 pub(crate) struct AgentRebuildSpec {
+    pub context_management:
+        Option<xai_grok_tools::implementations::codex::context_management::ContextManagementStore>,
     pub working_directory: PathBuf,
     pub terminal_backend: Arc<dyn TerminalBackend>,
     pub fs_backend: Arc<dyn AsyncFileSystem>,
@@ -308,6 +310,7 @@ impl AgentRebuildSpec {
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
     ) -> Result<Agent, AgentBuildError> {
         let Self {
+            context_management,
             working_directory,
             terminal_backend,
             fs_backend,
@@ -439,6 +442,7 @@ impl AgentRebuildSpec {
         .with_async_user_messages_enabled(
             *subagent_depth == 0 && active_sampling_config.read().supports_async_user_messages(),
         )
+        .with_context_management(context_management.clone())
         .with_native_agents_enabled({
             let sampling = active_sampling_config.read();
             (*subagents_enabled || *subagent_depth > 0)
@@ -668,6 +672,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         tokio_util::sync::CancellationToken::new(),
     );
     Arc::new(AgentRebuildSpec {
+        context_management: None,
         working_directory: std::env::temp_dir(),
         terminal_backend: Arc::new(
             xai_grok_tools::computer::local::LocalTerminalBackend::new_local(

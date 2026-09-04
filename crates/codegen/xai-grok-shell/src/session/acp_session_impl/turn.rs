@@ -2728,6 +2728,9 @@ impl SessionActor {
         let conv_turn_start = std::time::Instant::now();
         let conv_turn_clock = DualClock::now();
         self.maybe_refresh_model_metadata_on_resume().await;
+        if let Some(store) = self.experimental_context_store() {
+            store.begin_turn();
+        }
         self.maybe_compact_on_model_switch().await?;
         self.chat_state_handle
             .record_turn_start(chrono::Utc::now().timestamp_millis());
@@ -3034,7 +3037,13 @@ impl SessionActor {
             if !salvage.awaiting_continuation() {
                 self.maybe_inject_mcp_reminder().await;
             }
-            if self.tool_context.task_output_token_budget.is_none()
+            let experimental_context = if !salvage.awaiting_continuation() {
+                self.sync_experimental_context().await?
+            } else {
+                self.experimental_context_store().is_some()
+            };
+            if !experimental_context
+                && self.tool_context.task_output_token_budget.is_none()
                 && self.two_pass_active()
                 && !self.compaction.prefire.has_cache()
                 && self.should_prefire_two_pass().await
@@ -3051,6 +3060,7 @@ impl SessionActor {
             }
             if self.tool_context.task_output_token_budget.is_none()
                 && !salvage.awaiting_continuation()
+                && !experimental_context
                 && let Some(trigger_info) = self.check_auto_compact_needed().await
                 && let Err(e) = self.run_compact_only(trigger_info).await
             {
@@ -3101,6 +3111,7 @@ impl SessionActor {
                 })),
             );
             let mut request = request;
+            self.add_experimental_context_guidance(&mut request);
             if !crate::model_image_input::model_accepts_images(
                 request.model.as_deref().unwrap_or(""),
             ) {

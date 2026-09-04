@@ -12,6 +12,7 @@
 //! [openai/codex]: https://github.com/openai/codex
 
 pub mod apply_patch;
+pub mod context_management;
 pub mod grep_files;
 pub mod list_dir;
 pub mod multi_agent_v2;

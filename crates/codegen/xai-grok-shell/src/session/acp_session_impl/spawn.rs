@@ -1174,6 +1174,13 @@ pub(crate) async fn spawn_session_actor(
             .and_then(|r| r.scheduler_background_loops),
     );
     let rebuild_spec = std::sync::Arc::new(crate::session::agent_rebuild::AgentRebuildSpec {
+        context_management: if models_manager.experimental_context_enabled() {
+            Some(xai_grok_tools::implementations::codex::context_management::ContextManagementStore::open(
+                crate::session::persistence::session_dir(&session_info).join("context-management")
+            ).map_err(|e|xai_grok_agent::AgentBuildError::ToolError(format!("Could not open context history: {e}")))?)
+        } else {
+            None
+        },
         working_directory: tool_context.cwd.as_path().to_path_buf(),
         session_bus_client,
         terminal_backend: terminal_backend.clone(),

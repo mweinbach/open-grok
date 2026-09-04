@@ -64,6 +64,44 @@ model-catalog compatibility version is `0.153.1`, verified against the
 
 User settings: [Codex context and persistent work](../crates/codegen/xai-grok-pager/docs/user-guide/26-codex-model-controls.md).
 
+### Experimental context management
+
+`[features.context_management].experimental_mode = true` opts Codex Responses
+sessions into model-controlled windows. The host exposes `new_context`,
+`get_context_remaining`, and operation-specific `history_*`/`notes_*` tools.
+The setting defaults off, requires restart, and is rechecked against the active
+provider at listing and dispatch. Children have independent session stores.
+
+This deliberately adapts the 0.153.1 lifecycle to local Open Grok persistence:
+it does not call `alpha/history/v2` or `alpha/notes/v2`, enable backend ingestion,
+or require upstream's private subscription-gated history service. History is
+normalized text with stable window/item IDs; virtual note paths cannot address
+workspace files. Writes use atomic replacement and fsync. Earlier window files
+are preserved across divergent timelines and resumed sessions. Cross-agent
+queries and hosted encrypted history are not implemented by this local adapter.
+
+At a completed tool-batch boundary, archive the current window, persist the
+normal compaction checkpoint, and wait for `FlushAndAck` before replacing live
+history. Concurrent real-user interjections survive; incompatible history
+changes reject the replacement. Fresh state keeps system instructions, the
+first/latest real human messages, and at most 16,000 characters of historical
+assistant notes, so a later provider switch has plain-text continuity. Skill
+and AGENTS.md discovery reopens; plan state, tasks and V8 stay live. Private
+context cards and argument streaming are suppressed at the shell UI boundary.
+Normal hooks/permissions still apply to tools. Manual compaction and emergency
+overflow use the same durable rotation path; ordinary compaction stays intact
+outside this opt-in.
+
+Validation on Windows: package checks for shell and pager pass, as do the four
+context-store/schema/dispatch tests, 26 settings-registry tests, two portable
+login-environment parser tests, and 92 Codex regressions in MCP, pager, sampler,
+and sampling types. The five `session::acp_session::context_management::tests`
+compile but remain **unexecuted**: Windows Smart App Control blocks the shell
+test executable (error 4551), including outside the process sandbox. Run these
+five tests in an approved environment before marking turn-boundary, checkpoint,
+cancellation, and live-provider runtime verification complete. The local
+adapter does not change Windows application-control policy.
+
 ## Live model catalog
 
 Open Grok embeds GPT-6-astra and GPT-5.6 Sol, Terra, and Luna definitions so the

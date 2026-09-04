@@ -3300,7 +3300,7 @@ fn login_env_capture_enabled() -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 fn login_env_var_excluded(key: &str) -> bool {
     matches!(
         key,
@@ -3322,7 +3322,7 @@ fn login_env_var_excluded(key: &str) -> bool {
         || key.starts_with("GROK_SANDBOX")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 fn parse_login_env_capture(stdout: &str) -> (Option<String>, HashMap<String, String>) {
     let parts: Vec<&str> = stdout.split('\x01').collect();
     let login_path = parts

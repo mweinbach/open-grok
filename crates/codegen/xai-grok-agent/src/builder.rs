@@ -107,6 +107,8 @@ pub struct AgentBuilder {
     background_workflows_enabled: bool,
     ask_user_question_enabled: bool,
     async_user_messages_enabled: bool,
+    context_management:
+        Option<xai_grok_tools::implementations::codex::context_management::ContextManagementStore>,
     native_agents_enabled: bool,
     subagent_toggle: HashMap<String, bool>,
     task_model_slugs: Vec<String>,
@@ -254,6 +256,7 @@ impl AgentBuilder {
             background_workflows_enabled: false,
             ask_user_question_enabled: true,
             async_user_messages_enabled: false,
+            context_management: None,
             native_agents_enabled: false,
             subagent_toggle: HashMap::new(),
             task_model_slugs: Vec::new(),
@@ -619,6 +622,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn with_context_management(
+        mut self,
+        store: Option<
+            xai_grok_tools::implementations::codex::context_management::ContextManagementStore,
+        >,
+    ) -> Self {
+        self.context_management = store;
+        self
+    }
+
     pub fn with_native_agents_enabled(mut self, enabled: bool) -> Self {
         self.native_agents_enabled = enabled;
         self
@@ -785,6 +798,16 @@ impl AgentBuilder {
             tool_config
                 .tools
                 .push((&xai_grok_tools::implementations::codex::SendUserMessageAsyncTool).into());
+        }
+        tool_config.tools.retain(|tool| {
+            !xai_grok_tools::implementations::codex::context_management::TOOL_NAMES
+                .iter()
+                .any(|name| tool.id == format!("Codex:{name}"))
+        });
+        if self.context_management.is_some() {
+            tool_config
+                .tools
+                .extend(xai_grok_tools::implementations::codex::context_management::tool_configs());
         }
         if definition.inject_default_tools {
             if self.memory_backend.is_some() {
@@ -1272,6 +1295,9 @@ impl AgentBuilder {
                     },
                 ),
             );
+        }
+        if let Some(store) = self.context_management {
+            tool_bridge.update_resource(store).await;
         }
         if let Some(backend) = standalone_web_search_backend {
             tool_bridge.toolset().resources.lock().await.insert(backend);

@@ -745,6 +745,17 @@ impl ToolRegistryBuilder {
         b.register::<codex::grep_files::CodexGrepFilesTool>();
         b.register::<codex::read_file::CodexReadFileTool>();
         b.register::<codex::SendUserMessageAsyncTool>();
+        b.register::<codex::context_management::NewContextTool>();
+        b.register::<codex::context_management::GetContextRemainingTool>();
+        b.register::<codex::context_management::HistoryListWindowsTool>();
+        b.register::<codex::context_management::HistoryListItemsTool>();
+        b.register::<codex::context_management::HistoryReadItemTool>();
+        b.register::<codex::context_management::HistorySearchContentsTool>();
+        b.register::<codex::context_management::NotesListFilesTool>();
+        b.register::<codex::context_management::NotesReadFileTool>();
+        b.register::<codex::context_management::NotesSearchTool>();
+        b.register::<codex::context_management::NotesAppendTool>();
+        b.register::<codex::context_management::NotesWriteTool>();
         b.register::<opencode::OpenCodeBashTool>();
         b.register::<opencode::OpenCodeReadTool>();
         b.register::<opencode::OpenCodeEditTool>();

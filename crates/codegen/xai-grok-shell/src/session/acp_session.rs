@@ -170,6 +170,8 @@ mod session_mode;
 use session_mode::*;
 #[path = "acp_session_impl/codex_catalog_policy.rs"]
 mod codex_catalog_policy;
+#[path = "acp_session_impl/experimental_context.rs"]
+mod context_management;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
 #[path = "acp_session_impl/status_line.rs"]

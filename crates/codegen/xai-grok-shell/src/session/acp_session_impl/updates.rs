@@ -213,6 +213,17 @@ impl SessionActor {
         agent_timestamp_ms_override: Option<i64>,
         is_replay: bool,
     ) {
+        if let Some(store) = &self.rebuild_spec.context_management {
+            match &update {
+                acp::SessionUpdate::ToolCall(call) if store.enabled()
+                    && xai_grok_tools::implementations::codex::context_management::TOOL_NAMES.contains(&call.title.as_str()) => {
+                    store.hide_call(call.tool_call_id.0.as_ref());
+                    return;
+                }
+                acp::SessionUpdate::ToolCallUpdate(call) if store.call_is_hidden(call.tool_call_id.0.as_ref()) => return,
+                _ => {}
+            }
+        }
         self.close_rewind_window().await;
         if let acp::SessionUpdate::ToolCall(tool_call) = &update
             && matches!(tool_call.kind, acp::ToolKind::Edit)

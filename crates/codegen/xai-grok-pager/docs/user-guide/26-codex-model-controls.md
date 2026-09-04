@@ -36,6 +36,38 @@ To restore catalog defaults, remove the model override fields or remove the
 custom entry in Settings. Model configuration changes refresh the catalog and
 rebind the session through the normal provider/settings path.
 
+## Experimental context management
+
+Enable **Settings → Advanced → Experimental context management**, then restart,
+or set:
+
+```toml
+[features.context_management]
+experimental_mode = true
+```
+
+Codex models can use `new_context` and `get_context_remaining`, along with local
+`history_*` and `notes_*` tools. A fresh window starts after the current tool
+batch finishes. Running commands, subagents, the Code Mode JavaScript session,
+and plan state remain intact. The first and latest human instructions and a
+bounded digest of notes carry forward; the model can recover other details
+from its earlier windows. Notes never become new user authorization.
+
+The usable context override controls the window budget. By default, up to
+16,384 tokens are reserved for recovery, with a reminder at 6,144 remaining
+tokens. An explicit `auto_compact_token_limit` can request an earlier boundary.
+An explicitly changed compaction percentage keeps its existing precedence.
+If the model consumes the reserve without starting a window, the host starts
+one. Ordinary compaction applies when this setting is off or the route is not
+Codex Responses.
+
+This is Open Grok's local adaptation: text history and notes live under the
+session's `context-management/` directory and survive resume. They use separate
+stores for each session/subagent, without Codex's private cloud history service
+or cross-agent history queries. Private tool calls are hidden from the UI.
+A failed history/checkpoint write prevents the active history from being
+replaced. Manual `/compact` also starts a fresh window while this mode is on.
+
 ## Persistent work and browser review
 
 **Settings → Agent → Codex persistent work** keeps the root agent working on

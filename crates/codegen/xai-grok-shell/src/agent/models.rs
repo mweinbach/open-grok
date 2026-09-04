@@ -2078,6 +2078,15 @@ impl ModelsManager {
             .unwrap_or(false)
     }
 
+    pub(crate) fn experimental_context_enabled(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .features
+            .context_management
+            .experimental_mode
+    }
+
     pub(crate) fn codex_guardian_review(&self) -> bool {
         self.inner
             .cfg

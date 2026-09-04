@@ -1511,6 +1511,15 @@ impl SessionActor {
         codex_turn_state: Arc<std::sync::OnceLock<String>>,
     ) -> Result<(), acp::Error> {
         let (cancel, _cancel_scope) = self.compaction.cancel.enter();
+        if let Some(store) = self.experimental_context_store() {
+            let source = match trigger {
+                xai_grok_telemetry::events::CompactionTrigger::Manual => "manual",
+                xai_grok_telemetry::events::CompactionTrigger::Auto => "auto",
+            };
+            return self
+                .start_experimental_context_window(store, user_context, auto_continue, source)
+                .await;
+        }
         let tokens_before = self.chat_state_handle.get_total_tokens().await;
         tracing::Span::current().record("compaction_tokens_before", tokens_before as i64);
         self.signals_handle().record_compaction(tokens_before);
@@ -3038,7 +3047,7 @@ impl SessionActor {
     ///
     /// `auto_continue` should be `Some` when this compaction was triggered by auto-compact
     /// and an auto-continue prompt will follow.
-    fn persist_compaction_checkpoint(
+    pub(super) fn persist_compaction_checkpoint(
         &self,
         compacted_history: &[ConversationItem],
         prompt_index_at_compaction: usize,

@@ -17,6 +17,10 @@ pub struct LocalFeatureFlagSpec {
 
 pub const LOCAL_FEATURE_FLAG_SPECS: &[LocalFeatureFlagSpec] = &[
     LocalFeatureFlagSpec {
+        key: "features.context_management.experimental_mode",
+        default: false,
+    },
+    LocalFeatureFlagSpec {
         key: "memory.enabled",
         default: false,
     },

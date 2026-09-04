@@ -652,6 +652,12 @@ impl SessionActor {
         tool_name: &str,
         provider: xai_grok_sampling_types::ModelProvider,
     ) -> bool {
+        if xai_grok_tools::implementations::codex::context_management::TOOL_NAMES
+            .contains(&tool_name)
+        {
+            let enabled = self.experimental_context_store().is_some();
+            return provider == xai_grok_sampling_types::ModelProvider::Codex && enabled;
+        }
         let web_search = self.rebuild_spec.web_search_state();
         if matches!(tool_name, "spawn_agent" | "interrupt_agent") {
             let sampling = self.rebuild_spec.active_sampling_config.read();

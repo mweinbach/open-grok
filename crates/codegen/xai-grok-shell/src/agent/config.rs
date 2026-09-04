@@ -5566,7 +5566,16 @@ pub struct AutoModeConfig {
     pub reasoning_effort: Option<ReasoningEffort>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextManagementConfig {
+    /// Model-controlled windows with locally persisted history and notes.
+    pub experimental_mode: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Features {
+    #[serde(default)]
+    pub context_management: ContextManagementConfig,
     /// when set, the agent may ask permission for tool executions
     #[serde(default)]
     pub support_permission: bool,

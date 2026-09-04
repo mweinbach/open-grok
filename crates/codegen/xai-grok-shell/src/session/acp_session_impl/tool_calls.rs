@@ -3659,6 +3659,12 @@ impl SessionActor {
                 name,
                 arguments_delta,
             } => {
+                // A streamed argument fragment may arrive before its tool name.
+                // Keep fragments private in experimental mode; ordinary tools
+                // still receive their complete, normal execution cards.
+                if self.experimental_context_store().is_some() {
+                    return;
+                }
                 {
                     let mut cap = self.streaming_turn_capture.lock();
                     if cap.prompt_id.is_some() {
