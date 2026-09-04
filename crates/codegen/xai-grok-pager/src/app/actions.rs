@@ -550,6 +550,8 @@ pub enum Action {
     /// SHELL-owned: updates the process-wide cache mirror and persists to
     /// `[ui].stream_tool_calls` via `Effect::PersistSetting`.
     SetStreamToolCalls(bool),
+    SetCodexPersistentMode(bool),
+    SetCodexGuardianReview(bool),
     /// Set whether runs of consecutive non-destructive tool calls and
     /// subagent rows are grouped into one row. SHELL-owned: updates the
     /// process-wide cache mirror and persists to `[ui].group_tool_verbs`
@@ -728,6 +730,7 @@ pub enum Action {
     SetCustomModelProvider(String),
     SetCustomModelBaseUrl(String),
     SetCustomModelContextWindow(i64),
+    SetCustomModelMaxContextWindow(i64),
     SetCustomModelBackend(String),
     SetCustomModelEnvKey(String),
     SetCustomModelSave(bool),
@@ -1777,6 +1780,7 @@ pub enum Effect {
         provider: Option<String>,
         base_url: Option<String>,
         context_window: Option<u64>,
+        max_context_window: Option<u64>,
         api_backend: Option<String>,
         env_key: Option<String>,
     },

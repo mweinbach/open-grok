@@ -2,6 +2,9 @@
 
 Grok connects to custom model endpoints for alternative providers, self-hosted models, and overriding built-in settings. This guide explains how to add models from Settings, select them, configure `[model.*]` endpoints, and integrate third-party providers.
 
+For GPT-6-astra, Codex raw-context overrides, and persistent work, see
+[Codex model controls](26-codex-model-controls.md).
+
 ---
 
 ## Default Models

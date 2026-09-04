@@ -839,9 +839,11 @@ pub(crate) async fn generate_session_compact(
                 x_grok_agent_id: Some(xai_grok_telemetry::id::agent_id()),
                 ..Default::default()
             };
-            let stream_result =
-                await_unless_cancelled(cancel, client.conversation_stream_google_ai_studio(request))
-                    .await?;
+            let stream_result = await_unless_cancelled(
+                cancel,
+                client.conversation_stream_google_ai_studio(request),
+            )
+            .await?;
             let mut stream = match stream_result {
                 Ok((s, _metadata)) => s,
                 Err(e) => return Err(classify_sampling_error(e)),
@@ -2031,6 +2033,7 @@ mod reasoning_compaction_regression_tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,

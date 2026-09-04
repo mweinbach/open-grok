@@ -1664,6 +1664,7 @@ pub(crate) fn execute(
             provider,
             base_url,
             context_window,
+            max_context_window,
             api_backend,
             env_key,
         } => {
@@ -1682,6 +1683,7 @@ pub(crate) fn execute(
                 if let Some(base_url) = base_url {
                     params["base_url"] = serde_json::Value::String(base_url);
                 }
+                if let Some(max_context_window) = max_context_window { params["max_context_window"] = serde_json::json!(max_context_window); }
                 if let Some(context_window) = context_window {
                     params["context_window"] = serde_json::json!(context_window);
                 }

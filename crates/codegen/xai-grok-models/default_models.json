@@ -337,6 +337,67 @@
       "supports_backend_search": true
     },
     {
+      "model": "gpt-6-astra",
+      "name": "GPT-6-astra",
+      "default_reasoning_summary": "none",
+      "description": "Latest frontier agentic coding model",
+      "context_window": 258400,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "experimental_supported_tools": [
+        "send_user_message_async"
+      ],
+      "apply_patch_tool_type": "freeform",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 372000,
+        "effective_context_window_percent": 95,
+        "comp_hash": "3000",
+        "multi_agent_reasoning_effort": "xhigh",
+        "supported_reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra"
+        ],
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": [
+          "text",
+          "image"
+        ]
+      },
+      "reasoning_efforts": [
+        {
+          "value": "low"
+        },
+        {
+          "value": "medium",
+          "default": true
+        },
+        {
+          "value": "high"
+        },
+        {
+          "value": "xhigh"
+        },
+        {
+          "value": "max"
+        },
+        {
+          "value": "ultra"
+        }
+      ]
+    },
+    {
       "model": "gpt-5.6-sol",
       "name": "GPT-5.6 Sol",
       "description": "Latest frontier agentic coding model",

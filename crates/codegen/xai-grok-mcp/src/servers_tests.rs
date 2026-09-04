@@ -1748,6 +1748,7 @@ enum CallToolBehavior {
 
 #[derive(Clone)]
 struct FakeMcpHandles {
+    call_params: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
     inits: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
     init_version: Arc<parking_lot::Mutex<Option<String>>>,
@@ -1820,6 +1821,7 @@ async fn fake_handle_post(
         }))
         .into_response(),
         Some("tools/call") => {
+            state.handles.call_params.lock().push(req["params"].clone());
             let n = state.handles.calls.fetch_add(1, Ordering::Relaxed);
             match state.behavior {
                 CallToolBehavior::ErrorThenOk { code } => {
@@ -1876,6 +1878,7 @@ async fn spawn_test_http_server(app: axum::Router) -> String {
 
 async fn spawn_fake_mcp(behavior: CallToolBehavior) -> (String, FakeMcpHandles) {
     let handles = FakeMcpHandles {
+        call_params: Arc::new(parking_lot::Mutex::new(Vec::new())),
         inits: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
         init_version: Arc::new(parking_lot::Mutex::new(None)),
@@ -1921,6 +1924,50 @@ fn fake_echo_tool() -> McpErasedTool {
             None,
         ),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn codex_confirmation_metadata_survives_retry_and_does_not_leak_to_next_call() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::ErrorThenOk { code: -32603 }).await;
+    let client = fake_http_client(&url, 5);
+    let tool = fake_echo_tool();
+    let tmp = tempfile::tempdir().unwrap();
+    let ew = xai_grok_session_events::EventWriter::open(tmp.path());
+    let metadata = serde_json::Map::from_iter([(
+        "openai/confirmation_policies".into(),
+        serde_json::json!({"browser_use":"host policy"}),
+    )]);
+    let raw =
+        serde_json::json!({"_meta":{"openai/confirmation_policies":{"browser_use":"model spoof"}}});
+    tool.try_call_tool_with_meta(&client, &raw, &mut false, &mut false, &ew, Some(&metadata))
+        .await
+        .unwrap();
+    tool.try_call_tool_with_meta(
+        &client,
+        &serde_json::json!({}),
+        &mut false,
+        &mut false,
+        &ew,
+        None,
+    )
+    .await
+    .unwrap();
+    let requests = handles.call_params.lock();
+    assert_eq!(requests.len(), 3);
+    for request in &requests[..2] {
+        assert_eq!(
+            request["_meta"]["openai/confirmation_policies"]["browser_use"],
+            "host policy"
+        );
+        assert_eq!(request["arguments"], raw);
+    }
+    assert!(
+        requests[2]["_meta"]
+            .get("openai/confirmation_policies")
+            .is_none(),
+        "the next call must not inherit confirmation metadata: {}",
+        requests[2]
+    );
 }
 
 fn event_types(jsonl: &str) -> Vec<serde_json::Value> {

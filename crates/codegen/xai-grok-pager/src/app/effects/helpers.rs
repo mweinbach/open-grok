@@ -1418,6 +1418,16 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "codex_persistent_mode" | "codex_guardian_review" => {
+            let SettingValue::Bool(enabled) = value else {
+                return Err(kind_mismatch(key, "Bool", &value));
+            };
+            if key == "codex_persistent_mode" {
+                xai_grok_shell::util::config::set_codex_persistent_mode(enabled).await
+            } else {
+                xai_grok_shell::util::config::set_codex_guardian_review(enabled).await
+            }.map_err(|error| error.to_string())
+        }
         "code_mode" => {
             let SettingValue::Enum(value) = value else {
                 return Err(kind_mismatch("code_mode", "Enum", &value));

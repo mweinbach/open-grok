@@ -31,7 +31,7 @@ pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "OPENGROK_CODEX_CLIENT_VERSION
 /// Compatibility version of the pinned official Codex snapshot whose model
 /// catalog contract Open Grok implements. This is intentionally independent
 /// from Open Grok's own package version.
-pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.150.0";
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.153.1";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
 const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
@@ -160,18 +160,33 @@ impl CodexModelsCatalog {
     /// Return all remote entries, including hidden entries. Keeping hidden
     /// entries allows the live catalog to hide a same-slug embedded fallback.
     pub(crate) fn entries(&self) -> IndexMap<String, ModelEntry> {
-        self.models
-            .iter()
-            .map(|model| (model.slug().to_owned(), model.entry.clone()))
-            .collect()
+        let mut entries: IndexMap<String, ModelEntry> = IndexMap::new();
+        for model in &self.models {
+            let key = model
+                .entry
+                .info
+                .id
+                .clone()
+                .unwrap_or_else(|| model.slug().to_owned());
+            // When a rollout lists both names, the public routing entry wins,
+            // including its visibility, regardless of response ordering.
+            if model.slug() != key
+                && entries
+                    .get(&key)
+                    .is_some_and(|entry| entry.info.model == key)
+            {
+                continue;
+            }
+            entries.insert(key, model.entry.clone());
+        }
+        entries
     }
 
     /// Return only entries that the Codex backend marks as picker-visible.
     pub(crate) fn list_visible_entries(&self) -> IndexMap<String, ModelEntry> {
-        self.models
-            .iter()
-            .filter(|model| model.visibility.is_list_visible())
-            .map(|model| (model.slug().to_owned(), model.entry.clone()))
+        self.entries()
+            .into_iter()
+            .filter(|(_, entry)| !entry.info.hidden)
             .collect()
     }
 
@@ -242,6 +257,18 @@ struct CodexWireModel {
     subagent_context_default: Option<String>,
     #[serde(default)]
     multi_agent_version: Option<String>,
+    #[serde(default)]
+    multi_agent_reasoning_effort: Option<String>,
+    #[serde(default)]
+    upgrade: Option<xai_grok_sampling_types::CodexModelUpgrade>,
+    #[serde(default)]
+    model_messages: Option<xai_grok_sampling_types::CodexModelMessages>,
+    #[serde(default)]
+    support_verbosity: bool,
+    #[serde(default)]
+    default_verbosity: Option<String>,
+    #[serde(default)]
+    input_modalities: Vec<String>,
     #[serde(default)]
     use_responses_lite: bool,
     #[serde(default)]
@@ -578,7 +605,14 @@ impl CodexModelsClient {
         }
 
         let mut info = ModelInfo::fallback(slug);
-        info.id = Some(slug.to_owned());
+        // Catalog presentation aliases never determine provider/auth identity.
+        // Keep the server's routing slug, but expose Astra's public name/key.
+        let catalog_id = if slug == "vega-alpha" {
+            "gpt-6-astra"
+        } else {
+            slug
+        };
+        info.id = Some(catalog_id.to_owned());
         info.model = slug.to_owned();
         info.base_url = self.normalized_base_url();
         info.name = Some(
@@ -590,6 +624,9 @@ impl CodexModelsClient {
             .description
             .map(|description| description.trim().to_owned())
             .filter(|description| !description.is_empty());
+        if catalog_id == "gpt-6-astra" {
+            info.name = Some("GPT-6-astra".to_owned());
+        }
         info.api_backend = ApiBackend::Responses;
         info.provider = ModelProvider::Codex;
         info.tool_mode = match parse_tool_mode(wire.tool_mode.as_deref()) {
@@ -618,6 +655,36 @@ impl CodexModelsClient {
             },
         };
         info.codex_multi_agent_v2 = wire.multi_agent_version.as_deref() == Some("v2");
+        let positive = |value: Option<i64>| {
+            value
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+        };
+        info.codex_model = xai_grok_sampling_types::CodexModelMetadata {
+            context_window: positive(wire.context_window),
+            max_context_window: positive(wire.max_context_window),
+            effective_context_window_percent: wire.effective_context_window_percent.clamp(1, 100)
+                as u8,
+            auto_compact_token_limit: wire
+                .auto_compact_token_limit
+                .map(|value| u64::try_from(value).unwrap_or(0)),
+            comp_hash: wire.comp_hash.clone(),
+            multi_agent_reasoning_effort: wire
+                .multi_agent_reasoning_effort
+                .as_deref()
+                .and_then(parse_supported_reasoning_effort),
+            supported_reasoning_efforts: wire
+                .supported_reasoning_levels
+                .iter()
+                .filter_map(|level| parse_supported_reasoning_effort(&level.effort))
+                .collect(),
+            upgrade: wire.upgrade,
+            model_messages: wire.model_messages.unwrap_or_default(),
+            support_verbosity: wire.support_verbosity,
+            default_verbosity: wire.default_verbosity,
+            input_modalities: wire.input_modalities,
+            ..Default::default()
+        };
         info.use_responses_lite = wire.use_responses_lite;
         info.experimental_supported_tools = wire.experimental_supported_tools;
         info.apply_patch_tool_type = wire.apply_patch_tool_type;
@@ -1579,6 +1646,93 @@ mod tests {
     }
 
     #[test]
+    fn codex_1531_metadata_context_overrides_and_astra_presentation() {
+        let temp = tempfile::tempdir().unwrap();
+        let client = test_client(
+            &temp,
+            "https://chatgpt.example/codex".into(),
+            "0.153.1",
+            Duration::from_secs(300),
+            auth_source(credentials("token", "workspace-1", false)),
+        );
+        let wire = json!({
+            "slug":"vega-alpha", "display_name":"vega-alpha", "visibility":"list",
+            "context_window":272000, "max_context_window":372000, "effective_context_window_percent":95,
+            "multi_agent_version":"v2", "multi_agent_reasoning_effort":"xhigh",
+            "supported_reasoning_levels":[{"effort":"xhigh"},{"effort":"max"},{"effort":"ultra"}],
+            "default_reasoning_level":"xhigh", "comp_hash":"3000", "use_responses_lite":true,
+            "experimental_supported_tools":["send_user_message_async"],
+            "model_messages":{"persistent_instructions":"Keep working within scope", "confirmation_policies":{"browser_use":"policy"}, "guardian_v2":{"classifier_instructions":"review"}},
+            "upgrade":{"model":"replacement", "retirement_at":"2026-08-31T19:00:00Z"},
+            "support_verbosity":true, "default_verbosity":"low", "input_modalities":["text","image"]
+        });
+        let model = client
+            .convert_model(serde_json::from_value(wire).unwrap())
+            .unwrap();
+        let restored: CodexCatalogModel =
+            serde_json::from_value(serde_json::to_value(&model).unwrap()).unwrap();
+        assert_eq!(restored.entry.info.id.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(restored.entry.info.name.as_deref(), Some("GPT-6-astra"));
+        assert_eq!(restored.entry.info.model, "vega-alpha");
+        assert_eq!(
+            restored.entry.info.codex_model,
+            model.entry.info.codex_model
+        );
+        assert_eq!(restored.entry.info.context_window.get(), 258_400);
+        let mut public = restored.clone();
+        public.entry.info.model = "gpt-6-astra".to_owned();
+        for models in [
+            vec![public.clone(), restored.clone()],
+            vec![restored.clone(), public],
+        ] {
+            let catalog = CodexModelsCatalog {
+                models,
+                etag: None,
+                account_fingerprint: String::new(),
+            };
+            assert_eq!(catalog.entries().len(), 1);
+            assert_eq!(catalog.entries()["gpt-6-astra"].info.model, "gpt-6-astra");
+            assert!(!catalog.entries().contains_key("vega-alpha"));
+        }
+        let overridden = crate::agent::config::ConfigModelOverride {
+            max_context_window: Some(1_000_000),
+            ..Default::default()
+        }
+        .apply(
+            "gpt-6-astra",
+            Some(restored.entry),
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        assert_eq!(overridden.info.context_window.get(), 950_000);
+        assert_eq!(overridden.info.codex_model.compact_limit(), Some(900_000));
+        assert_eq!(
+            overridden.info.codex_model.max_context_window,
+            Some(372_000)
+        );
+        let effective_override = crate::agent::config::ConfigModelOverride {
+            context_window: Some(1_000_000),
+            ..Default::default()
+        }
+        .apply(
+            "gpt-6-astra",
+            Some(overridden),
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        assert_eq!(effective_override.info.context_window.get(), 1_000_000);
+        assert!(effective_override.info.codex_model.compact_limit().unwrap() > 940_000);
+        let other = crate::agent::config::ConfigModelOverride {
+            provider: Some(ModelProvider::Xai),
+            ..Default::default()
+        }
+        .apply(
+            "gpt-6-astra",
+            Some(effective_override),
+            &crate::agent::config::EndpointsConfig::default(),
+        );
+        assert_eq!(other.info.codex_model, Default::default());
+    }
+
+    #[test]
     fn model_capability_opt_ins_survive_catalog_conversion_and_cache_round_trip() {
         let temp = tempfile::tempdir().unwrap();
         let client = test_client(
@@ -1790,6 +1944,6 @@ mod tests {
             Some("0.145.0".to_owned())
         );
         assert_eq!(normalize_whole_semver("not-a-version"), None);
-        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.150.0");
+        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.153.1");
     }
 }

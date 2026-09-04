@@ -58,6 +58,53 @@ fn test_manager() -> ModelsManager {
 }
 
 #[test]
+fn codex_context_override_reaches_manager_compaction_and_acp() {
+    let manager = test_manager();
+    let mut entry =
+        ModelEntry::fallback("catalog-context-model", &config::EndpointsConfig::default());
+    entry.info.provider = xai_grok_sampling_types::ModelProvider::Codex;
+    entry.info.api_backend = xai_grok_sampling_types::ApiBackend::Responses;
+    entry.info.codex_model = xai_grok_sampling_types::CodexModelMetadata {
+        context_window: Some(272_000),
+        max_context_window: Some(372_000),
+        comp_hash: Some("3000".into()),
+        upgrade: Some(xai_grok_sampling_types::CodexModelUpgrade {
+            model: "replacement".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let entry = config::ConfigModelOverride {
+        max_context_window: Some(1_000_000),
+        ..Default::default()
+    }
+    .apply(
+        "context-alias",
+        Some(entry),
+        &config::EndpointsConfig::default(),
+    );
+    manager
+        .inner
+        .catalog
+        .write()
+        .models
+        .insert("context-alias".into(), entry.clone());
+    for id in ["context-alias", "catalog-context-model"] {
+        let metadata = manager.codex_compaction_metadata(id).unwrap();
+        assert_eq!(metadata.auto_compact_token_limit, Some(900_000));
+        assert_eq!(metadata.comp_hash.as_deref(), Some("3000"));
+    }
+    let acp = config::to_acp_model_info(&IndexMap::from([("context-alias".into(), entry)]));
+    let info = &acp[&acp::ModelId::new("context-alias")];
+    let meta = info.meta.as_ref().unwrap();
+    assert_eq!(meta["totalContextTokens"], 950_000);
+    assert_eq!(meta["rawContextTokens"], 1_000_000);
+    assert_eq!(meta["maxContextTokens"], 372_000);
+    assert_eq!(meta["codexUpgrade"]["model"], "replacement");
+    assert!(info.description.as_ref().unwrap().contains("replacement"));
+}
+
+#[test]
 fn model_capability_opt_ins_resolve_aliases_and_reject_other_providers() {
     let manager = test_manager();
     let mut entry = ModelEntry::fallback("catalog-test-model", &config::EndpointsConfig::default());
@@ -2234,6 +2281,7 @@ fn make_entry_config_with_id(
         tool_mode: None,
         subagent_context_default: None,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         apply_patch_tool_type: None,

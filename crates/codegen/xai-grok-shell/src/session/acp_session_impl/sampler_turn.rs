@@ -1058,6 +1058,9 @@ impl SessionActor {
             self.rebuild_spec.multi_agent_policy_enabled,
         );
         let reasoning_summary = self.models_manager.model_reasoning_summary(&cfg.model);
+        let mut codex_model = self.models_manager.codex_model_metadata(&cfg.model);
+        codex_model.persistent_mode =
+            !self.startup_hints.is_subagent && self.models_manager.codex_persistent_mode();
         let use_responses_lite = self.models_manager.model_uses_responses_lite(&cfg.model);
         let experimental_supported_tools = self
             .models_manager
@@ -1141,6 +1144,7 @@ impl SessionActor {
                 .active_sampling_config()
                 .supports_standalone_web_search,
             codex_multi_agent_v2,
+            codex_model,
             use_responses_lite,
             experimental_supported_tools,
             codex_permissions,

@@ -18,8 +18,8 @@ pub mod streaming;
 pub mod tool;
 
 pub use context::{
-    BehaviorVersion, Cancellation, Cwd, ListToolsContext, SessionContext, ToolCallContext,
-    TraceContext, TypedExtensions, WorkspaceBindMetadata, WorkspaceViewerContext,
+    BehaviorVersion, Cancellation, Cwd, ListToolsContext, McpCallMetadata, SessionContext,
+    ToolCallContext, TraceContext, TypedExtensions, WorkspaceBindMetadata, WorkspaceViewerContext,
 };
 pub use dispatch::ToolDispatch;
 pub use error::{ToolError, ToolErrorKind};

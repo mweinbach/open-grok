@@ -196,6 +196,10 @@ pub struct UiConfig {
     /// `true` = mixed Code Mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_mode: Option<ToolModePreference>,
+    /// Opt-in persistent work for the root Codex session.
+    pub codex_persistent_mode: Option<bool>,
+    /// Opt-in model-selected Guardian review of browser/computer MCP calls.
+    pub codex_guardian_review: Option<bool>,
     /// Image generation service for new sessions. Grok uses xAI Imagine with
     /// xAI credentials. OpenAI uses the Codex Images API with isolated Codex
     /// OAuth credentials.
@@ -383,6 +387,8 @@ impl Default for UiConfig {
             mouse_reporting_toggle: None,
             remember_tool_approvals: None,
             code_mode: None,
+            codex_persistent_mode: None,
+            codex_guardian_review: None,
             image_generation_provider: None,
             cancel_subagents_on_turn_cancel: None,
             keep_text_selection: None,

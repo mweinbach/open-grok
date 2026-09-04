@@ -168,6 +168,8 @@ use prompt_build::*;
 #[path = "acp_session_impl/session_mode.rs"]
 mod session_mode;
 use session_mode::*;
+#[path = "acp_session_impl/codex_catalog_policy.rs"]
+mod codex_catalog_policy;
 #[path = "acp_session_impl/sampler_turn.rs"]
 mod sampler_turn;
 #[path = "acp_session_impl/status_line.rs"]
@@ -673,6 +675,7 @@ mod managed_gateway_error_tests {
 /// Data carried from prepare_tool_call → dispatch_tool → finalize.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedToolCall {
+    mcp_request_meta: Option<serde_json::Map<String, serde_json::Value>>,
     /// The model's tool call ID (for tool_result matching).
     call_id: String,
     /// ACP-internal tool call ID.

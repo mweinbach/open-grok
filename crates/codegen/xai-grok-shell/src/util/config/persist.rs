@@ -324,6 +324,17 @@ pub(crate) fn persist_custom_model_upsert_to_root(
     record: &crate::custom_models::CustomModelRecord,
 ) -> Result<crate::agent::config::ConfigModelOverride> {
     upsert_config_model_table(root, &record.key, record.to_toml_table());
+    if let Some(table) = root
+        .get_mut("model")
+        .and_then(|section| section.get_mut(&record.key))
+        .and_then(TomlValue::as_table_mut)
+    {
+        if record.max_context_window.is_some() && record.context_window.is_none() {
+            table.remove("context_window");
+        } else if record.context_window.is_some() && record.max_context_window.is_none() {
+            table.remove("max_context_window");
+        }
+    }
     let table = root
         .get("model")
         .and_then(|section| section.get(&record.key))
@@ -377,6 +388,27 @@ pub(crate) fn persist_custom_model_delete_at(path: &std::path::Path, key: &str) 
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn codex_context_save_replaces_the_previous_override_coordinate() {
+        let mut root: toml::Value =
+            toml::from_str("[model.test]\ncontext_window = 200000\nname = 'keep me'\n").unwrap();
+        let mut record = crate::custom_models::CustomModelRecord {
+            key: "test".into(),
+            model: "catalog-model".into(),
+            provider: Some("codex".into()),
+            max_context_window: Some(1_000_000),
+            ..Default::default()
+        };
+        let parsed = super::persist_custom_model_upsert_to_root(&mut root, &record).unwrap();
+        assert_eq!(parsed.context_window, None);
+        assert_eq!(parsed.max_context_window, Some(1_000_000));
+        assert_eq!(parsed.name.as_deref(), Some("keep me"));
+        record.max_context_window = None;
+        record.context_window = Some(800_000);
+        let parsed = super::persist_custom_model_upsert_to_root(&mut root, &record).unwrap();
+        assert_eq!(parsed.context_window, Some(800_000));
+        assert_eq!(parsed.max_context_window, None);
+    }
     use super::super::load::load_config_from_toml;
     use super::super::mcp::{McpConfig, parse_mcp_config_with_oauth};
     use super::*;

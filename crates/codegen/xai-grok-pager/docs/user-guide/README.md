@@ -30,6 +30,7 @@ Customize and extend Grok Build.
 | 9 | [Plugins](09-plugins.md) | Bundle and share skills, commands, agents, hooks, and MCP servers; install from, author, and govern marketplaces (organization controls) |
 | 10 | [Hooks](10-hooks.md) | Lifecycle scripts and HTTP callbacks for pre- and post-tool-use events |
 | 11 | [Custom Models](11-custom-models.md) | Bring-your-own-key, Ollama, and OpenAI-compatible endpoints |
+| 26 | [Codex Model Controls](26-codex-model-controls.md) | GPT-6-astra, context overrides, persistent work, and browser review |
 | 12 | [Project Rules (AGENTS.md)](12-project-rules.md) | Per-directory AGENTS.md instructions and their precedence |
 | 13 | [Memory](13-memory.md) | Cross-session knowledge persistence with `/flush`, `/dream`, and hybrid search |
 

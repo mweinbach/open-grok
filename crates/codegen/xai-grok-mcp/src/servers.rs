@@ -1690,7 +1690,7 @@ impl xai_tool_runtime::Tool for McpErasedTool {
 
     async fn run(
         &self,
-        _ctx: xai_tool_runtime::ToolCallContext,
+        ctx: xai_tool_runtime::ToolCallContext,
         raw: serde_json::Value,
     ) -> Result<ToolOutput, xai_tool_runtime::ToolError> {
         let call_span = xai_grok_telemetry::region::Region::from_span(tracing::info_span!(
@@ -1725,12 +1725,21 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             timeout_sec: tool_timeout,
         });
 
+        let request_meta = ctx.get::<xai_tool_runtime::McpCallMetadata>();
+        let request_meta = request_meta.as_ref().map(|metadata| &metadata.0);
         let mut auth_retry_attempted = false;
         let mut reconnect_attempted = false;
         let mut is_timeout = false;
         let ew = &event_writer;
         let dispatch_result = match self
-            .try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
+            .try_call_tool_with_meta(
+                &client,
+                &raw,
+                &mut reconnect_attempted,
+                &mut is_timeout,
+                ew,
+                request_meta,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -1743,11 +1752,18 @@ impl xai_tool_runtime::Tool for McpErasedTool {
                     success: reauth_ok,
                 });
                 if reauth_ok {
-                    self.try_call_tool(&client, &raw, &mut reconnect_attempted, &mut is_timeout, ew)
-                        .await
-                        .map_err(|e| {
-                            xai_tool_runtime::ToolError::custom("process_manager", e.to_string())
-                        })
+                    self.try_call_tool_with_meta(
+                        &client,
+                        &raw,
+                        &mut reconnect_attempted,
+                        &mut is_timeout,
+                        ew,
+                        request_meta,
+                    )
+                    .await
+                    .map_err(|e| {
+                        xai_tool_runtime::ToolError::custom("process_manager", e.to_string())
+                    })
                 } else {
                     Err(first_err)
                 }
@@ -1918,6 +1934,7 @@ fn should_recover_service_error(
 }
 
 impl McpErasedTool {
+    #[cfg(test)]
     async fn try_call_tool(
         &self,
         client: &Arc<McpClient>,
@@ -1925,6 +1942,19 @@ impl McpErasedTool {
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_grok_session_events::EventWriter,
+    ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
+        self.try_call_tool_with_meta(client, raw, reconnect_attempted, is_timeout, ew, None)
+            .await
+    }
+
+    async fn try_call_tool_with_meta(
+        &self,
+        client: &Arc<McpClient>,
+        raw: &serde_json::Value,
+        reconnect_attempted: &mut bool,
+        is_timeout: &mut bool,
+        ew: &xai_grok_session_events::EventWriter,
+        request_meta: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
         let mcp_service = client
             .ensure_initialized()
@@ -1934,6 +1964,7 @@ impl McpErasedTool {
         let timeout_duration = std::time::Duration::from_secs(tool_timeout);
         let mut params = CallToolRequestParams::new(self.tool.name.clone());
         params.arguments = raw.as_object().cloned();
+        params.meta = request_meta.cloned().map(rmcp::model::Meta);
 
         let result =
             tokio::time::timeout(timeout_duration, mcp_service.call_tool(params.clone())).await;

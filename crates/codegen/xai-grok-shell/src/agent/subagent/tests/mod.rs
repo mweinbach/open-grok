@@ -2326,6 +2326,7 @@ fn test_model_entry(model_id: &str) -> crate::agent::config::ModelEntry {
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             apply_patch_tool_type: None,
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),

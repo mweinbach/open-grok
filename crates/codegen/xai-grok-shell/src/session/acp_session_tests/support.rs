@@ -268,7 +268,7 @@ pub(crate) async fn create_test_actor_with_terminal(
     SessionActor,
     tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
 ) {
-    let cwd = xai_grok_paths::AbsPathBuf::new(std::path::PathBuf::from("/tmp")).unwrap();
+    let cwd = xai_grok_paths::AbsPathBuf::new(std::env::temp_dir()).unwrap();
     let fs = Arc::new(xai_grok_workspace::file_system::MockFs::new(
         cwd.to_path_buf(),
     ));

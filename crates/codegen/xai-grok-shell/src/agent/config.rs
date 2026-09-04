@@ -4303,6 +4303,8 @@ struct DefaultModelJson {
     /// Codex model-catalog execution contract. Unknown versions stay disabled.
     multi_agent_version: Option<String>,
     #[serde(default)]
+    codex_model: xai_grok_sampling_types::CodexModelMetadata,
+    #[serde(default)]
     use_responses_lite: bool,
     #[serde(default)]
     experimental_supported_tools: Vec<String>,
@@ -4313,6 +4315,7 @@ struct DefaultModelJson {
     inference_idle_timeout_secs: Option<u64>,
     hidden: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    default_reasoning_summary: Option<ReasoningSummary>,
     #[serde(default)]
     supports_reasoning_effort: bool,
     #[serde(default)]
@@ -4456,6 +4459,7 @@ fn default_models(
                 subagent_context_default: m.subagent_context_default,
                 codex_multi_agent_v2: m.provider == ModelProvider::Codex
                     && m.multi_agent_version.as_deref() == Some("v2"),
+                codex_model: m.codex_model,
                 use_responses_lite: m.use_responses_lite,
                 experimental_supported_tools: m.experimental_supported_tools,
                 apply_patch_tool_type: m.apply_patch_tool_type,
@@ -4478,7 +4482,8 @@ fn default_models(
                 // Codex models default to detailed summaries; live models.json
                 // data remains authoritative and overwrites this value.
                 default_reasoning_summary: if m.provider == ModelProvider::Codex {
-                    ReasoningSummary::Detailed
+                    m.default_reasoning_summary
+                        .unwrap_or(ReasoningSummary::Detailed)
                 } else {
                     ReasoningSummary::None
                 },
@@ -4543,6 +4548,8 @@ pub struct ModelEntryConfig {
     /// Whether this Codex model advertises `multi_agent_version = "v2"`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub codex_multi_agent_v2: bool,
+    #[serde(default)]
+    pub codex_model: xai_grok_sampling_types::CodexModelMetadata,
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_responses_lite: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -4689,6 +4696,9 @@ pub struct ConfigModelOverride {
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
     pub context_window: Option<u64>,
+    /// Explicit raw Codex context budget, allowed above the advertised maximum.
+    pub max_context_window: Option<u64>,
+    pub auto_compact_token_limit: Option<u64>,
     /// Per-model auto-compact threshold override (0-100) from `[model.<id>]`.
     /// Read directly by `resolve_auto_compact_threshold_percent`; intentionally
     /// NOT merged into `ModelInfo.auto_compact_threshold_percent` so the
@@ -4786,6 +4796,7 @@ impl ConfigModelOverride {
             entry.info.tool_mode = None;
             entry.info.subagent_context_default = None;
             entry.info.codex_multi_agent_v2 = false;
+            entry.info.codex_model = Default::default();
             entry.info.use_responses_lite = false;
             entry.info.experimental_supported_tools.clear();
             entry.info.apply_patch_tool_type = None;
@@ -4854,8 +4865,31 @@ impl ConfigModelOverride {
         if !self.env_http_headers.is_empty() {
             entry.info.env_http_headers = self.env_http_headers.clone();
         }
+        if entry.info.provider == ModelProvider::Codex {
+            if let Some(raw) = self.max_context_window.filter(|value| *value > 0) {
+                entry.info.codex_model.context_window_override = Some(raw);
+                if let Some(effective) = entry
+                    .info
+                    .codex_model
+                    .effective_context_window()
+                    .and_then(NonZeroU64::new)
+                {
+                    entry.info.context_window = effective;
+                }
+            }
+            if let Some(limit) = self.auto_compact_token_limit.filter(|value| *value > 0) {
+                entry.info.codex_model.auto_compact_token_limit_override = Some(limit);
+            }
+        }
         if let Some(cw) = self.context_window.and_then(NonZeroU64::new) {
             entry.info.context_window = cw;
+            if entry.info.provider == ModelProvider::Codex {
+                // Preserve the established effective-token meaning of context_window.
+                let percent = entry.info.codex_model.effective_percent();
+                let raw = (u128::from(cw.get()) * 100).div_ceil(u128::from(percent));
+                entry.info.codex_model.context_window_override =
+                    Some(raw.min(u128::from(u64::MAX)) as u64);
+            }
         }
         if let Some(v) = self.use_concise {
             entry.info.use_concise = v;
@@ -4974,6 +5008,8 @@ pub struct ModelInfo {
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
     #[serde(default)]
+    pub codex_model: xai_grok_sampling_types::CodexModelMetadata,
+    #[serde(default)]
     pub use_responses_lite: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub experimental_supported_tools: Vec<String>,
@@ -5046,6 +5082,20 @@ pub struct ModelInfo {
     pub laziness_detector: LazinessDetectorPerModelConfig,
 }
 impl ModelInfo {
+    pub fn codex_metadata(&self) -> xai_grok_sampling_types::CodexModelMetadata {
+        if self.provider != ModelProvider::Codex || self.api_backend != ApiBackend::Responses {
+            return Default::default();
+        }
+        let mut metadata = self.codex_model.clone();
+        if !self.reasoning_efforts.is_empty() {
+            metadata.supported_reasoning_efforts = self
+                .reasoning_efforts
+                .iter()
+                .map(|option| option.value)
+                .collect();
+        }
+        metadata
+    }
     /// Minimal fallback descriptor for an unknown model slug.
     /// Used when a configured model ID isn't found in presets or remote models.
     pub fn fallback(slug: &str) -> Self {
@@ -5064,6 +5114,7 @@ impl ModelInfo {
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             apply_patch_tool_type: None,
@@ -5113,6 +5164,7 @@ impl ModelInfo {
             tool_mode: entry.tool_mode,
             subagent_context_default: entry.subagent_context_default,
             codex_multi_agent_v2: entry.codex_multi_agent_v2,
+            codex_model: entry.codex_model.clone(),
             use_responses_lite: entry.use_responses_lite,
             experimental_supported_tools: entry.experimental_supported_tools.clone(),
             apply_patch_tool_type: entry.apply_patch_tool_type.clone(),
@@ -6142,6 +6194,7 @@ pub fn resolve_aux_model_sampling_config(
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                codex_model: Default::default(),
                 use_responses_lite: false,
                 experimental_supported_tools: Vec::new(),
                 apply_patch_tool_type: None,
@@ -6455,6 +6508,7 @@ pub fn sampling_config_for_model(
         supports_standalone_web_search: supports_standalone_web_search(info, uses_codex_oauth),
         // Preserve the live Codex `multi_agent_version` contract through the sampler.
         codex_multi_agent_v2: supports_codex_multi_agent_v2(info),
+        codex_model: info.codex_metadata(),
         use_responses_lite: info.use_responses_lite,
         experimental_supported_tools: info.experimental_supported_tools.clone(),
         codex_permissions: None,
@@ -6562,6 +6616,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             apply_patch_tool_type: None,
@@ -6688,6 +6743,25 @@ pub fn to_acp_model_info(
                     "totalContextTokens".to_string(),
                     serde_json::Value::Number(total_context_tokens.into()),
                 );
+                if info.provider == ModelProvider::Codex {
+                    for (key, value) in [
+                        ("catalogContextTokens", info.codex_model.context_window),
+                        ("maxContextTokens", info.codex_model.max_context_window),
+                        (
+                            "contextWindowOverride",
+                            info.codex_model.context_window_override,
+                        ),
+                        ("rawContextTokens", info.codex_model.raw_context_window()),
+                        ("autoCompactTokenLimit", info.codex_model.compact_limit()),
+                    ] {
+                        if let Some(value) = value {
+                            map.insert(key.to_owned(), value.into());
+                        }
+                    }
+                    if let Some(upgrade) = &info.codex_model.upgrade {
+                        map.insert("codexUpgrade".to_owned(), serde_json::json!(upgrade));
+                    }
+                }
                 map.insert(
                     "agentType".to_string(),
                     serde_json::Value::String(info.agent_type.clone()),
@@ -6731,7 +6805,16 @@ pub fn to_acp_model_info(
                         xai_grok_sampling_types::service_tiers_meta_value(&info.service_tiers),
                     );
                 }
-                let accepts_images = crate::model_image_input::acp_accepts_images(key, &info.model);
+                let accepts_images = if info.provider == ModelProvider::Codex
+                    && !info.codex_model.input_modalities.is_empty()
+                {
+                    info.codex_model
+                        .input_modalities
+                        .iter()
+                        .any(|modality| modality == "image")
+                } else {
+                    crate::model_image_input::acp_accepts_images(key, &info.model)
+                };
                 map.insert(
                     "acceptsImages".to_string(),
                     serde_json::Value::Bool(accepts_images),
@@ -6752,11 +6835,30 @@ pub fn to_acp_model_info(
                     model_id,
                     info.name.clone().unwrap_or_else(|| info.model.clone()),
                 )
-                .description(info.description.clone())
+                .description(model_picker_description(info))
                 .meta(meta),
             )
         })
         .collect()
+}
+
+fn model_picker_description(info: &ModelInfo) -> Option<String> {
+    let upgrade = (info.provider == ModelProvider::Codex)
+        .then_some(info.codex_model.upgrade.as_ref())
+        .flatten()
+        .filter(|upgrade| !upgrade.model.trim().is_empty());
+    let Some(upgrade) = upgrade else {
+        return info.description.clone();
+    };
+    let mut description = info.description.clone().unwrap_or_default();
+    if !description.is_empty() {
+        description.push(' ');
+    }
+    description.push_str(&format!("Suggested replacement: {}.", upgrade.model));
+    if let Some(retirement) = &upgrade.retirement_at {
+        description.push_str(&format!(" Catalog retirement: {retirement}."));
+    }
+    Some(description)
 }
 /// Error code for model switch rejection due to agent type mismatch.
 pub const MODEL_SWITCH_INCOMPATIBLE_AGENT: &str = "MODEL_SWITCH_INCOMPATIBLE_AGENT";
@@ -8158,6 +8260,7 @@ reasoning_effort = "low"
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                codex_model: Default::default(),
                 use_responses_lite: false,
                 experimental_supported_tools: Vec::new(),
                 apply_patch_tool_type: None,
@@ -9568,6 +9671,7 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             apply_patch_tool_type: None,
@@ -9738,6 +9842,7 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             apply_patch_tool_type: None,
@@ -10268,6 +10373,7 @@ reasoning_effort = "low"
             tool_mode: None,
             subagent_context_default: None,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             apply_patch_tool_type: None,
@@ -14337,6 +14443,7 @@ default = "grok-4.5"
                 tool_mode: None,
                 subagent_context_default: None,
                 codex_multi_agent_v2: false,
+                codex_model: Default::default(),
                 use_responses_lite: false,
                 experimental_supported_tools: Vec::new(),
                 apply_patch_tool_type: None,

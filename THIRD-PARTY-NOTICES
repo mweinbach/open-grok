@@ -16635,6 +16635,7 @@ License: Apache-2.0
 Source revisions:
   2be648ba4a6c159a3d80b1c07e7323cbd5efef8f (Code Mode and OAuth baseline)
   cbc83d961e8132bfff4d340ab8342d181b79e95e (live model catalog contract)
+  985641272869835d01d025ed2a218fbbce35fa9f (Codex 0.153.1 catalog and behavior contracts)
   2b5bdcf67547860f2e5c5a605009a70026796b2b (standalone web-search parity)
 Upstream paths: codex-rs/code-mode, codex-rs/code-mode-protocol,
   codex-rs/core/src/tools/code_mode/, codex-rs/core/src/tools/handlers/
@@ -16661,6 +16662,13 @@ Additional requirements / notices:
     crates/codegen/xai-grok-shell/src/session/code_mode.rs
   Codex live-model transport and provider-isolated cache under:
     crates/codegen/xai-grok-shell/src/codex_models.rs
+  Codex 0.153.1 metadata, Ultra/persistent request mapping, and actor MCP policy
+  adapters under xai-grok-sampling-types/src/codex_model.rs,
+  xai-grok-sampler/src/provider.rs, xai-grok-sampler/src/client.rs, and
+  xai-grok-shell/src/session/acp_session_impl/codex_catalog_policy.rs derive
+  from the corresponding protocol, core/client.rs, context/world_state, and
+  core/mcp_tool_call.rs contracts. They are modified to use Open Grok's model
+  overrides, flat-team lifecycle, and existing synchronous permission pipeline.
   These are derived/portions of openai/codex tool handlers, adapted to this
   repository's tool traits, sampling transport, and session runtime. The
   out-of-process code-mode host was not ported; Grok Build uses the upstream

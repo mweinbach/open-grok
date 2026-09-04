@@ -591,9 +591,53 @@ fn normalize_x_search_call(item: &mut serde_json::Value) {
     item.insert("input".to_owned(), serde_json::Value::String(input));
 }
 
+#[cfg(test)]
+#[test]
+fn codex_persistent_requires_runtime_opt_in_and_actual_async_tool() {
+    let mut metadata = xai_grok_sampling_types::CodexModelMetadata::default();
+    let tools = serde_json::json!({"tools":[{"type":"function","name":"send_user_message_async"}]});
+    assert!(codex_persistent_instructions(&tools, &metadata).is_none());
+    metadata.persistent_mode = true;
+    assert!(codex_persistent_instructions(&serde_json::json!({"tools":[]}), &metadata).is_none());
+    assert!(codex_persistent_instructions(&tools, &metadata).is_some());
+    metadata.model_messages.persistent_instructions =
+        Some("Ask{{ approval_request_channel }}".into());
+    assert_eq!(
+        codex_persistent_instructions(&tools, &metadata).as_deref(),
+        Some("Ask via functions.send_user_message_async")
+    );
+}
+
+fn codex_persistent_instructions(
+    body: &serde_json::Value,
+    metadata: &xai_grok_sampling_types::CodexModelMetadata,
+) -> Option<String> {
+    let async_tool_available = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| {
+            tools.iter().any(|tool| {
+                tool.get("name")
+                    .or_else(|| tool.get("function").and_then(|f| f.get("name")))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("send_user_message_async")
+            })
+        });
+    if !metadata.persistent_mode || !async_tool_available {
+        return None;
+    }
+    let instructions = metadata.model_messages.persistent_instructions.as_deref().unwrap_or(
+        "Persistent work is active. Fulfill the user's request and continue useful, authorized follow-ups until its completion or stopping condition is reached. Use send_user_message_async for progress while work remains. Keep required unanswered questions pending, respect cancellation, and never expand the user's authorization. Send a final answer when no relevant follow-up remains."
+    );
+    Some(instructions.replace(
+        "{{ approval_request_channel }}",
+        " via functions.send_user_message_async",
+    ))
+}
+
 /// Apply Codex-only fields that async-openai 0.33.1 cannot represent.
 ///
-/// Max and Ultra are distinct local choices, but Codex accepts `max` for both.
+/// Max and Ultra remain distinct; Ultra uses a validated catalog effort.
 /// On live Codex v2 models, Ultra opts into proactive multi-agent delegation.
 /// The policy item exists only in this request body and is never persisted to chat.
 #[cfg(test)]
@@ -1281,6 +1325,7 @@ struct ClientDefaults {
     stream_tool_calls: bool,
     idle_timeout_secs: Option<u64>,
     codex_multi_agent_v2: bool,
+    codex_model: xai_grok_sampling_types::CodexModelMetadata,
     use_responses_lite: bool,
     codex_permissions: Option<crate::config::CodexPermissions>,
     reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
@@ -1607,6 +1652,7 @@ impl SamplingClient {
             stream_tool_calls: config.stream_tool_calls,
             idle_timeout_secs: config.idle_timeout_secs,
             codex_multi_agent_v2: config.codex_multi_agent_v2,
+            codex_model: config.codex_model,
             use_responses_lite,
             codex_permissions: config.codex_permissions,
             reasoning_effort: config.reasoning_effort,
@@ -1875,7 +1921,10 @@ impl SamplingClient {
             ":generateContent"
         };
         let base = self.base_url.trim_end_matches('/');
-        let base = base.strip_suffix("/openai").unwrap_or(base).trim_end_matches('/');
+        let base = base
+            .strip_suffix("/openai")
+            .unwrap_or(base)
+            .trim_end_matches('/');
         let model_path = if model.starts_with("models/") {
             format!("{model}{action}")
         } else {
@@ -2365,6 +2414,19 @@ impl SamplingClient {
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions: None,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -2775,10 +2837,25 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
+        let persistent_instructions =
+            codex_persistent_instructions(&request_body, &self.defaults.codex_model);
         self.provider_adapter.patch_responses_request(
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -2965,10 +3042,25 @@ impl SamplingClient {
             &request.original_detail_custom_output_images,
         );
         patch_raw_input_replacements(&mut request_body, &request.raw_input_replacements)?;
+        let persistent_instructions =
+            codex_persistent_instructions(&request_body, &self.defaults.codex_model);
         self.provider_adapter.patch_responses_request(
             &mut request_body,
             ResponsesRequestPolicy {
                 multi_agent_v2: self.defaults.codex_multi_agent_v2,
+                ultra_effort: (!self
+                    .defaults
+                    .codex_model
+                    .supported_reasoning_efforts
+                    .is_empty())
+                .then(|| self.defaults.codex_model.ultra_effort()),
+                verbosity: self
+                    .defaults
+                    .codex_model
+                    .support_verbosity
+                    .then(|| self.defaults.codex_model.default_verbosity.clone())
+                    .flatten(),
+                persistent_instructions,
                 use_responses_lite: self.defaults.use_responses_lite,
                 local_effort: request.local_reasoning_effort,
                 reasoning_summary: self.defaults.reasoning_summary,
@@ -3494,7 +3586,10 @@ impl SamplingClient {
         &self,
         request: ConversationRequest,
     ) -> Result<(
-        BoxStream<'static, Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>>,
+        BoxStream<
+            'static,
+            Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>,
+        >,
         Option<ResponseModelMetadata>,
     )> {
         let model = request
@@ -3953,7 +4048,10 @@ impl SamplingClient {
         &self,
         mut request: ConversationRequest,
     ) -> Result<(
-        BoxStream<'static, Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>>,
+        BoxStream<
+            'static,
+            Result<xai_grok_sampling_types::google_ai_studio::GenerateContentResponse>,
+        >,
         Option<ResponseModelMetadata>,
     )> {
         self.apply_conversation_defaults(&mut request)?;
@@ -4386,6 +4484,7 @@ mod tests {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,
@@ -7166,6 +7265,11 @@ mod tests {
             built.headers().get("x-goog-api-key").unwrap(),
             "test-goog-key-123"
         );
-        assert!(built.headers().get(reqwest::header::AUTHORIZATION).is_none());
+        assert!(
+            built
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 }

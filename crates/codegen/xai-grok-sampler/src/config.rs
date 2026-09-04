@@ -161,6 +161,8 @@ pub struct SamplerConfig {
     #[serde(default)]
     pub codex_multi_agent_v2: bool,
     #[serde(default)]
+    pub codex_model: xai_grok_sampling_types::CodexModelMetadata,
+    #[serde(default)]
     pub use_responses_lite: bool,
     #[serde(default)]
     pub experimental_supported_tools: Vec<String>,
@@ -243,6 +245,7 @@ impl Default for SamplerConfig {
             supports_backend_search: false,
             supports_standalone_web_search: false,
             codex_multi_agent_v2: false,
+            codex_model: Default::default(),
             use_responses_lite: false,
             experimental_supported_tools: Vec::new(),
             codex_permissions: None,

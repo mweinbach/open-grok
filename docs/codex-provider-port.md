@@ -18,11 +18,55 @@ at `6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a`; this includes the
 
 The Responses Lite and asynchronous user-message contracts were refreshed
 against Codex commit `8e93b1a405e02f8797a04d747bb7d1654b839685`. The default
-model-catalog compatibility version is `0.150.0`.
+model-catalog compatibility version is `0.153.1`, verified against the
+`rust-v0.153.1` release commit `985641272869835d01d025ed2a218fbbce35fa9f`.
+
+### 0.153.1 catalog and behavior refresh
+
+- GPT-6-astra is included in the offline catalog. Live preview entries use the
+  public Astra picker name/key while retaining the server-provided routing ID.
+  Provider identity and credentials remain explicit metadata, independent of aliases.
+- `multi_agent_reasoning_effort` selects Ultra's wire effort only when it is
+  advertised and is not Ultra itself. Fallback: Max, last non-Ultra preset,
+  then Medium. Ordinary Max remains Max. The same mapping covers Responses
+  sampling and compaction; v2 independently controls proactive delegation.
+- The catalog retains raw default/max context, effective percentage, migration
+  notices, input modalities, verbosity defaults, persistent instructions,
+  browser/computer confirmation policies, and Guardian classifier guidance.
+  Migration notices appear in the picker description and structured ACP meta;
+  they never switch a model automatically.
+- `[model.<key>].max_context_window` is an explicit **raw** context override,
+  allowed above the advertised maximum. The advertised values remain available
+  as metadata. Existing `context_window` overrides keep their **usable** token
+  meaning and win when both are set. Compaction reads the final resolved model,
+  so aliases, hot reload and child routes use the same budget as the sampler.
+  A context override replaces the old catalog compaction limit with 90% of
+  the resolved raw budget. `auto_compact_token_limit` explicitly overrides it,
+  bounded by that same 90% cap. Existing non-default percentage overrides retain
+  their precedence. No context-size field is invented on the Responses wire.
+- Opt-in `[ui].codex_persistent_mode` uses model-selected persistent instructions
+  (or a bounded Open Grok fallback), the `disabled` wire effort used by Codex
+  persistent mode, and async progress. It is root-only, requires the async
+  message tool, and is omitted from auxiliary/compaction requests. Instructions
+  are request-local; disabling the mode or changing provider cannot retain them.
+- Actor MCP calls to exactly `node_repl` and `cua_repl` receive
+  `openai/confirmation_policies` request metadata from the issuing model
+  snapshot. Blank text is preserved; an empty object clears old defaults.
+  Snapshots survive approval waits, retries and nested tool dispatch without
+  mutating shared MCP clients. Tool arguments cannot overwrite host metadata.
+- Opt-in `[ui].codex_guardian_review` adapts the model's Guardian classifier
+  guidance to Open Grok's permission pipeline. Review uses an explicitly
+  resolved Codex route with no tools or persistent mode. High/unknown risk or
+  unavailable review requests approval through the existing permission prompt;
+  a low-risk result still goes through ordinary permission rules. This is
+  synchronous per-action review, not upstream's background speculative
+  classifier/lag scheduler. Both UI toggles require restart and default off.
+
+User settings: [Codex context and persistent work](../crates/codegen/xai-grok-pager/docs/user-guide/26-codex-model-controls.md).
 
 ## Live model catalog
 
-Open Grok embeds the current GPT-5.6 Sol, Terra, and Luna definitions so the
+Open Grok embeds GPT-6-astra and GPT-5.6 Sol, Terra, and Luna definitions so the
 picker and headless model resolution still work offline. With ChatGPT Codex
 credentials available, the shell follows codex-rs' live catalog contract:
 
@@ -185,7 +229,8 @@ explicit model API key remains authoritative and is never replaced by OAuth.
 
 GPT-5.6 Sol's fallback entry uses the Responses API, a 353,000-token effective
 context window, `code_mode_only`, and backend-hosted search. Max and Ultra stay
-distinct in local session state while both encode as Codex `max`; Ultra adds the
+distinct in local session state. Max encodes as `max`; Ultra uses the catalog's
+validated multi-agent effort (Max when available as its fallback) and adds the
 same request-local proactive delegation policy used by codex-rs. Live catalog
 metadata replaces these fallback capabilities when OpenAI changes them.
 

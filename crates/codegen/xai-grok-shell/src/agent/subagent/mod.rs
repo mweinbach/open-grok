@@ -1003,6 +1003,9 @@ async fn read_parent_sampling_config(
                     .models_manager
                     .model_supports_backend_search(ctx.model_id.0.as_ref()),
                 supports_standalone_web_search: ctx.sampling_config.supports_standalone_web_search,
+                codex_model: ctx
+                    .models_manager
+                    .codex_model_metadata(ctx.model_id.0.as_ref()),
                 codex_multi_agent_v2: ctx
                     .models_manager
                     .model_supports_codex_multi_agent_v2(ctx.model_id.0.as_ref()),

@@ -26,6 +26,10 @@ pub struct CustomModelRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
@@ -54,6 +58,10 @@ pub struct CustomModelPublicRecord {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,12 +97,25 @@ pub fn normalize_custom_model(
 
     validate_model_key(&record.key)?;
     validate_model_id(&record.model)?;
+    if record.max_context_window == Some(0) || record.auto_compact_token_limit == Some(0) {
+        bail!("max_context_window and auto_compact_token_limit must be greater than 0");
+    }
     if record.context_window == Some(0) {
         bail!("context_window must be greater than 0");
     }
 
     if let Some(raw) = record.provider.as_deref() {
         record.provider = Some(parse_provider(raw)?.as_str().to_owned());
+    }
+    if record.max_context_window.is_some()
+        && record
+            .provider
+            .as_deref()
+            .is_some_and(|provider| provider != "codex")
+    {
+        bail!(
+            "max_context_window is a Codex raw-context override; use context_window for this provider"
+        );
     }
     if let Some(raw) = record.api_backend.as_deref() {
         record.api_backend = Some(api_backend_as_str(parse_api_backend(raw)?).to_owned());
@@ -148,6 +169,10 @@ impl CustomModelRecord {
             provider: self.provider.clone(),
             base_url: self.base_url.clone(),
             context_window: self.context_window,
+
+            max_context_window: self.max_context_window,
+
+            auto_compact_token_limit: self.auto_compact_token_limit,
             api_backend: self.api_backend.clone(),
             env_key: self.env_key.clone(),
             auth_scheme: self
@@ -175,6 +200,17 @@ impl CustomModelRecord {
                 "context_window".into(),
                 TomlValue::Integer(i64::try_from(context_window).unwrap_or(i64::MAX)),
             );
+        }
+        for (key, value) in [
+            ("max_context_window", self.max_context_window),
+            ("auto_compact_token_limit", self.auto_compact_token_limit),
+        ] {
+            if let Some(value) = value {
+                table.insert(
+                    key.into(),
+                    TomlValue::Integer(value.min(i64::MAX as u64) as i64),
+                );
+            }
         }
         if let Some(api_backend) = &self.api_backend {
             table.insert("api_backend".into(), TomlValue::String(api_backend.clone()));
@@ -234,6 +270,10 @@ impl CustomModelRecord {
                 .and_then(|raw| parse_provider(raw).ok()),
             base_url: self.base_url.clone(),
             context_window: self.context_window,
+
+            max_context_window: self.max_context_window,
+
+            auto_compact_token_limit: self.auto_compact_token_limit,
             api_backend: self
                 .api_backend
                 .as_deref()
@@ -254,6 +294,10 @@ pub fn override_to_public(key: &str, model: &ConfigModelOverride) -> CustomModel
         provider: model.provider.map(ModelProvider::as_str).map(str::to_owned),
         base_url: model.base_url.clone(),
         context_window: model.context_window,
+
+        max_context_window: model.max_context_window,
+
+        auto_compact_token_limit: model.auto_compact_token_limit,
         api_backend: model.api_backend.map(api_backend_as_str).map(str::to_owned),
         env_key: model
             .env_key
@@ -335,7 +379,11 @@ fn parse_auth_scheme(raw: &str) -> Result<xai_grok_sampler::AuthScheme> {
     serde_json::from_value::<xai_grok_sampler::AuthScheme>(serde_json::Value::String(
         raw.trim().to_owned(),
     ))
-    .map_err(|_| anyhow::anyhow!("invalid auth_scheme `{raw}`; expected bearer, x_api_key, or x_goog_api_key"))
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "invalid auth_scheme `{raw}`; expected bearer, x_api_key, or x_goog_api_key"
+        )
+    })
 }
 
 fn auth_scheme_as_str(scheme: xai_grok_sampler::AuthScheme) -> &'static str {
@@ -351,9 +399,7 @@ fn parse_api_backend(raw: &str) -> Result<ApiBackend> {
         "chat_completions" => Ok(ApiBackend::ChatCompletions),
         "responses" => Ok(ApiBackend::Responses),
         "messages" => Ok(ApiBackend::Messages),
-        "google_ai_studio" | "ai_studio" | "gemini" | "google" => {
-            Ok(ApiBackend::GoogleAiStudio)
-        }
+        "google_ai_studio" | "ai_studio" | "gemini" | "google" => Ok(ApiBackend::GoogleAiStudio),
         other => bail!(
             "invalid api_backend `{other}`; expected chat_completions, responses, messages, or google_ai_studio"
         ),

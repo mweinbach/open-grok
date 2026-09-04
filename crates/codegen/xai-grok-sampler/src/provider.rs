@@ -48,6 +48,9 @@ pub struct ResponsesRequestPolicy {
     pub multi_agent_v2: bool,
     pub use_responses_lite: bool,
     pub local_effort: Option<ReasoningEffort>,
+    pub ultra_effort: Option<ReasoningEffort>,
+    pub verbosity: Option<String>,
+    pub persistent_instructions: Option<String>,
     pub reasoning_summary: Option<ReasoningSummary>,
     pub codex_permissions: Option<CodexPermissions>,
     pub session_id: Option<String>,
@@ -947,13 +950,31 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         Some(ReasoningEffort::Max | ReasoningEffort::Ultra)
     ) {
         ensure_reasoning_object(request_body);
-        request_body["reasoning"]["effort"] = Value::String("max".to_owned());
+        let effort = if policy.local_effort == Some(ReasoningEffort::Ultra) {
+            policy.ultra_effort.unwrap_or(ReasoningEffort::Max)
+        } else {
+            ReasoningEffort::Max
+        };
+        request_body["reasoning"]["effort"] = Value::String(effort.as_str().to_owned());
+    }
+
+    if let Some(verbosity @ ("low" | "medium" | "high")) = policy.verbosity.as_deref() {
+        if request_body.get("text").is_none_or(Value::is_null) {
+            request_body["text"] = serde_json::json!({});
+        }
+        if let Some(text) = request_body.get_mut("text").and_then(Value::as_object_mut) {
+            text.entry("verbosity")
+                .or_insert_with(|| Value::String(verbosity.to_owned()));
+        }
     }
 
     if !policy.multi_agent_v2 {
+        patch_codex_persistent_mode(request_body, policy.persistent_instructions.as_deref());
         return;
     }
-    let mode_text = if policy.local_effort == Some(ReasoningEffort::Ultra) {
+    let mode_text = if policy.local_effort == Some(ReasoningEffort::Ultra)
+        && policy.persistent_instructions.is_none()
+    {
         PROACTIVE_MULTI_AGENT_MODE_TEXT
     } else {
         EXPLICIT_REQUEST_ONLY_MULTI_AGENT_MODE_TEXT
@@ -974,6 +995,118 @@ fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequ
         .filter(|item| item.get("role").and_then(Value::as_str) == Some("user"))
         .map_or(input.len(), |_| input.len() - 1);
     input.insert(insert_at, mode_item);
+    patch_codex_persistent_mode(request_body, policy.persistent_instructions.as_deref());
+}
+
+fn patch_codex_persistent_mode(body: &mut Value, instructions: Option<&str>) {
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        input.retain(|item| {
+            if item.get("role").and_then(Value::as_str) != Some("developer") {
+                return true;
+            }
+            let owned = |text: &str| {
+                text.starts_with("<persistent_mode>\n") && text.ends_with("\n</persistent_mode>")
+            };
+            match item.get("content") {
+                Some(Value::String(text)) => !owned(text),
+                Some(Value::Array(parts)) if parts.len() == 1 => !parts[0]
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(owned),
+                _ => true,
+            }
+        });
+    }
+    let Some(instructions) = instructions.filter(|text| !text.trim().is_empty()) else {
+        return;
+    };
+    // codex-rs 0.153.1 maps the local persistent effort to `disabled`.
+    ensure_reasoning_object(body);
+    body["reasoning"]["effort"] = "disabled".into();
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        let insert_at = input
+            .last()
+            .filter(|item| item["role"] == "user")
+            .map_or(input.len(), |_| input.len() - 1);
+        input.insert(insert_at, serde_json::json!({
+            "type": "message", "role": "developer",
+            "content": [{"type": "input_text", "text": format!("<persistent_mode>\n{instructions}\n</persistent_mode>")}]
+        }));
+    }
+}
+
+#[cfg(test)]
+mod codex_catalog_1531_tests {
+    use super::*;
+
+    #[test]
+    fn ultra_uses_catalog_effort_but_max_does_not() {
+        for (local, expected) in [
+            (ReasoningEffort::Ultra, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let mut body = serde_json::json!({"input":[{"role":"user","content":"work"}],"text":{"format":{"type":"text"}}});
+            patch_codex_responses_request(
+                &mut body,
+                ResponsesRequestPolicy {
+                    local_effort: Some(local),
+                    ultra_effort: Some(ReasoningEffort::Xhigh),
+                    multi_agent_v2: true,
+                    verbosity: Some("low".into()),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(body["reasoning"]["effort"], expected);
+            assert_eq!(body["text"]["verbosity"], "low");
+            assert_eq!(body["text"]["format"]["type"], "text");
+            assert_eq!(
+                body["input"][0]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(PROACTIVE_MULTI_AGENT_MODE_TEXT),
+                local == ReasoningEffort::Ultra
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_mode_is_request_local_and_provider_scoped() {
+        let original = serde_json::json!({"input":[{"role":"user","content":"work"}],"reasoning":{"effort":"medium"}});
+        let mut codex = original.clone();
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut codex,
+            ResponsesRequestPolicy {
+                persistent_instructions: Some("Continue the authorized task.".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(codex["reasoning"]["effort"], "disabled");
+        assert_eq!(codex["input"].as_array().unwrap().len(), 2);
+        provider_adapter(ModelProvider::Codex).patch_responses_request(
+            &mut codex,
+            ResponsesRequestPolicy {
+                persistent_instructions: Some("Updated instructions.".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(codex["input"].as_array().unwrap().len(), 2);
+        assert!(!codex.to_string().contains("Continue the authorized task."));
+        for provider in [ModelProvider::Xai, ModelProvider::Custom] {
+            let mut body = original.clone();
+            provider_adapter(provider).patch_responses_request(
+                &mut body,
+                ResponsesRequestPolicy {
+                    persistent_instructions: Some("must not leak".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(!body.to_string().contains("must not leak"));
+        }
+        let mut disabled = original.clone();
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut disabled, Default::default());
+        assert!(!disabled.to_string().contains("persistent_mode"));
+    }
 }
 
 fn patch_codex_agent_message_ids(request_body: &mut Value) {
@@ -2255,6 +2388,7 @@ mod tests {
                     supports_backend_search: false,
                     supports_standalone_web_search: false,
                     codex_multi_agent_v2: false,
+                    codex_model: Default::default(),
                     use_responses_lite: false,
                     experimental_supported_tools: Vec::new(),
                     codex_permissions: None,
@@ -2792,6 +2926,7 @@ mod tests {
                 supports_backend_search: false,
                 supports_standalone_web_search: false,
                 codex_multi_agent_v2: false,
+                codex_model: Default::default(),
                 use_responses_lite: false,
                 experimental_supported_tools: Vec::new(),
                 codex_permissions: None,

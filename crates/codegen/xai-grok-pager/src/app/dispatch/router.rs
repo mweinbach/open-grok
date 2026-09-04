@@ -1176,6 +1176,12 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetInvertScroll(v) => set_invert_scroll(app, v),
         Action::SetScrollLines(v) => set_scroll_lines(app, v),
         Action::SetShowThinkingBlocks(v) => set_show_thinking_blocks(app, v),
+        Action::SetCodexPersistentMode(value) => {
+            super::settings::setters::set_codex_behavior(app, "codex_persistent_mode", value)
+        }
+        Action::SetCodexGuardianReview(value) => {
+            super::settings::setters::set_codex_behavior(app, "codex_guardian_review", value)
+        }
         Action::SetStreamToolCalls(v) => set_stream_tool_calls(app, v),
         Action::SetGroupToolVerbs(v) => set_group_tool_verbs(app, v),
         Action::SetCollapsedEditBlocks(v) => set_collapsed_edit_blocks(app, v),
@@ -1247,6 +1253,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetCustomModelName(value) => set_custom_model_name(app, value),
         Action::SetCustomModelProvider(value) => set_custom_model_provider(app, value),
         Action::SetCustomModelBaseUrl(value) => set_custom_model_base_url(app, value),
+        Action::SetCustomModelMaxContextWindow(value) => {
+            super::settings::setters::set_custom_model_max_context_window(app, value)
+        }
         Action::SetCustomModelContextWindow(value) => set_custom_model_context_window(app, value),
         Action::SetCustomModelBackend(value) => set_custom_model_backend(app, value),
         Action::SetCustomModelEnvKey(value) => set_custom_model_env_key(app, value),

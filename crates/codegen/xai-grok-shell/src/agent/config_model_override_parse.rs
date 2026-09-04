@@ -707,6 +707,8 @@ mod tests {
                 .into_iter()
                 .collect(),
             context_window: Some(200_000),
+            max_context_window: Some(1_000_000),
+            auto_compact_token_limit: Some(850_000),
             auto_compact_threshold_percent: Some(80),
             system_prompt_label: Some("label".into()),
             use_concise: Some(true),

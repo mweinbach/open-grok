@@ -698,6 +698,16 @@ pub(in crate::app::dispatch) fn set_custom_model_context_window(
     vec![]
 }
 
+pub(in crate::app::dispatch) fn set_custom_model_max_context_window(
+    app: &mut AppView,
+    value: i64,
+) -> Vec<Effect> {
+    update_open_custom_model_draft(app, |snapshot| {
+        snapshot.custom_model_max_context_window = value.clamp(0, 100_000_000);
+    });
+    vec![]
+}
+
 pub(in crate::app::dispatch) fn set_custom_model_backend(
     app: &mut AppView,
     value: String,
@@ -776,7 +786,10 @@ pub(in crate::app::dispatch) fn set_custom_model_save(
         name: optional_draft_text(&draft.custom_model_name),
         provider: optional_draft_text(&draft.custom_model_provider),
         base_url: optional_draft_text(&draft.custom_model_base_url),
-        context_window: Some(draft.custom_model_context_window.max(1) as u64),
+        context_window: (draft.custom_model_max_context_window == 0)
+            .then_some(draft.custom_model_context_window.max(1) as u64),
+        max_context_window: (draft.custom_model_max_context_window > 0)
+            .then_some(draft.custom_model_max_context_window as u64),
         api_backend: optional_draft_text(&draft.custom_model_backend),
         env_key: optional_draft_text(&draft.custom_model_env_key),
     }]
@@ -1347,6 +1360,30 @@ pub(super) fn set_code_mode_inner(
     new: xai_grok_shell::agent::config::ToolModePreference,
 ) {
     app.current_ui.code_mode = Some(new);
+}
+
+pub(in crate::app::dispatch) fn set_codex_behavior(
+    app: &mut AppView,
+    key: &'static str,
+    enabled: bool,
+) -> Vec<Effect> {
+    let value = match key {
+        "codex_persistent_mode" => &mut app.current_ui.codex_persistent_mode,
+        "codex_guardian_review" => &mut app.current_ui.codex_guardian_review,
+        _ => return vec![],
+    };
+    let previous = value.unwrap_or(false);
+    if *value == Some(enabled) {
+        return vec![];
+    }
+    *value = Some(enabled);
+    refresh_open_settings_modals(app);
+    app.show_toast("Codex setting saved (restart Open Grok to apply)");
+    vec![Effect::PersistSetting {
+        key,
+        value: crate::settings::SettingValue::Bool(enabled),
+        rollback_value: crate::settings::SettingValue::Bool(previous),
+    }]
 }
 
 /// SHELL-owned setter for the restart-required `[ui].code_mode` selector.

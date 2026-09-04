@@ -646,6 +646,8 @@ pub(super) fn dispatch_send_prompt_inner(
                     custom_model_base_url: String::new(),
                     custom_model_context_window:
                         crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+
+                    custom_model_max_context_window: 0,
                     custom_model_backend: "chat_completions".to_owned(),
                     custom_model_env_key: String::new(),
                     custom_model_save: false,

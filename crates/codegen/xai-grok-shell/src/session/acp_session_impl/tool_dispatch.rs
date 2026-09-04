@@ -16,6 +16,46 @@ pub(super) async fn dispatch_tool(
     prepared: &PreparedToolCall,
     session_id: &str,
 ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+    if let Some(metadata) = &prepared.mcp_request_meta {
+        if let xai_grok_workspace::WorkspaceOps::Local { handle } = workspace_ops {
+            use futures::StreamExt;
+            let session = handle.session(session_id).ok_or_else(|| {
+                xai_tool_runtime::ToolError::custom(
+                    "session_not_found",
+                    "workspace session not found",
+                )
+            })?;
+            let mut extensions = xai_tool_runtime::TypedExtensions::new();
+            extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
+            let call_id: &str =
+                if xai_grok_sampling_types::conversation::decode_codex_function_call_id(
+                    &prepared.call_id,
+                )
+                .is_some()
+                {
+                    &prepared.call_id
+                } else {
+                    &prepared.tool_call_id.0
+                };
+            let mut stream = session.toolset().call_streaming_with_extensions(
+                &prepared.tool_name,
+                prepared.parsed_args.clone(),
+                call_id,
+                None,
+                None,
+                extensions,
+            );
+            while let Some(item) = stream.next().await {
+                if let xai_tool_runtime::ToolStreamItem::Terminal(result) = item {
+                    return result;
+                }
+            }
+            return Err(xai_tool_runtime::ToolError::custom(
+                "stream_no_terminal",
+                "MCP dispatch ended without a result",
+            ));
+        }
+    }
     tracing::debug!(
         tool = %prepared.tool_name,
         call_id = %prepared.tool_call_id.0,
@@ -79,15 +119,20 @@ where
         mode = "local_streaming",
         "dispatch_code_mode_nested_tool_streaming"
     );
-    let stream = toolset.call_streaming_with_cancellation_and_viewer_context(
+    let mut extensions = xai_tool_runtime::TypedExtensions::new();
+    extensions.insert(xai_tool_runtime::WorkspaceViewerContext {
+        stream_tool_progress: true,
+    });
+    if let Some(metadata) = &prepared.mcp_request_meta {
+        extensions.insert(xai_tool_runtime::McpCallMetadata(metadata.clone()));
+    }
+    let stream = toolset.call_streaming_with_extensions(
         &prepared.tool_name,
         prepared.parsed_args.clone(),
         &prepared.tool_call_id.0,
         None,
         Some(cancellation_token.clone()),
-        Some(xai_tool_runtime::WorkspaceViewerContext {
-            stream_tool_progress: true,
-        }),
+        extensions,
     );
     drain_code_mode_nested_tool_stream(stream, prepared, progress, on_progress).await
 }
@@ -650,6 +695,7 @@ mod tests {
 
     fn nested_prepared_call() -> PreparedToolCall {
         PreparedToolCall {
+            mcp_request_meta: None,
             call_id: "model-call-1".to_string(),
             tool_call_id: acp::ToolCallId::from("acp-call-1"),
             tool_name: "read_file".to_string(),

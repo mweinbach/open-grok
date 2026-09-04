@@ -6,6 +6,7 @@
 //! no file system access) so it can be depended on by downstream crates
 //! (e.g., `xai-chat-state`) without pulling in the full `xai-grok-shell`.
 
+pub mod codex_model;
 pub mod conversation;
 pub mod doom_loop;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod serde_helpers;
 pub mod tool_overrides;
 pub mod types;
 
+pub use self::codex_model::*;
 pub use self::conversation::*;
 pub use self::doom_loop::{
     DEFAULT_EXACT_REPETITION_MIN_TOKENS, DOOM_LOOP_CHECK_EVENT_TYPE, DOOM_LOOP_CHECK_HEADER,

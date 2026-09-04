@@ -67,9 +67,10 @@ pub fn handle_settings_paste(state: &mut SettingsModalState, text: &str) -> Sett
                 SettingsMode::PickingGroup { key, .. } => *key,
                 _ => unreachable!("mode kind changed before paste"),
             };
-            let outcome = state
-                .group_filter
-                .insert_paste_with_policy(text, safe_settings_char, usize::MAX);
+            let outcome =
+                state
+                    .group_filter
+                    .insert_paste_with_policy(text, safe_settings_char, usize::MAX);
             apply_group_filter_edit(state, group_key, outcome)
         }
         SettingsModeKind::EditingString => {
@@ -291,9 +292,7 @@ fn handle_picking_group(state: &mut SettingsModalState, key: &KeyEvent) -> Setti
     }
 
     match key.code {
-        KeyCode::Down | KeyCode::Char('j')
-            if !state.group_filter_focused || !has_dynamic =>
-        {
+        KeyCode::Down | KeyCode::Char('j') if !state.group_filter_focused || !has_dynamic => {
             if child_idx + 1 >= choice_len {
                 return SettingsKeyOutcome::Unchanged;
             }
@@ -476,6 +475,7 @@ pub(crate) fn custom_model_action_for_string(key: SettingKey, value: String) -> 
 
 pub(crate) fn custom_model_action_for_int(key: SettingKey, value: i64) -> Option<Action> {
     match key {
+        "custom_model_max_context_window" => Some(Action::SetCustomModelMaxContextWindow(value)),
         "custom_model_context_window" => Some(Action::SetCustomModelContextWindow(value)),
         _ => None,
     }

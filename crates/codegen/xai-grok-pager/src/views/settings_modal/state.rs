@@ -1121,6 +1121,8 @@ pub(super) fn action_for_bool(key: SettingKey, new: bool) -> Option<Action> {
         "vim_mode" => Some(Action::SetVimMode(new)),
         "voice_keybind_enabled" => Some(Action::SetVoiceKeybindEnabled(new)),
         "remember_tool_approvals" => Some(Action::SetRememberToolApprovals(new)),
+        "codex_persistent_mode" => Some(Action::SetCodexPersistentMode(new)),
+        "codex_guardian_review" => Some(Action::SetCodexGuardianReview(new)),
         "toolset.ask_user_question.timeout_enabled" => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(new))
         }
@@ -1316,6 +1318,7 @@ pub(super) fn action_for_int(key: SettingKey, value: i64) -> Option<Action> {
         "max_thoughts_width" => Some(Action::SetMaxThoughtsWidth(value)),
         "scroll_speed" => Some(Action::SetScrollSpeed(value)),
         "scroll_lines" => Some(Action::SetScrollLines(value)),
+        "custom_model_max_context_window" => Some(Action::SetCustomModelMaxContextWindow(value)),
         "custom_model_context_window" => Some(Action::SetCustomModelContextWindow(value)),
         _ => None,
     }

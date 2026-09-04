@@ -14,6 +14,38 @@ fn dispatch_save_custom_model_without_id_or_slug_does_not_upsert() {
     );
 }
 
+#[test]
+fn codex_context_and_behavior_settings_persist_explicit_choices() {
+    let mut app = test_app_with_agent();
+    let _ = dispatch(Action::OpenSettings, &mut app);
+    let _ = dispatch(Action::SetCustomModelId("gpt-6-astra".into()), &mut app);
+    let _ = dispatch(Action::SetCustomModelSlug("gpt-6-astra".into()), &mut app);
+    let _ = dispatch(Action::SetCustomModelProvider("codex".into()), &mut app);
+    let _ = dispatch(Action::SetCustomModelMaxContextWindow(1_000_000), &mut app);
+    let effects = dispatch(Action::SetCustomModelSave(true), &mut app);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::UpsertCustomModel {
+            max_context_window: Some(1_000_000),
+            context_window: None,
+            ..
+        }
+    )));
+    for (action, key) in [
+        (
+            Action::SetCodexPersistentMode(true),
+            "codex_persistent_mode",
+        ),
+        (
+            Action::SetCodexGuardianReview(true),
+            "codex_guardian_review",
+        ),
+    ] {
+        let effects = dispatch(action, &mut app);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::PersistSetting {key:actual,value:crate::settings::SettingValue::Bool(true),..} if *actual == key)));
+    }
+}
+
 /// `Action::ToggleVimMode` flips the active agent's `vim_mode` field,
 /// updates the in-process pager cache so future agents pick it up
 /// via `load_vim_mode`, emits `Effect::PersistSetting` so the new
@@ -2077,6 +2109,15 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "custom_model_context_window" => {
             let _ = dispatch(Action::SetCustomModelContextWindow(300_000), app);
+        }
+        "custom_model_max_context_window" => {
+            let _ = dispatch(Action::SetCustomModelMaxContextWindow(1_000_000), app);
+        }
+        "codex_persistent_mode" => {
+            let _ = dispatch(Action::SetCodexPersistentMode(true), app);
+        }
+        "codex_guardian_review" => {
+            let _ = dispatch(Action::SetCodexGuardianReview(true), app);
         }
         "custom_model_backend" => {
             let _ = dispatch(Action::SetCustomModelBackend("responses".to_owned()), app);

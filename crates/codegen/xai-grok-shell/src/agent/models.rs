@@ -2035,6 +2035,14 @@ impl ModelsManager {
             let cat = self.inner.catalog.read();
             let models = &cat.models;
             let entry = config::find_model_by_id(&models, model_id)?;
+            if entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                && entry.info.codex_model.raw_context_window().is_some()
+            {
+                return Some(CodexCompactionMetadata {
+                    auto_compact_token_limit: entry.info.codex_model.compact_limit(),
+                    comp_hash: entry.info.codex_model.comp_hash.clone(),
+                });
+            }
             (entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex)
                 .then(|| entry.info.model.clone())?
         };
@@ -2043,6 +2051,40 @@ impl ModelsManager {
             .read()
             .as_ref()
             .and_then(|catalog| catalog.compaction_metadata(&routing_slug))
+    }
+
+    /// Resolve metadata from the same final catalog as model selection, including
+    /// user context overrides. Never inherit it across providers or backends.
+    pub fn codex_model_metadata(
+        &self,
+        model_id: &str,
+    ) -> xai_grok_sampling_types::CodexModelMetadata {
+        let catalog = self.inner.catalog.read();
+        config::find_model_by_id(&catalog.models, model_id)
+            .filter(|entry| {
+                entry.info.provider == xai_grok_sampling_types::ModelProvider::Codex
+                    && entry.info.api_backend == xai_grok_sampling_types::ApiBackend::Responses
+            })
+            .map(|entry| entry.info.codex_metadata())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn codex_persistent_mode(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .ui
+            .codex_persistent_mode
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn codex_guardian_review(&self) -> bool {
+        self.inner
+            .cfg
+            .read()
+            .ui
+            .codex_guardian_review
+            .unwrap_or(false)
     }
 
     pub(crate) fn model_compactions_remaining(

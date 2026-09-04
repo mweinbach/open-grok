@@ -129,6 +129,11 @@ pub struct BehaviorVersion(pub String);
 #[derive(Clone, Debug)]
 pub struct TraceContext(pub String);
 
+/// Host-owned MCP request metadata, snapshotted before permission waits.
+/// This is a per-call extension, never a model-controlled tool argument.
+#[derive(Clone, Debug, Default)]
+pub struct McpCallMetadata(pub serde_json::Map<String, serde_json::Value>);
+
 /// Session ID context — identifies which hub session this call belongs to.
 /// Used by multi-session tool servers to dispatch to the correct
 /// per-session state.

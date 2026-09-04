@@ -1665,6 +1665,7 @@ impl SessionActor {
             xai_grok_sampling_types::conversation::provider_tool_call_id(&call.id),
         ));
         let model_id_str = self.current_model_id().await;
+        let codex_catalog_metadata = self.models_manager.codex_model_metadata(&model_id_str);
         tracing::info!(
             "Model requesting tool: name='{}', call_id='{}'",
             call.function.name,
@@ -1938,6 +1939,16 @@ impl SessionActor {
         let tool_call_display = self
             .send_tool_call_start(&tool_call_id, &call.function.name, tool_input.clone())
             .await;
+        if hook_ask.is_none() {
+            hook_ask = self
+                .codex_guardian_ask(
+                    &model_id_str,
+                    &codex_catalog_metadata,
+                    &access_kind,
+                    &raw_input,
+                )
+                .await;
+        }
         let plan_file_auto_approve = if let AccessKind::Edit(ref path) = access_kind
             && hook_ask.is_none()
         {
@@ -2326,6 +2337,10 @@ impl SessionActor {
             })
             .unwrap_or(false);
         let prepared = PreparedToolCall {
+            mcp_request_meta: codex_catalog_policy::confirmation_metadata(
+                &codex_catalog_metadata,
+                &access_kind,
+            ),
             call_id: call.id.clone(),
             tool_call_id,
             tool_name: call.function.name.clone(),

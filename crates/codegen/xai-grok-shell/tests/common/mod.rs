@@ -356,6 +356,7 @@ pub fn test_sampler_config(
         supports_backend_search: false,
         supports_standalone_web_search: false,
         codex_multi_agent_v2: false,
+        codex_model: Default::default(),
         use_responses_lite: false,
         experimental_supported_tools: Vec::new(),
         codex_permissions: None,

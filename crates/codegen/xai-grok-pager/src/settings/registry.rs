@@ -124,6 +124,8 @@ pub struct CustomModelRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
@@ -143,6 +145,12 @@ impl CustomModelRecord {
     pub fn description_line(&self) -> String {
         let provider = self.provider.as_deref().unwrap_or("inherit");
         let backend = self.api_backend.as_deref().unwrap_or("chat_completions");
+        if let Some(raw) = self.max_context_window {
+            return format!(
+                "{} · {provider} · {backend} · {raw} raw context",
+                self.model
+            );
+        }
         match self.context_window {
             Some(window) => format!("{} · {provider} · {backend} · {window} ctx", self.model),
             None => format!("{} · {provider} · {backend}", self.model),
@@ -470,6 +478,8 @@ pub struct PagerLocalSnapshot {
     pub custom_model_provider: String,
     pub custom_model_base_url: String,
     pub custom_model_context_window: i64,
+
+    pub custom_model_max_context_window: i64,
     pub custom_model_backend: String,
     pub custom_model_env_key: String,
     pub custom_model_save: bool,
@@ -566,6 +576,8 @@ impl Default for PagerLocalSnapshot {
             custom_model_provider: String::new(),
             custom_model_base_url: String::new(),
             custom_model_context_window: crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT,
+
+            custom_model_max_context_window: 0,
             custom_model_backend: "chat_completions".to_owned(),
             custom_model_env_key: String::new(),
             custom_model_save: false,
@@ -727,6 +739,7 @@ impl PagerLocalSnapshot {
         self.custom_model_base_url
             .clone_from(&other.custom_model_base_url);
         self.custom_model_context_window = other.custom_model_context_window;
+        self.custom_model_max_context_window = other.custom_model_max_context_window;
         self.custom_model_backend
             .clone_from(&other.custom_model_backend);
         self.custom_model_env_key
@@ -735,6 +748,7 @@ impl PagerLocalSnapshot {
     }
 
     pub fn clear_custom_model_draft(&mut self) {
+        self.custom_model_max_context_window = 0;
         self.custom_model_id.clear();
         self.custom_model_slug.clear();
         self.custom_model_name.clear();
@@ -958,6 +972,12 @@ pub fn current_value_for(
         "show_thinking_blocks" => Some(SettingValue::Bool(
             crate::appearance::cache::load_show_thinking_blocks(),
         )),
+        "codex_persistent_mode" => Some(SettingValue::Bool(
+            ui.codex_persistent_mode.unwrap_or(false),
+        )),
+        "codex_guardian_review" => Some(SettingValue::Bool(
+            ui.codex_guardian_review.unwrap_or(false),
+        )),
         "stream_tool_calls" => Some(SettingValue::Bool(
             crate::appearance::cache::load_stream_tool_calls(),
         )),
@@ -1107,6 +1127,9 @@ pub fn current_value_for(
             &pager.custom_model_provider,
         ))),
         "custom_model_base_url" => Some(SettingValue::String(pager.custom_model_base_url.clone())),
+        "custom_model_max_context_window" => {
+            Some(SettingValue::Int(pager.custom_model_max_context_window))
+        }
         "custom_model_context_window" => Some(SettingValue::Int(pager.custom_model_context_window)),
         "custom_model_backend" => Some(SettingValue::Enum(canonical_custom_model_backend(
             &pager.custom_model_backend,
@@ -1604,6 +1627,12 @@ mod tests {
                          shared resolver const in xai-grok-tools"
                     );
                 }
+                ("codex_persistent_mode", SettingKind::Bool { default }) => {
+                    assert_eq!(*default, ui.codex_persistent_mode.unwrap_or(false));
+                }
+                ("codex_guardian_review", SettingKind::Bool { default }) => {
+                    assert_eq!(*default, ui.codex_guardian_review.unwrap_or(false));
+                }
                 // show_thinking_blocks: Option<bool>; None → true (client default).
                 ("show_thinking_blocks", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -1964,6 +1993,10 @@ mod tests {
                         pager.custom_model_context_window,
                         crate::settings::defs::CUSTOM_MODEL_CONTEXT_WINDOW_DEFAULT
                     );
+                }
+                ("custom_model_max_context_window", SettingKind::Int { default, .. }) => {
+                    assert_eq!(*default, 0);
+                    assert_eq!(pager.custom_model_max_context_window, 0);
                 }
                 ("custom_model_save", SettingKind::Bool { default }) => {
                     assert!(!*default);
@@ -2444,6 +2477,7 @@ mod tests {
                 "custom_model_provider",
                 "custom_model_base_url",
                 "custom_model_context_window",
+                "custom_model_max_context_window",
                 "custom_model_backend",
                 "custom_model_env_key",
                 "custom_model_save",
