@@ -715,6 +715,8 @@ mod tests {
             agent_type: Some("agent".into()),
             tool_mode: Some(ToolMode::CodeModeOnly),
             subagent_context_default: Some(xai_tool_types::SubagentContextMode::Fork),
+            use_responses_lite: Some(false),
+            experimental_supported_tools: Some(vec!["send_user_message_async".into()]),
             inference_idle_timeout_secs: Some(60),
             max_retries: Some(3),
             subagent_rate_limit_max_attempts: Some(8),

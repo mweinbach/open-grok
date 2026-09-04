@@ -6,6 +6,42 @@ tiers. Ultra uses the model's advertised multi-agent effort; Max remains Max.
 Replacement and retirement notices appear in model descriptions without
 automatically switching your selected model.
 
+## Async messages on the OpenAI API
+
+When a Codex Responses model reports
+`experimental_supported_tools = ["send_user_message_async"]`, Open Grok lets the
+main agent send messages and questions while continuing its work. Replies arrive
+as new user messages. The tool is available with either ChatGPT login or an
+explicit API key, and is not exposed to subagents.
+
+For a public OpenAI Responses API model, configure an explicit route in
+`$OPENGROK_HOME/config.toml`:
+
+```toml
+[model.astra-api]
+model = "gpt-6-astra"
+provider = "codex"
+base_url = "https://api.openai.com/v1"
+api_backend = "responses"
+env_key = "OPENAI_API_KEY"
+supports_reasoning_effort = true
+reasoning_effort = "medium"
+use_responses_lite = false
+experimental_supported_tools = ["send_user_message_async"]
+```
+
+Select `astra-api` to use this route. Your existing API key must be available in
+`OPENAI_API_KEY`, and your API account must have access to the requested model.
+Use Responses for Astra tool calling, as described in the
+[OpenAI model guide](https://developers.openai.com/api/docs/guides/latest-model).
+
+These two capability fields are also accepted by the custom-model upsert API.
+Omitting either field preserves inherited metadata. Set
+`experimental_supported_tools = []` to disable the message tool; set
+`use_responses_lite = false` to use ordinary Responses instead of Codex Lite.
+The message tool acknowledges delivery immediately; it does not wait for a
+reply or enable the separate API protocol for deferred tool results.
+
 ## Context overrides
 
 In **Settings → Models → Custom models**, use the model's existing catalog key

@@ -671,11 +671,7 @@ impl SessionActor {
             let sampling = self.rebuild_spec.active_sampling_config.read();
             return provider == xai_grok_sampling_types::ModelProvider::Codex
                 && self.rebuild_spec.subagent_depth == 0
-                && self
-                    .models_manager
-                    .model_experimental_supported_tools(&sampling.model)
-                    .iter()
-                    .any(|tool| tool == "send_user_message_async");
+                && sampling.supports_async_user_messages();
         }
         if tool_name == "web_search" {
             return web_search.allowed_for_provider(provider);
@@ -1067,10 +1063,13 @@ impl SessionActor {
         let mut codex_model = self.models_manager.codex_model_metadata(&cfg.model);
         codex_model.persistent_mode =
             !self.startup_hints.is_subagent && self.models_manager.codex_persistent_mode();
-        let use_responses_lite = self.models_manager.model_uses_responses_lite(&cfg.model);
-        let experimental_supported_tools = self
-            .models_manager
-            .model_experimental_supported_tools(&cfg.model);
+        // The active route preserves per-entry overrides even when an API alias
+        // shares its wire model slug with a different catalog entry. Re-resolving
+        // by cfg.model here would restore that other entry's Lite/tool flags.
+        // Model/settings switches replace this snapshot together with the agent.
+        let active_sampling = self.rebuild_spec.active_sampling_config();
+        let use_responses_lite = active_sampling.uses_responses_lite();
+        let experimental_supported_tools = active_sampling.experimental_supported_tools.clone();
         let stream_tool_calls = crate::agent::config::resolve_stream_tool_calls_inject(
             self.models_manager
                 .model_stream_tool_calls_override(&cfg.model)

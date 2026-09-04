@@ -1036,6 +1036,118 @@ async fn reconstruct_full_config_uses_chat_state_provider_for_remote_only_codex_
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_user_message_alias_keeps_route_metadata_during_sampler_reconstruction() {
+    use crate::agent::config::{
+        ConfigModelOverride, resolve_credentials, sampling_config_for_model,
+    };
+    use xai_grok_sampling_types::{ApiBackend, ModelProvider};
+
+    const MODEL: &str = "test-api-message-model";
+    const ALIAS: &str = "test-api-message-alias";
+    const TOOL: &str = "send_user_message_async";
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            for subagent_depth in [0, 1] {
+                let (gateway_tx, _gateway_rx) = mpsc::unbounded_channel();
+                let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+                let mut actor =
+                    create_test_actor(0, 100_000, 85, gateway_tx, persistence_tx).await;
+                Arc::get_mut(&mut actor.rebuild_spec)
+                    .expect("test rebuild spec is uniquely owned")
+                    .subagent_depth = subagent_depth;
+                actor.auth_method_id = test_auth_method_id("xai.api_key");
+
+                for (provider, api_backend) in [
+                    (ModelProvider::Codex, ApiBackend::Responses),
+                    (ModelProvider::Codex, ApiBackend::ChatCompletions),
+                    (ModelProvider::Custom, ApiBackend::Responses),
+                ] {
+                    for opted_in in [true, false] {
+                        let tools = if opted_in { vec![TOOL.into()] } else { Vec::new() };
+                        let canonical_tools =
+                            if opted_in { Vec::new() } else { vec![TOOL.into()] };
+                        actor.models_manager.apply_custom_model_override(
+                            MODEL.into(),
+                            ConfigModelOverride {
+                                model: Some(MODEL.into()),
+                                provider: Some(ModelProvider::Codex),
+                                api_backend: Some(ApiBackend::Responses),
+                                use_responses_lite: Some(true),
+                                experimental_supported_tools: Some(canonical_tools.clone()),
+                                ..Default::default()
+                            },
+                        );
+                        actor.models_manager.apply_custom_model_override(
+                            ALIAS.into(),
+                            ConfigModelOverride {
+                                model: Some(MODEL.into()),
+                                provider: Some(provider),
+                                api_backend: Some(api_backend),
+                                base_url: Some("https://api.openai.com/v1".into()),
+                                api_key: Some("alias-test-api-key".into()),
+                                use_responses_lite: Some(false),
+                                experimental_supported_tools: Some(tools),
+                                ..Default::default()
+                            },
+                        );
+                        assert!(actor.models_manager.model_uses_responses_lite(MODEL));
+                        assert_eq!(
+                            actor.models_manager.model_experimental_supported_tools(MODEL),
+                            canonical_tools
+                        );
+                        let catalog = actor.models_manager.models();
+                        let alias = &catalog[ALIAS];
+                        let sampling = sampling_config_for_model(
+                            alias,
+                            resolve_credentials(alias, None),
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
+                        assert_eq!(sampling.model, MODEL, "sampling stores the routing slug");
+                        actor.rebuild_spec.replace_active_sampling_config(sampling.clone());
+                        let mut chat_config = actor
+                            .chat_state_handle
+                            .get_sampling_config()
+                            .await
+                            .expect("test actor has sampling config");
+                        chat_config.model = sampling.model.clone();
+                        chat_config.base_url = sampling.base_url.clone();
+                        chat_config.provider = sampling.provider;
+                        chat_config.api_backend = sampling.api_backend;
+                        actor.chat_state_handle.update_sampling_config(chat_config);
+                        actor.chat_state_handle.update_credentials(xai_chat_state::Credentials {
+                            api_key: sampling.api_key.clone(),
+                            auth_type: xai_chat_state::AuthType::ApiKey,
+                            ..Default::default()
+                        });
+
+                        let reconstructed = actor.reconstruct_full_config().await;
+                        assert!(!reconstructed.use_responses_lite);
+                        assert_eq!(
+                            reconstructed.experimental_supported_tools,
+                            sampling.experimental_supported_tools,
+                            "an alias must not inherit another route's tool metadata"
+                        );
+                        assert_eq!(reconstructed.api_key.as_deref(), Some("alias-test-api-key"));
+                        assert!(reconstructed.bearer_resolver.is_none());
+                        assert_eq!(
+                            actor.local_tool_allowed_for_provider(TOOL, provider),
+                            subagent_depth == 0
+                                && opted_in
+                                && provider == ModelProvider::Codex
+                                && api_backend == ApiBackend::Responses,
+                            "depth={subagent_depth}, provider={provider:?}, backend={api_backend:?}, opted_in={opted_in}"
+                        );
+                    }
+                }
+            }
+        })
+        .await;
+}
+
 #[test]
 fn turn_auth_refresh_route_is_provider_and_provenance_aware() {
     assert_eq!(

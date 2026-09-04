@@ -4664,7 +4664,8 @@ fn is_default_laziness_detector(cfg: &LazinessDetectorPerModelConfig) -> bool {
 /// (bypassing deep merge). Scalar fields are `Option` so absent means "inherit
 /// from defaults/prefetched"; the collection fields (`extra_headers`,
 /// `reasoning_efforts`) merge only when non-empty and so cannot express
-/// "override to empty."
+/// "override to empty." `experimental_supported_tools` is optional so an
+/// explicit empty list can disable inherited experimental tools.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConfigModelOverride {
@@ -4689,6 +4690,12 @@ pub struct ConfigModelOverride {
     pub auth_scheme: Option<AuthScheme>,
     pub tool_mode: Option<ToolMode>,
     pub subagent_context_default: Option<SubagentContextMode>,
+    /// Codex Responses transport opt-in. Public API routes can explicitly
+    /// disable Lite while retaining independently advertised local tools.
+    pub use_responses_lite: Option<bool>,
+    /// Replace the model's experimental tool list; `None` inherits and
+    /// `Some([])` disables it. Only Codex Responses routes consume this list.
+    pub experimental_supported_tools: Option<Vec<String>>,
     #[serde(default)]
     pub extra_headers: IndexMap<String, String>,
     #[serde(default)]
@@ -4855,6 +4862,19 @@ impl ConfigModelOverride {
         }
         if let Some(v) = self.subagent_context_default {
             entry.info.subagent_context_default = Some(v);
+        }
+        if entry.info.provider == ModelProvider::Codex
+            && entry.info.api_backend == ApiBackend::Responses
+        {
+            if let Some(enabled) = self.use_responses_lite {
+                entry.info.use_responses_lite = enabled;
+            }
+            if let Some(tools) = &self.experimental_supported_tools {
+                entry.info.experimental_supported_tools.clone_from(tools);
+            }
+        } else {
+            entry.info.use_responses_lite = false;
+            entry.info.experimental_supported_tools.clear();
         }
         if !self.extra_headers.is_empty() {
             entry.info.extra_headers = self.extra_headers.clone();
@@ -15596,6 +15616,108 @@ default = "grok-4.5"
         assert!(resolved.contains_key("gpt-5.6-sol"));
         assert!(resolved.contains_key("gpt-next"));
     }
+    #[test]
+    fn async_user_messages_api_model_override_reaches_sampler_without_oauth() {
+        let raw: toml::Value = toml::from_str(
+            r#"
+            [model.api-test-model]
+            model = "advertised-test-model"
+            provider = "codex"
+            api_backend = "responses"
+            base_url = "https://api.openai.com/v1"
+            api_key = "fixture-only-key"
+            use_responses_lite = false
+            experimental_supported_tools = ["send_user_message_async", "unknown_tool"]
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        assert!(cfg.config_warnings.is_empty());
+        let resolved = resolve_model_list(&cfg, None);
+        let model = &resolved["api-test-model"];
+        let sampling = sampling_config_for_model(
+            model,
+            resolve_credentials(model, Some("unrelated-session-token")),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(sampling.model, "advertised-test-model");
+        assert_eq!(sampling.base_url, "https://api.openai.com/v1");
+        assert_eq!(sampling.api_key.as_deref(), Some("fixture-only-key"));
+        assert!(sampling.bearer_resolver.is_none());
+        assert!(sampling.supports_async_user_messages());
+        assert!(!sampling.uses_responses_lite());
+        assert!(!sampling.supports_standalone_web_search);
+        assert_eq!(
+            sampling.experimental_supported_tools,
+            ["send_user_message_async", "unknown_tool"]
+        );
+    }
+
+    #[test]
+    fn async_user_messages_overrides_inherit_replace_and_disable_live_capabilities() {
+        for (tools, expected) in [
+            (None, vec!["send_user_message_async".to_owned()]),
+            (
+                Some(vec!["unknown_tool".to_owned()]),
+                vec!["unknown_tool".to_owned()],
+            ),
+            (Some(Vec::new()), Vec::new()),
+        ] {
+            let mut cfg = Config::default();
+            cfg.config_models.insert(
+                "catalog-test-model".into(),
+                ConfigModelOverride {
+                    use_responses_lite: Some(false),
+                    experimental_supported_tools: tools,
+                    ..Default::default()
+                },
+            );
+            let mut entry = codex_model_entry("catalog-test-model", 200_000);
+            entry.info.use_responses_lite = true;
+            entry.info.experimental_supported_tools = vec!["send_user_message_async".into()];
+            let resolved = resolve_model_list_with_codex(
+                &cfg,
+                None,
+                Some(IndexMap::from([("catalog-test-model".into(), entry)])),
+                true,
+            );
+            let info = &resolved["catalog-test-model"].info;
+            assert!(!info.use_responses_lite);
+            assert_eq!(info.experimental_supported_tools, expected);
+        }
+    }
+
+    #[test]
+    fn async_user_messages_model_overrides_require_codex_responses() {
+        let endpoints = EndpointsConfig::default();
+        for provider in [
+            ModelProvider::Codex,
+            ModelProvider::Xai,
+            ModelProvider::Custom,
+        ] {
+            for api_backend in [ApiBackend::Responses, ApiBackend::ChatCompletions] {
+                let mut base = codex_model_entry("catalog-test-model", 200_000);
+                base.info.use_responses_lite = true;
+                base.info.experimental_supported_tools = vec!["send_user_message_async".into()];
+                let entry = ConfigModelOverride {
+                    provider: Some(provider),
+                    api_backend: Some(api_backend),
+                    use_responses_lite: Some(true),
+                    experimental_supported_tools: Some(vec!["send_user_message_async".into()]),
+                    ..Default::default()
+                }
+                .apply("catalog-test-model", Some(base), &endpoints);
+                let enabled =
+                    provider == ModelProvider::Codex && api_backend == ApiBackend::Responses;
+                assert_eq!(entry.info.use_responses_lite, enabled);
+                assert_eq!(!entry.info.experimental_supported_tools.is_empty(), enabled);
+            }
+        }
+    }
+
     #[test]
     fn config_model_override_beats_live_codex_catalog() {
         let mut cfg = Config::default();

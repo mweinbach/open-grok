@@ -1209,6 +1209,134 @@ async fn responses_lite_is_model_gated_for_stream_unary_and_compact_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_api_key_async_user_message_uses_standard_responses_and_original_call_id() {
+    use std::sync::Mutex;
+
+    const TOOL_NAME: &str = "send_user_message_async";
+    const MODEL: &str = "advertised-api-test-model";
+    const CALL_ID: &str = "call-user-message";
+    const ARGUMENTS: &str = r#"{"message":"I am checking the implementation."}"#;
+    let captured = Arc::new(Mutex::new(Vec::<(HeaderMap, serde_json::Value)>::new()));
+    let captured_handler = Arc::clone(&captured);
+    let app = Router::new().route(
+        "/v1/responses",
+        post(
+            move |headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured = Arc::clone(&captured_handler);
+                async move {
+                    let has_result = body["input"].as_array().unwrap().iter().any(|item| {
+                        item["type"] == "function_call_output" && item["call_id"] == CALL_ID
+                    });
+                    captured.lock().unwrap().push((headers, body));
+                    let events = if has_result {
+                        sse::responses_api_reasoning_and_text_events(
+                            "The update was accepted; continue working.",
+                            "Implementation checked.",
+                            MODEL,
+                        )
+                    } else {
+                        sse::responses_api_reasoning_then_tool_call_events(
+                            "Send the user an update and continue working.",
+                            CALL_ID,
+                            TOOL_NAME,
+                            ARGUMENTS,
+                            MODEL,
+                        )
+                    };
+                    Sse::new(stream::iter(
+                        sse_events_to_axum(events)
+                            .into_iter()
+                            .map(Ok::<_, std::convert::Infallible>),
+                    ))
+                }
+            },
+        ),
+    );
+    let server = MockServer::spawn(app).await;
+    let config = SamplerConfig {
+        provider: ModelProvider::Codex,
+        model: MODEL.into(),
+        experimental_supported_tools: vec![TOOL_NAME.into()],
+        use_responses_lite: false,
+        ..responses_config(server.base_url(), None)
+    };
+    assert!(config.api_key.is_some());
+    assert!(config.bearer_resolver.is_none());
+    assert!(config.supports_async_user_messages());
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let handle = SamplerActor::spawn(config, RetryPolicy::default(), event_tx);
+    let mut request = user_request("Check the implementation and keep me updated.");
+    request.tools.push(ToolSpec {
+        name: TOOL_NAME.into(),
+        description: Some("Send a user message and return immediately.".into()),
+        parameters: json!({
+            "type": "object",
+            "properties": {"message": {"type": "string"}},
+            "required": ["message"],
+            "additionalProperties": false
+        }),
+    });
+    let (response, _) = handle
+        .submit_and_collect(RequestId::from("req-api-user-message"), request.clone())
+        .await
+        .expect("API-key route should receive the user-message function call");
+    let calls = &response.assistant().unwrap().tool_calls;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].call_id(), CALL_ID);
+    assert_eq!(calls[0].name, TOOL_NAME);
+    assert_eq!(calls[0].arguments.as_ref(), ARGUMENTS);
+    assert!(!calls[0].is_custom());
+
+    // The host acknowledges delivery immediately. A human reply, if any,
+    // arrives as a later user message rather than a deferred tool result.
+    request.items.extend(response.items);
+    request.items.push(ConversationItem::tool_result(
+        CALL_ID,
+        r#"{"accepted":true}"#,
+    ));
+    let (response, _) = handle
+        .submit_and_collect(RequestId::from("req-api-user-message-continue"), request)
+        .await
+        .expect("accepted message delivery should allow an immediate continuation");
+    assert_eq!(response.assistant_text(), "Implementation checked.");
+    server.shutdown();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 2);
+    for (headers, body) in captured.iter() {
+        assert_eq!(headers["authorization"], "Bearer test-key");
+        assert!(!headers.contains_key("chatgpt-account-id"));
+        assert!(!headers.contains_key("x-openai-internal-codex-responses-lite"));
+        assert_eq!(body["model"], MODEL);
+        assert!(body.get("experimental_supported_tools").is_none());
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], TOOL_NAME);
+        assert_eq!(tools[0]["parameters"]["required"], json!(["message"]));
+        assert!(tools[0].get("async").is_none());
+        assert!(body["input"].as_array().unwrap().iter().all(|item| {
+            item["type"] != "additional_tools" && item["type"] != "custom_tool_call_output"
+        }));
+    }
+    let continuation = captured[1].1["input"].as_array().unwrap();
+    let calls: Vec<_> = continuation
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["call_id"], CALL_ID);
+    assert_eq!(calls[0]["name"], TOOL_NAME);
+    let outputs: Vec<_> = continuation
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .collect();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0]["call_id"], CALL_ID);
+    assert_eq!(outputs[0]["output"], r#"{"accepted":true}"#);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_responses_wire_has_live_web_search_sources_and_never_x_search() {
     use std::sync::Mutex;
 

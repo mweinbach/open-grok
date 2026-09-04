@@ -31,6 +31,12 @@ pub struct CustomModelRecord {
     pub auto_compact_token_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
+    /// Override the Codex Responses transport; omission inherits the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
+    /// Codex Responses tool capabilities; an empty list explicitly disables them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_supported_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
     /// Persist only when the user typed one. Prefer [`Self::env_key`].
@@ -64,6 +70,10 @@ pub struct CustomModelPublicRecord {
     pub auto_compact_token_limit: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_responses_lite: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experimental_supported_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_key: Option<String>,
     /// Resolved credential header for this row, never the credential itself.
@@ -174,6 +184,8 @@ impl CustomModelRecord {
 
             auto_compact_token_limit: self.auto_compact_token_limit,
             api_backend: self.api_backend.clone(),
+            use_responses_lite: self.use_responses_lite,
+            experimental_supported_tools: self.experimental_supported_tools.clone(),
             env_key: self.env_key.clone(),
             auth_scheme: self
                 .resolved_auth_scheme()
@@ -214,6 +226,18 @@ impl CustomModelRecord {
         }
         if let Some(api_backend) = &self.api_backend {
             table.insert("api_backend".into(), TomlValue::String(api_backend.clone()));
+        }
+        if let Some(use_responses_lite) = self.use_responses_lite {
+            table.insert(
+                "use_responses_lite".into(),
+                TomlValue::Boolean(use_responses_lite),
+            );
+        }
+        if let Some(tools) = &self.experimental_supported_tools {
+            table.insert(
+                "experimental_supported_tools".into(),
+                TomlValue::Array(tools.iter().cloned().map(TomlValue::String).collect()),
+            );
         }
         if let Some(env_key) = &self.env_key {
             table.insert("env_key".into(), TomlValue::String(env_key.clone()));
@@ -278,6 +302,8 @@ impl CustomModelRecord {
                 .api_backend
                 .as_deref()
                 .and_then(|raw| parse_api_backend(raw).ok()),
+            use_responses_lite: self.use_responses_lite,
+            experimental_supported_tools: self.experimental_supported_tools.clone(),
             env_key: self.env_key.clone().map(EnvKeys::single),
             api_key: self.api_key.clone(),
             auth_scheme: self.resolved_auth_scheme(),
@@ -299,6 +325,8 @@ pub fn override_to_public(key: &str, model: &ConfigModelOverride) -> CustomModel
 
         auto_compact_token_limit: model.auto_compact_token_limit,
         api_backend: model.api_backend.map(api_backend_as_str).map(str::to_owned),
+        use_responses_lite: model.use_responses_lite,
+        experimental_supported_tools: model.experimental_supported_tools.clone(),
         env_key: model
             .env_key
             .as_ref()
@@ -689,6 +717,73 @@ mod tests {
         let json = serde_json::to_value(&public).unwrap();
         assert!(json.get("api_key").is_none());
         assert_eq!(json.get("has_api_key"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn codex_experimental_metadata_round_trips_through_the_custom_model_api() {
+        for (use_responses_lite, tools) in [
+            (true, vec!["send_user_message_async", "future_tool"]),
+            (false, Vec::new()),
+        ] {
+            let input = serde_json::json!({
+                "key": "openai:api-test-model",
+                "model": "advertised-api-test-model",
+                "provider": "openai",
+                "base_url": "https://api.openai.com/v1",
+                "api_backend": "responses",
+                "api_key": "test-api-secret",
+                "use_responses_lite": use_responses_lite,
+                "experimental_supported_tools": tools,
+            });
+            let (record, warning) =
+                normalize_custom_model(serde_json::from_value(input).unwrap()).unwrap();
+            assert!(warning.is_none());
+            assert_eq!(record.provider.as_deref(), Some("codex"));
+            let parsed: ConfigModelOverride =
+                TomlValue::Table(record.to_toml_table()).try_into().unwrap();
+            assert_eq!(parsed.use_responses_lite, Some(use_responses_lite));
+            assert_eq!(
+                parsed.experimental_supported_tools,
+                Some(tools.iter().map(|tool| (*tool).to_owned()).collect())
+            );
+            assert_eq!(
+                record.to_override().experimental_supported_tools,
+                parsed.experimental_supported_tools
+            );
+            assert_eq!(
+                record.to_override().use_responses_lite,
+                parsed.use_responses_lite
+            );
+            let public = override_to_public(&record.key, &parsed);
+            assert_eq!(public, record.to_public());
+            let json = serde_json::to_value(public).unwrap();
+            assert_eq!(json["use_responses_lite"], use_responses_lite);
+            assert_eq!(
+                json["experimental_supported_tools"],
+                serde_json::json!(tools)
+            );
+            assert_eq!(json["has_api_key"], true);
+            assert!(json.get("api_key").is_none());
+            assert!(!json.to_string().contains("test-api-secret"));
+        }
+    }
+
+    #[test]
+    fn omitted_codex_experimental_metadata_remains_unspecified() {
+        let record: CustomModelRecord = serde_json::from_value(serde_json::json!({
+            "key": "openai:api-test-model", "model": "advertised-api-test-model",
+        }))
+        .unwrap();
+        let model_override = record.to_override();
+        assert_eq!(model_override.use_responses_lite, None);
+        assert_eq!(model_override.experimental_supported_tools, None);
+        let public =
+            serde_json::to_value(override_to_public(&record.key, &model_override)).unwrap();
+        let table = record.to_toml_table();
+        for field in ["use_responses_lite", "experimental_supported_tools"] {
+            assert!(public.get(field).is_none());
+            assert!(!table.contains_key(field));
+        }
     }
 
     #[test]

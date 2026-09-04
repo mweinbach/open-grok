@@ -556,6 +556,9 @@ env_key = "OPENAI_API_KEY"
 
 ### OpenAI (Responses API)
 
+For GPT-6 Astra with async user messages, see
+[Async messages on the OpenAI API](26-codex-model-controls.md#async-messages-on-the-openai-api).
+
 If your provider supports the newer Responses API:
 
 ```toml

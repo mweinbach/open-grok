@@ -157,6 +157,22 @@ the same flags or supplying the Lite header in extra headers. Model switches
 re-evaluate tool exposure and rebuild the sampling route; subagent routes
 resolve their own model metadata and never expose async user messaging.
 
+Both fields are also accepted in `[model.<key>]` overrides and the
+`open-grok/custom-models/upsert` API, and are returned by the custom-model list
+API. An omitted field inherits catalog metadata; `use_responses_lite = false`
+disables Lite and `experimental_supported_tools = []` disables experimental
+tools. Explicit lists replace the inherited list. The resolved route must still
+be Codex Responses. API-key authentication does not disable the message tool
+and never selects or refreshes a Codex OAuth credential.
+
+Public OpenAI Responses routes should use `use_responses_lite = false` and
+declare `send_user_message_async` as an ordinary client function when enabled.
+The function completes as soon as the message is sent, returning its accepted
+result on the original call ID. This is independent of the Responses API's
+[`async: true` deferred tool-result protocol](https://developers.openai.com/api/docs/guides/async-tool-calling):
+Open Grok does not opt tools into that protocol based on this experimental tool
+name. Replies continue to arrive through the normal user-message path.
+
 The cache is `$OPENGROK_HOME/codex_models_cache.json` and is matched against the
 client version, endpoint, and non-secret Codex account identity. It is separate
 from xAI's `models_cache.json`, just as Codex credentials are separate from xAI
