@@ -23,6 +23,7 @@ pub const OPENCODE_GO_MODELS_DEV_URL: &str = "https://models.dev/api.json";
 pub const OPENCODE_GO_MODELS_DEV_URL_ENV: &str = "OPENGROK_OPENCODE_GO_MODELS_DEV_URL";
 pub const OPENCODE_GO_API_KEY_ENV: &str = "OPENCODE_API_KEY";
 const OPENCODE_GO_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const OPENCODE_GO_MODELS_DEV_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OpenCodeGoModelDescriptor {
@@ -177,7 +178,7 @@ impl OpenCodeGoModelsClient {
             .http
             .client()
             .get(&self.models_dev_url)
-            .timeout(OPENCODE_GO_MODELS_REQUEST_TIMEOUT)
+            .timeout(OPENCODE_GO_MODELS_DEV_REQUEST_TIMEOUT)
             .send();
         let (models_response, metadata_response) =
             tokio::try_join!(models_request, metadata_request)
@@ -202,14 +203,18 @@ impl OpenCodeGoModelsClient {
             .json()
             .await
             .context("OpenCode Go models response was invalid")?;
-        let metadata: IndexMap<String, ModelsDevProvider> = metadata_response
+        // Isolate to the `opencode-go` object. models.dev is a global catalog;
+        // sibling providers can carry schema the rest of this file does not
+        // model (null effort tokens, unexpected types) and must not fail
+        // OpenCode Go discovery.
+        let metadata: ModelsDevCatalog = metadata_response
             .json()
             .await
             .context("OpenCode Go models.dev response was invalid")?;
         let provider = metadata
-            .get("opencode-go")
+            .opencode_go
             .ok_or_else(|| anyhow!("models.dev did not contain the opencode-go provider"))?;
-        Ok(self.catalog_from_wire(available, provider, api_key))
+        Ok(self.catalog_from_wire(available, &provider, api_key))
     }
 
     fn catalog_from_wire(
@@ -328,6 +333,9 @@ fn reasoning_efforts_from_metadata(metadata: &ModelsDevModel) -> Vec<ReasoningEf
             continue;
         }
         for token in option.values.as_deref().unwrap_or(&[]) {
+            let Some(token) = token.as_deref() else {
+                continue;
+            };
             let Ok(effort) = token.parse::<ReasoningEffort>() else {
                 continue;
             };
@@ -379,6 +387,12 @@ struct OpenCodeGoWireModel {
 }
 
 #[derive(Debug, Deserialize)]
+struct ModelsDevCatalog {
+    #[serde(rename = "opencode-go", default)]
+    opencode_go: Option<ModelsDevProvider>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ModelsDevProvider {
     npm: String,
     #[serde(default)]
@@ -405,8 +419,10 @@ struct ModelsDevModel {
 struct ModelsDevReasoningOption {
     #[serde(default, rename = "type")]
     option_type: Option<String>,
+    /// models.dev has used `null` entries in effort lists (a sibling-provider
+    /// shape that previously failed the whole catalog parse). Skip them.
     #[serde(default)]
-    values: Option<Vec<String>>,
+    values: Option<Vec<Option<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,7 +594,12 @@ mod tests {
     fn effort_option(option_type: &str, values: &[&str]) -> ModelsDevReasoningOption {
         ModelsDevReasoningOption {
             option_type: Some(option_type.to_owned()),
-            values: Some(values.iter().map(|value| (*value).to_owned()).collect()),
+            values: Some(
+                values
+                    .iter()
+                    .map(|value| Some((*value).to_owned()))
+                    .collect(),
+            ),
         }
     }
 
@@ -639,7 +660,7 @@ mod tests {
                 Some(true),
                 Some(vec![ModelsDevReasoningOption {
                     option_type: None,
-                    values: Some(vec!["high".to_owned()]),
+                    values: Some(vec![Some("high".to_owned())]),
                 }]),
             ),
             models_dev_model(Some(false), Some(vec![effort_option("effort", &["high"])])),
@@ -693,6 +714,61 @@ mod tests {
         }))
         .expect("toggle-only models.dev shape");
         assert!(reasoning_efforts_from_metadata(&toggle_only).is_empty());
+
+        let null_tokens: ModelsDevModel = serde_json::from_value(serde_json::json!({
+            "reasoning": true,
+            "reasoning_options": [{"type": "effort", "values": [null, "low", "medium", "high"]}]
+        }))
+        .expect("models.dev null effort tokens");
+        assert_eq!(
+            effort_values(&reasoning_efforts_from_metadata(&null_tokens)),
+            vec![
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High
+            ]
+        );
+    }
+
+    #[test]
+    fn models_dev_catalog_ignores_sibling_provider_schema_drift() {
+        let json = serde_json::json!({
+            "sarvam": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "sarvam-105b": {
+                        "reasoning": true,
+                        "reasoning_options": [{
+                            "type": "effort",
+                            "values": [null, "low", "medium", "high"]
+                        }]
+                    }
+                }
+            },
+            "opencode-go": {
+                "npm": "@ai-sdk/openai-compatible",
+                "models": {
+                    "glm-5.2": {
+                        "name": "GLM-5.2",
+                        "reasoning": true,
+                        "reasoning_options": [{"type": "effort", "values": ["high", "max"]}]
+                    }
+                }
+            }
+        });
+        let catalog: ModelsDevCatalog =
+            serde_json::from_value(json).expect("sibling drift must not fail opencode-go parse");
+        let provider = catalog
+            .opencode_go
+            .expect("opencode-go provider")
+            .models
+            .shift_remove("glm-5.2")
+            .expect("glm-5.2");
+        assert_eq!(provider.name.as_deref(), Some("GLM-5.2"));
+        assert_eq!(
+            effort_values(&reasoning_efforts_from_metadata(&provider)),
+            vec![ReasoningEffort::High, ReasoningEffort::Max]
+        );
     }
 
     #[test]
