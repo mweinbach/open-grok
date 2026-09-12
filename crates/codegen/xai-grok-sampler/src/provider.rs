@@ -902,6 +902,7 @@ pub fn provider_adapter(provider: ModelProvider) -> &'static dyn ProviderAdapter
 
 fn patch_codex_responses_request(request_body: &mut Value, policy: ResponsesRequestPolicy) {
     patch_codex_agent_message_ids(request_body);
+    patch_codex_input_item_ids(request_body);
     patch_codex_instruction_roles(request_body);
 
     if let Some(permissions) = policy.codex_permissions.as_ref() {
@@ -1122,6 +1123,27 @@ fn patch_codex_agent_message_ids(request_body: &mut Value) {
         {
             item["id"] = Value::String(format!("amsg_{id}"));
         }
+    }
+}
+
+fn patch_codex_input_item_ids(request_body: &mut Value) {
+    const MAX_ID_LEN: usize = 64;
+    let Some(input) = request_body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        let Some(id) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let valid = !id.is_empty()
+            && id.len() <= MAX_ID_LEN
+            && id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if valid {
+            continue;
+        }
+        item["id"] = Value::String(format!("cid_{}", uuid::Uuid::new_v4()));
     }
 }
 
@@ -1802,6 +1824,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn codex_repairs_empty_and_oversized_input_item_ids() {
+        let long = "x".repeat(85);
+        let valid_max = "y".repeat(64);
+        let too_long = "z".repeat(65);
+        let input = serde_json::json!([
+            {"type": "reasoning", "id": "", "summary": [{"type": "summary_text", "text": "s"}]},
+            {"type": "reasoning", "id": long, "summary": [{"type": "summary_text", "text": "s"}]},
+            {"type": "reasoning", "id": "has space!", "summary": [{"type": "summary_text", "text": "s"}]},
+            {"type": "reasoning", "id": valid_max, "summary": [{"type": "summary_text", "text": "s"}]},
+            {"type": "reasoning", "id": too_long, "summary": [{"type": "summary_text", "text": "s"}]},
+            {"type": "agent_message", "id": "amsg_00000000-0000-7000-8000-000000000001",
+             "author": "/root", "recipient": "/root/worker",
+             "content": [{"type": "encrypted_content", "encrypted_content": "opaque"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ]);
+        let mut request = serde_json::json!({"input": input});
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut request, Default::default());
+        let patched = request["input"].as_array().unwrap();
+        for idx in 0..3 {
+            let id = patched[idx]["id"].as_str().unwrap();
+            assert!(
+                id.starts_with("cid_"),
+                "idx {idx} missing cid_ prefix: {id:?}"
+            );
+            assert!(
+                !id.is_empty() && id.len() <= 64,
+                "idx {idx} got invalid id {id:?}"
+            );
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            );
+        }
+        assert_eq!(patched[3]["id"], valid_max, "64-char valid id must be kept");
+        assert!(
+            patched[4]["id"].as_str().unwrap().starts_with("cid_"),
+            "65-char id must be repaired"
+        );
+        assert_eq!(
+            patched[5]["id"],
+            "amsg_00000000-0000-7000-8000-000000000001"
+        );
+        assert!(patched[6].get("id").is_none());
+        let prepared = request.clone();
+        provider_adapter(ModelProvider::Codex)
+            .patch_responses_request(&mut request, Default::default());
+        assert_eq!(
+            request, prepared,
+            "retry preparation must preserve stable IDs"
+        );
     }
 
     #[test]
