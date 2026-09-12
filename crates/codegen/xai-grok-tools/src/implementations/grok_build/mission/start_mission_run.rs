@@ -14,13 +14,19 @@ pub const START_MISSION_RUN_TOOL_NAME: &str = "start_mission_run";
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StartMissionRunInput {
-    #[schemars(description = "Mission ID or directory name to run. Defaults to active mission or latest in current workspace.")]
+    #[schemars(
+        description = "Mission ID or directory name to run. Defaults to active mission or latest in current workspace."
+    )]
     pub mission_id: Option<String>,
 
-    #[schemars(description = "Worker session ID to resume if resuming a paused worker mid-session")]
+    #[schemars(
+        description = "Worker session ID to resume if resuming a paused worker mid-session"
+    )]
     pub resume_worker_session_id: Option<String>,
 
-    #[schemars(description = "If true, discard paused worker context and restart the in-progress feature from scratch")]
+    #[schemars(
+        description = "If true, discard paused worker context and restart the in-progress feature from scratch"
+    )]
     pub restart_feature: Option<bool>,
 
     #[schemars(description = "Direct message or instructions to pass into the worker session")]
@@ -92,8 +98,9 @@ impl xai_tool_runtime::Tool for StartMissionRunTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         input: StartMissionRunInput,
     ) -> Result<StartMissionRunOutput, xai_tool_runtime::ToolError> {
-        let mission_dir = resolve_mission_dir(input.mission_id.as_deref())
-            .ok_or_else(|| xai_tool_runtime::ToolError::invalid_arguments("No matching mission found to run"))?;
+        let mission_dir = resolve_mission_dir(input.mission_id.as_deref()).ok_or_else(|| {
+            xai_tool_runtime::ToolError::invalid_arguments("No matching mission found to run")
+        })?;
 
         let mut runner = MissionRunner::new(&mission_dir);
         if let Err(e) = runner.prepare_run() {
@@ -119,7 +126,10 @@ impl xai_tool_runtime::Tool for StartMissionRunTool {
                 ..
             }) => {
                 if let Some(msg) = input.message_to_worker {
-                    worker_prompt = format!("## Direct Orchestrator Instructions:\n{}\n\n{}", msg, worker_prompt);
+                    worker_prompt = format!(
+                        "## Direct Orchestrator Instructions:\n{}\n\n{}",
+                        msg, worker_prompt
+                    );
                 }
                 Ok(StartMissionRunOutput {
                     success: true,
@@ -127,7 +137,10 @@ impl xai_tool_runtime::Tool for StartMissionRunTool {
                     active_feature_id: Some(feature.id.clone()),
                     skill_name: Some(skill_name),
                     worker_prompt: Some(worker_prompt),
-                    message: format!("Worker ready for feature '{}'. Proceeding with worker execution.", feature.id),
+                    message: format!(
+                        "Worker ready for feature '{}'. Proceeding with worker execution.",
+                        feature.id
+                    ),
                 })
             }
             Ok(MissionRunStepResult::Completed) => Ok(StartMissionRunOutput {
@@ -136,21 +149,23 @@ impl xai_tool_runtime::Tool for StartMissionRunTool {
                 active_feature_id: None,
                 skill_name: None,
                 worker_prompt: None,
-                message: "All mission features and validation gates have completed successfully!".to_string(),
+                message: "All mission features and validation gates have completed successfully!"
+                    .to_string(),
             }),
-            Ok(MissionRunStepResult::ScopeReviewRequired { initial_count, current_count }) => {
-                Ok(StartMissionRunOutput {
-                    success: false,
-                    status: "scope_review_required".to_string(),
-                    active_feature_id: None,
-                    skill_name: None,
-                    worker_prompt: None,
-                    message: format!(
-                        "MISSION SCOPE REVIEW REQUIRED: Mission started with {} features and now has {}. Review features.json before continuing.",
-                        initial_count, current_count
-                    ),
-                })
-            }
+            Ok(MissionRunStepResult::ScopeReviewRequired {
+                initial_count,
+                current_count,
+            }) => Ok(StartMissionRunOutput {
+                success: false,
+                status: "scope_review_required".to_string(),
+                active_feature_id: None,
+                skill_name: None,
+                worker_prompt: None,
+                message: format!(
+                    "MISSION SCOPE REVIEW REQUIRED: Mission started with {} features and now has {}. Review features.json before continuing.",
+                    initial_count, current_count
+                ),
+            }),
             Ok(MissionRunStepResult::OrchestratorTurn { reason, feature_id }) => {
                 Ok(StartMissionRunOutput {
                     success: false,
@@ -195,5 +210,7 @@ pub(crate) fn resolve_mission_dir(query: Option<&str>) -> Option<PathBuf> {
         }
     }
     // Fall back to most recent mission globally
-    crate::mission::discover_all_missions().first().map(|m| m.dir.clone())
+    crate::mission::discover_all_missions()
+        .first()
+        .map(|m| m.dir.clone())
 }

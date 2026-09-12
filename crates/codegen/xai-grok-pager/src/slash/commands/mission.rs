@@ -7,8 +7,8 @@ use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, Slas
 use std::fs;
 use std::path::Path;
 use xai_grok_tools::mission::{
-    MissionFileService, MissionSource, discover_all_missions,
-    discover_missions_for_workspace, find_mission, opengrok_missions_dir,
+    MissionFileService, MissionSource, discover_all_missions, discover_missions_for_workspace,
+    find_mission, opengrok_missions_dir,
 };
 
 /// Slash command `/mission`
@@ -37,7 +37,10 @@ impl SlashCommand for MissionCommand {
                 ("status", "Show detailed status and progress of a mission"),
                 ("continue", "Resume autonomous execution of a mission"),
                 ("new", "Propose and plan a new mission for this workspace"),
-                ("import", "Import an existing Factory Droid mission into Open Grok"),
+                (
+                    "import",
+                    "Import an existing Factory Droid mission into Open Grok",
+                ),
                 ("pause", "Pause the currently running autonomous mission"),
             ];
             let q = parts.first().copied().unwrap_or("");
@@ -55,7 +58,9 @@ impl SlashCommand for MissionCommand {
         }
 
         let op = parts[0].to_lowercase();
-        if (op == "continue" || op == "status" || op == "import") && (parts.len() == 1 || (parts.len() == 2 && !trimmed.ends_with(' '))) {
+        if (op == "continue" || op == "status" || op == "import")
+            && (parts.len() == 1 || (parts.len() == 2 && !trimmed.ends_with(' ')))
+        {
             let id_query = parts.get(1).copied().unwrap_or("");
             let all = discover_all_missions();
             return Some(
@@ -67,13 +72,19 @@ impl SlashCommand for MissionCommand {
                             true
                         }
                     })
-                    .filter(|m| m.id.to_lowercase().starts_with(&id_query.to_lowercase()) || m.title.to_lowercase().contains(&id_query.to_lowercase()))
+                    .filter(|m| {
+                        m.id.to_lowercase().starts_with(&id_query.to_lowercase())
+                            || m.title.to_lowercase().contains(&id_query.to_lowercase())
+                    })
                     .take(20)
                     .map(|m| ArgItem {
                         display: format!("{} ({})", m.title, &m.id[..8.min(m.id.len())]),
                         match_text: m.id.clone(),
                         insert_text: format!("{} {} ", op, m.id),
-                        description: format!("[{}] {}/{} done ({})", m.source, m.completed_features, m.total_features, m.state),
+                        description: format!(
+                            "[{}] {}/{} done ({})",
+                            m.source, m.completed_features, m.total_features, m.state
+                        ),
                     })
                     .collect(),
             );
@@ -132,11 +143,7 @@ fn handle_list() -> CommandResult {
     out.push_str("| --- | --- | --- | --- | --- | --- |\n");
 
     for m in missions {
-        let short_id = if m.id.len() > 8 {
-            &m.id[..8]
-        } else {
-            &m.id
-        };
+        let short_id = if m.id.len() > 8 { &m.id[..8] } else { &m.id };
         let src_label = match m.source {
             MissionSource::OpenGrok => "Open Grok",
             MissionSource::FactoryDroid => "Droid",
@@ -210,7 +217,10 @@ fn handle_status(target: &str) -> CommandResult {
                 ));
             }
             if ff.features.len() > 10 {
-                out.push_str(&format!("\n*...and {} more features*\n", ff.features.len() - 10));
+                out.push_str(&format!(
+                    "\n*...and {} more features*\n",
+                    ff.features.len() - 10
+                ));
             }
         }
     }
@@ -237,7 +247,9 @@ fn handle_continue(target: &str) -> CommandResult {
 
     let prompt = format!(
         "Continue execution of the mission \"{}\" (id: {}, directory: {}). Call the `start_mission_run` tool to advance the next pending feature.",
-        m.title, m.id, m.dir.display()
+        m.title,
+        m.id,
+        m.dir.display()
     );
 
     CommandResult::QueueCommand(prompt)
@@ -268,7 +280,8 @@ fn handle_pause() -> CommandResult {
 fn handle_import(target: &str) -> CommandResult {
     if target.is_empty() {
         return CommandResult::Error(
-            "Please specify the Factory Droid mission ID to import: `/mission import <id>`".to_string(),
+            "Please specify the Factory Droid mission ID to import: `/mission import <id>`"
+                .to_string(),
         );
     }
 

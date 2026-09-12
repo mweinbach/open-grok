@@ -5913,9 +5913,9 @@ impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationItem
                         content.push_str(&text);
                     }
                     if let Some(fc) = part.function_call {
-                        let id = fc.id.unwrap_or_else(|| {
-                            format!("call_{}_{}", tool_calls.len(), fc.name)
-                        });
+                        let id = fc
+                            .id
+                            .unwrap_or_else(|| format!("call_{}_{}", tool_calls.len(), fc.name));
                         tool_calls.push(ToolCall {
                             id: Arc::<str>::from(id),
                             name: fc.name,
@@ -5979,9 +5979,9 @@ impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationResp
                         content.push_str(&text);
                     }
                     if let Some(fc) = part.function_call {
-                        let id = fc.id.unwrap_or_else(|| {
-                            format!("call_{}_{}", tool_calls.len(), fc.name)
-                        });
+                        let id = fc
+                            .id
+                            .unwrap_or_else(|| format!("call_{}_{}", tool_calls.len(), fc.name));
                         tool_calls.push(ToolCall {
                             id: Arc::<str>::from(id),
                             name: fc.name,
@@ -6023,8 +6023,8 @@ impl From<crate::google_ai_studio::GenerateContentResponse> for ConversationResp
 mod google_ai_studio_tests {
     use super::*;
     use crate::google_ai_studio::{
-        Candidate, Content, FinishReason, FunctionCallingMode, GenerateContentResponse,
-        Part, UsageMetadata,
+        Candidate, Content, FinishReason, FunctionCallingMode, GenerateContentResponse, Part,
+        UsageMetadata,
     };
     use crate::{
         ConversationRequest, ConversationToolChoice, ReasoningEffort, StopReason, ToolSpec,
@@ -6084,18 +6084,22 @@ mod google_ai_studio_tests {
 
         assert_eq!(mapped.contents[1].role, Some("model".to_string()));
         assert_eq!(mapped.contents[1].parts.len(), 2);
+        assert_eq!(mapped.contents[1].parts[0], Part::text("Calling a tool"));
         assert_eq!(
-            mapped.contents[1].parts[0],
-            Part::text("Calling a tool")
-        );
-        assert_eq!(
-            mapped.contents[1].parts[1].function_call.as_ref().unwrap().name,
+            mapped.contents[1].parts[1]
+                .function_call
+                .as_ref()
+                .unwrap()
+                .name,
             "bash"
         );
 
         assert_eq!(mapped.contents[2].role, Some("user".to_string()));
         assert_eq!(mapped.contents[2].parts.len(), 1);
-        let fn_resp = mapped.contents[2].parts[0].function_response.as_ref().unwrap();
+        let fn_resp = mapped.contents[2].parts[0]
+            .function_response
+            .as_ref()
+            .unwrap();
         assert_eq!(fn_resp.name, "bash");
         assert_eq!(fn_resp.response, serde_json::json!({ "stdout": "hi" }));
 

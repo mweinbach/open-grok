@@ -18,13 +18,17 @@ pub struct ProposeMissionInput {
     #[schemars(description = "Concise title of the mission")]
     pub title: String,
 
-    #[schemars(description = "Detailed markdown overview, goals, architectural principles, and milestones")]
+    #[schemars(
+        description = "Detailed markdown overview, goals, architectural principles, and milestones"
+    )]
     pub overview: String,
 
     #[schemars(description = "Target project working directory (defaults to current workspace)")]
     pub working_directory: Option<String>,
 
-    #[schemars(description = "Optional existing mission directory ID if updating an existing proposal")]
+    #[schemars(
+        description = "Optional existing mission directory ID if updating an existing proposal"
+    )]
     pub mission_id: Option<String>,
 }
 
@@ -92,10 +96,15 @@ impl xai_tool_runtime::Tool for ProposeMissionTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         input: ProposeMissionInput,
     ) -> Result<ProposeMissionOutput, xai_tool_runtime::ToolError> {
-        let wd = input.working_directory
-            .unwrap_or_else(|| std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".to_string()));
+        let wd = input.working_directory.unwrap_or_else(|| {
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string())
+        });
 
-        let id = input.mission_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = input
+            .mission_id
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mission_dir = crate::mission::opengrok_missions_dir().join(&id);
 
         let service = MissionFileService::new(&mission_dir);
@@ -123,7 +132,9 @@ impl xai_tool_runtime::Tool for ProposeMissionTool {
         let _ = service.write_mission_md(&input.title, &input.overview);
 
         if !service.features_path().exists() {
-            let _ = service.write_features(&FeaturesFile { features: Vec::new() });
+            let _ = service.write_features(&FeaturesFile {
+                features: Vec::new(),
+            });
         }
 
         let _ = service.append_progress_log(&ProgressLogEntry::MissionAccepted {
@@ -135,7 +146,11 @@ impl xai_tool_runtime::Tool for ProposeMissionTool {
             success: true,
             mission_id: id,
             mission_dir: mission_dir.display().to_string(),
-            message: format!("Mission \"{}\" initialized successfully at {}", input.title, mission_dir.display()),
+            message: format!(
+                "Mission \"{}\" initialized successfully at {}",
+                input.title,
+                mission_dir.display()
+            ),
         })
     }
 }

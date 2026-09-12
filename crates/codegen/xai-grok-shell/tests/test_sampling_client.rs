@@ -1386,7 +1386,10 @@ async fn test_responses_backend_hits_responses_endpoint_not_chat_completions() {
             while stream.next().await.is_some() {}
         }
         ApiBackend::ChatCompletions | ApiBackend::Messages | ApiBackend::GoogleAiStudio => {
-            panic!("Expected Responses backend but got {:?}", client.api_backend());
+            panic!(
+                "Expected Responses backend but got {:?}",
+                client.api_backend()
+            );
         }
     }
 
@@ -1421,7 +1424,10 @@ async fn test_chat_completions_backend_hits_chat_endpoint_not_responses() {
             while stream.next().await.is_some() {}
         }
         ApiBackend::Responses | ApiBackend::Messages | ApiBackend::GoogleAiStudio => {
-            panic!("Expected ChatCompletions backend but got {:?}", client.api_backend());
+            panic!(
+                "Expected ChatCompletions backend but got {:?}",
+                client.api_backend()
+            );
         }
     }
 

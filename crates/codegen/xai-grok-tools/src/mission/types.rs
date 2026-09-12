@@ -322,7 +322,11 @@ pub enum ProgressLogEntry {
     },
     WorkerFailed {
         timestamp: String,
-        #[serde(rename = "workerSessionId", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "workerSessionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         worker_session_id: Option<String>,
         #[serde(rename = "featureId", default, skip_serializing_if = "Option::is_none")]
         feature_id: Option<String>,
@@ -330,7 +334,11 @@ pub enum ProgressLogEntry {
     },
     MissionPaused {
         timestamp: String,
-        #[serde(rename = "pauseReason", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "pauseReason",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         pause_reason: Option<String>,
     },
     MissionResumed {
@@ -386,7 +394,12 @@ mod tests {
         assert_eq!(parsed.mission_id, "mis_24348f5c");
         assert_eq!(parsed.state, MissionState::Paused);
         assert_eq!(parsed.initial_feature_count, Some(111));
-        assert_eq!(parsed.feature_retry_budget_bonus.get("startup-server-fixture-restart-settlement"), Some(&5));
+        assert_eq!(
+            parsed
+                .feature_retry_budget_bonus
+                .get("startup-server-fixture-restart-settlement"),
+            Some(&5)
+        );
 
         let reserialized = serde_json::to_string_pretty(&parsed).expect("reserialize");
         let parsed_again: MissionStateFile = serde_json::from_str(&reserialized).expect("reparse");
@@ -409,7 +422,10 @@ mod tests {
                 assert_eq!(feature_id, "startup-baseline-repair");
                 assert_eq!(success_state, WorkerSuccessState::Success);
                 assert!(!return_to_orchestrator);
-                assert_eq!(handoff.salient_summary, "Committed the complete baseline repair");
+                assert_eq!(
+                    handoff.salient_summary,
+                    "Committed the complete baseline repair"
+                );
                 assert_eq!(handoff.verification.commands_run.len(), 1);
             }
             _ => panic!("Expected WorkerCompleted entry"),

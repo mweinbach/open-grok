@@ -65,11 +65,10 @@ pub use kill_task::{KillTaskTool, KillTerminalCommandTool};
 pub use list_dir::ListDirTool;
 pub use lsp::LspTool;
 pub use mission::{
-    DISMISS_HANDOFF_ITEMS_TOOL_NAME, DismissHandoffItemsTool,
-    END_FEATURE_RUN_TOOL_NAME, EndFeatureRunTool,
-    INSPECT_MISSION_READINESS_TOOL_NAME, InspectMissionReadinessTool,
-    PROPOSE_MISSION_TOOL_NAME, ProposeMissionTool,
-    START_MISSION_RUN_TOOL_NAME, StartMissionRunTool,
+    DISMISS_HANDOFF_ITEMS_TOOL_NAME, DismissHandoffItemsTool, END_FEATURE_RUN_TOOL_NAME,
+    EndFeatureRunTool, INSPECT_MISSION_READINESS_TOOL_NAME, InspectMissionReadinessTool,
+    PROPOSE_MISSION_TOOL_NAME, ProposeMissionTool, START_MISSION_RUN_TOOL_NAME,
+    StartMissionRunTool,
 };
 pub use monitor::tool::MonitorTool;
 pub use read_file::ReadFileTool;

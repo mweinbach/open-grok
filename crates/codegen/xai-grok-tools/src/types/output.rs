@@ -665,7 +665,9 @@ pub enum ToolOutput {
     ProposeMission(crate::implementations::grok_build::mission::ProposeMissionOutput),
     StartMissionRun(crate::implementations::grok_build::mission::StartMissionRunOutput),
     DismissHandoffItems(crate::implementations::grok_build::mission::DismissHandoffItemsOutput),
-    InspectMissionReadiness(crate::implementations::grok_build::mission::InspectMissionReadinessOutput),
+    InspectMissionReadiness(
+        crate::implementations::grok_build::mission::InspectMissionReadinessOutput,
+    ),
     EndFeatureRun(crate::implementations::grok_build::mission::EndFeatureRunOutput),
     #[serde(alias = "SendAgentMessage")]
     SendSubagentMessage(
@@ -1088,8 +1090,12 @@ impl ToolOutput {
             ToolOutput::Workflow(o) => o.message.clone(),
             ToolOutput::ProposeMission(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::StartMissionRun(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
-            ToolOutput::DismissHandoffItems(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
-            ToolOutput::InspectMissionReadiness(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
+            ToolOutput::DismissHandoffItems(o) => {
+                serde_json::to_string_pretty(o).unwrap_or_default()
+            }
+            ToolOutput::InspectMissionReadiness(o) => {
+                serde_json::to_string_pretty(o).unwrap_or_default()
+            }
             ToolOutput::EndFeatureRun(o) => serde_json::to_string_pretty(o).unwrap_or_default(),
             ToolOutput::SendSubagentMessage(output) => output.to_string(),
             ToolOutput::ListAgents(o) => serde_json::to_string_pretty(o).unwrap_or_default(),

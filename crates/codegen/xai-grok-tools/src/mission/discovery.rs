@@ -97,7 +97,9 @@ pub fn discover_all_missions() -> Vec<MissionSummary> {
 
 /// Discover missions matching a specific working directory workspace.
 pub fn discover_missions_for_workspace(workspace_root: &Path) -> Vec<MissionSummary> {
-    let canonical_ws = workspace_root.canonicalize().unwrap_or_else(|_| workspace_root.to_path_buf());
+    let canonical_ws = workspace_root
+        .canonicalize()
+        .unwrap_or_else(|_| workspace_root.to_path_buf());
     discover_all_missions()
         .into_iter()
         .filter(|m| {
@@ -123,14 +125,20 @@ pub fn find_mission(query: &str) -> Option<MissionSummary> {
     }
 
     // 2. Exact match on internal mission_id
-    if let Some(m) = all.iter().find(|m| m.mission_id.as_deref().map(str::to_lowercase) == Some(q.clone())) {
+    if let Some(m) = all
+        .iter()
+        .find(|m| m.mission_id.as_deref().map(str::to_lowercase) == Some(q.clone()))
+    {
         return Some(m.clone());
     }
 
     // 3. Prefix match on directory ID or mission_id
     if let Some(m) = all.iter().find(|m| {
         m.id.to_lowercase().starts_with(&q)
-            || m.mission_id.as_deref().map(|id| id.to_lowercase().starts_with(&q)).unwrap_or(false)
+            || m.mission_id
+                .as_deref()
+                .map(|id| id.to_lowercase().starts_with(&q))
+                .unwrap_or(false)
     }) {
         return Some(m.clone());
     }
@@ -168,7 +176,11 @@ fn scan_missions_in_dir(parent_dir: &Path, source: MissionSource, out: &mut Vec<
         let state_file = svc.read_state().ok();
         let title = svc
             .read_mission_title()
-            .or_else(|| state_file.as_ref().and_then(|s| (!s.mission_id.is_empty()).then(|| s.mission_id.clone())))
+            .or_else(|| {
+                state_file
+                    .as_ref()
+                    .and_then(|s| (!s.mission_id.is_empty()).then(|| s.mission_id.clone()))
+            })
             .unwrap_or_else(|| id.clone());
 
         let working_dir = svc
@@ -176,20 +188,36 @@ fn scan_missions_in_dir(parent_dir: &Path, source: MissionSource, out: &mut Vec<
             .ok()
             .or_else(|| state_file.as_ref().map(|s| s.working_directory.clone()));
 
-        let state = state_file.as_ref().map(|s| s.state).unwrap_or(MissionState::AwaitingInput);
+        let state = state_file
+            .as_ref()
+            .map(|s| s.state)
+            .unwrap_or(MissionState::AwaitingInput);
         let created_at = state_file.as_ref().map(|s| s.created_at.clone());
         let updated_at = state_file.as_ref().map(|s| s.updated_at.clone());
         let mission_id = state_file.as_ref().map(|s| s.mission_id.clone());
 
-        let (total, completed, in_progress, pending) = if let Ok(features_file) = svc.read_features() {
-            let total = features_file.features.len();
-            let completed = features_file.features.iter().filter(|f| f.status == FeatureStatus::Completed).count();
-            let in_prog = features_file.features.iter().filter(|f| f.status == FeatureStatus::InProgress).count();
-            let pend = features_file.features.iter().filter(|f| f.status == FeatureStatus::Pending).count();
-            (total, completed, in_prog, pend)
-        } else {
-            (0, 0, 0, 0)
-        };
+        let (total, completed, in_progress, pending) =
+            if let Ok(features_file) = svc.read_features() {
+                let total = features_file.features.len();
+                let completed = features_file
+                    .features
+                    .iter()
+                    .filter(|f| f.status == FeatureStatus::Completed)
+                    .count();
+                let in_prog = features_file
+                    .features
+                    .iter()
+                    .filter(|f| f.status == FeatureStatus::InProgress)
+                    .count();
+                let pend = features_file
+                    .features
+                    .iter()
+                    .filter(|f| f.status == FeatureStatus::Pending)
+                    .count();
+                (total, completed, in_prog, pend)
+            } else {
+                (0, 0, 0, 0)
+            };
 
         out.push(MissionSummary {
             id,
@@ -220,14 +248,20 @@ mod tests {
                 let mut summaries = Vec::new();
                 scan_missions_in_dir(&droid_dir, MissionSource::FactoryDroid, &mut summaries);
                 // On this machine, ~/.factory/missions has at least 1 mission
-                assert!(!summaries.is_empty(), "Should discover existing Factory Droid missions");
+                assert!(
+                    !summaries.is_empty(),
+                    "Should discover existing Factory Droid missions"
+                );
                 for s in &summaries {
                     assert_eq!(s.source, MissionSource::FactoryDroid);
                     assert!(!s.id.is_empty());
                     if s.id == "6542d338-44c1-43e7-98e7-746950896862" {
                         assert_eq!(s.total_features, 116);
                         assert_eq!(s.state, MissionState::Paused);
-                        assert_eq!(s.working_directory.as_deref(), Some("/Users/mweinbach/Projects/agent-coworker"));
+                        assert_eq!(
+                            s.working_directory.as_deref(),
+                            Some("/Users/mweinbach/Projects/agent-coworker")
+                        );
                     }
                 }
             }

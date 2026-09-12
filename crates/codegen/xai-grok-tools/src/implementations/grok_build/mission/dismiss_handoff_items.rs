@@ -24,7 +24,9 @@ pub struct DismissItemInput {
     #[schemars(description = "Short summary of the item being dismissed")]
     pub summary: String,
 
-    #[schemars(description = "Technical justification explaining why this item is safe to dismiss or out of scope")]
+    #[schemars(
+        description = "Technical justification explaining why this item is safe to dismiss or out of scope"
+    )]
     pub justification: String,
 }
 
@@ -100,10 +102,13 @@ impl xai_tool_runtime::Tool for DismissHandoffItemsTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         input: DismissHandoffItemsInput,
     ) -> Result<DismissHandoffItemsOutput, xai_tool_runtime::ToolError> {
-        let mission_dir = crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
-            input.mission_id.as_deref(),
-        )
-        .ok_or_else(|| xai_tool_runtime::ToolError::invalid_arguments("No matching mission found"))?;
+        let mission_dir =
+            crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
+                input.mission_id.as_deref(),
+            )
+            .ok_or_else(|| {
+                xai_tool_runtime::ToolError::invalid_arguments("No matching mission found")
+            })?;
 
         let service = MissionFileService::new(&mission_dir);
         let dismissals: Vec<HandoffDismissal> = input
@@ -123,9 +128,12 @@ impl xai_tool_runtime::Tool for DismissHandoffItemsTool {
             dismissals,
         };
 
-        service
-            .append_progress_log(&entry)
-            .map_err(|e| xai_tool_runtime::ToolError::execution(self.id(), format!("Failed to record dismissals: {e}")))?;
+        service.append_progress_log(&entry).map_err(|e| {
+            xai_tool_runtime::ToolError::execution(
+                self.id(),
+                format!("Failed to record dismissals: {e}"),
+            )
+        })?;
 
         Ok(DismissHandoffItemsOutput {
             success: true,

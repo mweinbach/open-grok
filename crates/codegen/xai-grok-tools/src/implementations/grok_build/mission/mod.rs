@@ -27,8 +27,8 @@ pub use start_mission_run::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mission::types::{Feature, FeatureStatus, FeaturesFile, WorkerHandoff};
     use crate::mission::storage::MissionFileService;
+    use crate::mission::types::{Feature, FeatureStatus, FeaturesFile, WorkerHandoff};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -53,8 +53,12 @@ mod tests {
             feature_retry_budget_bonus: Default::default(),
         };
         service.write_state(&state).unwrap();
-        service.write_working_directory(&tmp.path().display().to_string()).unwrap();
-        service.write_mission_md("Test Mission", "Overview and objectives").unwrap();
+        service
+            .write_working_directory(&tmp.path().display().to_string())
+            .unwrap();
+        service
+            .write_mission_md("Test Mission", "Overview and objectives")
+            .unwrap();
 
         let f1 = Feature {
             id: "feature-alpha".to_string(),
@@ -69,14 +73,18 @@ mod tests {
             current_worker_session_id: None,
             completed_worker_session_id: None,
         };
-        service.write_features(&FeaturesFile { features: vec![f1] }).unwrap();
+        service
+            .write_features(&FeaturesFile { features: vec![f1] })
+            .unwrap();
 
         // 1. Test InspectMissionReadiness
         let inspect_tool = InspectMissionReadinessTool;
         let inspect_input = InspectMissionReadinessInput {
             mission_id: Some(mission_dir.display().to_string()),
         };
-        let ctx = xai_tool_runtime::ToolCallContext::new(xai_tool_protocol::ToolCallId::new("call-1").unwrap());
+        let ctx = xai_tool_runtime::ToolCallContext::new(
+            xai_tool_protocol::ToolCallId::new("call-1").unwrap(),
+        );
         use xai_tool_runtime::Tool;
         let readiness = inspect_tool.run(ctx.clone(), inspect_input).await.unwrap();
         assert!(readiness.ready);
@@ -93,7 +101,10 @@ mod tests {
         let run_output = start_tool.run(ctx.clone(), start_input).await.unwrap();
         assert!(run_output.success);
         assert_eq!(run_output.status, "worker_ready");
-        assert_eq!(run_output.active_feature_id, Some("feature-alpha".to_string()));
+        assert_eq!(
+            run_output.active_feature_id,
+            Some("feature-alpha".to_string())
+        );
         let prompt = run_output.worker_prompt.unwrap();
         assert!(prompt.contains("Be careful with invariants"));
         assert!(prompt.contains("feature-alpha"));

@@ -21,16 +21,22 @@ pub struct EndFeatureRunInput {
     #[schemars(description = "Outcome of the feature run: 'success', 'failure', or 'partial'")]
     pub success_state: String,
 
-    #[schemars(description = "True if orchestrator review is required (e.g. blockers, ambiguity, or incomplete work)")]
+    #[schemars(
+        description = "True if orchestrator review is required (e.g. blockers, ambiguity, or incomplete work)"
+    )]
     pub return_to_orchestrator: Option<bool>,
 
-    #[schemars(description = "Git commit SHA or stash identifier where changes were saved, if applicable")]
+    #[schemars(
+        description = "Git commit SHA or stash identifier where changes were saved, if applicable"
+    )]
     pub commit_id: Option<String>,
 
     #[schemars(description = "Exit code of primary verification command")]
     pub exit_code: Option<i32>,
 
-    #[schemars(description = "Structured handoff documenting changes, verification evidence, tests, and discovered issues")]
+    #[schemars(
+        description = "Structured handoff documenting changes, verification evidence, tests, and discovered issues"
+    )]
     pub handoff: WorkerHandoff,
 
     #[schemars(description = "Optional mission ID or directory")]
@@ -99,10 +105,13 @@ impl xai_tool_runtime::Tool for EndFeatureRunTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         input: EndFeatureRunInput,
     ) -> Result<EndFeatureRunOutput, xai_tool_runtime::ToolError> {
-        let mission_dir = crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
-            input.mission_id.as_deref(),
-        )
-        .ok_or_else(|| xai_tool_runtime::ToolError::invalid_arguments("No active mission directory found"))?;
+        let mission_dir =
+            crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
+                input.mission_id.as_deref(),
+            )
+            .ok_or_else(|| {
+                xai_tool_runtime::ToolError::invalid_arguments("No active mission directory found")
+            })?;
 
         let mut runner = MissionRunner::new(&mission_dir);
         let worker_session_id = uuid::Uuid::new_v4().to_string();
@@ -113,20 +122,30 @@ impl xai_tool_runtime::Tool for EndFeatureRunTool {
             _ => WorkerSuccessState::Failure,
         };
 
-        let result = runner.handle_worker_completion(
-            &worker_session_id,
-            &input.feature_id,
-            state_enum,
-            input.return_to_orchestrator.unwrap_or(false),
-            input.commit_id,
-            input.exit_code.unwrap_or(0),
-            input.handoff,
-        ).map_err(|e| xai_tool_runtime::ToolError::execution(self.id(), format!("Failed to record worker completion: {e}")))?;
+        let result = runner
+            .handle_worker_completion(
+                &worker_session_id,
+                &input.feature_id,
+                state_enum,
+                input.return_to_orchestrator.unwrap_or(false),
+                input.commit_id,
+                input.exit_code.unwrap_or(0),
+                input.handoff,
+            )
+            .map_err(|e| {
+                xai_tool_runtime::ToolError::execution(
+                    self.id(),
+                    format!("Failed to record worker completion: {e}"),
+                )
+            })?;
 
         let (next_action, msg) = match result {
             crate::mission::MissionRunStepResult::WorkerReady { feature, .. } => (
                 "next_worker_ready".to_string(),
-                format!("Feature '{}' concluded. Next feature '{}' is queued.", input.feature_id, feature.id),
+                format!(
+                    "Feature '{}' concluded. Next feature '{}' is queued.",
+                    input.feature_id, feature.id
+                ),
             ),
             crate::mission::MissionRunStepResult::Completed => (
                 "mission_completed".to_string(),

@@ -15,7 +15,9 @@ pub const INSPECT_MISSION_READINESS_TOOL_NAME: &str = "inspect_mission_readiness
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InspectMissionReadinessInput {
-    #[schemars(description = "Optional mission ID or directory to inspect. Defaults to active mission or current workspace.")]
+    #[schemars(
+        description = "Optional mission ID or directory to inspect. Defaults to active mission or current workspace."
+    )]
     pub mission_id: Option<String>,
 }
 
@@ -91,10 +93,15 @@ impl xai_tool_runtime::Tool for InspectMissionReadinessTool {
         _ctx: xai_tool_runtime::ToolCallContext,
         input: InspectMissionReadinessInput,
     ) -> Result<InspectMissionReadinessOutput, xai_tool_runtime::ToolError> {
-        let mission_dir = crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
-            input.mission_id.as_deref(),
-        )
-        .ok_or_else(|| xai_tool_runtime::ToolError::invalid_arguments("No matching mission found to inspect"))?;
+        let mission_dir =
+            crate::implementations::grok_build::mission::start_mission_run::resolve_mission_dir(
+                input.mission_id.as_deref(),
+            )
+            .ok_or_else(|| {
+                xai_tool_runtime::ToolError::invalid_arguments(
+                    "No matching mission found to inspect",
+                )
+            })?;
 
         let service = MissionFileService::new(&mission_dir);
         let mut checks = Vec::new();
@@ -106,7 +113,10 @@ impl xai_tool_runtime::Tool for InspectMissionReadinessTool {
                 checks.push(ReadinessCheckItem {
                     check: "state_file".to_string(),
                     passed: true,
-                    details: format!("State file valid (status: {:?}, missionId: {})", state.state, state.mission_id),
+                    details: format!(
+                        "State file valid (status: {:?}, missionId: {})",
+                        state.state, state.mission_id
+                    ),
                 });
             }
             Err(e) => {
@@ -125,7 +135,10 @@ impl xai_tool_runtime::Tool for InspectMissionReadinessTool {
                 checks.push(ReadinessCheckItem {
                     check: "features_file".to_string(),
                     passed: true,
-                    details: format!("features.json contains {} defined features", f.features.len()),
+                    details: format!(
+                        "features.json contains {} defined features",
+                        f.features.len()
+                    ),
                 });
                 f.features
             }
@@ -187,7 +200,11 @@ impl xai_tool_runtime::Tool for InspectMissionReadinessTool {
         }
 
         let summary = if all_ready {
-            format!("Mission is READY. {} features queued across {} milestones.", features.len(), seen_ids.len())
+            format!(
+                "Mission is READY. {} features queued across {} milestones.",
+                features.len(),
+                seen_ids.len()
+            )
         } else {
             "Mission is NOT ready. Resolve failing checks before starting.".to_string()
         };

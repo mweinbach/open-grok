@@ -5,8 +5,8 @@
 //! strictly conforming to Factory Droid conventions.
 
 use crate::mission::types::{
-    Feature, FeatureStatus, FeaturesFile, MissionModelSettings, MissionState,
-    MissionStateFile, ProgressLogEntry, SavedWorkerHandoff, WorkerHandoff,
+    Feature, FeatureStatus, FeaturesFile, MissionModelSettings, MissionState, MissionStateFile,
+    ProgressLogEntry, SavedWorkerHandoff, WorkerHandoff,
 };
 use anyhow::{Context, Result, anyhow};
 use std::fs::{self, OpenOptions};
@@ -100,8 +100,8 @@ impl MissionFileService {
     }
 
     pub fn write_state(&self, state: &MissionStateFile) -> Result<()> {
-        let content = serde_json::to_string_pretty(state)
-            .context("Failed to serialize MissionStateFile")?;
+        let content =
+            serde_json::to_string_pretty(state).context("Failed to serialize MissionStateFile")?;
         fs::write(self.state_path(), content)
             .with_context(|| format!("Failed to write state to {:?}", self.state_path()))?;
         Ok(())
@@ -133,22 +133,31 @@ impl MissionFileService {
     }
 
     pub fn write_working_directory(&self, path: &str) -> Result<()> {
-        fs::write(self.working_directory_path(), path.trim())
-            .with_context(|| format!("Failed to write working directory to {:?}", self.working_directory_path()))?;
+        fs::write(self.working_directory_path(), path.trim()).with_context(|| {
+            format!(
+                "Failed to write working directory to {:?}",
+                self.working_directory_path()
+            )
+        })?;
         Ok(())
     }
 
     // --- Mission.md ---
 
     pub fn read_mission_md(&self) -> Result<String> {
-        fs::read_to_string(self.mission_md_path())
-            .with_context(|| format!("Failed to read mission md from {:?}", self.mission_md_path()))
+        fs::read_to_string(self.mission_md_path()).with_context(|| {
+            format!(
+                "Failed to read mission md from {:?}",
+                self.mission_md_path()
+            )
+        })
     }
 
     pub fn write_mission_md(&self, title: &str, body: &str) -> Result<()> {
         let content = format!("# {}\n\n{}", title.trim(), body.trim());
-        fs::write(self.mission_md_path(), content)
-            .with_context(|| format!("Failed to write mission md to {:?}", self.mission_md_path()))?;
+        fs::write(self.mission_md_path(), content).with_context(|| {
+            format!("Failed to write mission md to {:?}", self.mission_md_path())
+        })?;
         Ok(())
     }
 
@@ -177,8 +186,8 @@ impl MissionFileService {
     }
 
     pub fn write_features(&self, file: &FeaturesFile) -> Result<()> {
-        let content = serde_json::to_string_pretty(file)
-            .context("Failed to serialize FeaturesFile")?;
+        let content =
+            serde_json::to_string_pretty(file).context("Failed to serialize FeaturesFile")?;
         fs::write(self.features_path(), content)
             .with_context(|| format!("Failed to write features to {:?}", self.features_path()))?;
         Ok(())
@@ -186,12 +195,18 @@ impl MissionFileService {
 
     pub fn get_in_progress_feature(&self) -> Result<Option<Feature>> {
         let file = self.read_features()?;
-        Ok(file.features.into_iter().find(|f| f.status == FeatureStatus::InProgress))
+        Ok(file
+            .features
+            .into_iter()
+            .find(|f| f.status == FeatureStatus::InProgress))
     }
 
     pub fn get_next_pending_feature(&self) -> Result<Option<Feature>> {
         let file = self.read_features()?;
-        Ok(file.features.into_iter().find(|f| f.status == FeatureStatus::Pending))
+        Ok(file
+            .features
+            .into_iter()
+            .find(|f| f.status == FeatureStatus::Pending))
     }
 
     pub fn update_feature(&self, updated: &Feature) -> Result<()> {
@@ -214,7 +229,9 @@ impl MissionFileService {
     /// Insert a feature at the very top of the queue.
     /// If there was an in-progress feature, callers should revert it to pending first.
     pub fn insert_feature_at_top(&self, feature: Feature) -> Result<()> {
-        let mut file = self.read_features().unwrap_or(FeaturesFile { features: Vec::new() });
+        let mut file = self.read_features().unwrap_or(FeaturesFile {
+            features: Vec::new(),
+        });
         file.features.retain(|f| f.id != feature.id);
         file.features.insert(0, feature);
         self.write_features(&file)?;
@@ -250,7 +267,10 @@ impl MissionFileService {
         if file.features.is_empty() {
             return Ok(false);
         }
-        Ok(file.features.iter().all(|f| f.status == FeatureStatus::Completed))
+        Ok(file
+            .features
+            .iter()
+            .all(|f| f.status == FeatureStatus::Completed))
     }
 
     // --- Milestone & Validation ---
@@ -270,14 +290,17 @@ impl MissionFileService {
         let impl_features: Vec<_> = features
             .into_iter()
             .filter(|f| {
-                f.skill_name != SCRUTINY_VALIDATOR_SKILL && f.skill_name != USER_TESTING_VALIDATOR_SKILL
+                f.skill_name != SCRUTINY_VALIDATOR_SKILL
+                    && f.skill_name != USER_TESTING_VALIDATOR_SKILL
             })
             .collect();
 
         if impl_features.is_empty() {
             return Ok(false);
         }
-        Ok(impl_features.iter().all(|f| f.status == FeatureStatus::Completed))
+        Ok(impl_features
+            .iter()
+            .all(|f| f.status == FeatureStatus::Completed))
     }
 
     /// Auto-inject milestone validation features if all implementation features are completed.
@@ -317,10 +340,19 @@ impl MissionFileService {
             if !file.features.iter().any(|f| f.id == user_testing_id) {
                 file.features.push(Feature {
                     id: user_testing_id,
-                    description: format!("Interactive user-testing and flow validation for milestone {}", milestone),
+                    description: format!(
+                        "Interactive user-testing and flow validation for milestone {}",
+                        milestone
+                    ),
                     skill_name: USER_TESTING_VALIDATOR_SKILL.to_string(),
-                    preconditions: vec![format!("Scrutiny validation for milestone {} is passing", milestone)],
-                    expected_behavior: vec!["Validate real user workflows, CLI commands, and UI interactions".to_string()],
+                    preconditions: vec![format!(
+                        "Scrutiny validation for milestone {} is passing",
+                        milestone
+                    )],
+                    expected_behavior: vec![
+                        "Validate real user workflows, CLI commands, and UI interactions"
+                            .to_string(),
+                    ],
                     fulfills: Vec::new(),
                     milestone: milestone.to_string(),
                     status: FeatureStatus::Pending,
@@ -355,8 +387,13 @@ impl MissionFileService {
             if trimmed.is_empty() {
                 continue;
             }
-            let entry: ProgressLogEntry = serde_json::from_str(trimmed)
-                .with_context(|| format!("Failed to parse progress log entry at line {} in {:?}", i + 1, path))?;
+            let entry: ProgressLogEntry = serde_json::from_str(trimmed).with_context(|| {
+                format!(
+                    "Failed to parse progress log entry at line {} in {:?}",
+                    i + 1,
+                    path
+                )
+            })?;
             entries.push(entry);
         }
         Ok(entries)
@@ -364,8 +401,8 @@ impl MissionFileService {
 
     pub fn append_progress_log(&self, entry: &ProgressLogEntry) -> Result<()> {
         let path = self.progress_log_path();
-        let serialized = serde_json::to_string(entry)
-            .context("Failed to serialize ProgressLogEntry")?;
+        let serialized =
+            serde_json::to_string(entry).context("Failed to serialize ProgressLogEntry")?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -385,7 +422,10 @@ impl MissionFileService {
 
         // Format: <timestamp>__<featureId>__<workerSessionId>.json
         let safe_timestamp = handoff.timestamp.replace(':', "-");
-        let filename = format!("{}__{}__{}.json", safe_timestamp, handoff.feature_id, handoff.worker_session_id);
+        let filename = format!(
+            "{}__{}__{}.json",
+            safe_timestamp, handoff.feature_id, handoff.worker_session_id
+        );
         let path = dir.join(filename);
 
         let content = serde_json::to_string_pretty(handoff)
@@ -449,8 +489,12 @@ impl MissionFileService {
     pub fn write_model_settings(&self, settings: &MissionModelSettings) -> Result<()> {
         let content = serde_json::to_string_pretty(settings)
             .context("Failed to serialize MissionModelSettings")?;
-        fs::write(self.model_settings_path(), content)
-            .with_context(|| format!("Failed to write model settings to {:?}", self.model_settings_path()))?;
+        fs::write(self.model_settings_path(), content).with_context(|| {
+            format!(
+                "Failed to write model settings to {:?}",
+                self.model_settings_path()
+            )
+        })?;
         Ok(())
     }
 

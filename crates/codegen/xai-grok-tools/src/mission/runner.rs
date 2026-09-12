@@ -38,9 +38,7 @@ pub enum MissionRunStepResult {
         feature_id: Option<String>,
     },
     /// Execution is paused (e.g. usage limit, retry budget exhausted, or user pause).
-    Paused {
-        reason: String,
-    },
+    Paused { reason: String },
 }
 
 /// Wake-lock to prevent system sleep during autonomous mission runs.
@@ -114,10 +112,11 @@ impl MissionRunner {
         state.updated_at = chrono::Utc::now().to_rfc3339();
         self.storage.write_state(&state)?;
 
-        self.storage.append_progress_log(&ProgressLogEntry::MissionRunStarted {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            message: format!("Started mission run with {} features", features.len()),
-        })?;
+        self.storage
+            .append_progress_log(&ProgressLogEntry::MissionRunStarted {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                message: format!("Started mission run with {} features", features.len()),
+            })?;
 
         self.wake_lock = Some(MissionWakeLock::acquire());
         Ok(())
@@ -149,10 +148,11 @@ impl MissionRunner {
                 state.state = MissionState::Paused;
                 state.updated_at = chrono::Utc::now().to_rfc3339();
                 self.storage.write_state(&state)?;
-                self.storage.append_progress_log(&ProgressLogEntry::MissionPaused {
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    pause_reason: Some("scope_growth_review_required".to_string()),
-                })?;
+                self.storage
+                    .append_progress_log(&ProgressLogEntry::MissionPaused {
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        pause_reason: Some("scope_growth_review_required".to_string()),
+                    })?;
                 return Ok(MissionRunStepResult::ScopeReviewRequired {
                     initial_count: initial,
                     current_count: features_file.features.len(),
@@ -164,8 +164,14 @@ impl MissionRunner {
         // If a feature is currently marked InProgress, but there is a Pending feature placed
         // ahead of it in features.json (e.g. user inserted an urgent fix at the top),
         // revert the in-progress feature to Pending and pick the top one first!
-        let in_prog_idx = features_file.features.iter().position(|f| f.status == FeatureStatus::InProgress);
-        let first_pending_idx = features_file.features.iter().position(|f| f.status == FeatureStatus::Pending);
+        let in_prog_idx = features_file
+            .features
+            .iter()
+            .position(|f| f.status == FeatureStatus::InProgress);
+        let first_pending_idx = features_file
+            .features
+            .iter()
+            .position(|f| f.status == FeatureStatus::Pending);
 
         if let (Some(ip_idx), Some(fp_idx)) = (in_prog_idx, first_pending_idx) {
             if fp_idx < ip_idx {
@@ -195,9 +201,17 @@ impl MissionRunner {
 
         // 4. Select candidate feature:
         // Prefer already InProgress feature (resumed run), or first Pending feature
-        let target_feature = if let Some(f) = features_file.features.iter().find(|f| f.status == FeatureStatus::InProgress) {
+        let target_feature = if let Some(f) = features_file
+            .features
+            .iter()
+            .find(|f| f.status == FeatureStatus::InProgress)
+        {
             f.clone()
-        } else if let Some(f) = features_file.features.iter().find(|f| f.status == FeatureStatus::Pending) {
+        } else if let Some(f) = features_file
+            .features
+            .iter()
+            .find(|f| f.status == FeatureStatus::Pending)
+        {
             f.clone()
         } else {
             // No features left to execute!
@@ -215,15 +229,25 @@ impl MissionRunner {
         }
 
         // 5. Read supporting documentation
-        let architecture = fs::read_to_string(self.storage.mission_dir().join("architecture.md")).ok();
-        let validation = fs::read_to_string(self.storage.mission_dir().join("validation-contract.md")).ok();
+        let architecture =
+            fs::read_to_string(self.storage.mission_dir().join("architecture.md")).ok();
+        let validation =
+            fs::read_to_string(self.storage.mission_dir().join("validation-contract.md")).ok();
 
         // Read skill
-        let skill_file = self.storage.skills_dir().join(&target_feature.skill_name).join("SKILL.md");
+        let skill_file = self
+            .storage
+            .skills_dir()
+            .join(&target_feature.skill_name)
+            .join("SKILL.md");
         let skill_content = fs::read_to_string(skill_file).ok();
 
         // Build worker prompt
-        let worker_prompt = build_worker_prompt(&target_feature, architecture.as_deref(), validation.as_deref());
+        let worker_prompt = build_worker_prompt(
+            &target_feature,
+            architecture.as_deref(),
+            validation.as_deref(),
+        );
 
         Ok(MissionRunStepResult::WorkerReady {
             feature: target_feature.clone(),
@@ -263,25 +287,34 @@ impl MissionRunner {
         self.storage.write_worker_handoff(&saved_handoff)?;
 
         // Log worker completed in progress_log.jsonl
-        self.storage.append_progress_log(&ProgressLogEntry::WorkerCompleted {
-            timestamp: timestamp.clone(),
-            worker_session_id: worker_session_id.to_string(),
-            feature_id: feature_id.to_string(),
-            success_state,
-            return_to_orchestrator,
-            commit_id,
-            repo_path: self.storage.read_working_directory().ok(),
-            exit_code,
-            validators_passed: success_state == WorkerSuccessState::Success,
-            handoff,
-        })?;
+        self.storage
+            .append_progress_log(&ProgressLogEntry::WorkerCompleted {
+                timestamp: timestamp.clone(),
+                worker_session_id: worker_session_id.to_string(),
+                feature_id: feature_id.to_string(),
+                success_state,
+                return_to_orchestrator,
+                commit_id,
+                repo_path: self.storage.read_working_directory().ok(),
+                exit_code,
+                validators_passed: success_state == WorkerSuccessState::Success,
+                handoff,
+            })?;
 
         let mut features_file = self.storage.read_features()?;
-        let feature = features_file.features.iter_mut().find(|f| f.id == feature_id)
+        let feature = features_file
+            .features
+            .iter_mut()
+            .find(|f| f.id == feature_id)
             .ok_or_else(|| anyhow!("Feature {} not found in features.json", feature_id))?;
 
-        if !feature.worker_session_ids.contains(&worker_session_id.to_string()) {
-            feature.worker_session_ids.push(worker_session_id.to_string());
+        if !feature
+            .worker_session_ids
+            .contains(&worker_session_id.to_string())
+        {
+            feature
+                .worker_session_ids
+                .push(worker_session_id.to_string());
         }
         feature.current_worker_session_id = None;
 
@@ -292,7 +325,8 @@ impl MissionRunner {
                 self.storage.write_features(&features_file)?;
 
                 if return_to_orchestrator {
-                    self.storage.update_state_status(MissionState::OrchestratorTurn)?;
+                    self.storage
+                        .update_state_status(MissionState::OrchestratorTurn)?;
                     return Ok(MissionRunStepResult::OrchestratorTurn {
                         reason: "Worker requested orchestrator review upon success".to_string(),
                         feature_id: Some(feature_id.to_string()),
@@ -312,7 +346,8 @@ impl MissionRunner {
                 feature.status = FeatureStatus::Pending;
                 self.storage.write_features(&features_file)?;
 
-                self.storage.update_state_status(MissionState::OrchestratorTurn)?;
+                self.storage
+                    .update_state_status(MissionState::OrchestratorTurn)?;
                 Ok(MissionRunStepResult::OrchestratorTurn {
                     reason: format!("Worker ended with state: {:?}", success_state),
                     feature_id: Some(feature_id.to_string()),
@@ -329,10 +364,11 @@ impl MissionRunner {
         state.updated_at = chrono::Utc::now().to_rfc3339();
         self.storage.write_state(&state)?;
 
-        self.storage.append_progress_log(&ProgressLogEntry::MissionPaused {
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            pause_reason: reason.map(str::to_string),
-        })?;
+        self.storage
+            .append_progress_log(&ProgressLogEntry::MissionPaused {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                pause_reason: reason.map(str::to_string),
+            })?;
         Ok(())
     }
 }
@@ -424,7 +460,8 @@ mod tests {
             current_worker_session_id: None,
             completed_worker_session_id: None,
         };
-        svc.write_features(&crate::mission::types::FeaturesFile { features: vec![f1] }).unwrap();
+        svc.write_features(&crate::mission::types::FeaturesFile { features: vec![f1] })
+            .unwrap();
 
         let mut runner = MissionRunner::new(tmp.path());
         runner.prepare_run().unwrap();
