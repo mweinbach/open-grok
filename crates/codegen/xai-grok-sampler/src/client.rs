@@ -122,6 +122,7 @@ fn deserialize_response_event_for_tools(
 ) -> Result<rs::ResponseStreamEvent> {
     let codex_data = if adapter.provider() == ModelProvider::Codex {
         let mut value: serde_json::Value = serde_json::from_str(data)?;
+        normalize_codex_response_event(&mut value);
         if !native_multi_agent && has_encrypted_function_calls(&value) {
             return Err(SamplingError::InvalidConfiguration(
                 "Encrypted agent arguments require advertised native collaboration tools",
@@ -158,6 +159,14 @@ fn deserialize_response_event_for_tools(
     };
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
+}
+
+fn normalize_codex_response_event(value: &mut serde_json::Value) {
+    if let Some(effort) = value.pointer_mut("/response/reasoning/effort")
+        && effort.as_str() == Some("disabled")
+    {
+        *effort = serde_json::Value::String("none".to_owned());
+    }
 }
 
 fn has_native_multi_agent_tools(body: &serde_json::Value) -> bool {
@@ -6403,6 +6412,45 @@ mod tests {
                 .reasoning
                 .and_then(|reasoning| reasoning.effort),
             Some(rs::ReasoningEffort::Max),
+        );
+    }
+
+    #[test]
+    fn codex_disabled_response_effort_parses_as_none() {
+        let event = serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "background": false,
+                "created_at": 0,
+                "id": "resp_astra",
+                "model": "gpt-6-astra",
+                "object": "response",
+                "output": [],
+                "reasoning": {
+                    "context": "all_turns",
+                    "effort": "disabled",
+                    "mode": "standard",
+                    "summary": "detailed"
+                },
+                "status": "in_progress",
+                "tools": []
+            }
+        })
+        .to_string();
+
+        let typed =
+            deserialize_response_event_for_adapter(&event, provider_adapter(ModelProvider::Codex))
+                .expect("Codex disabled effort should parse as no reasoning");
+        let rs::ResponseStreamEvent::ResponseCreated(created) = typed else {
+            panic!("expected response.created");
+        };
+        assert_eq!(
+            created
+                .response
+                .reasoning
+                .and_then(|reasoning| reasoning.effort),
+            Some(rs::ReasoningEffort::None),
         );
     }
 
