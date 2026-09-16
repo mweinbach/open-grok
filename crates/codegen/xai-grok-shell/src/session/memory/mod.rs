@@ -14,6 +14,7 @@ pub mod hooks;
 
 pub use xai_grok_memory::{
     EndpointScopedCredentials, MemoryBackendImpl, MemoryBackendParams, MemoryIndex, MemoryScope,
-    MemoryStorage, archive, backend, chunker, dream, dream_lock, embed_missing_chunks, embedding,
+    MemoryStorage, SaveRememberNoteError, V2AccessError, V2MemoryAccessPolicy, V2MemoryScope,
+    V2PathClass, archive, backend, chunker, dream, dream_lock, embed_missing_chunks, embedding,
     index, init_sqlite_vec, mmr, query_expansion, schema, search, storage, text_utils, watcher,
 };

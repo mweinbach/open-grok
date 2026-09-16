@@ -174,6 +174,7 @@ pub(crate) async fn run_search_replace(
         hints_enabled = res.get::<PathNotFoundHints>().is_some_and(|h| h.0);
     }
     let resolved = resolve_model_path(&cwd, display_cwd.as_deref(), &input.file_path);
+    let policy_path = resolved.clone();
     let path = match crate::util::fs::try_canonicalize(&resolved).await {
         Ok(p) => p,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -230,6 +231,7 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
@@ -244,6 +246,7 @@ pub(crate) async fn run_search_replace(
             &notification_handle,
             &tool_call_id,
             &path,
+            &policy_path,
             &cwd,
             display_cwd.as_deref(),
             hints_enabled,
@@ -299,6 +302,7 @@ async fn handle_new_file_creation(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
@@ -326,7 +330,18 @@ async fn handle_new_file_creation(
             old_string_name
         )));
     }
-    if let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
+    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+        &resources,
+        policy_path,
+        input.new_string.as_bytes(),
+    )
+    .await
+    {
+        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, input.new_string.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::NotFound) => {
                 let display_dcwd = display_cwd_or_cwd(cwd, display_cwd);
@@ -527,6 +542,7 @@ async fn handle_replacement(
     notification_handle: &ToolNotificationHandle,
     tool_call_id: &str,
     path: &std::path::Path,
+    policy_path: &std::path::Path,
     cwd: &std::path::Path,
     display_cwd: Option<&std::path::Path>,
     hints_enabled: bool,
@@ -712,7 +728,18 @@ async fn handle_replacement(
     } else {
         new_text.clone()
     };
-    if let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
+    let is_memory_write = match crate::types::memory_v2::write_memory_v2_file(
+        &resources,
+        policy_path,
+        write_text.as_bytes(),
+    )
+    .await
+    {
+        Ok(crate::types::memory_v2::MemoryV2Write::Written { .. }) => true,
+        Ok(crate::types::memory_v2::MemoryV2Write::Outside) => false,
+        Err(error) => return Ok(SearchReplaceOutput::InvalidInput(error)),
+    };
+    if !is_memory_write && let Err(e) = fs.write_file(path, write_text.as_bytes()).await {
         return Ok(match e.io_error_kind() {
             Some(std::io::ErrorKind::AlreadyExists) => SearchReplaceOutput::InvalidInput(format!(
                 "Error: cannot write {}. A component of the path already exists as a file where a directory is expected.",

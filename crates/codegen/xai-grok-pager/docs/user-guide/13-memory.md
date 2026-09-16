@@ -57,6 +57,31 @@ export GROK_MEMORY=0
 
 The `--no-memory` flag has absolute highest priority and always disables memory.
 
+### Isolated Memory v2
+
+Grok Build 1.0.32 adds an isolated topic/observation pipeline. Open Grok
+ports it as an **opt-in** alternative to the existing Markdown + experience
+index. The two implementations never share files.
+
+```toml
+# ~/.opengrok/config.toml
+[memory_v2]
+enabled = true
+```
+
+When `[memory_v2] enabled = true`:
+
+- Storage lives under `$OPENGROK_HOME/memory-v2/` (`global/` plus
+  `workspaces/<hash>/`). The legacy `$OPENGROK_HOME/memory/` tree and
+  experience index are not read or written.
+- The model uses ordinary file tools on `topics/` and
+  `observations/_inbox/`. Generated `MEMORY.md` indexes are read-only.
+- `[memory] enabled = true` alone still selects the legacy pipeline.
+- `GROK_MEMORY=0` and `--no-memory` disable both implementations.
+
+Remote xAI `memory_v2` flags cannot override a local opt-out. Open Grok
+does not default-on via unpublished remote gates.
+
 ### Mid-Session Toggle
 
 Toggle memory on or off during a session without restarting:

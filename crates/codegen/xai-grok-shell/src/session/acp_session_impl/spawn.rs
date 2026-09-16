@@ -974,8 +974,9 @@ pub(crate) async fn spawn_session_actor(
     // Local storage/FTS is provider-neutral. The user may also keep xAI
     // connected as the semantic embedding backend while chatting through
     // Codex, so this path is intentionally independent of the chat provider.
-    let memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
-        if mc.flat_memory_root
+    let mut memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
+        if mc.mode.is_legacy()
+            && mc.flat_memory_root
             && let Some(ref root) = mc.root_dir_override
         {
             return crate::session::memory::MemoryStorage::new_flat(
@@ -983,20 +984,59 @@ pub(crate) async fn spawn_session_actor(
                 root,
             );
         }
-        crate::session::memory::MemoryStorage::new(
+        crate::session::memory::MemoryStorage::new_for_mode(
             tool_context.cwd.as_path(),
             mc.root_dir_override.as_deref(),
+            mc.mode,
         )
     });
+    if memory_storage_for_session
+        .as_ref()
+        .is_some_and(|storage| storage.mode().is_v2() && storage.is_ephemeral())
+    {
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            cwd = %tool_context.cwd.as_path().display(),
+            "MEMORY_INIT: memory-v2 is disabled for ephemeral (temp-dir) workspaces"
+        );
+        memory_storage_for_session = None;
+    }
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
     let mut memory_backend_params_for_session: Option<crate::session::memory::MemoryBackendParams> =
         None;
     let mut memory_search_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> = None;
+    let mut memory_v2_access = None;
+    if let Some(storage) = memory_storage_for_session
+        .as_ref()
+        .filter(|storage| storage.mode().is_v2())
+    {
+        match crate::session::memory::V2MemoryAccessPolicy::new(
+            storage.global_dir(),
+            storage.workspace_dir(),
+        ) {
+            Ok(policy) => {
+                memory_v2_access = Some(xai_grok_tools::types::memory_v2::MemoryV2AccessResource(
+                    std::sync::Arc::new(policy),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    error = %error,
+                    "MEMORY_INIT: memory-v2 file access policy failed; memory is disabled for this session"
+                );
+                memory_storage_for_session = None;
+            }
+        }
+    }
     let memory_backend_for_spec: Option<
         std::sync::Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
-    > = if let Some(ref storage) = memory_storage_for_session {
+    > = if let Some(ref storage) = memory_storage_for_session
+        .as_ref()
+        .filter(|storage| storage.mode().is_legacy())
+    {
         if let Err(e) = storage.ensure_initialized() {
             tracing::warn!(
                 target: xai_grok_telemetry::memory_log::TARGET,
@@ -1005,7 +1045,7 @@ pub(crate) async fn spawn_session_actor(
             );
         }
         {
-            let gc_storage = storage.clone();
+            let gc_storage = (*storage).clone();
             let gc_max_age = memory_config.as_ref().map_or(30, |mc| mc.gc.max_age_days);
             tokio::task::spawn_blocking(move || match gc_storage.gc(gc_max_age) {
                 Ok(removed) if removed > 0 => {
@@ -1066,7 +1106,7 @@ pub(crate) async fn spawn_session_actor(
             embedding_credentials,
         };
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
-            storage.clone(),
+            (*storage).clone(),
             &params,
         );
         memory_search_counter = Some(backend.search_counter.clone());
@@ -1109,6 +1149,19 @@ pub(crate) async fn spawn_session_actor(
             },
         );
         Some(backend)
+    } else if memory_storage_for_session
+        .as_ref()
+        .is_some_and(|storage| storage.mode().is_v2())
+    {
+        if let Some(storage) = memory_storage_for_session.as_ref() {
+            tracing::info!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                workspace = %storage.workspace_dir().display(),
+                global = %storage.global_dir().display(),
+                "MEMORY_INIT: memory-v2 storage created"
+            );
+        }
+        None
     } else {
         tracing::debug!(
             target: xai_grok_telemetry::memory_log::TARGET,
@@ -1201,6 +1254,10 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
+        memory_v2_access,
+        memory_v2_exposed: memory_config
+            .as_ref()
+            .is_some_and(|mc| mc.enabled && mc.mode.is_v2() && mc.v2.can_expose_memory()),
         web_search: parking_lot::RwLock::new(web_search_state.clone()),
         active_sampling_config: parking_lot::RwLock::new(sampling_config.clone()),
         chat_state_handle: chat_state_handle.clone(),
@@ -1962,6 +2019,8 @@ pub(crate) async fn spawn_session_actor(
             dream_count: std::sync::atomic::AtomicU64::new(0),
             dream_success_count: std::sync::atomic::AtomicU64::new(0),
             dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            configured_mode: memory_config.as_ref().map(|mc| mc.mode),
+            v2_config: memory_config.as_ref().map(|mc| mc.v2).unwrap_or_default(),
         },
         session_start: std::time::Instant::now(),
         status_wake: Default::default(),

@@ -498,6 +498,11 @@ impl xai_tool_runtime::Tool for ListDirTool {
         let path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.target_directory);
         let display_base = display_cwd_or_cwd(&cwd, display_cwd.as_deref());
         let display_path = compute_display_path(&display_base, &input.target_directory);
+        if let Err(error) =
+            crate::types::memory_v2::validate_memory_v2_read(&resources, &path).await
+        {
+            return Ok(ListDirOutput::PermissionDenied(error));
+        }
         let meta = tokio::fs::metadata(&path).await;
         let is_dir = meta.as_ref().is_ok_and(|m| m.is_dir());
         if !is_dir {

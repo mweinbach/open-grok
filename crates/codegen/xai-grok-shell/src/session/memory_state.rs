@@ -21,6 +21,11 @@ pub(crate) struct SessionMemory {
     pub embedding_provider: xai_grok_sampling_types::ModelProvider,
     /// Live provider for the active chat model (telemetry/state only).
     pub active_provider: std::cell::Cell<xai_grok_sampling_types::ModelProvider>,
+    /// Mode resolved when the session was spawned. Kept even while memory is
+    /// disabled so toggles cannot switch the on-disk root mid-session.
+    pub configured_mode: Option<crate::config::MemoryMode>,
+    /// Rollout and kill switches resolved once at session spawn.
+    pub v2_config: crate::config::MemoryV2Config,
     /// Memory storage handle for writing flush output (None when memory disabled).
     /// Wrapped in `RefCell` to allow `/memory on|off` toggle from `&Arc<SessionActor>`.
     pub storage: RefCell<Option<crate::session::memory::MemoryStorage>>,
@@ -102,6 +107,30 @@ impl SessionMemory {
     /// Whether memory is enabled for this session.
     pub(crate) fn is_enabled(&self) -> bool {
         self.storage.borrow().is_some()
+    }
+
+    pub(crate) fn mode(&self) -> Option<crate::config::MemoryMode> {
+        self.configured_mode
+            .or_else(|| self.storage.borrow().as_ref().map(|storage| storage.mode()))
+    }
+
+    pub(crate) fn uses_legacy_pipeline(&self) -> bool {
+        self.is_enabled()
+            && self
+                .mode()
+                .is_some_and(crate::config::MemoryMode::is_legacy)
+    }
+
+    pub(crate) fn can_capture_v2(&self) -> bool {
+        self.is_enabled()
+            && self.mode().is_some_and(crate::config::MemoryMode::is_v2)
+            && self.v2_config.can_capture()
+    }
+
+    pub(crate) fn can_expose_v2(&self) -> bool {
+        self.is_enabled()
+            && self.mode().is_some_and(crate::config::MemoryMode::is_v2)
+            && self.v2_config.can_expose_memory()
     }
 
     /// Clone the storage out of the `RefCell`, dropping the borrow immediately.

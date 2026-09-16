@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use xai_grok_config_types::MemoryMode;
 use xai_grok_tools::util::grok_home::grok_home;
 
 /// Scope for a memory write operation.
@@ -20,6 +21,14 @@ pub enum MemoryScope {
     Workspace,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SaveRememberNoteError {
+    #[error(transparent)]
+    Legacy(#[from] std::io::Error),
+    #[error(transparent)]
+    V2(#[from] crate::v2::V2StorageError),
+}
+
 /// Handles file I/O for the memory storage layer.
 ///
 /// Memory files are human-readable/editable Markdown stored under
@@ -27,7 +36,8 @@ pub enum MemoryScope {
 /// named `{project-slug}-{hash8}`, e.g. `~/.opengrok/memory/xai-a3f7b2c9/`.
 #[derive(Debug, Clone)]
 pub struct MemoryStorage {
-    /// `~/.opengrok/memory/`
+    mode: MemoryMode,
+    /// `~/.opengrok/memory/` or `~/.opengrok/memory-v2/global/`
     global_dir: PathBuf,
     /// `~/.opengrok/memory/{project-slug}-{hash8}/`
     workspace_dir: PathBuf,
@@ -47,6 +57,28 @@ impl MemoryStorage {
     /// Directories are created lazily on first write, not here.
     pub fn new(cwd: &Path, root_override: Option<&Path>) -> Self {
         Self::new_inner(cwd, root_override, true)
+    }
+
+    /// Create storage for the resolved session mode.
+    ///
+    /// V2 uses an isolated `$OPENGROK_HOME/memory-v2/` root and cannot observe
+    /// files under the legacy `memory/` tree or experience index.
+    pub fn new_for_mode(cwd: &Path, root_override: Option<&Path>, mode: MemoryMode) -> Self {
+        match mode {
+            MemoryMode::Legacy => Self::new(cwd, root_override),
+            MemoryMode::V2 => {
+                let root = root_override
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| grok_home().join("memory-v2"));
+                Self {
+                    mode,
+                    global_dir: root.join("global"),
+                    workspace_dir: root.join("workspaces").join(compute_workspace_hash(cwd)),
+                    workspace_path: cwd.to_path_buf(),
+                    ephemeral: is_ephemeral_cwd(cwd),
+                }
+            }
+        }
     }
 
     /// Create a MemoryStorage with a flat root (no workspace hash subdirectory).
@@ -72,6 +104,7 @@ impl MemoryStorage {
         let ephemeral = use_workspace_hash && is_ephemeral_cwd(cwd);
 
         Self {
+            mode: MemoryMode::Legacy,
             global_dir,
             workspace_dir,
             workspace_path: cwd.to_path_buf(),
@@ -83,6 +116,7 @@ impl MemoryStorage {
     #[cfg(any(test, feature = "test-support"))]
     pub fn with_paths(global_dir: PathBuf, workspace_dir: PathBuf) -> Self {
         Self {
+            mode: MemoryMode::Legacy,
             global_dir,
             workspace_dir,
             workspace_path: PathBuf::from("/test/workspace"),
@@ -93,6 +127,10 @@ impl MemoryStorage {
     /// Returns the global memory directory path.
     pub fn global_dir(&self) -> &Path {
         &self.global_dir
+    }
+
+    pub fn mode(&self) -> MemoryMode {
+        self.mode
     }
 
     /// Returns the workspace-scoped memory directory path.
@@ -136,6 +174,15 @@ impl MemoryStorage {
     ///
     /// Returns `"global"`, `"workspace"`, or `"session"` based on location.
     pub fn classify_source(&self, path: &Path) -> &'static str {
+        if self.mode.is_v2() {
+            return if path.starts_with(&self.workspace_dir) {
+                "workspace"
+            } else if path.starts_with(&self.global_dir) {
+                "global"
+            } else {
+                "session"
+            };
+        }
         if path.starts_with(&self.workspace_dir) {
             if path.file_name().is_some_and(|f| f == "MEMORY.md") {
                 "workspace"
@@ -173,6 +220,7 @@ impl MemoryStorage {
         content: &str,
         append: bool,
     ) -> std::io::Result<PathBuf> {
+        self.require_legacy("daily session logs")?;
         let sessions_dir = self.sessions_dir();
         let sid8 = &session_id[..session_id.len().min(8)];
         let filename = format!("{date}-{slug}-{sid8}.md");
@@ -202,6 +250,7 @@ impl MemoryStorage {
     ///
     /// Creates parent directories as needed. Overwrites any existing content.
     pub fn write_long_term(&self, scope: MemoryScope, content: &str) -> std::io::Result<()> {
+        self.require_legacy("direct MEMORY.md writes")?;
         if self.ephemeral && scope == MemoryScope::Workspace {
             tracing::debug!("MEMORY_EPHEMERAL_SKIP: workspace long-term write skipped");
             return Ok(());
@@ -232,6 +281,7 @@ impl MemoryStorage {
     /// and the file if they don't exist. Empty/whitespace-only content is
     /// silently ignored.
     pub fn append_to_memory(&self, scope: MemoryScope, content: &str) -> std::io::Result<()> {
+        self.require_legacy("direct MEMORY.md appends")?;
         if self.ephemeral && scope == MemoryScope::Workspace {
             tracing::debug!("MEMORY_EPHEMERAL_SKIP: workspace memory append skipped");
             return Ok(());
@@ -269,6 +319,50 @@ impl MemoryStorage {
         Ok(())
     }
 
+    /// Save a user-authored remember note in the global memory scope.
+    ///
+    /// Legacy mode appends to `MEMORY.md`; v2 publishes a standalone immutable
+    /// observation so it never mutates the generated manifest directly.
+    pub fn save_remember_note(&self, content: &str) -> Result<(), SaveRememberNoteError> {
+        let normalized = normalize_memory_content(content);
+        if self.mode.is_v2() && normalized.len() > crate::v2::MAX_MANUAL_OBSERVATION_BYTES {
+            return Err(SaveRememberNoteError::V2(
+                crate::v2::V2StorageError::ObservationTooLarge {
+                    actual_bytes: normalized.len(),
+                    limit_bytes: crate::v2::MAX_MANUAL_OBSERVATION_BYTES,
+                },
+            ));
+        }
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        match self.mode {
+            MemoryMode::Legacy => self
+                .append_to_memory(MemoryScope::Global, &normalized)
+                .map_err(SaveRememberNoteError::Legacy),
+            MemoryMode::V2 => {
+                let root = self.global_dir.parent().ok_or_else(|| {
+                    SaveRememberNoteError::V2(crate::v2::V2StorageError::Io {
+                        operation: "resolve v2 storage root",
+                        path: self.global_dir.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "v2 global directory has no storage root",
+                        ),
+                    })
+                })?;
+                crate::v2::ensure_scope_initialized(
+                    root,
+                    &self.global_dir,
+                    crate::v2::V2MemoryScope::Global,
+                )?;
+                crate::v2::persist_observation(&self.global_dir, &normalized)
+                    .map(|_| ())
+                    .map_err(SaveRememberNoteError::V2)
+            }
+        }
+    }
+
     /// Read a memory file, optionally returning only a range of lines.
     ///
     /// - `from`: 0-based start line (default 0)
@@ -285,20 +379,43 @@ impl MemoryStorage {
     ) -> std::io::Result<String> {
         // Security: canonicalize both sides — fail hard if either doesn't exist.
         let canonical = dunce::canonicalize(path)?;
-        let canonical_global = dunce::canonicalize(&self.global_dir).map_err(|e| {
-            std::io::Error::new(
+        let canonical_global = dunce::canonicalize(&self.global_dir).ok();
+        let canonical_workspace = dunce::canonicalize(&self.workspace_dir).ok();
+        if canonical_global.is_none() && canonical_workspace.is_none() {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("memory directory {:?} does not exist: {e}", self.global_dir),
-            )
-        })?;
+                format!(
+                    "memory directories {:?} and {:?} do not exist",
+                    self.global_dir, self.workspace_dir
+                ),
+            ));
+        }
 
+        // Legacy nests workspaces below global_dir. V2 keeps global/ and
+        // workspaces/ as siblings under the configured memory-v2 root.
+        let inside_memory = match self.mode {
+            MemoryMode::Legacy => {
+                canonical_global.is_some_and(|global| canonical.starts_with(global))
+            }
+            MemoryMode::V2 => self
+                .global_dir
+                .parent()
+                .and_then(|root| dunce::canonicalize(root).ok())
+                .is_some_and(|root| {
+                    canonical_global.is_some_and(|global| {
+                        global.starts_with(&root) && canonical.starts_with(global)
+                    }) || canonical_workspace.is_some_and(|workspace| {
+                        workspace.starts_with(&root) && canonical.starts_with(workspace)
+                    })
+                }),
+        };
         // Fail-closed >MAX_PATH caveat: see workspace clippy.toml.
-        if !canonical.starts_with(&canonical_global) {
+        if !inside_memory {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "path {:?} is outside the memory directory {:?}",
-                    path, self.global_dir
+                    "path {:?} is outside the memory directories {:?} and {:?}",
+                    path, self.global_dir, self.workspace_dir
                 ),
             ));
         }
@@ -324,6 +441,9 @@ impl MemoryStorage {
     ///
     /// Returns paths sorted by scope: global files first, then workspace files.
     pub fn list_memory_files(&self) -> std::io::Result<Vec<PathBuf>> {
+        if self.mode.is_v2() {
+            return self.list_v2_memory_files();
+        }
         let mut files = Vec::new();
 
         // Global MEMORY.md
@@ -365,6 +485,29 @@ impl MemoryStorage {
     ///
     /// Called on first run with `--experimental-memory` to bootstrap the layout.
     pub fn ensure_initialized(&self) -> std::io::Result<()> {
+        if self.mode.is_v2() {
+            let root = self.global_dir.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "v2 global directory has no storage root",
+                )
+            })?;
+            crate::v2::ensure_scope_initialized(
+                root,
+                &self.global_dir,
+                crate::v2::V2MemoryScope::Global,
+            )
+            .map_err(std::io::Error::other)?;
+            if !self.ephemeral {
+                crate::v2::ensure_scope_initialized(
+                    root,
+                    &self.workspace_dir,
+                    crate::v2::V2MemoryScope::Workspace,
+                )
+                .map_err(std::io::Error::other)?;
+            }
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.global_dir)?;
 
         let global_file = self.global_memory_file();
@@ -436,6 +579,13 @@ impl MemoryStorage {
     /// Returns `Ok(true)` if the file existed and was removed, `Ok(false)` if
     /// it didn't exist.
     pub fn clear_global(&self) -> std::io::Result<bool> {
+        if self.mode.is_v2() {
+            return match std::fs::remove_dir_all(&self.global_dir) {
+                Ok(()) => Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(error) => Err(error),
+            };
+        }
         let path = self.global_memory_file();
         match std::fs::remove_file(&path) {
             Ok(()) => {
@@ -459,6 +609,9 @@ impl MemoryStorage {
     ///
     /// Returns the number of directories removed.
     pub fn gc(&self, max_age_days: u64) -> std::io::Result<usize> {
+        if self.mode.is_v2() {
+            return Ok(0);
+        }
         let entries = match std::fs::read_dir(&self.global_dir) {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -513,6 +666,20 @@ impl MemoryStorage {
         }
 
         Ok(removed)
+    }
+
+    fn require_legacy(&self, operation: &str) -> std::io::Result<()> {
+        if self.mode.is_legacy() {
+            return Ok(());
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!("{operation} are disabled in memory v2"),
+        ))
+    }
+
+    fn list_v2_memory_files(&self) -> std::io::Result<Vec<PathBuf>> {
+        crate::storage_v2::list_memory_files(&self.global_dir, &self.workspace_dir)
     }
 }
 
@@ -1799,6 +1966,7 @@ mod tests {
         let workspace_dir = global_dir.join("ephemeral-abc12345");
 
         let storage = MemoryStorage {
+            mode: MemoryMode::Legacy,
             global_dir: global_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             workspace_path: PathBuf::from("/tmp/test"),
@@ -1831,6 +1999,7 @@ mod tests {
         let workspace_dir = global_dir.join("ephemeral-abc12345");
 
         let storage = MemoryStorage {
+            mode: MemoryMode::Legacy,
             global_dir: global_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             workspace_path: PathBuf::from("/tmp/test"),
@@ -1857,6 +2026,7 @@ mod tests {
         let workspace_dir = global_dir.join("ephemeral-abc12345");
 
         let storage = MemoryStorage {
+            mode: MemoryMode::Legacy,
             global_dir: global_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             workspace_path: PathBuf::from("/tmp/test"),

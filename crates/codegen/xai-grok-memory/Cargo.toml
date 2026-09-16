@@ -19,6 +19,7 @@ git2 = { version = "0.20", default-features = false, features = [
     "vendored-libgit2",
 ] }
 notify = { workspace = true }
+parking_lot = { workspace = true }
 reqwest = { workspace = true }
 reqwest-middleware = { workspace = true }
 # rusqlite 0.37 + bundled = self-contained SQLite (>= 3.50.2) with FTS5.
@@ -28,6 +29,8 @@ serde_json = { workspace = true }
 # sqlite-vec: vec0 virtual table for KNN vector search.
 sqlite-vec = "=0.1.7-alpha.2"
 tar = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 xai-grok-auth = { workspace = true }

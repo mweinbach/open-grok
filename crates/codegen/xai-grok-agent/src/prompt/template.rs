@@ -113,6 +113,7 @@ mod tests {
             "working_directory": "/tmp/test",
             "current_date": "2025-01-15",
             "memory_enabled": false,
+            "memory_v2_enabled": false,
             "is_non_interactive": false,
             "system_prompt_label": crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL,
         })

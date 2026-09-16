@@ -3260,6 +3260,8 @@ mod inline_auto_compact_flow_tests {
                 dream_count: std::sync::atomic::AtomicU64::new(0),
                 dream_success_count: std::sync::atomic::AtomicU64::new(0),
                 dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            configured_mode: None,
+            v2_config: Default::default(),
             },
             session_start: std::time::Instant::now(),
             inference_idle_timeout: std::time::Duration::from_secs(300),
@@ -4532,6 +4534,8 @@ mod inline_auto_compact_flow_tests {
             dream_count: std::sync::atomic::AtomicU64::new(0),
             dream_success_count: std::sync::atomic::AtomicU64::new(0),
             dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            configured_mode: None,
+            v2_config: Default::default(),
         };
         actor.idle_flush_timeout = memory_config
             .as_ref()

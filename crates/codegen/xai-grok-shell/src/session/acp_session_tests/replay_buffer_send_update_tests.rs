@@ -159,6 +159,8 @@ pub(super) async fn make_replay_send_update_fixture() -> ReplaySendUpdateFixture
             dream_count: std::sync::atomic::AtomicU64::new(0),
             dream_success_count: std::sync::atomic::AtomicU64::new(0),
             dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            configured_mode: None,
+            v2_config: Default::default(),
         },
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Once;
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use xai_sqlite_journal::JournalMode;
 
 use super::chunker::{chunk_hash, chunk_markdown};
@@ -117,6 +117,47 @@ impl MemoryIndex {
         )
     }
 
+    /// Open an index for lexical-only maintenance without changing the vector
+    /// dimension already recorded by the embedding backend.
+    pub(crate) fn open_or_create_preserving_dimensions(
+        db_path: &Path,
+        storage: MemoryStorage,
+        config: MemoryIndexConfig,
+        fallback_dimensions: usize,
+    ) -> Result<Self, rusqlite::Error> {
+        if let Some(parent) = db_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let journal_mode = JournalMode::for_db_path(db_path);
+        let db = journal_mode.open(db_path)?;
+        let has_meta = db.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let stored_dimensions = if has_meta {
+            db.query_row(
+                schema::GET_META_SQL,
+                params!["embedding_dimensions"],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        } else {
+            None
+        };
+        let dimensions = match stored_dimensions {
+            Some(value) => value
+                .parse::<usize>()
+                .ok()
+                .filter(|dimensions| *dimensions > 0)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            None => fallback_dimensions,
+        };
+        Self::initialize(db, storage, config, dimensions)
+    }
+
     /// Open with an explicit journal mode — the seam tests use to exercise
     /// the network-filesystem decision on a local disk.
     fn open_or_create_with_journal_mode(
@@ -128,7 +169,15 @@ impl MemoryIndex {
     ) -> Result<Self, rusqlite::Error> {
         // busy_timeout + journal pragma live in the helper (see JournalMode::open).
         let db = journal_mode.open(db_path)?;
+        Self::initialize(db, storage, config, dimensions)
+    }
 
+    fn initialize(
+        db: rusqlite::Connection,
+        storage: MemoryStorage,
+        config: MemoryIndexConfig,
+        dimensions: usize,
+    ) -> Result<Self, rusqlite::Error> {
         // Check if sqlite-vec loaded (graceful fallback if not)
         let vec_available =
             match db.query_row("SELECT vec_version()", [], |r| r.get::<_, String>(0)) {
@@ -232,8 +281,20 @@ impl MemoryIndex {
                 return Ok(ReindexResult::default());
             }
         };
+        self.reindex_content(path, source, &content)
+    }
 
-        let new_chunks = chunk_markdown(&content, &self.chunk_config);
+    /// Reindex a path from bytes already read and validated by the caller.
+    ///
+    /// This avoids a second filesystem read when the caller must bind indexed
+    /// content to a durable hash.
+    pub fn reindex_content(
+        &mut self,
+        path: &Path,
+        source: &str,
+        content: &str,
+    ) -> Result<ReindexResult, rusqlite::Error> {
+        let new_chunks = chunk_markdown(content, &self.chunk_config);
         let path_str = path.to_string_lossy().to_string();
 
         // Load existing chunks for this path
@@ -842,6 +903,24 @@ mod tests {
         assert_eq!(result.added, 1);
         assert_eq!(result.updated, 0);
         assert_eq!(result.removed, 0);
+    }
+
+    #[test]
+    fn reindex_content_uses_the_callers_verified_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let mut idx = test_index(&tmp);
+        let file_path = tmp.path().join("test.md");
+        std::fs::write(&file_path, "# Changed\n\nUnverified disk content.").unwrap();
+
+        idx.reindex_content(
+            &file_path,
+            "workspace",
+            "# Verified\n\nHash-bound durable content.",
+        )
+        .unwrap();
+
+        assert!(!idx.search_fts("hash bound durable", 10).unwrap().is_empty());
+        assert!(idx.search_fts("unverified disk", 10).unwrap().is_empty());
     }
 
     #[test]

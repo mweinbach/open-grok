@@ -80,8 +80,10 @@ pub struct AgentBuilder {
     compaction_policy: CompactionPolicy,
     reminder_policy: ReminderPolicy,
     memory_enabled: bool,
+    memory_v2_enabled: bool,
     memory_global_path: Option<String>,
     memory_workspace_path: Option<String>,
+    memory_v2_access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
     is_non_interactive: bool,
     system_prompt_label: String,
     session_env: Option<Arc<HashMap<String, String>>>,
@@ -234,8 +236,10 @@ impl AgentBuilder {
             compaction_policy: CompactionPolicy::default(),
             reminder_policy: ReminderPolicy::default(),
             memory_enabled: false,
+            memory_v2_enabled: false,
             memory_global_path: None,
             memory_workspace_path: None,
+            memory_v2_access: None,
             is_non_interactive: false,
             system_prompt_label: crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
             session_env: None,
@@ -422,6 +426,22 @@ impl AgentBuilder {
         backend: Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
     ) -> Self {
         self.memory_backend = Some(backend);
+        self
+    }
+    /// Install the isolated memory-v2 filesystem policy and, when `exposed`,
+    /// surface the topic/observation roots in the system prompt.
+    pub fn with_memory_v2_access(
+        mut self,
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+        exposed: bool,
+    ) -> Self {
+        if let Some(access) = access.as_ref() {
+            let [global_root, workspace_root] = access.0.scope_roots();
+            self.memory_global_path = Some(global_root.to_string_lossy().into_owned());
+            self.memory_workspace_path = Some(workspace_root.to_string_lossy().into_owned());
+        }
+        self.memory_v2_enabled = exposed && access.is_some();
+        self.memory_v2_access = access;
         self
     }
     /// Set a custom filesystem backend for the ToolBridge.
@@ -1272,6 +1292,9 @@ impl AgentBuilder {
         )
         .await
         .map_err(|e| AgentBuildError::ToolError(e.to_string()))?;
+        if let Some(access) = self.memory_v2_access.clone() {
+            tool_bridge.update_resource(access).await;
+        }
         tool_bridge
             .update_resource(
                 xai_grok_tools::implementations::codex::multi_agent_v2::NativeAgentsEnabled(
@@ -1400,6 +1423,7 @@ impl AgentBuilder {
             persona_summaries: self.persona_summaries,
             build_timestamp_utc: now.to_rfc3339(),
             memory_enabled: self.memory_enabled,
+            memory_v2_enabled: self.memory_v2_enabled,
             memory_global_path: self.memory_global_path,
             memory_workspace_path: self.memory_workspace_path,
             role_instructions: self.role_instructions,

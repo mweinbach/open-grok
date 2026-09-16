@@ -13776,6 +13776,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "xai-grok-feedback"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "fs2",
+ "libc",
+ "same-file",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "strum 0.27.2",
+ "tar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "xai-grok-foreign-sessions"
 version = "0.1.0"
 dependencies = [
@@ -13923,6 +13942,7 @@ dependencies = [
  "libc",
  "nix 0.30.1",
  "notify",
+ "parking_lot",
  "reqwest 0.12.24",
  "reqwest-middleware 0.4.2",
  "rusqlite",
@@ -13931,6 +13951,7 @@ dependencies = [
  "sqlite-vec",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "windows 0.61.3",

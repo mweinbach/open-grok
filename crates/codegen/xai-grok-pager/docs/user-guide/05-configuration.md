@@ -493,6 +493,12 @@ min_score = 0.0                       # score threshold for first-turn injection
 [memory.embedding]
 model = "embedding-model"             # embedding model name
 dimensions = 1024                     # vector dimensions
+
+# Isolated topic/observation pipeline (Grok Build 1.0.32+).
+# Selecting this does not read or write ~/.opengrok/memory/.
+[memory_v2]
+enabled = false
+# rollout = "active"                  # off | record_only | shadow | active
 ```
 
 ### Subagents

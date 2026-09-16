@@ -513,6 +513,9 @@ pub struct RemoteSettings {
     /// Enable the experimental memory system remotely.
     #[serde(default)]
     pub memory_enabled: Option<bool>,
+    /// Isolated memory-v2 remote gates. Local `[memory_v2]` still wins.
+    #[serde(default)]
+    pub memory_v2: Option<memory::MemoryV2Settings>,
     #[serde(default)]
     pub memory_search_max_results: Option<u32>,
     #[serde(default)]
