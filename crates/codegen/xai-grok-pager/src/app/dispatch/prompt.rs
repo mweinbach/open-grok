@@ -544,12 +544,24 @@ pub(super) fn dispatch_send_prompt_inner(
     // (ambient tips live out their TTL across the submit).
     agent.ephemeral_tip.clear_on_submit();
 
-    let trimmed = text.trim();
+    // The raw text decides command-ness; a stripped ` /btw q` hoists.
+    let hoisted = if literal || text.trim().starts_with('/') {
+        None
+    } else {
+        crate::slash::mid_text_hoist::hoist_mid_text_command(
+            &text,
+            agent.prompt.slash_controller.registry(),
+        )
+    };
 
-    let recorded_as_command = !literal && consume_input && trimmed.starts_with('/');
+    let recorded_as_command =
+        !literal && consume_input && (hoisted.is_some() || text.trim().starts_with('/'));
     if recorded_as_command {
-        agent.record_prompt_in_history(trimmed);
+        // Up-arrow history recalls the message as typed, not the hoisted rewrite.
+        agent.record_prompt_in_history(text.trim());
     }
+    let text = hoisted.unwrap_or(text);
+    let trimmed = text.trim();
 
     let mut effects = Vec::new();
 
