@@ -1693,7 +1693,7 @@ pub(super) async fn run_session(
                                         schema,
                                         meta,
                                     );
-                                    if let Some(reg) = mcp_tool.into_registration() {
+                                    if let Ok(reg) = mcp_tool.into_registration() {
                                         mcp_state
                                             .disabled_tool_registrations
                                             .insert(qualified.clone(), reg);

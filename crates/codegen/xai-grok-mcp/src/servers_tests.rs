@@ -1488,6 +1488,11 @@ fn into_registration_validates_qualified_name() {
         .expect("should register");
     assert_eq!(registration.name, "linear__list_issues");
 
+    let digit_tool = make_mcp_tool("auth", "2fa_enable")
+        .into_registration()
+        .expect("digit-leading tool segments are catalog-valid");
+    assert_eq!(digit_tool.name, "auth__2fa_enable");
+
     for (server, tool) in [
         ("server__part", "tool"),
         ("server", "tool__part"),
@@ -1496,32 +1501,27 @@ fn into_registration_validates_qualified_name() {
         ("foo_", "_bar"),
         ("", "tool"),
         ("server", ""),
+        ("123", "lookup"),
+        ("server:scope", "tool"),
     ] {
         assert!(
-            make_mcp_tool(server, tool).into_registration().is_none(),
+            make_mcp_tool(server, tool).into_registration().is_err(),
             "unexpectedly registered {server:?} and {tool:?}"
         );
     }
 }
 
 #[test]
-fn into_registration_preserves_provider_name_policy() {
-    for qualified in ["123__lookup", "server:scope__tool"] {
-        assert!(parse_mcp_qualified_name(qualified).is_some());
-        let (server, tool) = qualified.split_once("__").unwrap();
-        assert!(make_mcp_tool(server, tool).into_registration().is_none());
-    }
-
-    let server_61 = format!("a{}", "b".repeat(60));
+fn into_registration_admits_qualified_names_longer_than_provider_64() {
     let server_62 = format!("a{}", "b".repeat(61));
-    let valid_64 = format!("{server_61}__b");
-    let invalid_65 = format!("{server_62}__b");
-    assert_eq!(valid_64.len(), 64);
-    assert_eq!(invalid_65.len(), 65);
-    assert!(parse_mcp_qualified_name(&valid_64).is_some());
-    assert!(parse_mcp_qualified_name(&invalid_65).is_some());
-    assert!(make_mcp_tool(&server_61, "b").into_registration().is_some());
-    assert!(make_mcp_tool(&server_62, "b").into_registration().is_none());
+    let qualified = format!("{server_62}__b");
+    assert_eq!(qualified.len(), 65);
+    assert!(parse_mcp_qualified_name(&qualified).is_some());
+    assert!(validate_tool_name(&qualified).is_err());
+    let registration = make_mcp_tool(&server_62, "b")
+        .into_registration()
+        .expect("qualified catalog keys may exceed the 64-char provider budget");
+    assert_eq!(registration.name, qualified);
 }
 
 // ── is_retriable_transport_error tests ───────────────────────────

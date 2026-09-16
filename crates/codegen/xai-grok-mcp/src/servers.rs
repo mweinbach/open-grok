@@ -8,7 +8,6 @@ use xai_grok_telemetry::region;
 use xai_grok_telemetry::region::Parent;
 
 use agent_client_protocol as acp;
-use regex::Regex;
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     process::{ChildStderr, Command},
@@ -34,12 +33,13 @@ use rmcp::{
 
 pub use crate::auth_status::McpOauthDiscovery;
 use crate::auth_status::{HttpAuthDecision, decide_http_auth_from_disk};
+use crate::call_result::mcp_output_from_call_result;
 use crate::oauth::OAUTH_DISCOVERY_TIMEOUT;
 
 use crate::oauth_config::McpOAuthConfig;
 
 use xai_grok_tools::types::{
-    output::{MCPOutput, MCPOutputDetails, ToolOutput},
+    output::{MCPOutputDetails, ToolOutput},
     tool::{ToolKind, ToolNamespace},
     tool_metadata::ToolMetadata,
 };
@@ -49,6 +49,12 @@ use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 /// Canonical definition lives in `xai_grok_workspace_types`; re-exported here
 /// for callers that historically imported it from this module.
 pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
+#[cfg(test)]
+pub(crate) use crate::call_result::format_mcp_image;
+pub use crate::tool_name::{
+    MCP_QUALIFIED_NAME_MAX_CHARS, McpToolAdmissionError, PROVIDER_TOOL_NAME_MAX_CHARS,
+    parse_mcp_qualified_name, parse_mcp_tool_name, qualify_mcp_tool_name, validate_tool_name,
+};
 
 /// Reqwest 0.13 adapter over `xai_grok_extra_ca::extra_root_ders` (DER is version-neutral).
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
@@ -70,37 +76,6 @@ fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest:
 /// Must match the normalization the host's managed-config layer uses
 /// (e.g. shell's `session::managed_mcp::normalize_url`) so refresh
 /// lookup keys agree.
-
-/// Regex for strictest cross-provider tool name validation.
-///
-/// Requirements across providers:
-/// - Anthropic/OpenAI: `^[a-zA-Z0-9_-]{1,64}$` (allows starting with digit/hyphen)
-/// - Google Gemini: `^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$` (must start with letter/underscore, allows dots)
-///
-/// Strictest common denominator: must start with letter/underscore, only alphanumeric/_/- allowed, max 64 chars.
-static TOOL_NAME_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$").unwrap());
-
-/// Validate that a tool name matches the strictest cross-provider LLM API requirements.
-///
-/// Pattern: `^[a-zA-Z_][a-zA-Z0-9_-]{0,63}$`
-/// - Must start with a letter or underscore (Gemini requirement)
-/// - Only letters, digits, underscores, hyphens allowed (no dots — Anthropic/OpenAI requirement)
-/// - Maximum 64 characters
-///
-/// Returns `Ok(())` if valid, or `Err(reason)` if invalid.
-pub fn validate_tool_name(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("tool name cannot be empty".to_string());
-    }
-    if !TOOL_NAME_REGEX.is_match(name) {
-        return Err(format!(
-            "tool name '{}' is invalid — must match ^[a-zA-Z_][a-zA-Z0-9_-]{{0,63}}$ (start with letter/underscore, max 64 chars)",
-            name
-        ));
-    }
-    Ok(())
-}
 
 pub const MAX_MCP_ICONS_PER_ENTITY: usize = 8;
 pub const MAX_MCP_ICON_SRC_BYTES: usize = 64 * 1024;
@@ -1273,33 +1248,6 @@ pub fn parse_mcp_meta_config(
 /// here so existing call sites continue to work.
 pub use xai_grok_telemetry::enums::McpInitStrategy;
 
-/// Parse a non-empty `server__tool` ID with one overlap-aware delimiter and
-/// valid [`xai_tool_protocol::ToolId`] syntax.
-pub fn parse_mcp_qualified_name(name: &str) -> Option<(xai_tool_protocol::ToolId, &str, &str)> {
-    let delimiter = MCP_TOOL_NAME_DELIMITER.as_bytes();
-    // Byte windows preserve both overlapping `__` boundaries in `___`.
-    let mut boundaries = name
-        .as_bytes()
-        .windows(delimiter.len())
-        .enumerate()
-        .filter_map(|(index, window)| (window == delimiter).then_some(index));
-    let boundary = boundaries.next()?;
-    if boundaries.next().is_some() {
-        return None;
-    }
-    let (server, tool_with_delimiter) = name.split_at(boundary);
-    let tool = &tool_with_delimiter[MCP_TOOL_NAME_DELIMITER.len()..];
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    Some((xai_tool_protocol::ToolId::new(name).ok()?, server, tool))
-}
-
-/// Parse an MCP tool name in `server__tool` format into owned segments.
-pub fn parse_mcp_tool_name(name: &str) -> Option<(String, String)> {
-    parse_mcp_qualified_name(name).map(|(_, server, tool)| (server.to_owned(), tool.to_owned()))
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
     #[error("MCP client error: {0}")]
@@ -1583,33 +1531,18 @@ impl McpTool {
 
     /// Convert into the data needed for `ToolBridge::register_erased()`.
     ///
-    /// Invalid or ambiguous qualified IDs and provider-invalid names are logged
-    /// and skipped; the upstream connector must provide non-empty `server` and
-    /// `tool` segments separated by exactly one `__` boundary.
-    pub fn into_registration(self) -> Option<McpToolRegistration> {
-        let qualified_name = format!(
-            "{}{}{}",
-            self.server_name, MCP_TOOL_NAME_DELIMITER, self.name
-        );
-
-        if parse_mcp_qualified_name(&qualified_name).is_none() {
-            tracing::error!(
-                server = %self.server_name,
-                tool = %self.name,
-                qualified = %qualified_name,
-                "Skipping MCP tool with invalid or ambiguous qualified name"
-            );
-            return None;
-        }
-        if let Err(reason) = validate_tool_name(&qualified_name) {
-            tracing::error!(
-                tool_name = %qualified_name,
-                server = %self.server_name,
-                reason = %reason,
-                "Skipping MCP tool with invalid name"
-            );
-            return None;
-        }
+    /// Invalid or ambiguous qualified IDs are logged and skipped. Catalog keys
+    /// may exceed the 64-char provider function-name budget (up to 256 chars).
+    pub fn into_registration(self) -> Result<McpToolRegistration, McpToolAdmissionError> {
+        let qualified_name =
+            qualify_mcp_tool_name(&self.server_name, &self.name).inspect_err(|reason| {
+                tracing::error!(
+                    server = %self.server_name,
+                    tool = %self.name,
+                    reason = %reason,
+                    "Skipping MCP tool"
+                );
+            })?;
 
         let description = self.description.clone();
         let input_schema = self.schema.clone();
@@ -1623,7 +1556,7 @@ impl McpTool {
             .map(|arr| arr.iter().any(|s| s.as_str() == Some("model")))
             .unwrap_or(true); // default: visible to model
 
-        Some(McpToolRegistration {
+        Ok(McpToolRegistration {
             name: qualified_name,
             description,
             input_schema,
@@ -1793,53 +1726,16 @@ impl xai_tool_runtime::Tool for McpErasedTool {
         };
 
         let is_error = call_result.is_error.unwrap_or(false);
-        let mut output = if is_error {
-            let error_msg = call_result
-                .content
-                .iter()
-                .filter_map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            ToolOutput::MCP(MCPOutput::errored(tool.clone(), server.clone(), error_msg))
-        } else {
-            let expose_base64 = client.expose_image_base64();
-            let parts: Vec<String> = call_result
-                .content
-                .into_iter()
-                .filter_map(|c| match c {
-                    rmcp::model::ContentBlock::Text(t) => Some(t.text),
-                    rmcp::model::ContentBlock::Image(img) => {
-                        Some(format_mcp_image(&img.mime_type, &img.data, expose_base64))
-                    }
-                    rmcp::model::ContentBlock::Resource(r) => match &r.resource {
-                        rmcp::model::ResourceContents::BlobResourceContents {
-                            mime_type,
-                            blob,
-                            ..
-                        } if mime_type
-                            .as_deref()
-                            .is_some_and(|m| m.starts_with("image/")) =>
-                        {
-                            let mime = mime_type.as_deref().unwrap();
-                            Some(format_mcp_image(mime, blob, expose_base64))
-                        }
-                        _ => serde_json::to_string(&r).ok(),
-                    },
-                    _ => None,
-                })
-                .collect();
-            let text = parts.join("\n");
-            ToolOutput::MCP(MCPOutput::okay_output(tool.clone(), server.clone(), text))
-        };
-
-        if let ToolOutput::MCP(ref mut mcp_out) = output {
-            mcp_out.auth_retry_attempted = auth_retry_attempted;
-            mcp_out.reconnect_attempted = reconnect_attempted;
-            mcp_out.is_timeout = is_timeout;
-        }
+        let mut mcp_out = mcp_output_from_call_result(
+            tool.clone(),
+            server.clone(),
+            call_result,
+            client.expose_image_base64(),
+        );
+        mcp_out.auth_retry_attempted = auth_retry_attempted;
+        mcp_out.reconnect_attempted = reconnect_attempted;
+        mcp_out.is_timeout = is_timeout;
+        let output = ToolOutput::MCP(mcp_out);
 
         let success = !is_error;
         let duration_ms = mcp_call_start.elapsed().as_millis() as u64;
@@ -1873,24 +1769,6 @@ impl xai_tool_runtime::Tool for McpErasedTool {
             duration_ms,
         });
         Ok(output)
-    }
-}
-
-/// Render an MCP image content block. The data URI is consumed by the
-/// session-layer `extract_base64_images` and rendered as vision tokens.
-/// When `expose_base64`, also emit a `<mcp_image_base64>` wrapper that
-/// survives extraction (wrapper has no `data:image/` prefix → regex skips
-/// it), exposing the raw bytes to the agent for path-based forwarding.
-fn format_mcp_image(mime: &str, base64_data: &str, expose_base64: bool) -> String {
-    if expose_base64 {
-        format!(
-            "data:{mime};base64,{base64_data}\n\
-             <mcp_image_base64 mime=\"{mime}\">\n\
-             {base64_data}\n\
-             </mcp_image_base64>"
-        )
-    } else {
-        format!("data:{mime};base64,{base64_data}")
     }
 }
 
@@ -4528,6 +4406,7 @@ impl McpClient {
             }
         }
 
+        let event_writer = mcp_state.lock().await.event_writer().clone();
         let registrations: Vec<_> = all_tools
             .into_iter()
             .filter_map(|tool| {
@@ -4554,18 +4433,29 @@ impl McpClient {
 
                 let icons = McpIcon::from_rmcp_list(tool.icons);
                 let mcp_tool = McpTool {
-                    name,
+                    name: name.clone(),
                     description,
                     server_name: self.server_name.clone(),
                     mcp_state: Arc::clone(&mcp_state),
                     schema,
                     meta,
                 };
-                // Invalid tools (bad names) return None and are skipped
-                mcp_tool.into_registration().map(|mut registration| {
-                    registration.icons = icons;
-                    registration
-                })
+                match mcp_tool.into_registration() {
+                    Ok(mut registration) => {
+                        registration.icons = icons;
+                        Some(registration)
+                    }
+                    Err(reason) => {
+                        event_writer.emit(
+                            xai_grok_session_events::Event::McpToolRegistrationFailed {
+                                server_name: self.server_name.clone(),
+                                tool_name: name,
+                                error: reason.to_string(),
+                            },
+                        );
+                        None
+                    }
+                }
             })
             .collect();
 
