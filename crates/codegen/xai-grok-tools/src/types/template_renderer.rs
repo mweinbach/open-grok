@@ -689,7 +689,7 @@ mod tests {
 
 Usage notes:
 - Use the task_id from a command run with ${{ params.execute.is_background }}=true, or a subagent launched with ${{ params.task.run_in_background }}=true
-- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~10 min)."#;
+- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~1 h)."#;
         let rendered = r.render(desc).expect("task_output description must render");
         let _ = std::fs::write("/tmp/task_output_tool_description.txt", &rendered);
         assert!(

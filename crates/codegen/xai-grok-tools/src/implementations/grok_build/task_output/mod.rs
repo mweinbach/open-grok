@@ -31,7 +31,7 @@ use xai_tool_types::{
 /// constant is not applied unless a wait is active.
 pub(crate) const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The blocking-wait ceiling: `GROK_MAX_WAIT_BLOCK_MS`, else 10 min.
+/// The blocking-wait ceiling: `OPENGROK_MAX_WAIT_BLOCK_MS`, else 1 hour.
 ///
 /// The same value fills `{max_wait_ms}` in the descriptions, so a wait can
 /// never exceed what the model was told it may ask for.
