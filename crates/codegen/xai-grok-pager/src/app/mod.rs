@@ -158,19 +158,6 @@ pub(crate) fn minimal_mode_active() -> bool {
 pub(crate) fn set_minimal_mode_active_for_test(on: bool) {
     MINIMAL_MODE_ACTIVE.store(on, Ordering::Release);
 }
-/// Whether a bare Esc cancels a running turn: minimal mode and non-vim
-/// fullscreen get the single-Esc cancel; fullscreen vim mode keeps the
-/// mid-turn swallow (Ctrl+C stays the cancel gesture there).
-///
-/// Pure over its inputs — production callers pass the agent's injected
-/// effective screen mode (`AgentView::is_minimal_mode`, seeded by
-/// `apply_app_scoped_gates`; never the [`minimal_mode_active`] process
-/// global) and tests pass explicit booleans. `vim_mode` is the
-/// scrollback-nav setting (`[ui].vim_mode` / `/vim-mode`), not the prompt
-/// `simple_mode`.
-pub(crate) fn esc_cancels_turn(is_minimal: bool, vim_mode: bool) -> bool {
-    is_minimal || !vim_mode
-}
 /// Whether the opt-in mouse-reporting toggle feature is enabled
 /// (`[ui] mouse_reporting_toggle` / `GROK_MOUSE_REPORTING_TOGGLE`). Seeded once
 /// at startup; gates both the `Ctrl+R` shortcut registration and the

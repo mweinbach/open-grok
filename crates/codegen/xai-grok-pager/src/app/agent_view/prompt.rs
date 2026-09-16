@@ -878,7 +878,11 @@ impl AgentView {
     ///
     /// Call only after overlay / dropdown / search / selection declined Esc.
     /// Returns `None` when the key is not a bare Esc press.
-    pub(super) fn try_handle_esc_policy(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
+    pub(super) fn try_handle_esc_policy(
+        &mut self,
+        key: &KeyEvent,
+        registry: &ActionRegistry,
+    ) -> Option<InputOutcome> {
         if key.kind == KeyEventKind::Release
             || key.code != KeyCode::Esc
             || !key.modifiers.is_empty()
@@ -886,32 +890,36 @@ impl AgentView {
             return None;
         }
 
-        // This bare Esc is now owned by the policy: every path below consumes the
-        // event (cancel / mid-turn swallow / arm-clear / arm-rewind / idle
-        // swallow). Disarm the Esc→d flight-recorder combo here, uniformly — the
-        // `0-esc-d` block set `esc_pressed_at` on this same press, but since the
-        // policy is handling the Esc, a following `d` is the user's text, not a
-        // dump.
+        // This bare Esc is now owned by the policy: every path below consumes
+        // the event (mid-turn hint / arm-clear / arm-rewind / idle swallow).
+        // Disarm the Esc→d flight-recorder combo here, uniformly — the
+        // `0-esc-d` block set `esc_pressed_at` on this same press, but since
+        // the policy is handling the Esc, a following `d` is the user's text,
+        // not a dump.
         self.esc_pressed_at = None;
 
         // A blocking card is still pending, parked behind the scrollback — the
         // only way its Esc reaches this policy. Swallow it like the idle arms
-        // below: cancelling here would kill the turn the card is blocking on,
-        // and `esc_would_cancel_turn`, which the bar reads, already promises
-        // it will not.
+        // below so the card's own Esc semantics stay the only ones advertised.
         if !self.no_input_overlay_pending() {
             return Some(InputOutcome::Changed);
         }
 
-        if self.stoppable_activity_running()
-            && !crate::app::esc_cancels_turn(self.is_minimal_mode(), self.vim_mode)
-        {
-            return Some(InputOutcome::Changed);
-        }
+        // Mid-turn (running or already cancelling), every mode: Esc never
+        // cancels; point at the registry cancel binding instead. A streaming
+        // wake turn follows the same policy as a running turn (the pane state
+        // is Idle only because wake turns are not adopted). Push the grace
+        // deadline out so an Esc mash past the turn's end cannot silently arm
+        // the rewind picker below.
         if self.stoppable_activity_running() || self.any_cancel_pending() {
-            self.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::Esc);
+            if self.stoppable_activity_running()
+                && let Some(cancel_key) = registry.key_for(ActionId::CancelTurn)
+            {
+                let cancel_key = cancel_key.display();
+                self.show_cancel_key_hint(&format!("Press {cancel_key} to cancel the turn"));
+            }
             self.suppress_rewind_arm(std::time::Instant::now());
-            return Some(InputOutcome::Action(Action::CancelTurn));
+            return Some(InputOutcome::Changed);
         }
 
         // The two idle arms split on pane ownership. CLEAR mutates the composer
@@ -919,9 +927,7 @@ impl AgentView {
         // keys — clearing a draft the reader has scrolled past would be a
         // surprising cross-pane side effect. REWIND requires an EMPTY prompt
         // (checked below), so there is no draft to clobber or silently stash and
-        // it may arm from EITHER pane. The mid-turn cancel or swallow /
-        // cancel-retry (above) stays cross-pane; any other idle Esc swallows
-        // (below).
+        // it may arm from EITHER pane.
         let has_content = !self.prompt.text().is_empty() || !self.prompt.images.is_empty();
 
         // Idle + non-empty (text and/or image chips) + prompt pane → arm clear (2× Esc).
@@ -975,12 +981,29 @@ impl AgentView {
         Some(InputOutcome::Changed)
     }
 
-    /// Arm the post-cancel grace: push the rewind-ARM suppression deadline
-    /// out to `now + ESC_CANCEL_REWIND_GRACE`. After an Esc-fired cancel the
-    /// session goes Cancelling → Idle with (typically) an empty composer, so
-    /// a user mashing Esc would otherwise immediately arm-and-fire the
-    /// silent double-Esc rewind picker. Takes `now` so tests are
-    /// deterministic (no fabricated `Instant`s).
+    /// Minimal has no toast slot and cannot erase committed lines, so the
+    /// hint is a scrollback system line there. Repeated Esc presses must
+    /// not stack copies of it, even with streamed blocks in between:
+    /// commit at most one per user turn.
+    fn show_cancel_key_hint(&mut self, msg: &str) {
+        if !self.is_minimal_mode() {
+            self.show_toast(msg);
+            return;
+        }
+        let turn = self.scrollback.turn_count();
+        if self.minimal_cancel_hint_turn != Some(turn) {
+            self.minimal_cancel_hint_turn = Some(turn);
+            self.scrollback
+                .push_block(crate::scrollback::block::RenderBlock::system(msg));
+        }
+    }
+
+    /// Arm the mid-turn Esc grace: push the rewind-ARM suppression deadline
+    /// out to `now + ESC_CANCEL_REWIND_GRACE`. A user mashing Esc at a turn
+    /// that then ends (Ctrl+C cancel or natural completion) lands on an
+    /// idle, typically empty composer. Without the grace the next press
+    /// would immediately arm-and-fire the silent double-Esc rewind picker.
+    /// Takes `now` so tests are deterministic (no fabricated `Instant`s).
     pub(crate) fn suppress_rewind_arm(&mut self, now: std::time::Instant) {
         self.rewind_suppress_deadline = Some(now + Self::ESC_CANCEL_REWIND_GRACE);
     }

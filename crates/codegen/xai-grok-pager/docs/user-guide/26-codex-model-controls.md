@@ -109,7 +109,7 @@ replaced. Manual `/compact` also starts a fresh window while this mode is on.
 **Settings → Agent → Codex persistent work** keeps the root agent working on
 relevant authorized follow-ups and monitoring while it sends progress messages.
 It requires a model with async user messaging. Codex's persistent mode disables
-reasoning on the wire. Escape cancels normally; the mode does not expand your
+reasoning on the wire. Ctrl+C cancels normally; the mode does not expand your
 authorization or enable itself on subagents.
 
 **Codex browser action review** uses available model Guardian guidance to

@@ -365,6 +365,7 @@ impl AgentView {
             input_log: crate::input_log::InputRingBuffer::new(),
             esc_pressed_at: None,
             rewind_suppress_deadline: None,
+            minimal_cancel_hint_turn: None,
             pending_first_prompt: None,
             pending_fork_banner: None,
             loading_placeholder_id: None,
@@ -748,7 +749,7 @@ impl AgentView {
     ///
     /// `/compact` is intentionally excluded — CancelTurn would work, but the
     /// overlay gesture arms the two-press close instead (matching idle /
-    /// cancelling). Compact cancel stays on Ctrl+C, Esc, and the *confirmed*
+    /// cancelling). Compact cancel stays on Ctrl+C and the *confirmed*
     /// overlay stop (`dispatch_dashboard_overlay_stop`).
     pub(crate) fn arm_dashboard_stop(&mut self) -> bool {
         let cancel = self.session.state.is_turn_running()
