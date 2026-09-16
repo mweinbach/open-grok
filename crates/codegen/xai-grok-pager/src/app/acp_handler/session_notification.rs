@@ -1423,7 +1423,7 @@ pub(super) fn handle_session_notification_with_origin(
             }
             actually_changed
         }
-        XaiSessionUpdate::MemoryFiles { files } => {
+        XaiSessionUpdate::MemoryFiles { files, .. } => {
             let entries = crate::views::memory_modal::build_entries(files);
             let modal_state = crate::views::memory_modal::MemoryModalState::new(entries);
             agent.active_modal = Some(crate::views::modal::ActiveModal::MemoryBrowser {

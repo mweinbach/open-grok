@@ -1900,6 +1900,34 @@ impl ModelsManager {
             .unwrap_or_default()
     }
 
+    /// Whether `model_id` accepts this effort on the wire.
+    pub(crate) fn model_supports_reasoning_effort_value(
+        &self,
+        model_id: &str,
+        effort: ReasoningEffort,
+    ) -> bool {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .get(model_id)
+            .is_some_and(|entry| resolution::model_offers_reasoning_effort(entry.info(), effort))
+    }
+
+    /// Id to send at `effort`. Fork catalogs do not remap slugs per effort.
+    pub(crate) fn model_for_effort(
+        &self,
+        model_id: &str,
+        _effort: ReasoningEffort,
+    ) -> Option<String> {
+        self.inner
+            .catalog
+            .read()
+            .models
+            .contains_key(model_id)
+            .then(|| model_id.to_owned())
+    }
+
     /// Service tiers advertised for `model_id` (Codex Fast/Flex routing).
     pub fn model_service_tiers(
         &self,

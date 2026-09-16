@@ -494,6 +494,12 @@ pub enum SessionCommand {
     FlushMemory {
         respond_to: oneshot::Sender<acp::Result<bool>>,
     },
+    /// Delete one memory note from the `/memory` modal.
+    MemoryForget {
+        path: String,
+        expected_content_hash: String,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryForgetResponse>,
+    },
     /// Auto-approve all permission prompts when `enabled`.
     SetYoloMode {
         enabled: bool,

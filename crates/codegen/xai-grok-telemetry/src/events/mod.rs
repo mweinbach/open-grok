@@ -2632,6 +2632,34 @@ telemetry_event!(
     crate::memory_telemetry::MemorySessionSummary,
     "memory_session_summary"
 );
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2ControlsPinned,
+    "memory_v2_controls_pinned"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2CaptureLifecycle,
+    "memory_v2_capture_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FlushResult,
+    "memory_v2_flush_result"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2DreamLifecycle,
+    "memory_v2_dream_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2GcCompleted,
+    "memory_v2_gc_completed"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2Forgotten,
+    "memory_v2_forgotten"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FailClosed,
+    "memory_v2_fail_closed"
+);
 
 #[cfg(test)]
 mod tests {

@@ -97,6 +97,20 @@ impl SessionActor {
                 dream_count: telem.dream_count,
                 dream_success_count: telem.dream_success_count,
                 dream_error_count: telem.dream_error_count,
+                memory_enabled: self.memory.is_enabled(),
+                memory_mode: match self.memory.mode() {
+                    Some(crate::config::MemoryMode::V2) => {
+                        xai_grok_telemetry::memory_telemetry::MemoryMode::V2
+                    }
+                    _ => xai_grok_telemetry::memory_telemetry::MemoryMode::Legacy,
+                },
+                capture_prompt_tokens: telem.capture_prompt_tokens,
+                capture_completion_tokens: telem.capture_completion_tokens,
+                capture_cost_usd_ticks: telem.capture_cost_usd_ticks,
+                dream_prompt_tokens: telem.dream_prompt_tokens,
+                dream_completion_tokens: telem.dream_completion_tokens,
+                dream_cost_usd_ticks: telem.dream_cost_usd_ticks,
+                injected_bytes: telem.injected_bytes,
             },
         );
     }
@@ -116,7 +130,7 @@ impl SessionActor {
         // save was Skipped for config (`save_on_end=false`) but the session
         // still meets the size threshold. Empty/brief sessions stay off.
         let mut run_exit_dream = false;
-        if !self.startup_hints.is_subagent {
+        if !self.startup_hints.is_subagent && self.memory.uses_legacy_pipeline() {
             if let Some(storage) = self.memory.storage() {
                 let conversation = self.chat_state_handle.get_conversation().await;
                 if self.memory.save_on_end && !storage.is_ephemeral() {
@@ -231,6 +245,9 @@ impl SessionActor {
         std::path::PathBuf,
         String,
     )> {
+        if !self.memory.uses_legacy_pipeline() {
+            return None;
+        }
         let storage = self.memory.storage()?;
         let workspace_dir = storage.workspace_dir();
         let lock = crate::session::memory::dream_lock::DreamLock::new(workspace_dir);
@@ -284,7 +301,11 @@ impl SessionActor {
     }
 
     /// Run dream from `/dream` slash command, bypassing time/session gates.
-    pub(super) async fn run_dream_slash_command(&self) {
+    pub(super) async fn run_dream_slash_command(self: &Arc<Self>) {
+        if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+            self.run_v2_dream_slash_command().await;
+            return;
+        }
         use crate::session::memory::dream_lock::sessions_since;
 
         let Some((storage, lock, sessions_dir, sid8)) = self.dream_context() else {
@@ -486,7 +507,7 @@ impl SessionActor {
     ) -> bool {
         use crate::session::helpers::memory_flush::*;
 
-        if !self.memory.is_enabled() {
+        if !self.memory.uses_legacy_pipeline() {
             return false;
         }
 

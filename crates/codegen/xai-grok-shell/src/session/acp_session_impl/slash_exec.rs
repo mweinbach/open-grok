@@ -94,7 +94,14 @@ impl SessionActor {
             }
             BuiltinAction::FlushMemory => {
                 if self.memory.is_enabled() {
-                    let did_flush = self.run_memory_flush("slash_command", None).await;
+                    let did_flush = if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                        matches!(
+                            self.flush_v2_capture().await,
+                            crate::session::memory::v2_capture::FlushResult::Success
+                        )
+                    } else {
+                        self.run_memory_flush("slash_command", None).await
+                    };
                     if !did_flush {
                         tracing::info!(
                             session_id = %self.session_info.id.0,
@@ -727,6 +734,11 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
+            BuiltinAction::MemoryStatus => {
+                let status = self.memory_v2_status().await;
+                self.send_host_turn_slash_command_output(&status).await;
+                ok_end_turn(0, None)
+            }
             BuiltinAction::MemoryBrowse => {
                 let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
                     match storage.list_memory_files() {
@@ -752,6 +764,10 @@ impl SessionActor {
                                         .and_then(|m| m.modified().ok())
                                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                         .map(|d| d.as_secs()),
+                                    generated: path
+                                        .file_name()
+                                        .is_some_and(|name| name == "MEMORY.md")
+                                        && storage.mode().is_v2(),
                                 }
                             })
                             .collect(),
@@ -780,8 +796,16 @@ impl SessionActor {
                     file_count = file_infos.len(),
                     "memory browse: listing files",
                 );
-                self.send_xai_notification(XaiSessionUpdate::MemoryFiles { files: file_infos })
-                    .await;
+                self.send_xai_notification(XaiSessionUpdate::MemoryFiles {
+                    files: file_infos,
+                    enabled: self.memory.is_enabled(),
+                    disabled_reason: self.memory.disabled_reason(),
+                    capture_enabled: self.memory.can_capture_v2()
+                        || self.memory.uses_legacy_pipeline(),
+                    dream_enabled: self.memory.v2_config.can_run_manual_dream()
+                        || self.memory.uses_legacy_pipeline(),
+                })
+                .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::MemoryToggle { enabled } => {

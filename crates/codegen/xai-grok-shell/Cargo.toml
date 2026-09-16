@@ -81,7 +81,7 @@ tracing-subscriber = { workspace = true, features = [
     "time",
 ] }
 obfstr = { workspace = true }
-tokio-util = { workspace = true, features = ["compat"] }
+tokio-util = { workspace = true, features = ["compat", "rt"] }
 tokio-retry = { workspace = true }
 uuid = { workspace = true, features = ["v4", "v5", "v7"] }
 xai-acp-lib = { workspace = true }

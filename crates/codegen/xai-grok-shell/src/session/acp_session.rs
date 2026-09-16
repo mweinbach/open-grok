@@ -239,6 +239,18 @@ use extensions::*;
 #[path = "acp_session_impl/memory_dream.rs"]
 mod memory_dream;
 use memory_dream::*;
+#[path = "acp_session_impl/memory_capture.rs"]
+mod memory_capture;
+use memory_capture::*;
+#[path = "acp_session_impl/memory_forget.rs"]
+mod memory_forget;
+use memory_forget::*;
+#[path = "acp_session_impl/memory_status.rs"]
+mod memory_status;
+use memory_status::*;
+#[path = "acp_session_impl/v2_memory_dream.rs"]
+mod v2_memory_dream;
+use v2_memory_dream::*;
 #[path = "acp_session_impl/goal_support.rs"]
 mod goal_support;
 pub(crate) use goal_support::*;

@@ -6,6 +6,7 @@ pub(crate) mod compaction_config;
 pub(crate) mod doom_loop_telemetry;
 pub mod handle;
 pub(crate) mod mcp_elicitation;
+pub(crate) mod memory_observation;
 pub(crate) mod memory_state;
 pub mod merge;
 pub(crate) mod native_agents;

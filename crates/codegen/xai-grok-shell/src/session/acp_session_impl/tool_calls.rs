@@ -1401,6 +1401,7 @@ impl SessionActor {
                         .extend(self.tool_hook_followups(&prepared, delivery, failure_contexts));
                     bridge_result.map_err(|error| error.to_string())?;
                     if let Some(evidence) = trusted_nested_evidence
+                        && self.memory.uses_legacy_pipeline()
                         && self
                             .memory
                             .storage()

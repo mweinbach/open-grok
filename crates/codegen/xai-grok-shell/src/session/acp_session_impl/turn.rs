@@ -2184,6 +2184,48 @@ impl SessionActor {
         self.memory
             .context_injected
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let is_v2_mode =
+            self.memory.is_enabled() && self.memory.mode() == Some(crate::config::MemoryMode::V2);
+        if is_v2_mode && !self.memory.can_expose_v2() {
+            return None;
+        }
+        if self.memory.can_expose_v2() {
+            let conversation = self.chat_state_handle.get_conversation().await;
+            if crate::session::helpers::memory_context::conversation_has_memory_context(
+                &conversation,
+            ) {
+                tracing::info!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    "MEMORY_INJECT: persisted v2 manifests reused to preserve prompt cache"
+                );
+                return None;
+            }
+            let storage = self.memory.storage()?;
+            let context = tokio::task::spawn_blocking(move || {
+                crate::session::helpers::memory_context::format_v2_memory_context(&storage)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(std::convert::identity);
+            return match context {
+                Ok(context) => {
+                    self.memory
+                        .record_injected_bytes(context.content.len() as u64);
+                    self.memory
+                        .injection_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(context.content)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: xai_grok_telemetry::memory_log::TARGET,
+                        %error,
+                        "MEMORY_INJECT: v2 manifest injection failed"
+                    );
+                    None
+                }
+            };
+        }
         if !self.memory.initial_injection_config.enabled {
             tracing::info!(
                 target: xai_grok_telemetry::memory_log::TARGET,
@@ -2247,11 +2289,12 @@ impl SessionActor {
                 injection_duration_ms: inject_start.elapsed().as_millis() as u64,
             },
         );
-        let experience_briefing = if actor_uses_experience_memory(self.startup_hints.is_subagent) {
-            self.experience_planning_briefing(&storage, &query, None)
-        } else {
-            None
-        };
+        let experience_briefing =
+            if actor_uses_experience_memory(self.startup_hints.is_subagent, &self.memory) {
+                self.experience_planning_briefing(&storage, &query, None)
+            } else {
+                None
+            };
         crate::session::helpers::memory_context::format_memory_reminder_with_experience(
             &inject_results,
             experience_briefing.as_deref(),
@@ -2264,7 +2307,9 @@ impl SessionActor {
         query_text: &str,
         failure_context: Option<String>,
     ) -> Option<String> {
-        if !actor_uses_experience_memory(self.startup_hints.is_subagent) || storage.is_ephemeral() {
+        if !actor_uses_experience_memory(self.startup_hints.is_subagent, &self.memory)
+            || storage.is_ephemeral()
+        {
             return None;
         }
         let store = match xai_grok_memory::experience::store::ExperienceStore::open(
@@ -2316,7 +2361,7 @@ impl SessionActor {
         &self,
         observed_failures: &mut std::collections::HashSet<u64>,
     ) {
-        if !actor_uses_experience_memory(self.startup_hints.is_subagent)
+        if !actor_uses_experience_memory(self.startup_hints.is_subagent, &self.memory)
             || !self.memory.initial_injection_config.enabled
         {
             return;
@@ -3017,7 +3062,9 @@ impl SessionActor {
                 self.flush_pending_skill_reminders().await;
                 self.inject_pending_monitor_events().await;
                 self.drain_detached_swarm_completions().await;
-                if loop_index > 1 && actor_uses_experience_memory(self.startup_hints.is_subagent) {
+                if loop_index > 1
+                    && actor_uses_experience_memory(self.startup_hints.is_subagent, &self.memory)
+                {
                     self.maybe_inject_experience_failure_reminder(
                         &mut experience_replanning_nudges,
                     )
@@ -4172,8 +4219,11 @@ const ACTION_STATIONARITY_NUDGE_TEMPLATE: &str = "You have called the same tool 
      tell the user what you are waiting for. This turn will be halted automatically if the \
      identical call keeps repeating.";
 
-fn actor_uses_experience_memory(is_subagent: bool) -> bool {
-    !is_subagent
+fn actor_uses_experience_memory(
+    is_subagent: bool,
+    memory: &super::memory_state::SessionMemory,
+) -> bool {
+    !is_subagent && memory.uses_legacy_pipeline()
 }
 
 fn visible_turn_experience_ids(
@@ -5068,9 +5118,24 @@ mod experience_replanning_tests {
     }
 
     #[test]
-    fn experience_memory_is_reserved_for_root_actors() {
-        assert!(actor_uses_experience_memory(false));
-        assert!(!actor_uses_experience_memory(true));
+    fn experience_memory_is_reserved_for_legacy_root_actors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = crate::session::memory::MemoryStorage::new(temp.path(), None);
+        let mut memory = crate::session::memory_state::SessionMemory::empty();
+        memory.configured_mode = Some(crate::config::MemoryMode::Legacy);
+        memory.storage = std::cell::RefCell::new(Some(storage.clone()));
+        assert!(actor_uses_experience_memory(false, &memory));
+        assert!(!actor_uses_experience_memory(true, &memory));
+
+        memory.configured_mode = Some(crate::config::MemoryMode::V2);
+        assert!(
+            !actor_uses_experience_memory(false, &memory),
+            "v2 sessions must not run experience hooks"
+        );
+        assert!(!actor_uses_experience_memory(
+            false,
+            &crate::session::memory_state::SessionMemory::empty()
+        ));
     }
 
     #[test]

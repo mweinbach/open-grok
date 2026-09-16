@@ -116,6 +116,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
             match trimmed.as_str() {
                 "on" | "enable" => BuiltinAction::MemoryToggle { enabled: true },
                 "off" | "disable" => BuiltinAction::MemoryToggle { enabled: false },
+                "status" => BuiltinAction::MemoryStatus,
                 _ => BuiltinAction::MemoryBrowse,
             }
         },
@@ -1008,6 +1009,7 @@ pub(super) enum BuiltinAction {
         text: String,
     },
     MemoryBrowse,
+    MemoryStatus,
     MemoryToggle {
         enabled: bool,
     },
@@ -1056,7 +1058,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsUninstall { .. } => "plugins-uninstall",
             BuiltinAction::PluginsUpdate { .. } => "plugins-update",
             BuiltinAction::Feedback { .. } => "feedback",
-            BuiltinAction::MemoryBrowse => "memory",
+            BuiltinAction::MemoryBrowse | BuiltinAction::MemoryStatus => "memory",
             BuiltinAction::MemoryToggle { .. } => "memory",
             BuiltinAction::GoalSet { .. }
             | BuiltinAction::GoalStatus
@@ -1094,6 +1096,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsUpdate { name } => name.is_some(),
             BuiltinAction::Feedback { text } => !text.is_empty(),
             BuiltinAction::MemoryBrowse => false,
+            BuiltinAction::MemoryStatus => true,
             BuiltinAction::MemoryToggle { .. } => true,
             BuiltinAction::GoalSet { .. } => true,
             BuiltinAction::GoalStatus
@@ -3056,9 +3059,13 @@ mod tests {
             resolve_builtin("memory", ""),
             Some(BuiltinAction::MemoryBrowse)
         ));
-        // Any unrecognized arg also falls through to browse
         assert!(matches!(
             resolve_builtin("memory", "status"),
+            Some(BuiltinAction::MemoryStatus)
+        ));
+        // Any unrecognized arg also falls through to browse
+        assert!(matches!(
+            resolve_builtin("memory", "unknown"),
             Some(BuiltinAction::MemoryBrowse)
         ));
     }
