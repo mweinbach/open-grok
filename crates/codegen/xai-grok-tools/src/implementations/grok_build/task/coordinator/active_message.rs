@@ -311,7 +311,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 let _ = respond_to.send(ActiveAgentMessageOutcome::NotActiveOrFinalizing);
                 return;
             }
-            let text = request.text().clone();
+            let text = request.text().to_string();
             match self.wake_completed_child(request.subagent_id(), &parent_session_id, text) {
                 Ok(wake) => {
                     let message_id = match wake {

@@ -847,7 +847,7 @@ async fn stale_admission_and_completed_lookup_preserve_terminal_authority() {
 async fn completed_child_wakes_when_runner_supports_it() {
     let (command_tx, command_rx) =
         SubagentCoordinatorReceiver::with_capacity(MAX_ACTIVE_MESSAGE_ADMISSIONS);
-    let (admission_tx, admissions) = mpsc::unbounded_channel();
+    let (admission_tx, mut admissions) = mpsc::unbounded_channel();
     let mut coordinator: WakeCoordinator =
         SubagentCoordinator::from_channel(command_rx, WakeRunner, CoordinatorConfig::default());
     insert_child(&mut coordinator, admission_tx, "child", "parent");
