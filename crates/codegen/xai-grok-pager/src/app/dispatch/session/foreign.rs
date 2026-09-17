@@ -80,6 +80,7 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     };
     let mut effects = vec![Effect::FetchSessionList {
         host,
+        cwd_override: None,
         generation,
         query: None,
         seq,

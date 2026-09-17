@@ -2,6 +2,167 @@
 use super::*;
 use crate::app::app_view::InputOutcome;
 use crate::app::dispatch::queue::maybe_drain_queue;
+use xai_grok_shell::session::unified_list::ListScope;
+
+#[test]
+fn dashboard_resume_owns_picker_lifecycle_and_leaves_welcome_untouched() {
+    use crate::views::session_picker::SourceFilter;
+    use crate::views::session_picker_surface::SessionPickerHost;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app();
+    app.workspace_dashboard_enabled = true;
+    app.active_view = ActiveView::AgentDashboard;
+    app.cwd = std::path::PathBuf::from("/process-cwd");
+    ensure_dashboard_state(&mut app);
+    let dashboard_cwd = std::path::PathBuf::from("/dashboard-cwd");
+    app.dashboard.as_mut().unwrap().cwd = dashboard_cwd.clone();
+    app.session_picker_entries = Some(vec![super::make_picker_entry("welcome-marker", "/welcome")]);
+    app.session_picker_state.set_query("welcome query");
+    let welcome_generation = app.session_picker_generation;
+    let welcome_seq = app.session_picker_list_seq;
+    let effects = dispatch(
+        Action::DashboardDispatchSlash {
+            text: "/resume".to_owned(),
+        },
+        &mut app,
+    );
+    let [
+        Effect::FetchSessionList {
+            host,
+            cwd_override,
+            generation,
+            seq,
+            kind_filter,
+            query,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("dashboard /resume must issue one list fetch: {effects:?}");
+    };
+    assert_eq!(*host, SessionPickerHost::Dashboard);
+    assert_eq!(cwd_override.as_ref(), Some(&dashboard_cwd));
+    assert_eq!(
+        kind_filter.as_deref(),
+        Some(["build".to_owned()].as_slice())
+    );
+    assert!(query.is_none());
+    let generation = *generation;
+    let seq = *seq;
+    let surface = app.dashboard_session_picker.as_ref().expect("picker");
+    assert_eq!(surface.generation, generation);
+    assert_eq!(surface.list_seq, seq);
+    assert_eq!(surface.source_filter, SourceFilter::Local);
+    assert!(surface.loading);
+    assert_eq!(app.session_picker_generation, welcome_generation);
+    assert_eq!(app.session_picker_list_seq, welcome_seq);
+    assert_eq!(app.session_picker_state.query(), "welcome query");
+    assert_eq!(
+        app.session_picker_entries
+            .as_ref()
+            .and_then(|entries| entries.first())
+            .map(|entry| entry.id.as_str()),
+        Some("welcome-marker")
+    );
+    assert!(
+        dispatch(Action::ShowSessionPicker, &mut app).is_empty(),
+        "open is idempotent"
+    );
+    assert_eq!(
+        app.dashboard_session_picker
+            .as_ref()
+            .map(|surface| surface.generation),
+        Some(generation)
+    );
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Dashboard,
+            generation: generation + 1,
+            sessions: vec![],
+            partial: None,
+            scope: ListScope::Cwd,
+            seq,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert!(
+        app.dashboard_session_picker
+            .as_ref()
+            .is_some_and(|surface| surface.loading && surface.entries.is_none()),
+        "a mismatched generation must not mutate the live dashboard surface"
+    );
+    let close = app.handle_input(&Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+    assert!(matches!(
+        close,
+        InputOutcome::Action(Action::DashboardCloseSessionPicker)
+    ));
+    let _ = dispatch(
+        match close {
+            InputOutcome::Action(action) => action,
+            _ => unreachable!(),
+        },
+        &mut app,
+    );
+    assert!(app.dashboard_session_picker.is_none());
+    let _ = dispatch(
+        Action::TaskComplete(TaskResult::SessionListLoaded {
+            host: SessionPickerHost::Dashboard,
+            generation,
+            sessions: vec![super::make_picker_entry("late-dashboard", "/late")],
+            partial: None,
+            scope: ListScope::Cwd,
+            seq,
+            query: None,
+        }),
+        &mut app,
+    );
+    assert_eq!(app.session_picker_state.query(), "welcome query");
+    assert_eq!(
+        app.session_picker_entries
+            .as_ref()
+            .and_then(|entries| entries.first())
+            .map(|entry| entry.id.as_str()),
+        Some("welcome-marker"),
+        "late dashboard results must not fall through to Welcome"
+    );
+}
+
+#[test]
+fn session_picker_routing_remains_unchanged_outside_dashboard_v2() {
+    use crate::views::modal::ActiveModal;
+    use crate::views::session_picker_surface::SessionPickerHost;
+    let mut v1 = test_app();
+    v1.active_view = ActiveView::AgentDashboard;
+    ensure_dashboard_state(&mut v1);
+    let effects = dispatch(Action::ShowSessionPicker, &mut v1);
+    assert!(v1.dashboard_session_picker.is_none());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::FetchSessionList {
+            host: SessionPickerHost::Welcome,
+            cwd_override: None,
+            ..
+        }]
+    ));
+    let mut agent_view = test_app_with_agent();
+    agent_view.workspace_dashboard_enabled = true;
+    let effects = dispatch(Action::ShowSessionPicker, &mut agent_view);
+    assert!(agent_view.dashboard_session_picker.is_none());
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::FetchSessionList {
+            host: SessionPickerHost::AgentModal,
+            cwd_override: None,
+            ..
+        }]
+    ));
+    assert!(matches!(
+        super::get_active_agent(&agent_view).and_then(|agent| agent.active_modal.as_ref()),
+        Some(ActiveModal::SessionPicker { .. })
+    ));
+}
+
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_handled_noop_clears_submission_without_starting_a_session() {

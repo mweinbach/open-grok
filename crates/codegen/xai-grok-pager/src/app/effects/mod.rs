@@ -3362,6 +3362,7 @@ pub(crate) fn execute(
         }
         Effect::FetchSessionList {
             host,
+            cwd_override,
             generation,
             query,
             seq,
@@ -3369,7 +3370,7 @@ pub(crate) fn execute(
             headless_policy,
         } => {
             let tx = acp_tx.clone();
-            let cwd = cwd.to_path_buf();
+            let cwd = cwd_override.unwrap_or_else(|| cwd.to_path_buf());
             tasks
                 .spawn(async move {
                     let mut params = serde_json::json!({

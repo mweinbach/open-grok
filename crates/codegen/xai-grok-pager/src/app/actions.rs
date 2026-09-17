@@ -1168,6 +1168,10 @@ pub enum Action {
     /// the working directory. Routed from Esc, the modal-chrome
     /// `CloseRequested` outcome, and a click outside the modal.
     DashboardCloseLocationPicker,
+    /// Close the workspace-dashboard `/resume` picker without loading a session.
+    DashboardCloseSessionPicker,
+    /// Load the workspace-dashboard `/resume` picker's selected local build.
+    DashboardPickSession(usize),
     /// Change the working directory for newly dispatched dashboard
     /// sessions. `input` is the raw path text — a picker row's path, a
     /// path typed into the picker's query field, or the `/cd <path>`
@@ -2001,6 +2005,10 @@ pub enum Effect {
     FetchSessionList {
         /// The picker this fetch was issued for; the result routes back to this host's storage only.
         host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Directory the list request should use. `None` keeps the process cwd
+        /// (welcome / in-session pickers). Dashboard `/resume` passes the
+        /// dashboard location so a `/cd` does not leak into the process cwd.
+        cwd_override: Option<std::path::PathBuf>,
         /// Live generation of the requesting picker at dispatch time.
         generation: u64,
         /// Text search pushed down to `x.ai/session/list` as `query` (chat mode: forwarded to the backend conversations search).

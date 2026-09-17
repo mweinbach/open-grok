@@ -24,6 +24,7 @@ pub use xai_prompt_queue as prompt_queue;
 mod acp_handler;
 pub(crate) mod cancel_latency;
 mod csi_filter;
+mod dashboard_session_picker;
 mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;

@@ -765,6 +765,7 @@ pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
     let seq = next_picker_list_generation(app);
     let mut effects = vec![Effect::FetchSessionList {
         host: request_identity.0,
+        cwd_override: None,
         generation: request_identity.1,
         query: None,
         seq,
@@ -892,6 +893,7 @@ fn dispatch_chat_search_refetch(app: &mut AppView, force: bool) -> Vec<Effect> {
         set_chat_search_loading(app, host, false);
         return vec![Effect::FetchSessionList {
             host,
+            cwd_override: None,
             generation,
             query: None,
             seq,
@@ -903,6 +905,7 @@ fn dispatch_chat_search_refetch(app: &mut AppView, force: bool) -> Vec<Effect> {
     if force {
         vec![Effect::FetchSessionList {
             host,
+            cwd_override: None,
             generation,
             query: Some(query),
             seq,
@@ -1435,6 +1438,7 @@ pub(in crate::app::dispatch) fn handle_session_search_debounce_expired(
     if chat_mode {
         vec![Effect::FetchSessionList {
             host: request.host,
+            cwd_override: None,
             generation: request.generation,
             query: (!query.is_empty()).then_some(query),
             seq: request.seq,

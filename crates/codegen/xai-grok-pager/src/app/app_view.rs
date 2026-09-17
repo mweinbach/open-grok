@@ -3553,6 +3553,9 @@ impl AppView {
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
                 }
+                if let Some(outcome) = self.handle_dashboard_session_picker_input(ev) {
+                    return outcome;
+                }
                 if let Event::Key(key) = ev
                     && key.kind != KeyEventKind::Release
                 {
@@ -5839,6 +5842,10 @@ impl AppView {
                                 .and_then(|id| self.agents.get(&id))
                                 .is_some_and(|agent| agent.login_or_secret_modal_active())
                     })
+            )
+            || matches!(
+                self.active_view,
+                ActiveView::AgentDashboard if self.dashboard_session_picker.is_some()
             )
             || cloud_modal_open
     }

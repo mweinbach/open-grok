@@ -39,7 +39,7 @@ pub enum DashboardRowId {
         session_id: String,
     },
     /// A saved dashboard-v2 workspace member that is not loaded in this process.
-    /// Rendered read-only; load/archive actions are not implemented yet.
+    /// Attach / `/resume` pick loads the local build via the shared picker path.
     Workspace {
         session_id: String,
     },
