@@ -321,6 +321,7 @@ impl ChildRunner for SoakRunner {
                 request,
                 cancellation,
                 reporter,
+                wake_origin: _,
                 queued_for: _,
                 session_running: _,
             } = run;

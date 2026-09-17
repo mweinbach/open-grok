@@ -14,6 +14,7 @@ mod native;
 mod query;
 mod queue;
 mod spawn;
+mod wake;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -46,7 +47,7 @@ pub use super::coordinator_state::{
     CompletionDisposition, CoordinatorConfig, LimitedSpawnOrigin, LocalBoxFuture,
     MAX_ACTIVE_MESSAGE_ADMISSIONS, MAX_ACTIVE_MESSAGE_ADMISSIONS_PER_CHILD, MAX_COMPLETED_ENTRIES,
     SendBoxFuture, StartedChild, SubagentLimitDecision, SubagentLimitNotice, SubagentLimitSink,
-    SubagentProgress,
+    SubagentProgress, WakeOrigin,
 };
 use queue::{QUEUED_REAP_INTERVAL, QueuedCaller, SpawnQueue, StartOrigin};
 
@@ -753,10 +754,28 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 .get(&target)
                 .is_some_and(|child| child.request.parent_session_id == identity.team_scope_id)
         {
-            return Err(format!(
-                "Agent '{target}' has finished. Continue it with task(resume_from=\"{target}\") \
-                 before sending more work."
-            ));
+            return match self.wake_completed_child(
+                &target,
+                &identity.team_scope_id,
+                message.body.clone(),
+            ) {
+                Ok(wake) => {
+                    let status = match wake {
+                        wake::WakeAdmit::Started { .. } => AgentMessageDeliveryStatus::Delivered,
+                        wake::WakeAdmit::Queued { .. } => AgentMessageDeliveryStatus::Queued,
+                    };
+                    self.runner.on_agent_message(&message, status);
+                    Ok(AgentMessageSendOutput {
+                        message_id: message.message_id,
+                        target_agent_id: target,
+                        status,
+                    })
+                }
+                Err(_) => Err(format!(
+                    "Agent '{target}' has finished. Continue it with task(resume_from=\"{target}\") \
+                     before sending more work."
+                )),
+            };
         }
 
         let key = MailboxKey {
@@ -1026,6 +1045,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         request: SubagentRequest,
         spawn_reply: Option<oneshot::Sender<SubagentResult>>,
         origin: StartOrigin,
+        wake_origin: Option<super::coordinator_state::WakeOrigin>,
     ) {
         let id = request.id.clone();
         let cancellation = request.cancel_token.clone();
@@ -1069,6 +1089,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     request,
                     cancellation,
                     reporter,
+                    wake_origin,
                     queued_for,
                     session_running,
                 }))

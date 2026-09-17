@@ -147,6 +147,7 @@ pub(crate) async fn run_shell_child(
         mut request,
         cancellation: cancel_token,
         reporter,
+        wake_origin,
         queued_for,
         session_running,
     } = run;
@@ -298,48 +299,54 @@ pub(crate) async fn run_shell_child(
         .as_deref()
         .filter(|s| is_valid_resume_id(s))
     {
-        match reporter
-            .resume_source(resume_id, &ctx.parent_session_id)
-            .await
-        {
-            SubagentResumeLookup::Active => {
-                let msg = format!(
-                    "Cannot resume from subagent '{resume_id}': it is still running. \
-                     Wait for it to complete before resuming."
-                );
-                return child_run_output(failure_result(&request, &msg), completion_data, None);
-            }
-            SubagentResumeLookup::Completed(info) => Some(
-                // Prefer the durable meta.json: it carries the fork's
-                // provider-pinned model_route, which the in-memory
-                // registry does not.
-                load_resume_source(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
-                    .await
-                    .unwrap_or_else(|| ResumeSourceData {
-                        subagent_id: info.subagent_id,
-                        child_session_id: info.child_session_id,
-                        child_cwd: info.child_cwd,
-                        worktree_path: info.worktree_path.map(PathBuf::from),
-                        snapshot_ref: info.snapshot_ref,
-                        subagent_type: info.subagent_type,
-                        persona: info.persona,
-                        model_id: info.model_id,
-                        model_route: None,
-                    }),
-            ),
-            SubagentResumeLookup::Missing => {
-                match load_resume_source(resume_id, &ctx.parent_session_id, &ctx.parent_cwd).await {
-                    Some(info) => Some(info),
-                    None => {
-                        let msg = format!(
-                            "Cannot resume from subagent '{resume_id}': not found. \
-                             The subagent may have been evicted or the ID is invalid."
-                        );
-                        return child_run_output(
-                            failure_result(&request, &msg),
-                            completion_data,
-                            None,
-                        );
+        if wake_origin.is_some() {
+            load_resume_source(resume_id, &ctx.parent_session_id, &ctx.parent_cwd).await
+        } else {
+            match reporter
+                .resume_source(resume_id, &ctx.parent_session_id)
+                .await
+            {
+                SubagentResumeLookup::Active => {
+                    let msg = format!(
+                        "Cannot resume from subagent '{resume_id}': it is still running. \
+                         Wait for it to complete before resuming."
+                    );
+                    return child_run_output(failure_result(&request, &msg), completion_data, None);
+                }
+                SubagentResumeLookup::Completed(info) => Some(
+                    // Prefer the durable meta.json: it carries the fork's
+                    // provider-pinned model_route, which the in-memory
+                    // registry does not.
+                    load_resume_source(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
+                        .await
+                        .unwrap_or_else(|| ResumeSourceData {
+                            subagent_id: info.subagent_id,
+                            child_session_id: info.child_session_id,
+                            child_cwd: info.child_cwd,
+                            worktree_path: info.worktree_path.map(PathBuf::from),
+                            snapshot_ref: info.snapshot_ref,
+                            subagent_type: info.subagent_type,
+                            persona: info.persona,
+                            model_id: info.model_id,
+                            model_route: None,
+                        }),
+                ),
+                SubagentResumeLookup::Missing => {
+                    match load_resume_source(resume_id, &ctx.parent_session_id, &ctx.parent_cwd)
+                        .await
+                    {
+                        Some(info) => Some(info),
+                        None => {
+                            let msg = format!(
+                                "Cannot resume from subagent '{resume_id}': not found. \
+                                 The subagent may have been evicted or the ID is invalid."
+                            );
+                            return child_run_output(
+                                failure_result(&request, &msg),
+                                completion_data,
+                                None,
+                            );
+                        }
                     }
                 }
             }

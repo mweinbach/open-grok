@@ -303,6 +303,7 @@ impl ChildControl for TestControl {
 struct TestRunner {
     wait_before_start: bool,
     wait_after_cancel: bool,
+    supports_wake: bool,
     start: tokio::sync::broadcast::Sender<()>,
     finish: tokio::sync::broadcast::Sender<()>,
     completions: mpsc::UnboundedSender<CompletionDisposition>,
@@ -339,6 +340,10 @@ impl ChildRunner for TestRunner {
         Ok(())
     }
 
+    fn supports_wake(&self) -> bool {
+        self.supports_wake
+    }
+
     fn deliver_root_followup(&self, _root: &str, message: &AgentMailboxMessage) -> bool {
         message.native.is_some() && self.followups.send(message.clone()).is_ok()
     }
@@ -358,6 +363,7 @@ impl ChildRunner for TestRunner {
                 request,
                 cancellation,
                 reporter,
+                wake_origin: _,
                 queued_for,
                 session_running,
             } = run;
@@ -515,6 +521,15 @@ fn harness_with_options(
     wait_after_cancel: bool,
     config: CoordinatorConfig,
 ) -> Harness {
+    harness_with_wake(wait_before_start, wait_after_cancel, false, config)
+}
+
+fn harness_with_wake(
+    wait_before_start: bool,
+    wait_after_cancel: bool,
+    supports_wake: bool,
+    config: CoordinatorConfig,
+) -> Harness {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (start, _) = tokio::sync::broadcast::channel(4);
     let (finish, _) = tokio::sync::broadcast::channel(4);
@@ -531,6 +546,7 @@ fn harness_with_options(
             TestRunner {
                 wait_before_start,
                 wait_after_cancel,
+                supports_wake,
                 start: start.clone(),
                 finish: finish.clone(),
                 completions: completion_tx,
@@ -2331,6 +2347,72 @@ async fn team_mailbox_rejects_foreign_scope_and_self_send() {
     assert!(error.contains("itself"));
 
     spawn.abort();
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn team_mailbox_rejects_finished_child_without_wake() {
+    let mut harness = harness(false, std::time::Duration::from_secs(60));
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("done-child", true)).await });
+    let _ = harness.requests.recv().await.expect("spawn request");
+    assert_eq!(
+        harness.started.recv().await.expect("child started"),
+        "done-child"
+    );
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    let _ = harness.completions.recv().await;
+
+    let root = mailbox_identity("parent", "parent");
+    let error = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "done-child",
+            mailbox_message("m1", &root, "done-child", "keep going"),
+        )
+        .await
+        .expect_err("finished child stays closed without wake");
+    assert!(error.contains("has finished"), "error: {error}");
+
+    harness.actor.abort();
+}
+
+#[tokio::test]
+async fn team_mailbox_wakes_finished_child() {
+    let mut harness = harness_with_wake(false, false, true, CoordinatorConfig::default());
+    let backend = harness.backend.clone();
+    let spawn = tokio::spawn(async move { backend.spawn(request("wake-child", true)).await });
+    let first = harness.requests.recv().await.expect("first spawn");
+    assert_eq!(first.id, "wake-child");
+    assert_eq!(
+        harness.started.recv().await.expect("child started"),
+        "wake-child"
+    );
+    let _ = harness.finish.send(());
+    let _ = spawn.await;
+    let _ = harness.completions.recv().await;
+
+    let root = mailbox_identity("parent", "parent");
+    let output = harness
+        .backend
+        .send_agent_message(
+            root.clone(),
+            "wake-child",
+            mailbox_message("m1", &root, "wake-child", "keep going"),
+        )
+        .await
+        .expect("wake accepted");
+    assert_eq!(output.status, AgentMessageDeliveryStatus::Delivered);
+
+    let woken = harness.requests.recv().await.expect("wake spawn");
+    assert_eq!(woken.id, "wake-child");
+    assert_eq!(woken.prompt, "keep going");
+    assert_eq!(woken.resume_from.as_deref(), Some("wake-child"));
+    assert!(woken.run_in_background);
+
+    let _ = harness.finish.send(());
     harness.actor.abort();
 }
 

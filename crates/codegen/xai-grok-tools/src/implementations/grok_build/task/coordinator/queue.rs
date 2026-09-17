@@ -4,6 +4,7 @@ use std::collections::VecDeque;
 
 use tokio::sync::oneshot;
 
+use super::super::coordinator_state::WakeOrigin;
 use super::super::types::{SubagentRequest, SubagentResult};
 use super::{ChildRunner, SubagentCoordinator};
 
@@ -57,6 +58,7 @@ pub(super) struct QueuedSpawn {
     /// Tokio clock so paused-clock tests can assert the wait.
     pub(super) queued_at: tokio::time::Instant,
     pub(super) caller: QueuedCaller,
+    pub(super) wake_origin: Option<WakeOrigin>,
 }
 
 pub(super) enum QueuedCaller {
@@ -125,6 +127,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                     request,
                     queued_at,
                     caller,
+                    wake_origin,
                 } = queued;
                 let (spawn_reply, deadline) = match caller {
                     QueuedCaller::Awaiting {
@@ -140,6 +143,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         queued_for: queued_at.elapsed(),
                         deadline,
                     },
+                    wake_origin,
                 );
             } else {
                 kept.push_back(queued);
@@ -174,6 +178,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             request,
             caller,
             queued_at,
+            wake_origin: _,
         } = queued;
         // Token observers must see command-path cancels too.
         request.cancel_token.cancel();

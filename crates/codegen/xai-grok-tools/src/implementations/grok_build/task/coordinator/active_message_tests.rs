@@ -134,6 +134,35 @@ impl ChildRunner for TestRunner {
 }
 
 type TestCoordinator = SubagentCoordinator<TestRunner>;
+type WakeCoordinator = SubagentCoordinator<WakeRunner>;
+
+struct WakeRunner;
+
+impl ChildRunner for WakeRunner {
+    type Control = TestControl;
+    type CompletionData = ();
+    type RunFuture = SendBoxFuture<ChildRunOutput<()>>;
+    type ValidateFuture = SendBoxFuture<SubagentValidateTypeOutcome>;
+    type DescribeFuture = SendBoxFuture<SubagentDescribeOutcome>;
+
+    fn supports_wake(&self) -> bool {
+        true
+    }
+
+    fn run(&self, _: ChildRunRequest<Self::Control>) -> Self::RunFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn validate_type(&self, _: String, _: String) -> Self::ValidateFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn describe_type(&self, _: String, _: Option<String>, _: String) -> Self::DescribeFuture {
+        Box::pin(std::future::pending())
+    }
+
+    fn on_completed(&self, _: ChildCompletion<()>) {}
+}
 
 fn fixture_with_capacity(
     active_message_capacity: usize,
@@ -160,8 +189,8 @@ fn fixture() -> (
     fixture_with_capacity(MAX_ACTIVE_MESSAGE_ADMISSIONS)
 }
 
-fn insert_child(
-    coordinator: &mut TestCoordinator,
+fn insert_child<R: ChildRunner<Control = TestControl>>(
+    coordinator: &mut SubagentCoordinator<R>,
     admissions: mpsc::UnboundedSender<AdmissionCall>,
     id: &str,
     parent: &str,
@@ -194,8 +223,8 @@ fn insert_child(
     );
 }
 
-fn begin_send(
-    coordinator: &mut TestCoordinator,
+fn begin_send<R: ChildRunner<Control = TestControl>>(
+    coordinator: &mut SubagentCoordinator<R>,
     command_tx: &crate::implementations::grok_build::task::backend::SubagentCoordinatorSender,
     id: &str,
     parent: &str,
@@ -263,7 +292,10 @@ async fn finalization_outcome(response: oneshot::Receiver<bool>) -> bool {
         .expect("active-message finalization response dropped")
 }
 
-fn finish_child(coordinator: &mut TestCoordinator, id: &str) {
+fn finish_child<R: ChildRunner<Control = TestControl, CompletionData = ()>>(
+    coordinator: &mut SubagentCoordinator<R>,
+    id: &str,
+) {
     coordinator.begin_terminalization(
         id,
         ChildRunOutput {
@@ -809,6 +841,34 @@ async fn stale_admission_and_completed_lookup_preserve_terminal_authority() {
         ))
         .await
     );
+}
+
+#[tokio::test]
+async fn completed_child_wakes_when_runner_supports_it() {
+    let (command_tx, command_rx) =
+        SubagentCoordinatorReceiver::with_capacity(MAX_ACTIVE_MESSAGE_ADMISSIONS);
+    let (admission_tx, admissions) = mpsc::unbounded_channel();
+    let mut coordinator: WakeCoordinator =
+        SubagentCoordinator::from_channel(command_rx, WakeRunner, CoordinatorConfig::default());
+    insert_child(&mut coordinator, admission_tx, "child", "parent");
+    finish_child(&mut coordinator, "child");
+    assert!(coordinator.completed.contains_key("child"));
+
+    let outcome =
+        response_outcome(begin_send(&mut coordinator, &command_tx, "child", "parent")).await;
+    assert!(
+        matches!(outcome, ActiveAgentMessageOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    assert!(!coordinator.completed.contains_key("child"));
+    let pending = coordinator
+        .pending
+        .get("child")
+        .expect("wake must restart the same identity");
+    assert_eq!(pending.request.prompt, "follow up");
+    assert_eq!(pending.request.resume_from.as_deref(), Some("child"));
+    assert!(pending.request.run_in_background);
+    assert!(admissions.try_recv().is_err());
 }
 
 #[tokio::test]

@@ -85,11 +85,20 @@ pub struct StartedChild<C> {
     pub control: C,
 }
 
+/// Provenance for a completed-child wake that continues the same identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeOrigin {
+    pub agent_id: String,
+    pub message_id: String,
+}
+
 /// Input to one runtime-specific child run.
 pub struct ChildRunRequest<C> {
     pub request: SubagentRequest,
     pub cancellation: CancellationToken,
     pub reporter: ChildReporter<C>,
+    /// Set when this run continues a finished non-workflow child in place.
+    pub wake_origin: Option<WakeOrigin>,
     /// Time parked in the admission queue; `None` if admitted immediately.
     pub queued_for: Option<std::time::Duration>,
     /// The session's running non-workflow children when this spawn started,
@@ -150,6 +159,12 @@ pub trait ChildRunner: 'static {
     ) -> Self::DescribeFuture;
 
     fn on_completed(&self, completion: ChildCompletion<Self::CompletionData>);
+
+    /// Whether `run` can continue a finished child's persisted session in place.
+    /// Default false so hosts without durable resume keep `NotActiveOrFinalizing`.
+    fn supports_wake(&self) -> bool {
+        false
+    }
 
     fn load_native_agents(
         &self,

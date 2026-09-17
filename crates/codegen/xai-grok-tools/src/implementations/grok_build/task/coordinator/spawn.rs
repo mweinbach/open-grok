@@ -54,7 +54,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         let running = self.session_running_count(&request.parent_session_id);
         match self.admission.admit(&request, running) {
             AdmissionDecision::Start => {
-                self.start_child(*request, Some(result_tx), StartOrigin::Direct)
+                self.start_child(*request, Some(result_tx), StartOrigin::Direct, None)
             }
             AdmissionDecision::Enqueue => {
                 debug_assert!(
@@ -83,6 +83,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         result_tx,
                         deadline,
                     },
+                    wake_origin: None,
                 });
             }
             AdmissionDecision::Reject(error) => {
@@ -157,7 +158,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
     /// Counts are computed here, not at call sites: a queued spawn counts
     /// itself in `queue_depth` (the notice fires before the push), a rejected
     /// spawn does not.
-    fn notify_limit(&self, request: &SubagentRequest, decision: SubagentLimitDecision) {
+    pub(super) fn notify_limit(&self, request: &SubagentRequest, decision: SubagentLimitDecision) {
         let Some(sink) = &self.config.limit_sink else {
             return;
         };
