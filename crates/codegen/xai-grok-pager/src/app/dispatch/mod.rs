@@ -21,6 +21,7 @@ mod dashboard;
 mod dashboard_telemetry;
 pub(crate) mod external_editor;
 mod import_claude;
+mod inline_feedback;
 mod interject;
 mod jump;
 mod modes;

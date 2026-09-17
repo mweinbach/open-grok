@@ -794,6 +794,8 @@ pub(super) fn dispatch_send_prompt_inner(
                     | Action::OpenFeedbackPane { images, .. } = &mut action
                     {
                         *images = agent.prompt.drain_images().into();
+                    } else if let Action::OpenFeedbackModal(open) = &mut action {
+                        open.images = agent.prompt.drain_images().into();
                     }
                     agent.prompt.set_text("");
                 }

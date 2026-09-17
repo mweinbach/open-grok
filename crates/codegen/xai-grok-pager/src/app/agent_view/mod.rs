@@ -136,6 +136,7 @@ pub use crate::views::agent::{ActivePane, AgentViewLayout, InputMode, PaneAreas}
 use crate::views::block_viewer::BlockViewerPane;
 use crate::views::elicitation_view::ElicitationViewState;
 use crate::views::extensions_modal::ExtensionsModalState;
+use crate::views::feedback_modal::FeedbackModalState;
 use crate::views::file_search::line_viewer::LineViewerState;
 use crate::views::modal::{self, ActiveModal, ModalButtonHit};
 use crate::views::permission_view::{PermissionViewState, SubagentInfo};
@@ -1359,6 +1360,15 @@ pub struct AgentView {
     /// Active question view (from `AskUserQuestion` tool). When `Some`, the
     /// prompt area shows a structured question UI and input is modal.
     pub(crate) question_view: Option<QuestionViewState>,
+    /// Isolated `/feedback` editor. When `Some`, it owns keys and paints over the agent.
+    pub(crate) feedback_modal: Option<FeedbackModalState>,
+    #[allow(dead_code)]
+    pending_feedback_trace_uploads:
+        std::collections::VecDeque<crate::views::feedback_modal::FeedbackSubmissionId>,
+    parked_feedback_trace_consents: std::collections::VecDeque<(
+        crate::views::feedback_modal::FeedbackSubmissionId,
+        crate::views::feedback_modal::ParkedFeedbackTraceConsent,
+    )>,
     pub(crate) elicitation_view: Option<ElicitationViewState>,
     pub(crate) pending_elicitation: Option<(
         xai_grok_tools::mcp_elicitation::McpElicitExtRequest,

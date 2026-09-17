@@ -1805,7 +1805,11 @@ pub struct CodingDataConsentSelected {
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackTraceConsentChoice {
     TurnOn,
+    /// Upload only the session attached to this feedback report.
+    SendThisSession,
     NoUpload,
+    /// Close the in-modal trace prompt without choosing.
+    Dismissed,
     NeverAsk,
 }
 

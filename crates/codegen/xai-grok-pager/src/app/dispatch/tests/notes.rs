@@ -901,6 +901,9 @@ fn feedback_failed_reports_the_error_and_spares_the_composer() {
     let _ = dispatch(
         Action::TaskComplete(crate::app::actions::TaskResult::FeedbackFailed {
             agent_id: id,
+            origin: crate::app::actions::FeedbackSendOrigin::Immediate,
+            feedback_text: String::new(),
+            image_count: 0,
             error: "disabled".into(),
         }),
         &mut app,

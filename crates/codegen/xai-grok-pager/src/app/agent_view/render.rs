@@ -4220,6 +4220,22 @@ impl AgentView {
             self.pane_areas = layout.pane_areas();
             return (prompt_cursor_pos, prompt_post_flush);
         }
+        if let Some(ref mut modal) = self.feedback_modal {
+            let overlay_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: layout.shortcuts.y.saturating_sub(area.y).saturating_sub(1),
+            };
+            let compact = self.scrollback.appearance().prompt.compact;
+            let theme = Theme::current();
+            let rendered = modal.render(buf, overlay_area, &theme, compact);
+            self.pane_areas = layout.pane_areas();
+            return match rendered {
+                Some(result) => (result.cursor, result.post_flush),
+                None => (None, crate::terminal::overlay::clear().map(Into::into)),
+            };
+        }
         if let Some(ref mut modal_state) = self.agents_modal {
             let overlay_area = Rect {
                 x: area.x,

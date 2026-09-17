@@ -40,9 +40,10 @@ use super::modes::{
     set_permission_mode, set_plan_mode, set_swarm_mode, set_yolo_mode,
 };
 use super::notes::{
-    dispatch_enter_remember_mode, dispatch_open_feedback_pane,
-    dispatch_save_remember_note_from_modal, dispatch_send_btw, dispatch_send_feedback,
-    dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_enter_remember_mode, dispatch_open_feedback_modal, dispatch_open_feedback_pane,
+    dispatch_request_feedback_draft, dispatch_save_remember_note_from_modal, dispatch_send_btw,
+    dispatch_send_feedback, dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_submit_feedback_modal,
 };
 use super::permissions::{
     dispatch_permission_cancel, dispatch_permission_followup, dispatch_permission_select,
@@ -1152,6 +1153,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenFeedbackPane { prefill, images } => {
             dispatch_open_feedback_pane(app, prefill, images)
         }
+        Action::OpenFeedbackModal(open) => dispatch_open_feedback_modal(app, open),
+        Action::SubmitFeedbackModal { modal_id } => dispatch_submit_feedback_modal(app, modal_id),
+        Action::RequestFeedbackDraft { request } => dispatch_request_feedback_draft(app, request),
         Action::SendFeedback {
             text,
             images,

@@ -2,6 +2,7 @@
 
 use crate::app::actions::Action;
 use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::views::feedback_modal::OpenFeedbackModal;
 
 pub struct FeedbackCommand;
 
@@ -18,10 +19,7 @@ impl SlashCommand for FeedbackCommand {
         let trimmed = args.trim();
         let result = if ctx.screen_mode.is_minimal() {
             if trimmed.is_empty() {
-                CommandResult::Action(Action::OpenFeedbackPane {
-                    prefill: None,
-                    images: Default::default(),
-                })
+                CommandResult::Action(Action::OpenFeedbackModal(OpenFeedbackModal::default()))
             } else {
                 CommandResult::Action(Action::SendFeedback {
                     text: trimmed.to_string(),
@@ -30,20 +28,19 @@ impl SlashCommand for FeedbackCommand {
                 })
             }
         } else {
-            CommandResult::Action(Action::OpenFeedbackPane {
-                prefill: (!trimmed.is_empty()).then(|| trimmed.to_string()),
-                images: Default::default(),
-            })
+            CommandResult::Action(Action::OpenFeedbackModal(OpenFeedbackModal {
+                text: (!trimmed.is_empty()).then(|| trimmed.to_string()),
+                ..OpenFeedbackModal::default()
+            }))
         };
         let action = match &result {
-            CommandResult::Action(Action::OpenFeedbackPane { prefill, .. }) => {
-                if prefill.is_some() {
+            CommandResult::Action(Action::OpenFeedbackModal(open)) => {
+                if open.text.is_some() {
                     "open_prefill"
                 } else {
                     "open_empty"
                 }
             }
-
             CommandResult::Action(Action::SendFeedback { .. }) => "send_immediate",
             _ => "other",
         };
@@ -79,35 +76,37 @@ mod tests {
 
     /// The whitespace case matters: the composer keeps a trailing space while the user is still typing the command.
     #[test]
-    fn full_tui_always_opens_the_pane_and_prefills_inline_text() {
+    fn full_tui_always_opens_the_modal_and_prefills_inline_text() {
         let models = ModelState::default();
         let mut ctx = make_ctx(&models);
         let cmd = FeedbackCommand;
 
         for args in ["", "   ", "\t"] {
             match cmd.run(&mut ctx, args) {
-                CommandResult::Action(Action::OpenFeedbackPane {
-                    prefill: None,
-                    images,
-                }) => {
-                    assert!(images.is_empty(), "images attach at dispatch, not here");
+                CommandResult::Action(Action::OpenFeedbackModal(open)) => {
+                    assert!(open.text.is_none());
+                    assert!(
+                        open.images.is_empty(),
+                        "images attach at dispatch, not here"
+                    );
                 }
-                other => panic!("{args:?} should open the pane, got {other:?}"),
+                other => panic!("{args:?} should open the modal, got {other:?}"),
             }
         }
 
         match cmd.run(&mut ctx, "  the tool crashed  ") {
-            CommandResult::Action(Action::OpenFeedbackPane {
-                prefill: Some(text),
-                images,
-            }) => {
+            CommandResult::Action(Action::OpenFeedbackModal(open)) => {
                 assert_eq!(
-                    text, "the tool crashed",
+                    open.text.as_deref(),
+                    Some("the tool crashed"),
                     "inline text is trimmed into the prefill"
                 );
-                assert!(images.is_empty(), "images attach at dispatch, not here");
+                assert!(
+                    open.images.is_empty(),
+                    "images attach at dispatch, not here"
+                );
             }
-            other => panic!("full TUI inline text should prefill the pane, got {other:?}"),
+            other => panic!("full TUI inline text should prefill the modal, got {other:?}"),
         }
     }
 
@@ -119,8 +118,10 @@ mod tests {
         let cmd = FeedbackCommand;
 
         match cmd.run(&mut ctx, "") {
-            CommandResult::Action(Action::OpenFeedbackPane { prefill: None, .. }) => {}
-            other => panic!("minimal bare should open the pane, got {other:?}"),
+            CommandResult::Action(Action::OpenFeedbackModal(open)) => {
+                assert!(open.text.is_none());
+            }
+            other => panic!("minimal bare should open the modal, got {other:?}"),
         }
         match cmd.run(&mut ctx, "  the tool crashed  ") {
             CommandResult::Action(Action::SendFeedback {

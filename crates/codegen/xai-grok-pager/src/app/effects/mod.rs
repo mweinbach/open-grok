@@ -6809,7 +6809,16 @@ pub(crate) fn execute(
                     }
                 });
         }
-        Effect::SendFeedback { agent_id, session_id, feedback_text, images } => {
+        Effect::SendFeedback {
+            agent_id,
+            session_id,
+            feedback_text,
+            images,
+            metadata,
+            request_trace_upload_token,
+            draft: _,
+            origin,
+        } => {
             use xai_grok_shell::session::ClientType;
             use xai_grok_shell::session::acp_types::ClientFeedbackInput;
             let terminal_info = Some(
@@ -6818,11 +6827,21 @@ pub(crate) fn execute(
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
+                    let image_count = images.len();
                     let images = match tokio::task::spawn_blocking(move || encode_feedback_images(images)).await {
                         Ok(Ok(images)) => images,
-                        Ok(Err(error)) => return TaskResult::FeedbackFailed { agent_id, error },
+                        Ok(Err(error)) => return TaskResult::FeedbackFailed {
+                            agent_id,
+                            origin,
+                            feedback_text,
+                            image_count,
+                            error,
+                        },
                         Err(_) => return TaskResult::FeedbackFailed {
                             agent_id,
+                            origin,
+                            feedback_text,
+                            image_count,
                             error: "Could not prepare feedback attachments.".to_owned(),
                         },
                     };
@@ -6838,14 +6857,18 @@ pub(crate) fn execute(
                         turn_number: None,
                         request_id: None,
                         client_version: Some(xai_grok_version::version().to_string()),
-                        metadata: None,
+                        metadata,
                         terminal_info,
+                        request_trace_upload_token,
                     };
                     let raw_params = match serde_json::value::to_raw_value(&input) {
                         Ok(v) => v,
                         Err(e) => {
                             return TaskResult::FeedbackFailed {
                                 agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
                                 error: sanitize_user_error(
                                     &format!(
                                 "couldn't serialize feedback: {e}"
@@ -6859,14 +6882,29 @@ pub(crate) fn execute(
                         raw_params.into(),
                     );
                     match acp_send(request, &tx).await {
-                        Ok(_) => {
+                        Ok(response) => {
+                            let parsed = serde_json::from_str::<
+                                xai_grok_shell::session::FeedbackResponse,
+                            >(response.0.get());
                             TaskResult::FeedbackComplete {
                                 agent_id,
+                                origin,
+                                outcome: parsed
+                                    .as_ref()
+                                    .ok()
+                                    .and_then(|response| response.outcome)
+                                    .unwrap_or(xai_grok_shell::session::FeedbackOutcome::Submitted),
+                                trace_upload_token: parsed
+                                    .ok()
+                                    .and_then(|response| response.trace_upload_token),
                             }
                         }
                         Err(e) => {
                             TaskResult::FeedbackFailed {
                                 agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
                                 error: sanitize_user_error(
                                     &format!("couldn't send feedback: {e}"),
                                 ),
@@ -6874,6 +6912,217 @@ pub(crate) fn execute(
                         }
                     }
                 });
+        }
+        Effect::FeedbackDraftRequest {
+            agent_id,
+            session_id,
+            request,
+        } => {
+            let tx = acp_tx.clone();
+            const FEEDBACK_DRAFT_ACP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+            tasks.spawn(async move {
+                match request {
+                    crate::views::feedback_modal::FeedbackDraftRequest::List {
+                        modal_id,
+                        generation,
+                    } => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftListComplete {
+                                    agent_id,
+                                    modal_id,
+                                    generation,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft list: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/list",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map_err(|error| sanitize_user_error(&error.to_string()))
+                                .and_then(|response| {
+                                    #[derive(serde::Deserialize)]
+                                    struct DraftListResponse {
+                                        drafts: Vec<xai_grok_feedback::FeedbackDraft>,
+                                    }
+                                    serde_json::from_str::<DraftListResponse>(response.0.get())
+                                        .map(|response| response.drafts)
+                                        .map_err(|error| sanitize_user_error(&error.to_string()))
+                                }),
+                            Err(_elapsed) => Err("feedback draft list timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftListComplete {
+                            agent_id,
+                            modal_id,
+                            generation,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Load(load) => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                            "draft_id": load.draft_id,
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftLoadComplete {
+                                    agent_id,
+                                    load,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft get: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/get",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map_err(|error| sanitize_user_error(&error.to_string()))
+                                .and_then(|response| {
+                                    #[derive(serde::Deserialize)]
+                                    struct DraftGetResponse {
+                                        draft: xai_grok_feedback::FeedbackDraft,
+                                    }
+                                    serde_json::from_str::<DraftGetResponse>(response.0.get())
+                                        .map(|response| response.draft)
+                                        .map_err(|error| sanitize_user_error(&error.to_string()))
+                                }),
+                            Err(_elapsed) => Err("feedback draft load timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftLoadComplete {
+                            agent_id,
+                            load,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Delete(delete) => {
+                        let raw_params = match serde_json::value::to_raw_value(&serde_json::json!({
+                            "session_id": session_id.0.to_string(),
+                            "draft_id": delete.draft_id,
+                        })) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftDeleteComplete {
+                                    agent_id,
+                                    delete,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft delete: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/delete",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map(|_| ())
+                                .map_err(|error| sanitize_user_error(&error.to_string())),
+                            Err(_elapsed) => Err("feedback draft delete timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftDeleteComplete {
+                            agent_id,
+                            delete,
+                            result,
+                        }
+                    }
+                    crate::views::feedback_modal::FeedbackDraftRequest::Update(update) => {
+                        let raw_params = match serde_json::value::to_raw_value(
+                            &xai_grok_shell::session::FeedbackDraftUpdateRequest {
+                                session_id: session_id.0.to_string(),
+                                draft_id: update.draft_id.clone(),
+                                input: xai_grok_feedback::FeedbackDraftInput {
+                                    title: update.title.clone(),
+                                    details: update.details.clone(),
+                                    area: update.area.clone(),
+                                    r#type: update.r#type,
+                                    task_category: update.task_category,
+                                    failure_mode: update.failure_mode,
+                                },
+                            },
+                        ) {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return TaskResult::FeedbackDraftUpdateComplete {
+                                    agent_id,
+                                    update,
+                                    result: Err(sanitize_user_error(&format!(
+                                        "couldn't serialize feedback draft update: {error}"
+                                    ))),
+                                };
+                            }
+                        };
+                        let request = acp::ExtRequest::new(
+                            "x.ai/feedback/drafts/update",
+                            raw_params.into(),
+                        );
+                        let result = match tokio::time::timeout(
+                            FEEDBACK_DRAFT_ACP_TIMEOUT,
+                            acp_send(request, &tx),
+                        )
+                        .await
+                        {
+                            Ok(send) => send
+                                .map(|_| ())
+                                .map_err(|error| sanitize_user_error(&error.to_string())),
+                            Err(_elapsed) => Err("feedback draft update timed out".to_string()),
+                        };
+                        TaskResult::FeedbackDraftUpdateComplete {
+                            agent_id,
+                            update,
+                            result,
+                        }
+                    }
+                }
+            });
+        }
+        Effect::RehydrateFeedbackImage {
+            agent_id,
+            modal_id,
+            image_identity,
+            path,
+        } => {
+            tasks.spawn(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    xai_grok_feedback::read_regular_capped(&path, 16 * 1024 * 1024)
+                        .map_err(|error| error.to_string())
+                })
+                .await
+                .unwrap_or_else(|_| Err("Could not restore a feedback image.".to_owned()));
+                TaskResult::FeedbackImageRehydrated {
+                    agent_id,
+                    modal_id,
+                    image_identity,
+                    result,
+                }
+            });
         }
         Effect::RewriteMemoryNote {
             agent_id,

@@ -64,10 +64,30 @@ pub(crate) struct FeedbackRequestDismiss {
     pub request_id: String,
 }
 
+/// How a feedback POST resolved. Unknown newer wire values map to [`Self::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FeedbackOutcome {
+    Submitted,
+    SubmittedCleanupFailed,
+    LocalOnly,
+    OutcomeUnknown,
+    /// Unknown wire variant from a newer shell. Treat like [`Self::OutcomeUnknown`].
+    #[serde(other)]
+    Other,
+}
+
 /// Response from submitting user feedback
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FeedbackResponse {
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<FeedbackOutcome>,
+    /// Single-use capability returned only for a successful, explicitly consented modal report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_upload_token: Option<String>,
 }
 
 /// Input from client for feedback submission.
@@ -138,6 +158,10 @@ pub struct ClientFeedbackInput {
     /// Terminal environment snapshot from the client.
     #[serde(default)]
     pub terminal_info: Option<prod_mc_cli_chat_proxy_types::feedback_types::FeedbackTerminalInfo>,
+
+    /// Ask the shell to mint a one-shot upload capability after this report succeeds.
+    #[serde(default)]
+    pub request_trace_upload_token: bool,
 }
 
 /// `x.ai/feedback/drafts/update` params, built by the pager and parsed by the shell.

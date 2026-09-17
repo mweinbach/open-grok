@@ -126,6 +126,7 @@ fn parse_feedback_input(params: &str) -> Result<ClientFeedbackInput, acp::Error>
                 client_version: None,
                 metadata: None,
                 terminal_info: None,
+                request_trace_upload_token: false,
             })
         }
     }
@@ -363,10 +364,14 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                 }
             }
 
-            let value = serde_json::to_value(FeedbackResponse { success: true })
-                .map(|value| serde_json::value::to_raw_value(&value).map(Arc::from))
-                .expect("to work")
-                .expect("to work");
+            let value = serde_json::to_value(FeedbackResponse {
+                success: true,
+                outcome: Some(crate::session::FeedbackOutcome::Submitted),
+                trace_upload_token: None,
+            })
+            .map(|value| serde_json::value::to_raw_value(&value).map(Arc::from))
+            .expect("to work")
+            .expect("to work");
             Ok(acp::ExtResponse::new(value))
         }
         "x.ai/feedback/dismiss" => {

@@ -131,6 +131,7 @@ impl AgentView {
             || self.btw_focused
             || !self.permission_queue.is_empty()
             || self.question_view.is_some()
+            || self.feedback_modal.is_some()
             || self.elicitation_view.is_some()
             || self.plan_approval_view.is_some()
             || self.casual_commenting_range.is_some()
@@ -199,6 +200,7 @@ impl AgentView {
             || self.gboom.is_some()
             || self.video_viewer.is_some()
             || self.image_viewer.is_some()
+            || self.feedback_modal.is_some()
     }
     /// Prompt pane focused with an empty draft and no overlay or prompt-local
     /// sub-state owning keys — the state where a bare Left backs out of the
@@ -790,6 +792,19 @@ impl AgentView {
                         self.handle_line_viewer_mouse(mouse)
                     }
                 }
+                _ => InputOutcome::Changed,
+            };
+        }
+        if self.feedback_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always).is_some() {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_feedback_modal_key(key)
+                }
+                Event::Mouse(mouse) => self.handle_feedback_modal_mouse(mouse),
+                Event::Paste(text) => self.handle_feedback_modal_paste(text),
                 _ => InputOutcome::Changed,
             };
         }

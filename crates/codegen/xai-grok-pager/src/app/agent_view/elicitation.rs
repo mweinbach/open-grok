@@ -287,6 +287,9 @@ impl AgentView {
             return;
         };
         let stashed = self.stash_prompt_for_elicitation();
+        self.displace_feedback_modal(
+            crate::views::feedback_modal::FeedbackModalDisplacement::McpElicitation,
+        );
         self.elicitation_view = Some(ElicitationViewState::from_request(req, stashed, Some(tx)));
     }
 

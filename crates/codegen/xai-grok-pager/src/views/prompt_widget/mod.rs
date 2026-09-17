@@ -567,6 +567,9 @@ pub struct PromptWidget {
     textarea_area: Rect,
     /// @-completion file search state.
     pub file_search: FileSearchState,
+    /// When false, `@` file search never opens. Feedback's throwaway composer
+    /// does not render or drain file-search UI.
+    file_search_enabled: bool,
     /// Pending request to open the line viewer.
     /// Set by accept_file_search_for_viewer / Ctrl-L / : triggers, consumed by AgentView.
     pub(crate) pending_viewer_request: Option<ViewerRequest>,
@@ -670,6 +673,7 @@ impl PromptWidget {
             textarea_state: TextAreaState::default(),
             textarea_area: Rect::default(),
             file_search: FileSearchState::new(cwd),
+            file_search_enabled: true,
             pending_viewer_request: None,
             history_search: HistorySearchState::new(),
             slash_controller: crate::slash::SlashController::with_builtins(cwd.to_path_buf()),
@@ -831,6 +835,28 @@ impl PromptWidget {
             || self.slash_open()
             || self.completion_dropdown_open()
             || self.history_search.is_active()
+    }
+
+    /// Wrap-aware top of the draft: Up stays in the composer until the caret
+    /// is on the first visual row.
+    pub fn caret_on_top_visual_row(&self) -> bool {
+        let area = self.textarea_area;
+        if area.height == 0 {
+            return false;
+        }
+        if self.textarea.text().is_empty() {
+            return true;
+        }
+        let caret = self
+            .textarea
+            .cursor_pos_with_state(area, self.textarea_state);
+        let top = self
+            .textarea
+            .screen_position_of(0, area, self.textarea_state);
+        match (caret, top) {
+            (Some((_, caret_row)), Some((_, top_row))) => caret_row == top_row,
+            _ => false,
+        }
     }
 
     /// Open the completion dropdown if items are available.
@@ -1533,7 +1559,18 @@ impl PromptWidget {
     /// Suppresses the context if the cursor is on or immediately after a
     /// file reference element — the `@` belongs to the atomic block and
     /// the dropdown can't edit it.
+    /// Disable `@` file references for a composer that does not render or drain file-search UI.
+    pub(crate) fn disable_file_search(&mut self) {
+        self.file_search_enabled = false;
+        self.file_search.clear_context();
+        self.pending_viewer_request = None;
+    }
+
     fn update_file_search_context(&mut self) {
+        if !self.file_search_enabled {
+            self.file_search.clear_context();
+            return;
+        }
         let cursor = self.textarea.cursor();
 
         // Check if cursor is adjacent to a file ref element (on it or right after it).
@@ -2691,6 +2728,82 @@ impl PromptWidget {
             .collect();
         crate::prompt_images::reconcile(&mut self.images, &live_ids);
         std::mem::take(&mut self.images)
+    }
+
+    pub(crate) fn has_live_image(&self) -> bool {
+        self.images.iter().any(|image| {
+            self.textarea
+                .elements()
+                .iter()
+                .any(|element| element.kind == KIND_IMAGE && element.id == image.element_id)
+        })
+    }
+
+    pub(crate) fn drop_image_preserving_session_file(&mut self, image_identity: u64) {
+        let Some(position) = self
+            .images
+            .iter()
+            .position(|image| image.preview.identity() == image_identity)
+        else {
+            return;
+        };
+        let Some(element_id) = self.images.get(position).map(|image| image.element_id) else {
+            return;
+        };
+        if let Some(range) = self
+            .textarea
+            .elements()
+            .iter()
+            .find(|element| element.id == element_id)
+            .map(|element| element.range.clone())
+        {
+            self.textarea.replace_range(range, "");
+        }
+        let image = self.images.remove(position);
+        crate::prompt_images::cleanup_temp_file(&image);
+    }
+
+    /// Reconcile modal-owned images with live chips, deleting removed staged temps.
+    pub(crate) fn reconcile_feedback_images_on_teardown(&mut self) {
+        let live_ids: std::collections::HashSet<_> = self
+            .textarea
+            .elements()
+            .iter()
+            .filter(|element| element.kind == KIND_IMAGE)
+            .map(|element| element.id)
+            .collect();
+        crate::prompt_images::reconcile(&mut self.images, &live_ids);
+    }
+
+    /// Keep disk-backed sources whose off-thread rehydration has not completed.
+    pub(crate) fn preserve_pending_feedback_image_sources(&mut self) {
+        for image in self.images.iter_mut().chain(&mut self.image_undo_stash) {
+            if image.encoded_bytes.is_none() {
+                image.session_image_path = None;
+            }
+        }
+    }
+
+    /// Drain and delete every staged image this composer still owns.
+    pub(crate) fn cleanup_images_on_teardown(&mut self) {
+        crate::prompt_images::drain_and_cleanup(&mut self.images);
+        crate::prompt_images::drain_and_cleanup(&mut self.image_undo_stash);
+    }
+
+    /// Seed a fresh composer through the normal image insertion path.
+    pub(crate) fn seed_images(&mut self, images: Vec<PastedImage>) -> usize {
+        let mut rejected = 0;
+        self.set_cursor(self.text().len());
+        for image in images {
+            self.image_counter = self
+                .image_counter
+                .max(image.display_number.saturating_sub(1));
+            if self.insert_image(image.clone()).is_err() {
+                crate::prompt_images::cleanup_temp_file(&image);
+                rejected += 1;
+            }
+        }
+        rejected
     }
 
     /// Buffer text with `[Image #N]` chip placeholders removed, for
