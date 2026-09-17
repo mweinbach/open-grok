@@ -40,6 +40,7 @@ pub mod prompt_widget;
 pub mod question_view;
 pub mod queue_pane;
 pub mod rewind;
+pub(crate) mod scheduled_next;
 pub mod scroll_debug_hud;
 pub mod session_picker;
 pub mod session_picker_surface;

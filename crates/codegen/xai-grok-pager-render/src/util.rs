@@ -76,6 +76,13 @@ pub fn abbreviate_path(path: &str) -> Cow<'_, str> {
     Cow::Borrowed(path)
 }
 
+/// Location-chrome path: [`abbreviate_path`] then last-two-component shortening.
+/// Clipboard and other callers keep [`abbreviate_path`].
+pub fn display_location_path(path: impl AsRef<Path>) -> String {
+    let lossy = path.as_ref().to_string_lossy();
+    crate::location_path::shorten_location_path(&abbreviate_path(&lossy)).into_owned()
+}
+
 /// True when `path` is under user [`grok_home()`] (not project `{cwd}/.opengrok`).
 pub fn is_under_user_grok_home(path: &Path) -> bool {
     path.starts_with(grok_home())
@@ -483,6 +490,15 @@ mod tests {
             Path::new("not-opengrok-home").join("file.txt").display()
         );
         assert_eq!(abbreviated.as_ref(), expected);
+    }
+
+    #[test]
+    fn display_location_path_shortens_middle_components() {
+        assert_eq!(
+            display_location_path(Path::new("/work/xai/frontend/apps")),
+            "/w/x/frontend/apps"
+        );
+        assert!(!display_location_path(Path::new("/work/wt/session-1")).contains("(worktree of"));
     }
 
     #[test]

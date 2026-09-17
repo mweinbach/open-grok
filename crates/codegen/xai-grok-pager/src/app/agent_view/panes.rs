@@ -410,6 +410,7 @@ impl AgentView {
         let mut loops: Vec<&crate::app::agent::ScheduledTaskInfo> =
             self.session.scheduled_tasks.values().collect();
         loops.sort_by_key(|text| text.created_at);
+        let now = chrono::Utc::now();
         rows.extend(loops.into_iter().map(|text| {
             (
                 DockWatcherId::Loop(text.task_id.clone()),
@@ -417,7 +418,11 @@ impl AgentView {
                     kind: "Loop".into(),
                     description: text.prompt.clone(),
                     activity: None,
-                    meta: text.human_schedule.clone(),
+                    meta: format!(
+                        "{}{}",
+                        text.human_schedule,
+                        crate::views::scheduled_next::next_suffix(text, now)
+                    ),
                     killable: true,
                 },
             )
@@ -948,6 +953,30 @@ mod dock_tests {
             matches!(outcome, InputOutcome::Action(Action::CancelScheduledTask(id)) if id == task_id)
         );
         assert_eq!(agent.prompt.text(), "unfinished native-agent request");
+    }
+
+    #[test]
+    fn dock_loop_meta_includes_cadence_and_next_trigger() {
+        let mut agent = make_agent();
+        let next = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        agent.session.scheduled_tasks.insert(
+            "loop-1".to_string(),
+            crate::app::agent::ScheduledTaskInfo {
+                task_id: "loop-1".to_string(),
+                prompt: "check CI".to_string(),
+                human_schedule: "every 30 minutes".to_string(),
+                created_at: std::time::Instant::now(),
+                next_fire_at: Some(next),
+                tag: "loop".to_string(),
+                last_subagent_id: None,
+            },
+        );
+        let rows = agent.dock_watcher_rows();
+        let meta = &rows.first().expect("loop row").1.meta;
+        assert!(
+            meta.starts_with("every 30 minutes (next in ") && !meta.contains("due now"),
+            "{meta}"
+        );
     }
 
     #[test]

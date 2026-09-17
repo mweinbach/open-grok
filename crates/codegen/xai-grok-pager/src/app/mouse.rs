@@ -254,6 +254,15 @@ impl AgentView {
                         xai_grok_telemetry::events::AnnouncementCtaSurface::Header,
                     ));
                 }
+                if self.hit_dashboard.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(if self.in_dashboard_overlay {
+                        Action::DashboardOverlayExit
+                    } else {
+                        Action::OpenDashboard
+                    });
+                }
                 if self.hit_cwd.contains(mouse.column, mouse.row) {
                     let path = self.session.cwd.display().to_string();
                     self.copy_to_clipboard(&path);
@@ -1154,6 +1163,7 @@ impl AgentView {
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_dashboard.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_upgrade_cta.update_hover(mouse.column, mouse.row);
                 {
                     let new_kill = self

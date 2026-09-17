@@ -1724,6 +1724,19 @@ impl AgentView {
         ) {
             status.push("badge", Line::from(badge_spans));
         }
+        let dashboard_available =
+            in_dashboard_overlay || crate::views::dashboard::dashboard_enabled();
+        if dashboard_available {
+            let dashboard_style = if self.hit_dashboard.hovered {
+                Style::default().fg(theme.text_primary).bg(theme.bg_base)
+            } else {
+                Style::default().fg(theme.gray).bg(theme.bg_base)
+            };
+            status.push(
+                "dashboard",
+                Line::from(Span::styled("[Dashboard]", dashboard_style)),
+            );
+        }
         let areas = status.render(buf, layout.status_bar);
         self.hit_bg_status.rect = areas.get("bg_tasks").copied();
         self.hit_goal_status.rect = areas.get("goal").copied();
@@ -1732,14 +1745,10 @@ impl AgentView {
         self.hit_plan_button.rect = areas.get("plan").copied();
         self.hit_queue_badge.rect = areas.get("queue").copied();
         self.hit_badge.rect = areas.get("badge").copied();
-        let home = std::env::var("HOME").ok();
-        let display = self.session.cwd.display().to_string();
-        let short = match &home {
-            Some(h) if display.starts_with(h.as_str()) => {
-                format!("~{}", &display[h.len()..])
-            }
-            _ => display,
-        };
+        let dropdown_open = self.prompt.any_dropdown_open();
+        self.hit_dashboard
+            .set_unless_dropdown(areas.get("dashboard").copied(), dropdown_open);
+        let short = crate::util::display_location_path(&self.session.cwd);
         let cwd_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
         use unicode_width::UnicodeWidthStr;
         let mut parts: Vec<Span> = Vec::new();
@@ -1788,16 +1797,6 @@ impl AgentView {
             cwd_style
         };
         parts.push(Span::styled(short, path_style));
-        let main_repo_display = self
-            .main_repo
-            .clone()
-            .or_else(|| lazy_git.as_ref().and_then(|i| i.main_repo.clone()));
-        if let Some(main_repo) = main_repo_display {
-            parts.push(Span::styled(
-                format!(" (worktree of {main_repo})"),
-                cwd_style,
-            ));
-        }
         let cwd_line = Line::from(parts);
         let max_cwd_width = areas
             .values()
@@ -1852,7 +1851,6 @@ impl AgentView {
                 );
             }
         }
-        let dropdown_open = self.prompt.any_dropdown_open();
         self.hit_upgrade_cta
             .set_unless_dropdown(upgrade_cta_rect, dropdown_open);
         let mut inline_edit_cursor: Option<(u16, u16)> = None;

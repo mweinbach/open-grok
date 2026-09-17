@@ -176,6 +176,8 @@ pub use prompt_stash::{PromptStashEntry, StashCause};
 mod queue;
 mod render;
 pub use render::AppRenderParams;
+#[cfg(test)]
+mod header_tests;
 mod rewind;
 mod selection;
 mod session;
@@ -1192,6 +1194,9 @@ pub struct AgentView {
     pub hit_response_top_indicator: HitArea,
     /// CWD / worktree path in the status bar (click to copy).
     pub hit_cwd: HitArea,
+    /// `[Dashboard]` on the status bar: opens the dashboard, or returns to it
+    /// when this view is the dashboard's session overlay.
+    pub hit_dashboard: HitArea,
     /// Cancel button in turn status line (`[stop]`).
     pub hit_cancel_button: HitArea,
     /// Still-running watcher cue on the turn-status row (click opens the

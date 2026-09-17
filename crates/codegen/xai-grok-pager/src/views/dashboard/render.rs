@@ -577,7 +577,7 @@ fn render_dashboard_banner(
 /// Render the dashboard header row:
 ///
 /// ```text
-///   main worktree ~/wt/wt1 (worktree of ~/proj)   ◆ 2 awaiting · ⋮ 3 working · ◇ 1 idle │ [+ New Agent]
+///   main worktree ~/w/wt1   ◆ 2 awaiting · ⋮ 3 working · ◇ 1 idle │ [+ New Agent]
 /// ```
 ///
 /// Left: the current location (git branch, worktree badge, cwd), the same line the welcome top bar paints (see `views::welcome::location_line`).

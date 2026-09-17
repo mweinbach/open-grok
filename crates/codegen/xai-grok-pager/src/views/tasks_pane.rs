@@ -24,7 +24,7 @@ use crate::scrollback::layout::HorizontalLayout;
 use crate::syntax::get_syntect;
 use crate::theme::{Theme, ThemeKind};
 use crate::util::format_duration;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
 use super::list_pane::{
     ListItem, ListPane, ListPaneConfig, ListPaneState, ListPaneStyle, WrapMode,
@@ -548,19 +548,6 @@ impl TaskEntry {
         } else {
             info.prompt.clone()
         };
-        let countdown = |schedule: &str, created: std::time::Instant| -> String {
-            if let Some(secs) = crate::util::parse_schedule_interval_secs(schedule) {
-                let approx = created + std::time::Duration::from_secs(secs);
-                let now = std::time::Instant::now();
-                if approx > now {
-                    format!(" (next in {})", format_duration(approx.duration_since(now)))
-                } else {
-                    " (due now)".to_string()
-                }
-            } else {
-                String::new()
-            }
-        };
         let is_provisional = info.task_id.starts_with("provisional-");
         let suffix = if current_cron == Some(&info.task_id) || linked_running {
             " (running)".to_string()
@@ -568,21 +555,8 @@ impl TaskEntry {
             " (queued)".to_string()
         } else if is_provisional {
             " (starting)".to_string()
-        } else if let Some(n) = &info.next_fire_at {
-            if let Ok(dt) = DateTime::<chrono::FixedOffset>::parse_from_rfc3339(n) {
-                let dt = dt.with_timezone(&Utc);
-                let now = Utc::now();
-                if dt > now {
-                    let dur = (dt - now).to_std().unwrap_or_default();
-                    format!(" (next in {})", format_duration(dur))
-                } else {
-                    " (due now)".to_string()
-                }
-            } else {
-                countdown(&info.human_schedule, info.created_at)
-            }
         } else {
-            countdown(&info.human_schedule, info.created_at)
+            crate::views::scheduled_next::next_suffix(info, Utc::now())
         };
         // Capitalize the tag for display (`loop` → `Loop`) so it reads as a
         // proper label, matching the monitor row's `Monitor` tag.
