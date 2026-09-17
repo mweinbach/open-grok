@@ -914,7 +914,12 @@ pub struct AgentView {
     pub dock_tasks_expanded: bool,
     pub dock_watchers_expanded: bool,
     pub dock_queued_expanded: bool,
+    /// Last frame: dock replaced Tasks/Queue, even if every section is empty.
+    pub dock_on: bool,
+    /// Last frame: dock painted (`dock_on` and ≥1 non-empty section).
     pub dock_shown: bool,
+    /// Sticky: Ctrl+G hid the dock; paint stays off until the next Ctrl+G.
+    pub dock_hidden: bool,
     /// Current mode of the prompt widget (normal vs editing a queued prompt).
     pub prompt_mode: PromptMode,
     /// Current special prompt input mode (Normal/Bash/Remember).

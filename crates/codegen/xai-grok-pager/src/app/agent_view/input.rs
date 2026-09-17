@@ -1239,13 +1239,19 @@ impl AgentView {
             && key.kind != KeyEventKind::Release
             && registry.matches_id(ActionId::ToggleTasks, key)
         {
-            if self.active_pane == AgentPane::Dock {
-                self.set_active_pane(AgentPane::Scrollback, false);
-                return InputOutcome::Changed;
-            }
-            if self.dock_shown {
-                self.set_active_pane(AgentPane::Dock, false);
-                return InputOutcome::Changed;
+            if self.dock_on {
+                if self.dock_hidden {
+                    self.dock_hidden = false;
+                    return InputOutcome::Changed;
+                }
+                if self.dock_shown {
+                    self.dock_hidden = true;
+                    if self.active_pane == AgentPane::Dock {
+                        self.set_active_pane(AgentPane::Scrollback, false);
+                    }
+                    return InputOutcome::Changed;
+                }
+                return InputOutcome::Unchanged;
             }
             self.tasks.overlay.toggle();
             self.tasks.on_state_change();
@@ -1285,6 +1291,8 @@ impl AgentView {
         {
             if self.dock_shown {
                 self.dock_queued_expanded = !self.dock_queued_expanded;
+            } else if self.dock_on {
+                return InputOutcome::Unchanged;
             } else {
                 self.toggle_queue_pane();
             }

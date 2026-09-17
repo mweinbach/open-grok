@@ -1366,6 +1366,7 @@ impl AgentView {
         let dock_on = crate::views::dock::enabled()
             && !viewer_open
             && area.height > agent::SHORT_TERMINAL_ROWS;
+        self.dock_on = dock_on;
         let tasks_height = if viewer_open || dock_on {
             0
         } else {
@@ -1443,7 +1444,7 @@ impl AgentView {
             _ => 1,
         };
         let follow_ups_height = u16::from(self.follow_ups.is_some());
-        let mut dock_data = dock_on.then(|| self.dock_snapshot());
+        let mut dock_data = (dock_on && !self.dock_hidden).then(|| self.dock_snapshot());
         if let Some(data) = &mut dock_data {
             let max = crate::views::dock::visible_items(data)
                 .len()

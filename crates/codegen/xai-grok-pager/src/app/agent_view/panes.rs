@@ -39,6 +39,14 @@ impl AgentView {
                 return InputOutcome::Changed;
             }
             if key.code == KeyCode::Tab
+                && self.dock_shown
+                && !self.dock_hidden
+                && self.set_active_pane(AgentPane::Dock, false)
+            {
+                self.dock_cursor = 0;
+                return InputOutcome::Changed;
+            }
+            if key.code == KeyCode::Tab
                 && self.tasks.overlay.visible
                 && self.set_active_pane(AgentPane::Tasks, false)
             {
@@ -586,6 +594,14 @@ impl AgentView {
     pub(super) fn handle_dock_key(&mut self, key: &KeyEvent) -> InputOutcome {
         use crate::views::dock::{DockItem, Section};
         use crossterm::event::KeyCode;
+        if self.dock_hidden {
+            return InputOutcome::Unchanged;
+        }
+        let shift_tab = matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && key.modifiers == KeyModifiers::SHIFT;
+        if !key.modifiers.is_empty() && !shift_tab {
+            return InputOutcome::Unchanged;
+        }
         let items = self.dock_items();
         if items.is_empty() {
             self.set_active_pane(AgentPane::Scrollback, false);
@@ -599,6 +615,11 @@ impl AgentView {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 self.dock_cursor = (self.dock_cursor + 1).min(items.len() - 1);
+                InputOutcome::Changed
+            }
+            KeyCode::Tab if !shift_tab => InputOutcome::Action(Action::FocusPrompt),
+            KeyCode::BackTab | KeyCode::Tab => {
+                self.set_active_pane(AgentPane::Scrollback, false);
                 InputOutcome::Changed
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.dock_activate(items[self.dock_cursor]),
@@ -1302,6 +1323,168 @@ mod dock_tests {
         assert_eq!(
             painted_header_bg(&agent, Section::Tasks),
             crate::theme::Theme::tokyonight().bg_highlight
+        );
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
+
+    fn ctrl_g(agent: &mut AgentView) -> InputOutcome {
+        agent.handle_input(
+            &crossterm::event::Event::Key(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            &crate::actions::ActionRegistry::defaults(),
+        )
+    }
+
+    #[test]
+    fn tab_cycles_scrollback_to_dock_to_prompt() {
+        let mut agent = make_agent();
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), running_subagent_info("child-1"));
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_shown = true;
+        agent.dock_on = true;
+        agent.vim_mode = true;
+        agent.active_pane = AgentPane::Scrollback;
+        agent.dock_cursor = agent
+            .dock_items()
+            .iter()
+            .position(|item| *item == DockItem::Header(Section::Tasks))
+            .expect("tasks");
+        let registry = crate::actions::ActionRegistry::defaults();
+
+        let outcome =
+            agent.handle_scrollback_key(&key(KeyCode::Tab, KeyModifiers::NONE), &registry);
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(agent.active_pane, AgentPane::Dock);
+        assert_eq!(
+            agent.dock_items().get(agent.dock_cursor).copied(),
+            Some(DockItem::Header(Section::Subagents))
+        );
+
+        let outcome = agent.handle_dock_key(&key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Action(Action::FocusPrompt)));
+    }
+
+    #[test]
+    fn tab_from_dock_is_one_stop() {
+        let mut agent = make_agent();
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), running_subagent_info("child-1"));
+        agent
+            .session
+            .pending_prompts
+            .push_back(crate::app::agent::QueuedPrompt::plain(
+                1,
+                "queued",
+                crate::app::agent::QueueEntryKind::Prompt,
+            ));
+        agent.dock_shown = true;
+        agent.dock_on = true;
+        agent.dock_queued_expanded = false;
+        agent.active_pane = AgentPane::Dock;
+        agent.dock_cursor = agent
+            .dock_items()
+            .iter()
+            .position(|item| *item == DockItem::Header(Section::Queued))
+            .expect("queued");
+
+        let outcome = agent.handle_dock_key(&key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Action(Action::FocusPrompt)));
+
+        let outcome = agent.handle_dock_key(&key(KeyCode::BackTab, KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(agent.active_pane, AgentPane::Scrollback);
+    }
+
+    #[test]
+    fn tab_from_scrollback_skips_dock_when_hidden() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.tasks.overlay.visible = false;
+        agent.vim_mode = true;
+        agent.dock_on = true;
+        agent.dock_shown = false;
+        agent.active_pane = AgentPane::Scrollback;
+        let registry = crate::actions::ActionRegistry::defaults();
+        let outcome =
+            agent.handle_scrollback_key(&key(KeyCode::Tab, KeyModifiers::NONE), &registry);
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::FocusPrompt)),
+            "hidden dock stays out of the Tab cycle, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn ctrl_g_hides_and_shows_dock_from_prompt() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.tasks.overlay.visible = false;
+        agent.dock_shown = true;
+        agent.dock_on = true;
+        agent.active_pane = AgentPane::Prompt;
+        assert!(matches!(ctrl_g(&mut agent), InputOutcome::Changed));
+        assert!(agent.dock_hidden);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert!(!agent.tasks.overlay.visible);
+        assert!(matches!(ctrl_g(&mut agent), InputOutcome::Changed));
+        assert!(!agent.dock_hidden);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+    }
+
+    #[test]
+    fn ctrl_g_hides_shown_dock_when_dock_focused() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_shown = true;
+        agent.dock_on = true;
+        agent.active_pane = AgentPane::Dock;
+        assert!(matches!(ctrl_g(&mut agent), InputOutcome::Changed));
+        assert!(agent.dock_hidden);
+        assert_eq!(agent.active_pane, AgentPane::Scrollback);
+    }
+
+    #[test]
+    fn toggle_tasks_does_not_open_hidden_pane_when_dock_on_but_empty() {
+        let mut agent = make_agent();
+        agent.dock_on = true;
+        agent.dock_shown = false;
+        agent.tasks.overlay.visible = false;
+        assert!(matches!(ctrl_g(&mut agent), InputOutcome::Unchanged));
+        assert!(!agent.tasks.overlay.visible);
+        assert_ne!(agent.active_pane, AgentPane::Tasks);
+    }
+
+    #[test]
+    fn toggle_tasks_still_toggles_legacy_pane_when_dock_off() {
+        let mut agent = make_agent();
+        agent.dock_on = false;
+        agent.dock_shown = false;
+        assert!(matches!(ctrl_g(&mut agent), InputOutcome::Changed));
+        assert!(agent.tasks.overlay.visible);
+        assert_eq!(agent.active_pane, AgentPane::Tasks);
+    }
+
+    #[test]
+    fn hidden_dock_does_not_navigate_or_kill() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_on = true;
+        agent.dock_shown = true;
+        agent.dock_hidden = true;
+        agent.active_pane = AgentPane::Dock;
+        agent.dock_cursor = 0;
+        let outcome = agent.handle_dock_key(&key(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Unchanged));
+        assert_eq!(agent.dock_cursor, 0);
+
+        let outcome = agent.handle_dock_key(&key(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(
+            !matches!(outcome, InputOutcome::Action(_)),
+            "x on a hidden dock must not kill, got {outcome:?}"
         );
     }
 }
