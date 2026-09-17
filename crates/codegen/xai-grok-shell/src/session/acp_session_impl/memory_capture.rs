@@ -342,6 +342,12 @@ fn build_extraction_request(
     }
 }
 
+fn user_item_starts_prompt_turn(reason: &Option<SyntheticReason>) -> bool {
+    reason
+        .as_ref()
+        .is_none_or(SyntheticReason::starts_prompt_turn)
+}
+
 fn select_completed_turn_items(
     items: Vec<ConversationItem>,
     source_prompt_index: u32,
@@ -351,12 +357,7 @@ fn select_completed_turn_items(
     let mut selected = Vec::new();
     for item in items {
         if let ConversationItem::User(user) = &item {
-            if is_selected_turn
-                && user
-                    .synthetic_reason
-                    .as_ref()
-                    .is_some_and(SyntheticReason::starts_prompt_turn)
-            {
+            if is_selected_turn && user_item_starts_prompt_turn(&user.synthetic_reason) {
                 break;
             }
             // Fork user items are human when they carry no synthetic reason.

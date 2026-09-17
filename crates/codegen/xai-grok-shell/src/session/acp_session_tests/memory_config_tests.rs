@@ -57,7 +57,7 @@ fn initial_injection_backend_params_preserve_default_zero_min_score() {
     assert!((0.0 - effective_min_score as f32).abs() < f32::EPSILON);
 }
 #[allow(clippy::field_reassign_with_default)]
-async fn create_test_actor_with_memory(
+pub(super) async fn create_test_actor_with_memory(
     total_tokens: u64,
     context_window: u64,
     threshold_percent: u8,
@@ -79,10 +79,13 @@ async fn create_test_actor_with_memory(
         tokio_util::sync::CancellationToken::new(),
     );
     let tool_context = ToolContext::new(cwd.clone(), None, None, fs, terminal, hunk_tracker_handle);
-    let memory_storage = memory_config
-        .as_ref()
-        .filter(|mc| mc.enabled)
-        .map(|_| crate::session::memory::MemoryStorage::new(&cwd_path, None));
+    let memory_storage = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
+        crate::session::memory::MemoryStorage::new_for_mode(
+            &cwd_path,
+            mc.root_dir_override.as_deref(),
+            mc.mode,
+        )
+    });
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
@@ -191,6 +194,11 @@ async fn create_test_actor_with_memory(
             configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
             initial_injection_config: memory_initial_injection_config,
+            configured_mode: memory_config.as_ref().map(|mc| mc.mode),
+            v2_config: memory_config
+                .as_ref()
+                .map(|mc| mc.v2.clone())
+                .unwrap_or_default(),
             ..crate::session::memory_state::SessionMemory::empty()
         },
         session_start: std::time::Instant::now(),
