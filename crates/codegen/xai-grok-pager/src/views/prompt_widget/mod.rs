@@ -2237,6 +2237,19 @@ impl PromptWidget {
     /// - `Submit` → perform the context-specific submit action
     /// - `PassThrough` → fall through to `self.handle_key(key)`
     pub fn route_enter(&mut self, key: &KeyEvent) -> EnterOutcome {
+        self.route_enter_with_newline_modifier(
+            key,
+            crate::input::is_apple_terminal_newline_modifier_held(),
+        )
+    }
+
+    /// Testable seam for the Apple Terminal CoreGraphics modifier rescue.
+    /// Production callers use [`Self::route_enter`]; tests inject the modifier.
+    pub(crate) fn route_enter_with_newline_modifier(
+        &mut self,
+        key: &KeyEvent,
+        is_newline_modifier_held: bool,
+    ) -> EnterOutcome {
         // File-search dropdown is open — Enter accepts the selection,
         // not submit.  Let handle_key() deal with it.
         if self.file_search_visible() {
@@ -2247,7 +2260,7 @@ impl PromptWidget {
         // no Kitty keyboard protocol.  Poll CoreGraphics for the real
         // modifier state — if Shift/Option/Cmd is physically held, insert
         // a newline instead of submitting.
-        if key.code == KeyCode::Enter && crate::input::is_apple_terminal_newline_modifier_held() {
+        if key.code == KeyCode::Enter && is_newline_modifier_held {
             self.textarea.insert_str("\n");
             return EnterOutcome::NewlineInserted;
         }

@@ -544,6 +544,12 @@ impl AgentView {
         {
             return InputOutcome::Changed;
         }
+        if self.feedback_modal.is_some()
+            && let Event::Paste(text) = ev
+            && crate::wrap_clipboard_image::try_decode_wrap_host_image_paste(text).is_some()
+        {
+            return self.handle_feedback_modal_paste(text);
+        }
         if let Event::Paste(text) = ev
             && let Some(outcome) = self.try_handle_wrap_host_image_paste(text)
         {
