@@ -1464,6 +1464,7 @@ impl DashboardState {
     /// Starts fresh; clears any half-typed dispatch text and the prior filter so the query builds from empty.
     pub fn enter_search_mode(&mut self) {
         self.search_mode = true;
+        self.set_list_focused(false);
         self.dispatch.set_text("");
         self.filter = Filter::None;
         self.error_toast = None;
@@ -8344,6 +8345,23 @@ mod tests {
         let o2 = state.handle_input(&ctrl_slash, &reg);
         assert!(matches!(o2, InputOutcome::Changed));
         assert!(!state.search_mode, "Ctrl+/ again must exit search mode");
+    }
+
+    #[test]
+    fn ctrl_slash_from_list_focuses_the_search_field() {
+        let mut state = DashboardState::new();
+        let reg = crate::actions::ActionRegistry::defaults();
+        state.list_focused = true;
+        let ctrl_slash = Event::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        let _ = state.handle_input(&ctrl_slash, &reg);
+        assert!(state.search_mode);
+        assert!(
+            !state.list_focused,
+            "Ctrl+/ must leave the session list and focus the search field"
+        );
+        let typed = Event::Key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let _ = state.handle_input(&typed, &reg);
+        assert_eq!(state.dispatch.text(), "z");
     }
 
     /// In search mode the dispatch buffer is a live filter query;

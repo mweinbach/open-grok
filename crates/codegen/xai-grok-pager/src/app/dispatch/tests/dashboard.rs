@@ -4609,6 +4609,7 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: true,
             caption: Some(CAPTION),
         }),
+        None,
     );
     assert!(
         state.pinned_upgrade_cta_live,
@@ -4660,6 +4661,7 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: true,
             caption: None,
         }),
+        None,
     );
     assert!(state.pinned_upgrade_cta_live);
     let rect = state
@@ -4690,6 +4692,7 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
             pinned: false,
             caption: Some(CAPTION),
         }),
+        None,
     );
     assert!(!state.pinned_upgrade_cta_live);
     let rect = state
@@ -4722,6 +4725,7 @@ fn dashboard_upgrade_cta_paints_arms_rect_and_ctrl_o_override() {
         false,
         None,
         false,
+        None,
         None,
     );
     assert!(state.upgrade_cta_hit.rect.is_none());
@@ -6394,6 +6398,7 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         None,
         false,
         None,
+        None,
     );
     assert!(
         app.dashboard.as_ref().unwrap().peek.is_some(),
@@ -6412,6 +6417,7 @@ fn dashboard_peek_auto_opens_for_selected_row() {
         false,
         None,
         false,
+        None,
         None,
     );
     assert!(
@@ -6450,6 +6456,7 @@ fn dashboard_peek_box_grows_for_multiline_reply() {
                 false,
                 None,
                 false,
+                None,
                 None,
             );
         };

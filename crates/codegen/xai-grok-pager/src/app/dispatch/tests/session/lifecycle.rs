@@ -2744,6 +2744,7 @@ fn dashboard_stop_with_peek_open_moves_selection_and_peek_down_one() {
             app.workspace_snapshot.as_ref(),
             app.dashboard_sessions_loading,
             None,
+            None,
         );
     };
     render(&mut app);

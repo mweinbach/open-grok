@@ -5601,6 +5601,7 @@ impl AppView {
                                 self.workspace_snapshot.as_ref(),
                                 self.dashboard_sessions_loading,
                                 dash_upgrade_cta,
+                                self.dashboard_session_picker.as_mut(),
                             );
                             let (popup_cursor, popup_post_flush, drawn_popup_agent) =
                                 if let Some(agent_id) = dashboard.attached_agent {

@@ -90,6 +90,9 @@ pub fn render_dashboard(
     dashboard_sessions_loading: bool,
 
     upgrade_cta: Option<HeaderUpgradeCta<'_>>,
+    dashboard_session_picker: Option<
+        &mut crate::views::session_picker_surface::SessionPickerSurface,
+    >,
 ) -> Option<(u16, u16)> {
     state.pinned_upgrade_cta_live = upgrade_cta.is_some_and(|cta| cta.pinned);
 
@@ -370,6 +373,39 @@ pub fn render_dashboard(
         peek_active,
         pending_hint,
     );
+
+    if let Some(surface) = dashboard_session_picker {
+        if surface.loading {
+            state.painted_animations.mark(Animation::Spinner);
+        }
+        let hit_areas = crate::views::session_picker_surface::render_session_picker(
+            area,
+            buf,
+            &theme,
+            crate::views::session_picker_surface::SessionPickerRenderMode::Modal {
+                window: &mut surface.window,
+                title: crate::views::session_picker_surface::DASHBOARD_PICKER_TITLE,
+            },
+            &mut crate::views::session_picker_surface::SessionPickerRenderCtx {
+                state: &mut surface.state,
+                sessions: surface.entries.as_deref(),
+                cwd: &state.cwd,
+                loading: surface.loading,
+                pending_hint: None,
+                shortcuts_area: None,
+                content_results: None,
+                content_loading: false,
+                entries_query: surface.entries_query.as_deref(),
+                tick: state.spinner_tick,
+                grouped: true,
+                source_filter: surface.source_filter,
+                pending_delete: false,
+                chat_mode: false,
+            },
+        );
+        surface.state.hit_areas = (hit_areas.search_bar.width > 0).then_some(hit_areas);
+        return None;
+    }
 
     if let Some(modal) = state.shortcuts_modal.as_mut() {
         crate::views::shortcuts_help::render_modal(
@@ -3874,6 +3910,184 @@ mod tests {
         content
     }
 
+    fn row_text(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width).fold(String::new(), |mut text, x| {
+            text.push_str(buf[(x, y)].symbol());
+            text
+        })
+    }
+
+    fn row_has_title_label(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+        (0..buf.area.width).any(|x| {
+            let cell = &buf[(x, y)];
+            cell.symbol() == "s"
+                && cell.fg == theme.text_primary
+                && cell.modifier.contains(Modifier::BOLD)
+        })
+    }
+
+    fn row_has_block_cursor(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+        (0..buf.area.width).any(|x| buf[(x, y)].bg == theme.text_primary)
+    }
+
+    fn row_has_selection(buf: &Buffer, y: u16, theme: &Theme) -> bool {
+        (0..buf.area.width).any(|x| buf[(x, y)].bg == theme.bg_visual)
+    }
+
+    fn dashboard_picker_entry(id: &str, summary: &str) -> crate::app::app_view::SessionPickerEntry {
+        crate::app::app_view::SessionPickerEntry {
+            session_kind: None,
+            last_recap: None,
+            id: id.to_owned(),
+            summary: summary.to_owned(),
+            updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            cwd: "/repo".to_owned(),
+            hostname: None,
+            source: "local".to_owned(),
+            model_id: None,
+            num_messages: 1,
+            last_active_at: None,
+            branch: None,
+            repo_name: "repo".to_owned(),
+            worktree_label: None,
+            last_turn_summary: None,
+            card_detail: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_session_picker_renders_simple_open_surface() {
+        crate::appearance::cache::set_vim_mode(true);
+        let area = Rect::new(0, 0, 100, 28);
+        let mut buf = Buffer::empty(area);
+        let mut state = DashboardState::new();
+        state.cwd = "/repo".into();
+        let mut agents = IndexMap::new();
+        let registry = crate::actions::ActionRegistry::defaults();
+        let snapshot = xai_grok_dashboard_store::WorkspaceSnapshot {
+            grouping: xai_grok_dashboard_store::Grouping::State,
+            members: vec![],
+            data_version: 1,
+        };
+        let mut surface = crate::views::session_picker_surface::SessionPickerSurface::new(1);
+        surface.source_filter = crate::views::session_picker::SourceFilter::Local;
+        surface.entries = Some(vec![dashboard_picker_entry(
+            "local-session",
+            "Resume this local session",
+        )]);
+
+        let _ = render_dashboard(
+            &mut buf,
+            area,
+            &mut state,
+            &mut agents,
+            &registry,
+            None,
+            &[],
+            true,
+            Some(&snapshot),
+            false,
+            None,
+            Some(&mut surface),
+        );
+        let content = buf_to_text(&buf);
+        assert!(content.contains("Open session"));
+        assert!(content.contains("Resume this local session"));
+        assert!(
+            content.contains("/ search"),
+            "dashboard /resume must advertise / search, got: {content:?}"
+        );
+        assert!(
+            !content.contains("i search"),
+            "leaving the field must not add an i search hint, got: {content:?}"
+        );
+        crate::appearance::cache::set_vim_mode(false);
+        assert!(
+            content.contains("/ to search"),
+            "an unfocused search field must show the browse hint, got: {content:?}"
+        );
+        assert!(
+            !content.contains(">search:"),
+            "an unfocused search field must not use the editing marker"
+        );
+        assert!(
+            surface.state.hit_areas.is_some(),
+            "shared picker renderer must publish dashboard-owned hit areas"
+        );
+    }
+
+    #[test]
+    fn dashboard_session_picker_search_focus_keeps_the_selected_row() {
+        let theme = Theme::current();
+        let area = Rect::new(0, 0, 100, 28);
+        let mut buf = Buffer::empty(area);
+        let mut state = DashboardState::new();
+        state.cwd = "/repo".into();
+        let mut agents = IndexMap::new();
+        let registry = crate::actions::ActionRegistry::defaults();
+        let snapshot = xai_grok_dashboard_store::WorkspaceSnapshot {
+            grouping: xai_grok_dashboard_store::Grouping::State,
+            members: vec![],
+            data_version: 1,
+        };
+        let mut surface = crate::views::session_picker_surface::SessionPickerSurface::new(1);
+        surface.source_filter = crate::views::session_picker::SourceFilter::Local;
+        surface.entries = Some(vec![dashboard_picker_entry(
+            "local-session",
+            "Resume this local session",
+        )]);
+        surface.state.search_active = true;
+        surface.state.selected = 1;
+        surface.state.set_query("local");
+
+        let _ = render_dashboard(
+            &mut buf,
+            area,
+            &mut state,
+            &mut agents,
+            &registry,
+            None,
+            &[],
+            true,
+            Some(&snapshot),
+            false,
+            None,
+            Some(&mut surface),
+        );
+        let content = buf_to_text(&buf);
+        assert!(
+            content.contains(" search:"),
+            "focused /resume search must keep the search label, got: {content:?}"
+        );
+        assert!(
+            !content.contains(">search:"),
+            "focused /resume search must not use a > marker"
+        );
+        assert!(
+            content.contains("local"),
+            "focused search must keep the query visible"
+        );
+        let search_y = (0..buf.area.height)
+            .find(|y| row_text(&buf, *y).contains(" search:"))
+            .expect("search row");
+        assert!(
+            row_has_title_label(&buf, search_y, &theme),
+            "focused search label must use the modal title color"
+        );
+        assert!(
+            row_has_block_cursor(&buf, search_y, &theme),
+            "focused search must paint a caret"
+        );
+        let title_y = (0..buf.area.height)
+            .find(|y| row_text(&buf, *y).contains("Resume this local session"))
+            .expect("selected session row");
+        assert!(
+            row_has_selection(&buf, title_y, &theme),
+            "editing search must keep the selected-result highlight"
+        );
+    }
+
     #[test]
     fn workspace_dashboard_renders_snapshot_member_without_delete_control() {
         let area = Rect::new(0, 0, 100, 28);
@@ -3913,6 +4127,7 @@ mod tests {
             true,
             Some(&snapshot),
             false,
+            None,
             None,
         );
 
@@ -3973,6 +4188,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
 
         let content = buf_to_text(&buf);
@@ -4025,6 +4241,7 @@ mod tests {
                 false,
                 None,
                 false,
+                None,
                 None,
             );
             buf_to_text(&buf)
@@ -6579,6 +6796,7 @@ mod tests {
             false,
             None,
             false,
+            None,
             None,
         );
 
