@@ -182,7 +182,7 @@ mod mcp_apps_tests {
             Arc::new(schema),
         );
         let meta_map: JsonObject = serde_json::from_value(json!({ "ui": ui_meta })).unwrap();
-        tool.meta = Some(rmcp::model::Meta(meta_map));
+        tool.meta = Some(rmcp::model::MetaObject::from(meta_map));
         tool
     }
 

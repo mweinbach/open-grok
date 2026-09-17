@@ -22,7 +22,10 @@ async fn spawn_counting_gated_server() -> (String, Arc<AtomicUsize>, Arc<AtomicU
         .await
         .expect("bind fake server");
     let addr = listener.local_addr().expect("fake server addr");
-    let issuer = format!("http://{addr}");
+    // rmcp 3.x enforces RFC 8414 issuer validation: the advertised issuer must
+    // equal the issuer the client derived from the MCP base URL (including its
+    // path).
+    let issuer = format!("http://{addr}/mcp");
     let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
         let requests = Arc::clone(&handler_requests);
         let token_grants = Arc::clone(&handler_token_grants);
@@ -43,7 +46,7 @@ async fn spawn_counting_gated_server() -> (String, Arc<AtomicUsize>, Arc<AtomicU
             if path.contains("oauth-protected-resource") {
                 return StatusCode::NOT_FOUND.into_response();
             }
-            if path == "/token" {
+            if path.ends_with("/token") {
                 token_grants.fetch_add(1, Ordering::SeqCst);
                 return axum::Json(json!({
                     "access_token": TOKEN,
@@ -89,6 +92,15 @@ async fn spawn_counting_gated_server() -> (String, Arc<AtomicUsize>, Arc<AtomicU
                     "jsonrpc": "2.0",
                     "id": msg["id"],
                     "result": {"tools": []},
+                }))
+                .into_response(),
+                // Legacy server: reject the SEP-2575 `server/discover` probe so
+                // the client falls back to `initialize` without waiting out
+                // the probe timeout.
+                Some("server/discover") => axum::Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": msg["id"],
+                    "error": {"code": -32601, "message": "Method not found"},
                 }))
                 .into_response(),
                 _ => StatusCode::ACCEPTED.into_response(),

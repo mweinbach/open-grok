@@ -18,7 +18,8 @@ use tokio::sync::{Mutex, oneshot, watch};
 
 use crate::oauth_config::McpOAuthConfig;
 use crate::rmcp::transport::auth::{
-    AuthError, AuthorizationManager, AuthorizationMetadata, OAuthClientConfig,
+    AuthError, AuthorizationManager, AuthorizationMetadata, AuthorizationMetadataSource,
+    OAuthClientConfig,
 };
 
 /// Client name advertised to MCP servers during Dynamic Client Registration
@@ -50,7 +51,18 @@ pub(crate) const OAUTH_DISCOVERY_TIMEOUT: std::time::Duration = std::time::Durat
 pub(crate) async fn discover_metadata_bounded(
     manager: &AuthorizationManager,
 ) -> Result<AuthorizationMetadata, AuthError> {
-    tokio::time::timeout(OAUTH_DISCOVERY_TIMEOUT, manager.discover_metadata())
+    // rmcp 3.x `resolve_metadata` never fails discovery: it degrades to legacy
+    // endpoints guessed from the base URL. The probe's auth decision needs the
+    // rmcp 2.x "no OAuth support" signal back, so the fallback maps to
+    // `NoAuthorizationSupport` instead of guessing endpoints.
+    let resolve = async {
+        let resolution = manager.resolve_metadata().await?;
+        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+            return Err(AuthError::NoAuthorizationSupport);
+        }
+        Ok(resolution.metadata)
+    };
+    tokio::time::timeout(OAUTH_DISCOVERY_TIMEOUT, resolve)
         .await
         .unwrap_or_else(|_| {
             Err(AuthError::InternalError(format!(
@@ -88,7 +100,7 @@ static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// If another task or process is already running the flow for the same server,
 /// waits for it instead of opening another browser tab. The provided
 /// `AuthorizationManager` must already have metadata set (from
-/// `discover_metadata`). On success, the manager's credentials are updated
+/// `resolve_metadata`). On success, the manager's credentials are updated
 /// and persisted via its `CredentialStore`.
 ///
 /// When `force` is true (user-initiated auth), any existing in-flight entry

@@ -1,4 +1,5 @@
 use super::*;
+use rmcp::ServiceExt;
 use std::path::PathBuf;
 
 /// A single undecodable line on an MCP stdio server's stdout must NOT
@@ -1740,19 +1741,60 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Clone, Copy)]
 enum CallToolBehavior {
-    ErrorThenOk { code: i32 },
-    AlwaysError { code: i32 },
-    HangThenOk { hang_ms: u64 },
-    ErrorThenHang { code: i32, hang_ms: u64 },
+    ErrorThenOk {
+        code: i32,
+    },
+    AlwaysError {
+        code: i32,
+    },
+    HangThenOk {
+        hang_ms: u64,
+    },
+    ErrorThenHang {
+        code: i32,
+        hang_ms: u64,
+    },
+    /// SEP-2322: first `tools/call` returns `input_required` with a form
+    /// elicitation and a `requestState`; the retry completes.
+    FormElicitThenOk,
+    /// SEP-2322 + transport recovery: round 0 returns `input_required`, the
+    /// retry fails with a recoverable JSON-RPC error, and the post-recovery
+    /// retry completes.
+    FormElicitThenErrorThenOk,
+    /// SEP-2322 URL mode: round 0 returns a URL elicitation + `requestState`,
+    /// round 1 returns a `requestState`-only `input_required`, round 2 completes.
+    UrlElicitThenStateOnlyThenOk,
+}
+
+/// How the fake reacts to the SEP-2575 `server/discover` probe.
+#[derive(Clone, Copy, Default)]
+enum DiscoverBehavior {
+    /// JSON-RPC method-not-found — the typical legacy SDK reaction.
+    #[default]
+    MethodNotFound,
+    /// A modern server: discover succeeds with 2026-07-28.
+    Modern,
+    /// Legacy middleware that 500s the probe with a non-JSON body.
+    NonJsonServerError,
+}
+
+#[derive(Clone, Default)]
+struct FakeMcpOptions {
+    discover: DiscoverBehavior,
+    init_unauthorized: bool,
 }
 
 #[derive(Clone)]
 struct FakeMcpHandles {
     call_params: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
     inits: Arc<AtomicUsize>,
+    discovers: Arc<AtomicUsize>,
     calls: Arc<AtomicUsize>,
     init_version: Arc<parking_lot::Mutex<Option<String>>>,
     init_user_agents: Arc<parking_lot::Mutex<Vec<String>>>,
+    init_capabilities: Arc<parking_lot::Mutex<Option<serde_json::Value>>>,
+    call_bodies: Arc<parking_lot::Mutex<Vec<serde_json::Value>>>,
+    discover_override: Arc<parking_lot::Mutex<Option<DiscoverBehavior>>>,
 }
 
 fn header_values(
@@ -1769,6 +1811,7 @@ fn header_values(
 #[derive(Clone)]
 struct FakeMcpState {
     behavior: CallToolBehavior,
+    options: FakeMcpOptions,
     handles: FakeMcpHandles,
 }
 
@@ -1798,11 +1841,31 @@ async fn fake_handle_post(
             state.handles.inits.fetch_add(1, Ordering::Relaxed);
             *state.handles.init_version.lock() =
                 req["params"]["protocolVersion"].as_str().map(str::to_owned);
+            *state.handles.init_capabilities.lock() = req
+                .get("params")
+                .and_then(|p| p.get("capabilities"))
+                .cloned();
             state
                 .handles
                 .init_user_agents
                 .lock()
                 .extend(header_values(&headers, axum::http::header::USER_AGENT));
+            let requested = req["params"]["protocolVersion"]
+                .as_str()
+                .unwrap_or_default();
+            if requested == "2026-07-28" {
+                return axum::Json(err(
+                    -32602,
+                    format!(
+                        "Protocol version '{requested}' is not available through the initialize handshake."
+                    ),
+                ))
+                .into_response();
+            }
+            if state.options.init_unauthorized {
+                return axum::Json(err(-32001, "Unauthorized: token expired".to_string()))
+                    .into_response();
+            }
             let result = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": id.clone(),
@@ -1814,6 +1877,39 @@ async fn fake_handle_post(
             });
             ([("mcp-session-id", "fake-session")], axum::Json(result)).into_response()
         }
+        Some("server/discover") => {
+            state.handles.discovers.fetch_add(1, Ordering::Relaxed);
+            let discover = state
+                .handles
+                .discover_override
+                .lock()
+                .unwrap_or(state.options.discover);
+            match discover {
+                DiscoverBehavior::Modern => axum::Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id.clone(),
+                    "result": {
+                        "resultType": "complete",
+                        "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}},
+                        "ttlMs": 0,
+                        "cacheScope": "private",
+                        "_meta": {
+                            "io.modelcontextprotocol/serverInfo": {"name": "fake", "version": "0.0.0"}
+                        },
+                    },
+                }))
+                .into_response(),
+                DiscoverBehavior::MethodNotFound => {
+                    axum::Json(err(-32601, "Method not found".to_string())).into_response()
+                }
+                DiscoverBehavior::NonJsonServerError => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "middleware exploded",
+                )
+                    .into_response(),
+            }
+        }
         Some("tools/list") => axum::Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": id.clone(),
@@ -1822,7 +1918,15 @@ async fn fake_handle_post(
         .into_response(),
         Some("tools/call") => {
             state.handles.call_params.lock().push(req["params"].clone());
+            state.handles.call_bodies.lock().push(req.clone());
             let n = state.handles.calls.fetch_add(1, Ordering::Relaxed);
+            let input_required = |result: serde_json::Value| {
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id.clone(),
+                    "result": result,
+                })
+            };
             match state.behavior {
                 CallToolBehavior::ErrorThenOk { code } => {
                     if n == 0 {
@@ -1848,6 +1952,82 @@ async fn fake_handle_post(
                         axum::Json(ok()).into_response()
                     }
                 }
+                CallToolBehavior::FormElicitThenOk => {
+                    if n == 0 {
+                        axum::Json(input_required(serde_json::json!({
+                            "resultType": "input_required",
+                            "inputRequests": {
+                                "user_email": {
+                                    "method": "elicitation/create",
+                                    "params": {
+                                        "mode": "form",
+                                        "message": "Please provide your email",
+                                        "requestedSchema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "email": {"type": "string", "format": "email"}
+                                            },
+                                            "required": ["email"]
+                                        }
+                                    }
+                                }
+                            },
+                            "requestState": "sealed-round-1",
+                        })))
+                        .into_response()
+                    } else {
+                        axum::Json(ok()).into_response()
+                    }
+                }
+                CallToolBehavior::FormElicitThenErrorThenOk => match n {
+                    0 => axum::Json(input_required(serde_json::json!({
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "user_email": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "form",
+                                    "message": "Please provide your email",
+                                    "requestedSchema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "email": {"type": "string", "format": "email"}
+                                        },
+                                        "required": ["email"]
+                                    }
+                                }
+                            }
+                        },
+                        "requestState": "sealed-round-1",
+                    })))
+                    .into_response(),
+                    1 => axum::Json(err(-32603, "session expired".to_string())).into_response(),
+                    _ => axum::Json(ok()).into_response(),
+                },
+                CallToolBehavior::UrlElicitThenStateOnlyThenOk => match n {
+                    0 => axum::Json(input_required(serde_json::json!({
+                        "resultType": "input_required",
+                        "inputRequests": {
+                            "user_auth": {
+                                "method": "elicitation/create",
+                                "params": {
+                                    "mode": "url",
+                                    "message": "Connect your account",
+                                    "url": "https://example.com/connect",
+                                    "elicitationId": "e-42"
+                                }
+                            }
+                        },
+                        "requestState": "sealed-url-1",
+                    })))
+                    .into_response(),
+                    1 => axum::Json(input_required(serde_json::json!({
+                        "resultType": "input_required",
+                        "requestState": "sealed-url-2",
+                    })))
+                    .into_response(),
+                    _ => axum::Json(ok()).into_response(),
+                },
             }
         }
         _ => axum::http::StatusCode::ACCEPTED.into_response(),
@@ -1877,12 +2057,34 @@ async fn spawn_test_http_server(app: axum::Router) -> String {
 }
 
 async fn spawn_fake_mcp(behavior: CallToolBehavior) -> (String, FakeMcpHandles) {
+    spawn_fake_mcp_with(behavior, FakeMcpOptions::default()).await
+}
+
+async fn spawn_fake_mcp_modern(behavior: CallToolBehavior) -> (String, FakeMcpHandles) {
+    spawn_fake_mcp_with(
+        behavior,
+        FakeMcpOptions {
+            discover: DiscoverBehavior::Modern,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn spawn_fake_mcp_with(
+    behavior: CallToolBehavior,
+    options: FakeMcpOptions,
+) -> (String, FakeMcpHandles) {
     let handles = FakeMcpHandles {
         call_params: Arc::new(parking_lot::Mutex::new(Vec::new())),
         inits: Arc::new(AtomicUsize::new(0)),
+        discovers: Arc::new(AtomicUsize::new(0)),
         calls: Arc::new(AtomicUsize::new(0)),
         init_version: Arc::new(parking_lot::Mutex::new(None)),
         init_user_agents: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        init_capabilities: Arc::new(parking_lot::Mutex::new(None)),
+        call_bodies: Arc::new(parking_lot::Mutex::new(Vec::new())),
+        discover_override: Arc::new(parking_lot::Mutex::new(None)),
     };
     let app = axum::Router::new()
         .route(
@@ -1891,9 +2093,31 @@ async fn spawn_fake_mcp(behavior: CallToolBehavior) -> (String, FakeMcpHandles) 
         )
         .with_state(FakeMcpState {
             behavior,
+            options,
             handles: handles.clone(),
         });
     (spawn_test_http_server(app).await, handles)
+}
+
+fn fake_http_client_probing(url: &str, tool_timeout_sec: u64) -> Arc<McpClient> {
+    fake_http_client_with_startup(
+        url,
+        McpClient::DISCOVER_PROBE_TIMEOUT_SECS + 5,
+        tool_timeout_sec,
+    )
+}
+
+fn fake_http_client_with_startup(
+    url: &str,
+    startup_timeout_sec: u64,
+    tool_timeout_sec: u64,
+) -> Arc<McpClient> {
+    let overrides = McpClientTimeoutOverrides {
+        startup_timeout_sec: Some(startup_timeout_sec),
+        tool_timeout_sec: Some(tool_timeout_sec),
+        ..Default::default()
+    };
+    fake_http_client_with_overrides(url, overrides)
 }
 
 fn fake_http_client(url: &str, tool_timeout_sec: u64) -> Arc<McpClient> {
@@ -1902,6 +2126,13 @@ fn fake_http_client(url: &str, tool_timeout_sec: u64) -> Arc<McpClient> {
         tool_timeout_sec: Some(tool_timeout_sec),
         ..Default::default()
     };
+    fake_http_client_with_overrides(url, overrides)
+}
+
+fn fake_http_client_with_overrides(
+    url: &str,
+    overrides: McpClientTimeoutOverrides,
+) -> Arc<McpClient> {
     Arc::new(McpClient::new_http(
         "fake".to_string(),
         HttpConfig {
@@ -2093,6 +2324,420 @@ async fn try_call_tool_http_invalid_params_not_recovered() {
         handles.inits.load(Ordering::Relaxed),
         1,
         "no recovery re-init"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handshake_falls_back_to_initialize_era_version_on_legacy_server() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::AlwaysError { code: -32603 }).await;
+    let client = fake_http_client_probing(&url, 5);
+
+    client.ensure_initialized().await.expect("handshake");
+
+    assert_eq!(
+        handles.discovers.load(Ordering::Relaxed),
+        1,
+        "startup must probe server/discover once"
+    );
+    assert_eq!(
+        handles.inits.load(Ordering::Relaxed),
+        1,
+        "legacy classification must fall back to one initialize"
+    );
+    assert_eq!(
+        handles.init_version.lock().as_deref(),
+        Some("2025-11-25"),
+        "the fallback initialize must name the newest initialize-era protocolVersion"
+    );
+}
+
+#[test]
+fn probe_timeout_tracks_short_startup_budgets() {
+    let url = "http://127.0.0.1:1/mcp";
+    assert_eq!(
+        fake_http_client_with_startup(url, 5, 5).probe_timeout_secs(),
+        5
+    );
+    assert_eq!(
+        fake_http_client_with_startup(url, McpClient::DISCOVER_PROBE_TIMEOUT_SECS, 5)
+            .probe_timeout_secs(),
+        McpClient::DISCOVER_PROBE_TIMEOUT_SECS
+    );
+    assert_eq!(
+        fake_http_client_with_startup(url, McpClient::DISCOVER_PROBE_TIMEOUT_SECS + 5, 5)
+            .probe_timeout_secs(),
+        McpClient::DISCOVER_PROBE_TIMEOUT_SECS
+    );
+}
+
+#[test]
+fn handshake_budget_covers_the_probe_phase() {
+    let url = "http://127.0.0.1:1/mcp";
+    assert_eq!(
+        fake_http_client_with_startup(url, 5, 5).handshake_budget_secs(),
+        10
+    );
+    let long = McpClient::DISCOVER_PROBE_TIMEOUT_SECS + 5;
+    assert_eq!(
+        fake_http_client_with_startup(url, long, 5).handshake_budget_secs(),
+        long + McpClient::DISCOVER_PROBE_TIMEOUT_SECS
+    );
+}
+
+#[test]
+fn max_startup_within_deadline_fits_the_probe_phase() {
+    let probe = McpClient::DISCOVER_PROBE_TIMEOUT_SECS;
+    assert_eq!(McpClient::max_startup_within_deadline(30), 30 - probe);
+    assert_eq!(McpClient::max_startup_within_deadline(2 * probe), probe);
+    assert_eq!(
+        McpClient::max_startup_within_deadline(2 * probe - 1),
+        probe - 1
+    );
+    assert_eq!(McpClient::max_startup_within_deadline(10), 5);
+    assert_eq!(McpClient::max_startup_within_deadline(6), 3);
+    let budget = |deadline: u64| {
+        let startup = McpClient::max_startup_within_deadline(deadline);
+        fake_http_client_with_startup("http://127.0.0.1:1/mcp", startup, 5).handshake_budget_secs()
+    };
+    for deadline in McpClient::MIN_HANDSHAKE_DEADLINE_SECS..=60 {
+        assert!(
+            budget(deadline) <= deadline,
+            "deadline {deadline}s: worst-case handshake {}s exceeds it",
+            budget(deadline)
+        );
+    }
+    for deadline in 0..McpClient::MIN_HANDSHAKE_DEADLINE_SECS {
+        assert_eq!(budget(deadline), McpClient::MIN_HANDSHAKE_DEADLINE_SECS);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn handshake_negotiates_modern_discover_without_initialize() {
+    let (url, handles) = spawn_fake_mcp_modern(CallToolBehavior::HangThenOk { hang_ms: 0 }).await;
+    let client = fake_http_client_probing(&url, 5);
+    client.set_elicitation_tx(Some(crate::elicitation::ElicitationInbox::new()));
+
+    client.ensure_initialized().await.expect("handshake");
+
+    assert_eq!(
+        handles.discovers.load(Ordering::Relaxed),
+        1,
+        "startup must negotiate via server/discover"
+    );
+    assert_eq!(
+        handles.inits.load(Ordering::Relaxed),
+        0,
+        "a modern server must never receive initialize"
+    );
+
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let mut reconnect = false;
+    let mut is_timeout = false;
+    let out = tool
+        .try_call_tool(
+            &client,
+            &serde_json::json!({}),
+            &mut reconnect,
+            &mut is_timeout,
+            &ew,
+        )
+        .await
+        .expect("tools/call succeeds over the modern session");
+    assert!(!out.is_error.unwrap_or(false));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn junk_discover_response_still_handshakes_via_initialize() {
+    let (url, handles) = spawn_fake_mcp_with(
+        CallToolBehavior::AlwaysError { code: -32603 },
+        FakeMcpOptions {
+            discover: DiscoverBehavior::NonJsonServerError,
+            ..Default::default()
+        },
+    )
+    .await;
+    let client = fake_http_client_probing(&url, 5);
+
+    client.ensure_initialized().await.expect("handshake");
+
+    assert_eq!(handles.discovers.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        handles.inits.load(Ordering::Relaxed),
+        1,
+        "a malformed probe reaction must still reach the initialize fallback"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn probe_connect_failure_surfaces_instead_of_legacy_fallback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    drop(listener);
+
+    let client = fake_http_client_probing(&url, 5);
+    let config = HttpConfig {
+        url: url.clone(),
+        headers: vec![],
+    };
+    let http_client = McpClient::build_http_client(
+        &config,
+        "fake",
+        crate::mcp_http_client::WarnBudget::default(),
+    )
+    .expect("client builds");
+    let transport = StreamableHttpClientTransport::with_client(
+        http_client,
+        StreamableHttpClientTransportConfig::with_uri(url.as_str()),
+    );
+
+    let err = match client.probe_modern(transport).await {
+        Err(err) => err,
+        Ok(ProbeVerdict::Modern(_)) => panic!("no server is listening"),
+        Ok(ProbeVerdict::Legacy { probe_error }) => {
+            panic!("connect failures must not become a legacy verdict: {probe_error}")
+        }
+    };
+    assert!(
+        err.is_connect_failure(),
+        "the surfaced error must classify as a connect failure: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_call_tool_mrtr_form_elicitation_round_trip() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::FormElicitThenOk).await;
+    let client = fake_http_client(&url, 5);
+    let inbox = crate::elicitation::ElicitationInbox::new();
+    client.set_elicitation_tx(Some(inbox.clone()));
+
+    let answer = tokio::spawn(async move {
+        let job = inbox
+            .recv()
+            .await
+            .expect("elicitation job reaches the inbox");
+        assert_eq!(job.server_name, "fake");
+        assert_eq!(job.fields.message, "Please provide your email");
+        assert!(
+            matches!(
+                job.fields.mode,
+                xai_grok_tools::mcp_elicitation::McpElicitModeFields::Form {
+                    requested_schema: Some(_)
+                }
+            ),
+            "form schema must survive the bridge"
+        );
+        let _ = job.response_tx.send(crate::elicitation::accept_result(Some(
+            serde_json::json!({"email": "user@example.com"}),
+        )));
+    });
+
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let mut reconnect = false;
+    let mut is_timeout = false;
+    let out = tool
+        .try_call_tool(
+            &client,
+            &serde_json::json!({"q": 1}),
+            &mut reconnect,
+            &mut is_timeout,
+            &ew,
+        )
+        .await
+        .expect("tool call completes after the MRTR round");
+    answer.await.unwrap();
+
+    assert!(!out.is_error.unwrap_or(false));
+    assert!(!reconnect, "MRTR rounds are not transport recovery");
+    assert!(!is_timeout);
+    assert_eq!(
+        handles.calls.load(Ordering::Relaxed),
+        2,
+        "initial call + one retry"
+    );
+
+    let bodies = handles.call_bodies.lock().clone();
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies
+            .first()
+            .and_then(|b| b.get("params"))
+            .and_then(|p| p.get("requestState"))
+            .is_none(),
+        "fresh call must not carry requestState"
+    );
+    let Some(retry) = bodies.get(1).and_then(|b| b.get("params")) else {
+        panic!("expected retry params: {bodies:?}");
+    };
+    assert_eq!(
+        retry.get("requestState").and_then(|v| v.as_str()),
+        Some("sealed-round-1"),
+        "requestState must be echoed verbatim"
+    );
+    assert_eq!(
+        retry
+            .get("inputResponses")
+            .and_then(|r| r.get("user_email"))
+            .and_then(|e| e.get("action"))
+            .and_then(|a| a.as_str()),
+        Some("accept")
+    );
+    assert_eq!(
+        retry
+            .get("inputResponses")
+            .and_then(|r| r.get("user_email"))
+            .and_then(|e| e.get("content"))
+            .and_then(|c| c.get("email"))
+            .and_then(|e| e.as_str()),
+        Some("user@example.com")
+    );
+    assert_eq!(
+        retry
+            .get("arguments")
+            .and_then(|a| a.get("q"))
+            .and_then(|q| q.as_i64()),
+        Some(1),
+        "retry must re-send the original arguments"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_call_tool_mrtr_round_survives_transport_recovery() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::FormElicitThenErrorThenOk).await;
+    let client = fake_http_client(&url, 5);
+    let inbox = crate::elicitation::ElicitationInbox::new();
+    client.set_elicitation_tx(Some(inbox.clone()));
+
+    let answer = tokio::spawn(async move {
+        let job = inbox
+            .recv()
+            .await
+            .expect("elicitation job reaches the inbox");
+        let _ = job.response_tx.send(crate::elicitation::accept_result(Some(
+            serde_json::json!({"email": "user@example.com"}),
+        )));
+    });
+
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let mut reconnect = false;
+    let mut is_timeout = false;
+    let out = tool
+        .try_call_tool(
+            &client,
+            &serde_json::json!({}),
+            &mut reconnect,
+            &mut is_timeout,
+            &ew,
+        )
+        .await
+        .expect("tool call completes after recovery");
+    answer.await.unwrap();
+
+    assert!(!out.is_error.unwrap_or(false));
+    assert!(reconnect, "the failed retry must trigger recovery");
+    assert!(!is_timeout);
+    assert_eq!(
+        handles.calls.load(Ordering::Relaxed),
+        3,
+        "initial call + failed retry + recovered retry"
+    );
+    assert_eq!(
+        handles.inits.load(Ordering::Relaxed),
+        2,
+        "initial handshake + one recovery re-init"
+    );
+    let bodies = handles.call_bodies.lock().clone();
+    let Some(recovered_retry) = bodies.get(2).and_then(|b| b.get("params")) else {
+        panic!("expected recovered retry params: {bodies:?}");
+    };
+    assert_eq!(
+        recovered_retry.get("requestState").and_then(|v| v.as_str()),
+        Some("sealed-round-1"),
+        "the recovered retry must still echo requestState"
+    );
+    assert_eq!(
+        recovered_retry
+            .get("inputResponses")
+            .and_then(|r| r.get("user_email"))
+            .and_then(|e| e.get("action"))
+            .and_then(|a| a.as_str()),
+        Some("accept")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn try_call_tool_mrtr_url_elicitation_with_state_only_round() {
+    let (url, handles) = spawn_fake_mcp(CallToolBehavior::UrlElicitThenStateOnlyThenOk).await;
+    let client = fake_http_client(&url, 5);
+    let inbox = crate::elicitation::ElicitationInbox::new();
+    client.set_elicitation_tx(Some(inbox.clone()));
+
+    let answer = tokio::spawn(async move {
+        let job = inbox
+            .recv()
+            .await
+            .expect("elicitation job reaches the inbox");
+        let xai_grok_tools::mcp_elicitation::McpElicitModeFields::Url {
+            url,
+            elicitation_id,
+        } = &job.fields.mode
+        else {
+            panic!("expected url mode, got {:?}", job.fields.mode);
+        };
+        assert_eq!(url, "https://example.com/connect");
+        assert_eq!(elicitation_id, "e-42");
+        let _ = job
+            .response_tx
+            .send(crate::elicitation::accept_result(None));
+    });
+
+    let tool = fake_echo_tool();
+    let ew = xai_grok_session_events::EventWriter::noop();
+    let mut reconnect = false;
+    let mut is_timeout = false;
+    let out = tool
+        .try_call_tool(
+            &client,
+            &serde_json::json!({}),
+            &mut reconnect,
+            &mut is_timeout,
+            &ew,
+        )
+        .await
+        .expect("tool call completes after the pending round resolves");
+    answer.await.unwrap();
+
+    assert!(!out.is_error.unwrap_or(false));
+    assert_eq!(
+        handles.calls.load(Ordering::Relaxed),
+        3,
+        "initial call + consent retry + state-only retry"
+    );
+
+    let bodies = handles.call_bodies.lock().clone();
+    let Some(consent_retry) = bodies.get(1).and_then(|b| b.get("params")) else {
+        panic!("expected consent retry params: {bodies:?}");
+    };
+    assert_eq!(
+        consent_retry.get("requestState").and_then(|v| v.as_str()),
+        Some("sealed-url-1")
+    );
+    assert_eq!(
+        consent_retry
+            .get("inputResponses")
+            .and_then(|r| r.get("user_auth"))
+            .and_then(|e| e.get("action"))
+            .and_then(|a| a.as_str()),
+        Some("accept")
+    );
+    let Some(state_only) = bodies.get(2).and_then(|b| b.get("params")) else {
+        panic!("expected state-only retry params: {bodies:?}");
+    };
+    assert_eq!(
+        state_only.get("requestState").and_then(|v| v.as_str()),
+        Some("sealed-url-2")
     );
 }
 

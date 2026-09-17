@@ -41,7 +41,7 @@ glob = { workspace = true }
 globset = { workspace = true }
 kanal = "0.1"
 regex = { workspace = true }
-# rmcp 2.1 + reqwest 0.13 are quarantined inside `xai-grok-mcp`. The remaining
+# rmcp 3.2 + reqwest 0.13 are quarantined inside `xai-grok-mcp`. The remaining
 # MCP code in this crate (extensions/mcp.rs, mcp_doctor.rs) reaches rmcp model
 # types via `xai_grok_mcp::rmcp::model::*`. reqwest 0.13 is a private impl
 # detail of xai-grok-mcp::servers; shell never sees it. Every HTTP call site

@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use rmcp::{
-    ClientHandler, ServiceExt,
+    ClientHandler, ClientLifecycleMode, ClientServiceExt,
     model::{
         CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation,
         PaginatedRequestParams,
@@ -45,16 +45,16 @@ use xai_grok_tools::types::{
 };
 use xai_grok_tools::util::{ProcessGroup, ProcessScope};
 
-/// MCP tool name delimiter: server names are qualified as `"server__tool"`.
-/// Canonical definition lives in `xai_grok_workspace_types`; re-exported here
-/// for callers that historically imported it from this module.
-pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 #[cfg(test)]
 pub(crate) use crate::call_result::format_mcp_image;
 pub use crate::tool_name::{
     MCP_QUALIFIED_NAME_MAX_CHARS, McpToolAdmissionError, PROVIDER_TOOL_NAME_MAX_CHARS,
     parse_mcp_qualified_name, parse_mcp_tool_name, qualify_mcp_tool_name, validate_tool_name,
 };
+/// MCP tool name delimiter: server names are qualified as `"server__tool"`.
+/// Canonical definition lives in `xai_grok_workspace_types`; re-exported here
+/// for callers that historically imported it from this module.
+pub use xai_grok_workspace_types::MCP_TOOL_NAME_DELIMITER;
 
 /// Reqwest 0.13 adapter over `xai_grok_extra_ca::extra_root_ders` (DER is version-neutral).
 fn with_extra_root_certificates(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
@@ -1782,7 +1782,10 @@ fn is_retriable_transport_error(err: &ServiceError) -> bool {
 }
 
 /// Recover for every JSON-RPC code except the deterministic client set
-/// {-32700, -32600, -32601, -32602} (those mean the request was wrong, not the session).
+/// {-32700, -32600, -32601, -32602}. Those mean the request was wrong, not
+/// the session. -32021/-32022 stay recoverable on purpose: a 2026-07-28-era
+/// server sends them to a legacy session, and the re-handshake's
+/// `server/discover` probe upgrades it.
 fn should_recover_mcp_error(code: i32) -> bool {
     use rmcp::model::ErrorCode;
     let deterministic_client_error = code == ErrorCode::PARSE_ERROR.0
@@ -1811,6 +1814,29 @@ fn should_recover_service_error(
         )
 }
 
+/// The `ToolError` for a `tools/call` the service could not complete. A dead
+/// transport is typed `NetworkError` so the caller can tell it from protocol
+/// and input errors.
+fn tool_error_for_service_error(err: &ServiceError) -> xai_tool_runtime::ToolError {
+    if is_retriable_transport_error(err) {
+        xai_tool_runtime::ToolError::network_error(err.to_string())
+    } else {
+        xai_tool_runtime::ToolError::custom("process_manager", err.to_string())
+    }
+}
+
+/// How long a tool call may stay parked on `requestState`-only
+/// `input_required` rounds while an out-of-band URL elicitation completes in
+/// the browser. Matches the crate's browser OAuth deadline
+/// ([`crate::oauth`]'s `BROWSER_AUTH_TIMEOUT`): both wait on the same kind
+/// of user journey through an external page.
+const MRTR_PENDING_STATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Poll backoff for `requestState`-only rounds: 250ms doubling to a 5s ceiling.
+fn mrtr_pending_poll_delay(pending_polls: u32) -> std::time::Duration {
+    std::time::Duration::from_millis((250u64.saturating_mul(1 << pending_polls.min(5))).min(5_000))
+}
+
 impl McpErasedTool {
     #[cfg(test)]
     async fn try_call_tool(
@@ -1825,6 +1851,15 @@ impl McpErasedTool {
             .await
     }
 
+    /// Dispatch one `tools/call`, driving SEP-2322 multi round-trip requests
+    /// (protocol 2026-07-28). Host `_meta` from [`McpCallMetadata`] is stamped
+    /// on every round, including recovery retries.
+    ///
+    /// Rounds that carry `inputRequests` are interactive re-prompts, capped by
+    /// count ([`rmcp::model::DEFAULT_MRTR_MAX_ROUNDS`]). Rounds carrying only
+    /// `requestState` mean an out-of-band interaction (URL elicitation) is
+    /// still pending server-side, so they are polled with capped backoff and
+    /// bounded by [`MRTR_PENDING_STATE_TIMEOUT`].
     async fn try_call_tool_with_meta(
         &self,
         client: &Arc<McpClient>,
@@ -1834,22 +1869,124 @@ impl McpErasedTool {
         ew: &xai_grok_session_events::EventWriter,
         request_meta: Option<&serde_json::Map<String, serde_json::Value>>,
     ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
-        let mcp_service = client
-            .ensure_initialized()
-            .await
-            .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
         let tool_timeout = client.tool_timeout_for(&self.tool.name);
         let timeout_duration = std::time::Duration::from_secs(tool_timeout);
         let mut params = CallToolRequestParams::new(self.tool.name.clone());
         params.arguments = raw.as_object().cloned();
-        params.meta = request_meta.cloned().map(rmcp::model::Meta);
+        params.meta = request_meta
+            .cloned()
+            .map(rmcp::model::RequestMetaObject::from);
 
-        let result =
-            tokio::time::timeout(timeout_duration, mcp_service.call_tool(params.clone())).await;
+        let mut input_rounds = 0usize;
+        let mut pending_polls = 0u32;
+        let mut pending_since: Option<std::time::Instant> = None;
+        loop {
+            let response = self
+                .call_tool_round(
+                    client,
+                    params.clone(),
+                    timeout_duration,
+                    tool_timeout,
+                    reconnect_attempted,
+                    is_timeout,
+                    ew,
+                )
+                .await?;
+            let input_required = match response {
+                rmcp::model::CallToolResponse::Complete(call_result) => return Ok(call_result),
+                rmcp::model::CallToolResponse::InputRequired(input_required) => input_required,
+                // SEP-2663 tasks are never advertised by this client, so a
+                // conforming server cannot return one; `CallToolResponse` is
+                // also non_exhaustive.
+                _ => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' returned an unsupported response kind",
+                            self.tool.name
+                        ),
+                    ));
+                }
+            };
 
-        match result {
-            Ok(Ok(call_result)) => Ok(call_result),
-            Ok(Err(service_err))
+            let has_input_requests = input_required
+                .input_requests
+                .as_ref()
+                .is_some_and(|requests| !requests.is_empty());
+            if has_input_requests {
+                input_rounds += 1;
+                if input_rounds > rmcp::model::DEFAULT_MRTR_MAX_ROUNDS {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' kept requiring input beyond {} rounds",
+                            self.tool.name,
+                            rmcp::model::DEFAULT_MRTR_MAX_ROUNDS
+                        ),
+                    ));
+                }
+                pending_since = None;
+                pending_polls = 0;
+            } else {
+                let started = *pending_since.get_or_insert_with(std::time::Instant::now);
+                if started.elapsed() >= MRTR_PENDING_STATE_TIMEOUT {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP tool '{}' still awaited an out-of-band interaction after {}s",
+                            self.tool.name,
+                            MRTR_PENDING_STATE_TIMEOUT.as_secs()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(mrtr_pending_poll_delay(pending_polls)).await;
+                pending_polls = pending_polls.saturating_add(1);
+            }
+
+            let (input_responses, request_state) =
+                self.gather_input_responses(client, input_required).await?;
+            params.input_responses = input_responses;
+            params.request_state = request_state;
+        }
+    }
+
+    /// One wire round of [`Self::try_call_tool_with_meta`]: timeout, transport
+    /// recovery, and error classification apply per round trip. The live
+    /// session is re-resolved every round because recovery (and
+    /// re-initialization after long elicitation waits) replaces the client's
+    /// `RunningService` between rounds.
+    #[allow(clippy::too_many_arguments)]
+    async fn call_tool_round(
+        &self,
+        client: &Arc<McpClient>,
+        params: CallToolRequestParams,
+        timeout_duration: std::time::Duration,
+        tool_timeout: u64,
+        reconnect_attempted: &mut bool,
+        is_timeout: &mut bool,
+        ew: &xai_grok_session_events::EventWriter,
+    ) -> Result<rmcp::model::CallToolResponse, xai_tool_runtime::ToolError> {
+        let mcp_service = client
+            .ensure_initialized()
+            .await
+            .map_err(|e| xai_tool_runtime::ToolError::custom("process_manager", e.to_string()))?;
+        match call_tool_cancel_aware(&mcp_service, params.clone(), timeout_duration).await {
+            Ok(response) => Ok(response),
+            Err(ServiceError::Timeout { .. }) => {
+                *is_timeout = true;
+                if client.is_http() && !*reconnect_attempted {
+                    client.reset_transport().await;
+                    *reconnect_attempted = true;
+                }
+                Err(xai_tool_runtime::ToolError::custom(
+                    "process_manager",
+                    format!(
+                        "MCP tool '{}' timed out after {} seconds",
+                        self.tool.name, tool_timeout
+                    ),
+                ))
+            }
+            Err(service_err)
                 if should_recover_service_error(
                     &service_err,
                     client.is_http(),
@@ -1868,30 +2005,70 @@ impl McpErasedTool {
                 )
                 .await
             }
-            Ok(Err(e)) => Err(xai_tool_runtime::ToolError::custom(
-                "process_manager",
-                e.to_string(),
-            )),
-            Err(_) => {
-                *is_timeout = true;
-                // Reset for the next call but don't retry — a slow side-effecting tool must not run twice.
-                if client.is_http() && !*reconnect_attempted {
-                    client.reset_transport().await;
-                    *reconnect_attempted = true;
-                }
-                Err(xai_tool_runtime::ToolError::custom(
-                    "process_manager",
-                    format!(
-                        "MCP tool '{}' timed out after {} seconds",
-                        self.tool.name, tool_timeout
-                    ),
-                ))
-            }
+            Err(e) => Err(tool_error_for_service_error(&e)),
         }
     }
 
-    /// On `recover()` failure surface the original error, else the retry error
-    /// (preserves the auth signal managed re-auth reads from the string).
+    /// Gather responses for an `input_required` round and hand back the
+    /// opaque `requestState` to echo verbatim on the retry.
+    async fn gather_input_responses(
+        &self,
+        client: &Arc<McpClient>,
+        result: rmcp::model::InputRequiredResult,
+    ) -> Result<(Option<rmcp::model::InputResponses>, Option<String>), xai_tool_runtime::ToolError>
+    {
+        let input_requests = result.input_requests.unwrap_or_default();
+        if input_requests.is_empty() && result.request_state.is_none() {
+            return Err(xai_tool_runtime::ToolError::custom(
+                "process_manager",
+                format!(
+                    "MCP tool '{}' returned input_required with neither inputRequests nor requestState",
+                    self.tool.name
+                ),
+            ));
+        }
+
+        let mut responses = rmcp::model::InputResponses::new();
+        for (key, request) in input_requests {
+            match request {
+                rmcp::model::InputRequest::Elicitation(elicit) => {
+                    tracing::info!(
+                        server = %self.tool.server_name,
+                        tool = %self.tool.name,
+                        "MCP elicitation received in input_required round"
+                    );
+                    let elicit_result = client.bridge_elicit(elicit.params).await;
+                    let value = serde_json::to_value(elicit_result).map_err(|e| {
+                        xai_tool_runtime::ToolError::custom(
+                            "process_manager",
+                            format!("failed to serialize elicitation response: {e}"),
+                        )
+                    })?;
+                    responses.insert(key, value);
+                }
+                // Sampling and roots are never advertised in our client
+                // capabilities, so a conforming server cannot request them.
+                _ => {
+                    return Err(xai_tool_runtime::ToolError::custom(
+                        "process_manager",
+                        format!(
+                            "MCP server '{}' requested an unsupported input kind ('{key}'); \
+                             this client only supports elicitation",
+                            self.tool.server_name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        Ok((
+            (!responses.is_empty()).then_some(responses),
+            result.request_state,
+        ))
+    }
+
+    /// On `recover()` failure surface the original error, else the retry
+    /// error (preserves the auth signal managed re-auth reads from the string).
     #[allow(clippy::too_many_arguments)]
     async fn recover_and_retry(
         &self,
@@ -1903,7 +2080,7 @@ impl McpErasedTool {
         reconnect_attempted: &mut bool,
         is_timeout: &mut bool,
         ew: &xai_grok_session_events::EventWriter,
-    ) -> Result<rmcp::model::CallToolResult, xai_tool_runtime::ToolError> {
+    ) -> Result<rmcp::model::CallToolResponse, xai_tool_runtime::ToolError> {
         *reconnect_attempted = true;
         tracing::warn!(
             server = self.tool.server_name.as_str(),
@@ -1925,25 +2102,18 @@ impl McpErasedTool {
                 });
                 service
             }
-            Err(e) => {
+            Err(_) => {
                 ew.emit(xai_grok_session_events::Event::McpTransportReconnect {
                     server_name: self.tool.server_name.clone(),
                     success: false,
-                    error: Some(e.to_string()),
+                    error: Some(original_err.to_string()),
                 });
-                return Err(xai_tool_runtime::ToolError::custom(
-                    "process_manager",
-                    original_err.to_string(),
-                ));
+                return Err(tool_error_for_service_error(&original_err));
             }
         };
-        match tokio::time::timeout(timeout_duration, mcp_service.call_tool(params)).await {
-            Ok(Ok(call_result)) => Ok(call_result),
-            Ok(Err(retry_err)) => Err(xai_tool_runtime::ToolError::custom(
-                "process_manager",
-                retry_err.to_string(),
-            )),
-            Err(_) => {
+        match call_tool_cancel_aware(&mcp_service, params, timeout_duration).await {
+            Ok(response) => Ok(response),
+            Err(ServiceError::Timeout { .. }) => {
                 *is_timeout = true;
                 Err(xai_tool_runtime::ToolError::custom(
                     "process_manager",
@@ -1953,7 +2123,77 @@ impl McpErasedTool {
                     ),
                 ))
             }
+            Err(retry_err) => Err(tool_error_for_service_error(&retry_err)),
         }
+    }
+}
+
+/// One `tools/call` that tells the server when the host stops waiting for it.
+///
+/// Two abandonment paths send `notifications/cancelled` for the request id:
+/// rmcp sends it itself when the tool timeout elapses (surfaced as
+/// [`ServiceError::Timeout`]), and [`CancelOnDrop`] sends it when the future
+/// is dropped before a reply, which is how a cancelled turn reaches the
+/// server.
+async fn call_tool_cancel_aware(
+    service: &McpService,
+    params: CallToolRequestParams,
+    timeout: std::time::Duration,
+) -> Result<rmcp::model::CallToolResponse, ServiceError> {
+    use rmcp::model::{CallToolRequest, CallToolResponse, ClientRequest, ServerResult};
+    use rmcp::service::PeerRequestOptions;
+
+    let handle = service
+        .peer()
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(params)),
+            PeerRequestOptions::with_timeout(timeout),
+        )
+        .await?;
+    let mut guard = CancelOnDrop {
+        peer: service.peer().clone(),
+        request_id: Some(handle.id.clone()),
+    };
+    let response = handle.await_response().await;
+    guard.request_id = None;
+    match response? {
+        ServerResult::CallToolResult(result) => Ok(CallToolResponse::Complete(result)),
+        ServerResult::InputRequiredResult(result) => Ok(CallToolResponse::InputRequired(result)),
+        ServerResult::CreateTaskResult(result) => Ok(CallToolResponse::Task(result)),
+        _ => Err(ServiceError::UnexpectedResponse),
+    }
+}
+
+/// Sends `notifications/cancelled` for an in-flight request when its future
+/// is dropped before the reply arrived. Disarmed (`request_id = None`) once
+/// the request settles.
+struct CancelOnDrop {
+    peer: rmcp::service::Peer<RoleClient>,
+    request_id: Option<rmcp::model::RequestId>,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let Some(request_id) = self.request_id.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::debug!(
+                ?request_id,
+                "MCP call dropped outside a runtime; cancel not sent"
+            );
+            return;
+        };
+        let peer = self.peer.clone();
+        runtime.spawn(async move {
+            let params = rmcp::model::CancelledNotificationParam::new(
+                Some(request_id.clone()),
+                Some("client cancelled".to_owned()),
+            );
+            if let Err(e) = peer.notify_cancelled(params).await {
+                tracing::debug!(?request_id, error = %e, "notifications/cancelled not delivered");
+            }
+        });
     }
 }
 
@@ -2695,6 +2935,16 @@ impl Transport<RoleClient> for SafeTokioChildProcess {
     async fn close(&mut self) -> Result<(), Self::Error> {
         self.graceful_shutdown().await
     }
+}
+
+/// Outcome of the `server/discover` probe phase (see `McpClient::probe_modern`).
+enum ProbeVerdict {
+    /// Modern negotiation succeeded; this running service IS the connection.
+    Modern(Box<rmcp::service::RunningService<RoleClient, GrokClientHandler>>),
+    /// The server was reached but is not a usable modern server; run the
+    /// legacy handshake. The probe's error is kept so a subsequent legacy
+    /// failure can log both phases together.
+    Legacy { probe_error: String },
 }
 
 /// Transport configuration before connection is established.
@@ -3688,13 +3938,12 @@ impl McpClient {
     pub async fn ensure_initialized(&self) -> Result<McpService, McpError> {
         // Bound how long a parked caller waits on `init_done` before
         // surfacing an error. `try_handshake` is itself bounded by
-        // `startup_timeout_sec`, so anything beyond that plus a 1 s margin
-        // means the holder was dropped without restoring the transport
-        // (cancellation under heavy contention) — wedging silently would
-        // turn this into the exact "stuck client" failure mode the rest of
-        // this rewrite is designed to eliminate.
+        // [`Self::handshake_worst_case_secs`] (probe + legacy, and a second
+        // attempt after OAuth refresh), so anything beyond that plus a 1 s
+        // margin means the holder was dropped without restoring the
+        // transport.
         let inflight_wait =
-            std::time::Duration::from_secs(self.startup_timeout_sec.saturating_add(1));
+            std::time::Duration::from_secs(self.handshake_worst_case_secs().saturating_add(1));
 
         // Drive the loop body until we either return directly or break
         // out with an owned `PendingTransport`. We deliberately use a
@@ -3911,107 +4160,258 @@ impl McpClient {
         &self,
         pending: PendingTransport,
     ) -> Result<rmcp::service::RunningService<RoleClient, GrokClientHandler>, McpError> {
-        let timeout = std::time::Duration::from_secs(self.startup_timeout_sec);
-        let name = &self.server_name;
-
         match pending {
-            PendingTransport::Stdio(process) => {
-                let handler = self.make_client_handler();
-                tokio::time::timeout(timeout, handler.serve(*process))
-                    .await
-                    .map_err(|_| McpError::timeout(name, timeout))?
-                    .map_err(|e| McpError::HandshakeFailed {
-                        server: name.to_string(),
-                        source: Box::new(e),
-                    })
-            }
+            // Stdio stays on the legacy `initialize`-only handshake. Probing
+            // it is unsafe on two counts: a slow-starting server can answer
+            // the abandoned `server/discover` after rmcp has already sent
+            // `initialize` on the SAME byte stream, and unlike the other
+            // transports the child process cannot be rebuilt here for a
+            // clean fallback.
+            PendingTransport::Stdio(process) => self.serve_legacy(*process).await,
             PendingTransport::Http(config) => {
-                let transport =
-                    Self::build_http_transport(&config, name, self.warn_budget.clone())?;
-                let handler = self.make_client_handler();
-                tokio::time::timeout(timeout, handler.serve(transport))
-                    .await
-                    .map_err(|_| McpError::timeout(name, timeout))?
-                    .map_err(|e| McpError::HandshakeFailed {
-                        server: name.to_string(),
-                        source: Box::new(e),
-                    })
+                let http_client =
+                    Self::build_http_client(&config, &self.server_name, self.warn_budget.clone())?;
+                self.probe_then_legacy(|| {
+                    StreamableHttpClientTransport::with_client(
+                        http_client.clone(),
+                        StreamableHttpClientTransportConfig::with_uri(config.url.as_str()),
+                    )
+                })
+                .await
             }
             PendingTransport::HttpAuth {
                 config,
                 auth_manager,
             } => {
-                let mut headers = parse_config_headers(
-                    name,
-                    "oauth-transport",
-                    config
-                        .headers
-                        .iter()
-                        .filter(|(key, _)| !key.eq_ignore_ascii_case("Authorization"))
-                        .map(|(key, value)| (key.as_str(), value.as_str())),
-                );
-                apply_user_agent_policy(&mut headers, name, &config.url);
-
-                #[allow(clippy::disallowed_methods)]
-                let http_client = with_extra_root_certificates(
-                    reqwest::Client::builder()
-                        .default_headers(headers)
-                        .connect_timeout(HTTP_CONNECT_TIMEOUT),
-                )
-                .build()
-                .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
-                // `AuthClient::new` wants an owned manager, but ours is shared
-                // (`Arc`) with the OAuth flow; the struct is non_exhaustive, so
-                // build with a throwaway manager and swap in the shared one.
-                let placeholder_manager =
-                    rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
-                        .await
-                        .map_err(|e| {
-                            McpError::ClientError(format!("Failed to build OAuth client: {e}"))
-                        })?;
-                let mut auth_client =
-                    rmcp::transport::auth::AuthClient::new(http_client, placeholder_manager);
-                auth_client.auth_manager = auth_manager.clone();
-                let mcp_http_client = crate::mcp_http_client::McpHttpClient::new(
-                    auth_client,
-                    name.as_str(),
-                    self.warn_budget.clone(),
-                );
-                let transport_config =
-                    StreamableHttpClientTransportConfig::with_uri(config.url.as_str());
-                let transport =
-                    StreamableHttpClientTransport::with_client(mcp_http_client, transport_config);
-                let handler = self.make_client_handler();
-                tokio::time::timeout(timeout, handler.serve(transport))
-                    .await
-                    .map_err(|_| McpError::timeout(name, timeout))?
-                    .map_err(|e| McpError::HandshakeFailed {
-                        server: name.to_string(),
-                        source: Box::new(e),
-                    })
+                let http_client = self.build_oauth_http_client(&config, &auth_manager).await?;
+                self.probe_then_legacy(|| {
+                    StreamableHttpClientTransport::with_client(
+                        http_client.clone(),
+                        StreamableHttpClientTransportConfig::with_uri(config.url.as_str()),
+                    )
+                })
+                .await
             }
             PendingTransport::Acp { server_id, invoker } => {
-                // Per-reverse-call backstop on `x.ai/mcp/sdk_call`: the larger of the
-                // startup and tool timeouts, so it never undercuts the real outer bound
-                // (the handshake `initialize` is bounded by the serve `timeout` below;
-                // tool calls by `tool_timeout_for` in `try_call_tool`). The bridge
-                // forwards raw JSON-RPC without the tool name, so per-TOOL overrides
-                // aren't applied here in v1; the HTTP path still honors them.
-                let invoke_timeout = std::time::Duration::from_secs(
-                    self.startup_timeout_sec.max(self.tool_timeout_sec),
-                );
-                let transport =
-                    crate::acp_transport::acp_bridge_transport(server_id, invoker, invoke_timeout);
-                let handler = self.make_client_handler();
-                tokio::time::timeout(timeout, handler.serve(transport))
+                self.probe_then_legacy(|| self.build_acp_transport(server_id.clone(), &invoker))
                     .await
-                    .map_err(|_| McpError::timeout(name, timeout))?
-                    .map_err(|e| McpError::HandshakeFailed {
-                        server: name.to_string(),
-                        source: Box::new(e),
-                    })
             }
         }
+    }
+
+    /// Probe for a modern server, then run the legacy handshake on a fresh
+    /// transport when the probe says "legacy". Shared by every transport that
+    /// can rebuild its transport (all but stdio).
+    async fn probe_then_legacy<T, E, A>(
+        &self,
+        mut make_transport: impl FnMut() -> T,
+    ) -> Result<rmcp::service::RunningService<RoleClient, GrokClientHandler>, McpError>
+    where
+        T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let probe_failure = match self.probe_modern(make_transport()).await? {
+            ProbeVerdict::Modern(service) => return Ok(*service),
+            ProbeVerdict::Legacy { probe_error } => probe_error,
+        };
+        let result = self.serve_legacy(make_transport()).await;
+        if let Err(legacy_error) = &result {
+            tracing::warn!(
+                server = %self.server_name,
+                probe_error = %probe_failure,
+                %legacy_error,
+                "both handshake phases failed (surfacing the legacy error)"
+            );
+        }
+        result
+    }
+
+    /// Cap on the `server/discover` probe phase. Mirrors rmcp's private
+    /// `DEFAULT_AUTO_DISCOVER_TIMEOUT` so a server that swallows the probe
+    /// costs at most this much extra startup latency before the legacy
+    /// handshake runs with its full budget.
+    pub(crate) const DISCOVER_PROBE_TIMEOUT_SECS: u64 = 10;
+
+    /// Timeout of the `server/discover` probe phase:
+    /// [`Self::DISCOVER_PROBE_TIMEOUT_SECS`], shrunk to the startup budget
+    /// when that is shorter. Never skipped: 2026-07-28-era servers reject
+    /// every `tools/call` on a legacy session, so a short budget must still
+    /// probe.
+    fn probe_timeout_secs(&self) -> u64 {
+        Self::DISCOVER_PROBE_TIMEOUT_SECS
+            .min(self.startup_timeout_sec)
+            .max(1)
+    }
+
+    /// Worst-case wall time of one [`Self::try_handshake`] attempt: the probe
+    /// phase plus the legacy phase's full startup budget.
+    fn handshake_budget_secs(&self) -> u64 {
+        self.startup_timeout_sec
+            .saturating_add(self.probe_timeout_secs())
+    }
+
+    /// Worst case for [`Self::ensure_initialized`]: one attempt, or for an
+    /// OAuth-capable client a failed attempt, a token refresh, and a full retry.
+    fn handshake_worst_case_secs(&self) -> u64 {
+        if self.auth_manager.is_some() && self.http_config.is_some() {
+            self.handshake_budget_secs()
+                .saturating_mul(2)
+                .saturating_add(Self::OAUTH_REFRESH_RETRY_ALLOWANCE_SECS)
+        } else {
+            self.handshake_budget_secs()
+        }
+    }
+
+    /// Waiter allowance for the token-refresh interlude between an OAuth
+    /// client's two handshake attempts.
+    const OAUTH_REFRESH_RETRY_ALLOWANCE_SECS: u64 = 15;
+
+    /// Smallest whole-second deadline that holds both handshake phases.
+    pub const MIN_HANDSHAKE_DEADLINE_SECS: u64 = 2;
+
+    /// Largest `startup_timeout_sec` whose worst-case handshake still fits
+    /// inside `deadline_secs`.
+    pub fn max_startup_within_deadline(deadline_secs: u64) -> u64 {
+        let deadline_secs = deadline_secs.max(Self::MIN_HANDSHAKE_DEADLINE_SECS);
+        if deadline_secs >= Self::DISCOVER_PROBE_TIMEOUT_SECS.saturating_mul(2) {
+            deadline_secs - Self::DISCOVER_PROBE_TIMEOUT_SECS
+        } else {
+            deadline_secs / 2
+        }
+    }
+
+    /// Phase 1: probe `server/discover` so 2026-07-28 (SEP-2575) can be
+    /// negotiated without an `initialize` handshake.
+    async fn probe_modern<T, E, A>(&self, transport: T) -> Result<ProbeVerdict, McpError>
+    where
+        T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let probe_timeout = std::time::Duration::from_secs(self.probe_timeout_secs());
+        let handler = self.make_client_handler();
+        let lifecycle = ClientLifecycleMode::Discover {
+            preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
+        };
+        match tokio::time::timeout(
+            probe_timeout,
+            handler.serve_with_lifecycle(transport, lifecycle),
+        )
+        .await
+        {
+            Ok(Ok(service)) => Ok(ProbeVerdict::Modern(Box::new(service))),
+            Ok(Err(probe_error)) => {
+                if init_error_is_connect_phase(&probe_error)
+                    || is_connect_failure_message(&probe_error.to_string())
+                {
+                    return Err(McpError::HandshakeFailed {
+                        server: self.server_name.to_string(),
+                        source: Box::new(probe_error),
+                    });
+                }
+                tracing::debug!(
+                    server = %self.server_name,
+                    %probe_error,
+                    "server/discover probe failed; falling back to the legacy initialize handshake"
+                );
+                Ok(ProbeVerdict::Legacy {
+                    probe_error: probe_error.to_string(),
+                })
+            }
+            Err(_) => {
+                tracing::debug!(
+                    server = %self.server_name,
+                    "server/discover probe timed out; falling back to the legacy initialize handshake"
+                );
+                Ok(ProbeVerdict::Legacy {
+                    probe_error: format!(
+                        "server/discover probe timed out after {}s",
+                        probe_timeout.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Phase 2 (and the only phase for stdio): the legacy `initialize`
+    /// handshake on its own fresh transport with the full startup budget.
+    /// The `initialize` names 2025-11-25 (pinned in
+    /// [`Self::make_client_info`]) — the newest revision that HAS an
+    /// initialize handshake. Never 2026-07-28: that revision removed the
+    /// handshake.
+    async fn serve_legacy<T, E, A>(
+        &self,
+        transport: T,
+    ) -> Result<rmcp::service::RunningService<RoleClient, GrokClientHandler>, McpError>
+    where
+        T: rmcp::transport::IntoTransport<RoleClient, E, A>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let timeout = std::time::Duration::from_secs(self.startup_timeout_sec);
+        let handler = self.make_client_handler();
+        tokio::time::timeout(
+            timeout,
+            handler.serve_with_lifecycle(transport, ClientLifecycleMode::Initialize),
+        )
+        .await
+        .map_err(|_| McpError::timeout(&self.server_name, timeout))?
+        .map_err(|e| McpError::HandshakeFailed {
+            server: self.server_name.to_string(),
+            source: Box::new(e),
+        })
+    }
+
+    fn build_acp_transport(
+        &self,
+        server_id: String,
+        invoker: &Arc<dyn crate::acp_transport::AcpReverseInvoker>,
+    ) -> crate::acp_transport::AcpBridgeTransport {
+        let invoke_timeout =
+            std::time::Duration::from_secs(self.startup_timeout_sec.max(self.tool_timeout_sec));
+        crate::acp_transport::acp_bridge_transport(server_id, Arc::clone(invoker), invoke_timeout)
+    }
+
+    /// OAuth flavor of [`Self::build_http_client`]: one shared, cloneable
+    /// client for both handshake phases, with per-request `Authorization`
+    /// injected by the shared [`rmcp::transport::auth::AuthClient`].
+    async fn build_oauth_http_client(
+        &self,
+        config: &HttpConfig,
+        auth_manager: &Arc<tokio::sync::Mutex<rmcp::transport::auth::AuthorizationManager>>,
+    ) -> Result<
+        crate::mcp_http_client::McpHttpClient<rmcp::transport::auth::AuthClient<reqwest::Client>>,
+        McpError,
+    > {
+        let name = &self.server_name;
+        let mut headers = parse_config_headers(
+            name,
+            "oauth-transport",
+            config
+                .headers
+                .iter()
+                .filter(|(key, _)| !key.eq_ignore_ascii_case("Authorization"))
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+        apply_user_agent_policy(&mut headers, name, &config.url);
+        #[allow(clippy::disallowed_methods)]
+        let http_client = with_extra_root_certificates(
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .connect_timeout(HTTP_CONNECT_TIMEOUT),
+        )
+        .build()
+        .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
+        let placeholder_manager =
+            rmcp::transport::auth::AuthorizationManager::new(config.url.as_str())
+                .await
+                .map_err(|e| McpError::ClientError(format!("Failed to build OAuth client: {e}")))?;
+        let mut auth_client =
+            rmcp::transport::auth::AuthClient::new(http_client, placeholder_manager);
+        auth_client.auth_manager = auth_manager.clone();
+        Ok(crate::mcp_http_client::McpHttpClient::new(
+            auth_client,
+            name.as_str(),
+            self.warn_budget.clone(),
+        ))
     }
 
     fn make_client_info(server_name: &str, advertise_elicitation: bool) -> ClientInfo {
@@ -4043,13 +4443,15 @@ impl McpClient {
                 xai_grok_version::version().to_string(),
             ),
         )
-        // This pin currently equals rmcp 2.1 LATEST, but the explicit setter
-        // must remain so a future rmcp bump cannot silently move the wire
-        // (including to 2026-07-28).
+        // The newest initialize-era revision — the single pin
+        // `serve_legacy`'s handshake names. Never pin 2026-07-28 here: that
+        // revision removed the initialize handshake, and version-strict
+        // servers reject an `initialize` that names it. 2026-07-28 is only
+        // negotiated via `server/discover` (see `probe_modern`).
         .with_protocol_version(rmcp::model::ProtocolVersion::V_2025_11_25)
     }
 
-    /// Build the [`GrokClientHandler`] that drives `client.serve(...)`.
+    /// Build the [`GrokClientHandler`] that drives `client.serve_with_lifecycle(...)`.
     ///
     /// The handler holds a **clone of `Arc<Mutex<Option<Sender>>>`**,
     /// not a snapshot — so any subsequent call to
@@ -4080,6 +4482,17 @@ impl McpClient {
 
     pub fn set_elicitation_tx(&self, tx: Option<crate::elicitation::ElicitationInbox>) {
         *self.elicitation_tx.lock() = tx;
+    }
+
+    /// Bridge one elicitation request from an MRTR `input_required` round to
+    /// the HITL UI. Same inbox path as the server-initiated
+    /// `elicitation/create` handler, so both protocol generations share the
+    /// coordinator, wire format, and card rendering.
+    pub(crate) async fn bridge_elicit(
+        &self,
+        params: rmcp::model::ElicitRequestParams,
+    ) -> rmcp::model::ElicitResult {
+        crate::elicitation::bridge_elicit(&self.elicitation_tx, &self.server_name, params).await
     }
 
     /// Snapshot the current event sender, if any.
@@ -4160,14 +4573,14 @@ impl McpClient {
         true
     }
 
-    fn build_http_transport(
+    /// One shared, cloneable HTTP client for a server's handshake: the probe
+    /// and the legacy transports are separate rmcp sessions built from clones
+    /// of this client, so they share its connection pool.
+    fn build_http_client(
         config: &HttpConfig,
         server_name: &str,
         warn_budget: crate::mcp_http_client::WarnBudget,
-    ) -> Result<
-        StreamableHttpClientTransport<crate::mcp_http_client::McpHttpClient<reqwest::Client>>,
-        McpError,
-    > {
+    ) -> Result<crate::mcp_http_client::McpHttpClient<reqwest::Client>, McpError> {
         let mut headers = parse_config_headers(
             server_name,
             "transport",
@@ -4186,12 +4599,10 @@ impl McpClient {
         )
         .build()
         .map_err(|e| McpError::ClientError(format!("Failed to build HTTP client: {e}")))?;
-        let mcp_http_client =
-            crate::mcp_http_client::McpHttpClient::new(client, server_name, warn_budget);
-        let transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str());
-        Ok(StreamableHttpClientTransport::with_client(
-            mcp_http_client,
-            transport_config,
+        Ok(crate::mcp_http_client::McpHttpClient::new(
+            client,
+            server_name,
+            warn_budget,
         ))
     }
 
@@ -4373,7 +4784,8 @@ impl McpClient {
         match &*guard {
             ClientState::Ready { service, .. } => service
                 .peer_info()
-                .map(|info| McpIcon::from_rmcp_list(info.server_info.icons.clone()))
+                .and_then(|info| info.server_info.clone())
+                .map(|server_info| McpIcon::from_rmcp_list(server_info.icons))
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -5112,13 +5524,40 @@ impl ClientHandler for GrokClientHandler {
         }
     }
 
-    async fn on_url_elicitation_notification_complete(
+    // rmcp 3.x dropped the typed URL-elicitation completion handler; the
+    // notification (either the 2026-07-28 `notifications/elicitation/response`
+    // or the 2025-11-25 `notifications/elicitation/complete` spelling) now
+    // arrives through the custom-notification catch-all.
+    async fn on_custom_notification(
         &self,
-        params: rmcp::model::ElicitationResponseNotificationParam,
+        notification: rmcp::model::CustomNotification,
         _context: NotificationContext<RoleClient>,
     ) {
+        if notification.method != "notifications/elicitation/response"
+            && notification.method != "notifications/elicitation/complete"
+        {
+            tracing::debug!(
+                server = %self.server_name,
+                method = %notification.method,
+                "ignoring unknown MCP notification"
+            );
+            return;
+        }
+        let Some(elicitation_id) = notification
+            .params
+            .as_ref()
+            .and_then(|p| p.get("elicitationId"))
+            .and_then(|v| v.as_str())
+        else {
+            tracing::warn!(
+                server = %self.server_name,
+                method = %notification.method,
+                "elicitation completion notification without elicitationId; dropping"
+            );
+            return;
+        };
         if !xai_grok_tools::mcp_elicitation::chars_within(
-            &params.elicitation_id,
+            elicitation_id,
             xai_grok_tools::mcp_elicitation::MAX_ELICIT_ID_CHARS,
         ) {
             tracing::warn!(
@@ -5129,7 +5568,7 @@ impl ClientHandler for GrokClientHandler {
         }
         self.emit(McpClientEvent::ElicitationComplete {
             server: self.server_name.clone(),
-            elicitation_id: params.elicitation_id,
+            elicitation_id: elicitation_id.to_string(),
         });
     }
 

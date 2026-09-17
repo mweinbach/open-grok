@@ -2,7 +2,7 @@
 //!
 //! Two responsibilities:
 //!
-//! 1. **Quarantines `rmcp` 2.1 and `reqwest` 0.13.** `rmcp` 2.1 requires
+//! 1. **Quarantines `rmcp` 3.2 and `reqwest` 0.13.** `rmcp` 3.x requires
 //!    `reqwest >= 0.13.2`. The rest of the workspace consumes `reqwest` 0.12
 //!    and a transitive ecosystem (`opentelemetry-otlp`, `oauth2`,
 //!    `xai-mixpanel`, `xai-grok-tools`, ...) also pinned to 0.12. Bumping every

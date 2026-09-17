@@ -40,9 +40,11 @@ impl McpTransport for McpClientTransportAdapter {
         let info = service.peer_info().ok_or_else(|| {
             xai_computer_hub_mcp_adapter::McpError::Transport("no peer info after init".into())
         })?;
+        // rmcp 3.x makes the server implementation identity optional on peer info.
+        let server_info = info.server_info.as_ref();
         Ok(McpServerInfo {
-            name: info.server_info.name.clone(),
-            version: info.server_info.version.clone(),
+            name: server_info.map(|si| si.name.clone()).unwrap_or_default(),
+            version: server_info.map(|si| si.version.clone()).unwrap_or_default(),
             capabilities: serde_json::to_value(&info.capabilities).unwrap_or_default(),
         })
     }
