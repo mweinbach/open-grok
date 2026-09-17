@@ -375,9 +375,6 @@ pub fn render_dashboard(
     );
 
     if let Some(surface) = dashboard_session_picker {
-        if surface.loading {
-            state.painted_animations.mark(Animation::Spinner);
-        }
         let hit_areas = crate::views::session_picker_surface::render_session_picker(
             area,
             buf,
