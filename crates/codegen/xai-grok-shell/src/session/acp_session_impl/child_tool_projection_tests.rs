@@ -19,10 +19,12 @@ fn both_projections_strip_canonical_and_renamed_root_only_tools() {
                 "read_file",
                 "ask_user_question",
                 "workflow",
+                "send_feedback",
                 SEND_SUBAGENT_MESSAGE_TOOL_NAME,
                 "renamed_parent_message",
                 "renamed_question",
                 "renamed_workflow",
+                "renamed_feedback",
             ]
             .map(tool)
             .into(),
@@ -31,6 +33,7 @@ fn both_projections_strip_canonical_and_renamed_root_only_tools() {
                 "renamed_parent_message" => Some(ToolKind::ActiveAgentMessage),
                 "renamed_question" => Some(ToolKind::AskUser),
                 "renamed_workflow" => Some(ToolKind::Workflow),
+                "renamed_feedback" => Some(ToolKind::Feedback),
                 _ => None,
             },
         );

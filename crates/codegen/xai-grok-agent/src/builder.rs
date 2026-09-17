@@ -829,6 +829,26 @@ impl AgentBuilder {
                 .tools
                 .extend(xai_grok_tools::implementations::codex::context_management::tool_configs());
         }
+        let is_parent_grok_build = matches!(
+            definition.builtin_name,
+            Some(
+                BuiltinAgentName::GrokBuild
+                    | BuiltinAgentName::GrokBuildPlan
+                    | BuiltinAgentName::GrokBuildPlanNoSubagents
+                    | BuiltinAgentName::GrokBuildAskUser
+            )
+        );
+        if self.prompt_audience == PromptAudience::Primary
+            && is_parent_grok_build
+            && !tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.kind == Some(ToolKind::Feedback))
+        {
+            tool_config
+                .tools
+                .push((&xai_grok_tools::implementations::grok_build::SendFeedbackTool).into());
+        }
         if definition.inject_default_tools {
             if self.memory_backend.is_some() {
                 use xai_grok_tools::implementations::memory;
@@ -930,6 +950,20 @@ impl AgentBuilder {
             );
             tool_config.tools.retain(|tc| {
                 tc.id != mem_search_id && tc.id != experience_search_id && tc.id != mem_get_id
+            });
+        }
+        if self.prompt_audience == PromptAudience::Subagent {
+            let feedback_id = xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                xai_grok_tools::implementations::grok_build::SendFeedbackTool,
+            >()
+            .id;
+            let feedback_name =
+                xai_grok_tools::implementations::grok_build::SEND_FEEDBACK_TOOL_NAME;
+            tool_config.tools.retain(|tool| {
+                tool.kind != Some(ToolKind::Feedback)
+                    && tool.id != feedback_id
+                    && tool.id != feedback_name
+                    && tool.name_override.as_deref() != Some(feedback_name)
             });
         }
         if self.prompt_audience == PromptAudience::Subagent || !self.ask_user_question_enabled {
@@ -2072,6 +2106,7 @@ mod tests {
         for profile in [
             crate::config::AgentDefinition::explore(),
             crate::config::AgentDefinition::codex(),
+            crate::config::AgentDefinition::default_grok_build(),
         ] {
             let label = profile.name.clone();
             let agent = build_pager_agent(profile, false, true, PromptAudience::Subagent).await;
@@ -2088,6 +2123,10 @@ mod tests {
             assert!(
                 !names.contains(&"ask_user_question"),
                 "[{label}] subagent must not expose root-only human questions: {names:?}"
+            );
+            assert!(
+                !names.contains(&"send_feedback"),
+                "[{label}] subagent must not expose send_feedback; got tools: {names:?}"
             );
         }
     }
@@ -2244,6 +2283,10 @@ mod tests {
             assert!(
                 names.contains(&"exit_plan_mode"),
                 "[{label}] exit_plan_mode must always be present (TUI plan-mode keybind needs it); got tools: {names:?}"
+            );
+            assert!(
+                names.contains(&"send_feedback"),
+                "[{label}] parent grok-build sessions must advertise send_feedback; got tools: {names:?}"
             );
         }
     }

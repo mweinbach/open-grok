@@ -19,9 +19,16 @@ pub(super) fn child_safe_tool_specs(
             .filter(|spec| {
                 !matches!(
                     kind_for_name(&spec.name),
-                    Some(ToolKind::ActiveAgentMessage | ToolKind::AskUser | ToolKind::Workflow)
-                ) && !matches!(spec.name.as_str(), "ask_user_question" | "workflow")
-                    && spec.name != SEND_SUBAGENT_MESSAGE_TOOL_NAME
+                    Some(
+                        ToolKind::ActiveAgentMessage
+                            | ToolKind::AskUser
+                            | ToolKind::Workflow
+                            | ToolKind::Feedback
+                    )
+                ) && !matches!(
+                    spec.name.as_str(),
+                    "ask_user_question" | "workflow" | "send_feedback"
+                ) && spec.name != SEND_SUBAGENT_MESSAGE_TOOL_NAME
             })
             .collect(),
     }

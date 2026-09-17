@@ -291,12 +291,21 @@ pub fn toolset_for_preset(preset: &str) -> Option<ToolServerConfig> {
         .or_else(|| registered_toolset_preset(&normalized))
 }
 fn default_grok_build_toolset() -> ToolServerConfig {
+    grok_build_core_toolset_with(true, true)
+}
+fn default_agent_toolset() -> ToolServerConfig {
     grok_build_core_toolset(true)
 }
 fn general_purpose_toolset() -> ToolServerConfig {
     grok_build_core_toolset(false)
 }
 fn grok_build_core_toolset(include_workflow: bool) -> ToolServerConfig {
+    grok_build_core_toolset_with(include_workflow, false)
+}
+fn grok_build_core_toolset_with(
+    include_workflow: bool,
+    include_send_feedback: bool,
+) -> ToolServerConfig {
     let mut tools = vec![
         bash_tool_config(),
         (&grok_build::ReadFileTool).into(),
@@ -321,6 +330,9 @@ fn grok_build_core_toolset(include_workflow: bool) -> ToolServerConfig {
     ];
     if include_workflow {
         tools.push((&grok_build::WorkflowTool).into());
+    }
+    if include_send_feedback {
+        tools.push((&grok_build::SendFeedbackTool).into());
     }
     tools.extend(collaboration_tool_configs());
     tools.extend(session_collaboration_tool_configs());
@@ -787,7 +799,7 @@ pub struct AgentDefinition {
     pub(crate) builtin_name: Option<BuiltinAgentName>,
     #[serde(default = "default_prompt_mode")]
     pub prompt_mode: PromptMode,
-    #[serde(default = "default_grok_build_toolset")]
+    #[serde(default = "default_agent_toolset")]
     pub tool_config: ToolServerConfig,
     /// Runtime capability mode that constrains which tool kinds the agent
     /// can use. Applied during subagent spawn in `handle_subagent_request`
@@ -1537,7 +1549,7 @@ impl AgentDefinition {
             plugin_name: None,
             builtin_name: None,
             prompt_mode: PromptMode::Extend,
-            tool_config: default_grok_build_toolset(),
+            tool_config: default_agent_toolset(),
             capability_mode: None,
             permission_mode: PermissionMode::Default,
             skills: vec![],
@@ -1571,10 +1583,13 @@ impl AgentDefinition {
         }
     }
     pub fn default_grok_build() -> Self {
-        Self::base(
-            BuiltinAgentName::GrokBuild,
-            "Grok Build agent for software engineering tasks.",
-        )
+        Self {
+            tool_config: default_grok_build_toolset(),
+            ..Self::base(
+                BuiltinAgentName::GrokBuild,
+                "Grok Build agent for software engineering tasks.",
+            )
+        }
     }
     /// Grok Build Concise agent definition — concise output format for SFT/RL.
     pub fn grok_build_concise() -> Self {
@@ -1843,6 +1858,84 @@ mod tests {
         let explore = toolset_for_preset("explore").unwrap();
         assert!(explore.tools.len() < plan.tools.len());
         assert!(plan.tools.len() < gb.tools.len());
+    }
+    fn feedback_tool_id() -> String {
+        ToolConfig::from(&grok_build::SendFeedbackTool).id
+    }
+    fn contains_feedback(config: &ToolServerConfig) -> bool {
+        let id = feedback_tool_id();
+        config.tools.iter().any(|tool| tool.id == id)
+    }
+    #[test]
+    fn send_feedback_exposure_is_grok_build_only() {
+        use strum::IntoEnumIterator;
+        let presets = all_toolset_presets();
+        for (name, config) in &presets {
+            let expected = name == "grok-build";
+            let count = config
+                .tools
+                .iter()
+                .filter(|tool| tool.id == feedback_tool_id())
+                .count();
+            assert_eq!(
+                count,
+                usize::from(expected),
+                "preset `{name}` has the wrong send_feedback exposure"
+            );
+        }
+        for builtin in BuiltinAgentName::iter() {
+            let expected = match builtin {
+                BuiltinAgentName::GrokBuild => true,
+                BuiltinAgentName::GrokBuildConcise
+                | BuiltinAgentName::GrokBuildPlan
+                | BuiltinAgentName::GrokBuildPlanNoSubagents
+                | BuiltinAgentName::GrokBuildAskUser
+                | BuiltinAgentName::Codex
+                | BuiltinAgentName::Opencode
+                | BuiltinAgentName::GeneralPurpose
+                | BuiltinAgentName::Explore
+                | BuiltinAgentName::Plan
+                | BuiltinAgentName::BrowserUse
+                | BuiltinAgentName::GrokBuildOrchestrator => false,
+            };
+            assert_eq!(
+                contains_feedback(&builtin.definition().tool_config),
+                expected,
+                "builtin `{builtin}` has the wrong send_feedback exposure"
+            );
+        }
+        for (name, config) in [
+            ("core", grok_build_core_toolset(true)),
+            ("general-purpose", general_purpose_toolset()),
+        ] {
+            assert!(
+                !contains_feedback(&config),
+                "toolset `{name}` leaked send_feedback"
+            );
+        }
+        let workspace = workspace_grok_build_toolset();
+        assert_eq!(
+            workspace
+                .tools
+                .iter()
+                .filter(|tool| tool.id == feedback_tool_id())
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn defaulted_agent_definitions_omit_send_feedback() {
+        let builtins = AgentDefinition::builtin_defaults("external", "External definition");
+        assert!(!contains_feedback(&builtins.tool_config));
+        assert!(!contains_feedback(
+            &AgentDefinition::browser_use().tool_config
+        ));
+        let serde_default: AgentDefinition = serde_json::from_value(serde_json::json!({
+            "name": "external",
+            "description": "External definition"
+        }))
+        .unwrap();
+        assert!(!contains_feedback(&serde_default.tool_config));
     }
     fn grok_computer_exclusive_ids() -> Vec<String> {
         #[allow(unused_mut)]

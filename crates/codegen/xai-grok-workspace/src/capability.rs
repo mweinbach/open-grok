@@ -108,6 +108,7 @@ pub(crate) const ALL_TOOL_KINDS: &[ToolKind] = &[
     ToolKind::Workflow,
     ToolKind::AgentSwarm,
     ToolKind::AgentCollaboration,
+    ToolKind::Feedback,
     ToolKind::Other,
 ];
 
@@ -148,8 +149,8 @@ pub(crate) fn kind_allowed(mode: CapabilityMode, kind: ToolKind) -> bool {
         Lsp | ListDir | List => matches!(mode, M::ReadOnly | M::ReadWrite | M::Execute),
 
         // Edit class.
-        Edit | Write | Delete | Move | ImageGen | VideoGen | ImageToVideo | ReferenceToVideo
-        | DeployApp | InitOrUpdateApp => matches!(mode, M::ReadWrite),
+        Edit | Write | Delete | Move | Feedback | ImageGen | VideoGen | ImageToVideo
+        | ReferenceToVideo | DeployApp | InitOrUpdateApp => matches!(mode, M::ReadWrite),
 
         // Bash / shell.
         Execute => matches!(mode, M::Execute),
@@ -212,6 +213,7 @@ mod tests {
             test_support::tc("inspect", Some(ToolKind::Lsp)),
             test_support::tc("edit", Some(ToolKind::Edit)),
             test_support::tc("write", Some(ToolKind::Write)),
+            test_support::tc("feedback", Some(ToolKind::Feedback)),
             test_support::tc("bash", Some(ToolKind::Execute)),
             test_support::tc("bg", Some(ToolKind::BackgroundTaskAction)),
             test_support::tc("plan", Some(ToolKind::Plan)),
@@ -229,7 +231,9 @@ mod tests {
         let rw = CapabilityMode::ReadWrite.filter(&cfg);
         assert_eq!(
             names(&rw),
-            vec!["read", "search", "inspect", "edit", "write", "plan", "ask"]
+            vec![
+                "read", "search", "inspect", "edit", "write", "feedback", "plan", "ask"
+            ]
         );
 
         let ex = CapabilityMode::Execute.filter(&cfg);
@@ -242,7 +246,8 @@ mod tests {
         assert_eq!(
             names(&all),
             vec![
-                "read", "search", "inspect", "edit", "write", "bash", "bg", "plan", "ask", "other"
+                "read", "search", "inspect", "edit", "write", "feedback", "bash", "bg", "plan",
+                "ask", "other"
             ]
         );
     }

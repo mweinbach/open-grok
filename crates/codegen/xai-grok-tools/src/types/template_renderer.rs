@@ -70,6 +70,8 @@ struct TemplateContext {
     /// on this so the promise is only made when it can be kept. Defaults
     /// to `true` (prod CLI behavior).
     system_reminders_enabled: bool,
+    /// Absolute path to this session's drafts file, when known.
+    feedback_drafts_path: String,
 }
 
 /// Shared render implementation: fast-path check + MiniJinja render.
@@ -218,8 +220,17 @@ impl TemplateRenderer {
                 shell_uses_semicolon: xai_grok_config::shell::chain_separator() == ";",
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
+                feedback_drafts_path: String::new(),
             },
         }
+    }
+
+    /// Set the absolute drafts-file path advertised in `send_feedback`.
+    /// An empty path omits the drafts-file sentence from the description.
+    #[must_use]
+    pub fn with_feedback_drafts_path(mut self, path: impl Into<String>) -> Self {
+        self.ctx.feedback_drafts_path = path.into();
+        self
     }
 
     /// Override whether templates see `system_reminders_enabled` as true.

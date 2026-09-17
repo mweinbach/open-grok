@@ -146,6 +146,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::DismissHandoffItems(_)
         | ToolInput::InspectMissionReadiness(_)
         | ToolInput::EndFeatureRun(_)
+        | ToolInput::SendFeedback(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }

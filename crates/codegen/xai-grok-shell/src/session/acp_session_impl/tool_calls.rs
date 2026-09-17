@@ -2819,6 +2819,12 @@ impl SessionActor {
                 vec![],
                 vec![],
             ),
+            ToolInput::SendFeedback(_) => (
+                "Feedback drafted".to_string(),
+                acp::ToolKind::Other,
+                vec![],
+                vec![],
+            ),
             ToolInput::AskUserQuestion(ref ask) => {
                 let title = if ask.questions.len() == 1 {
                     format!("Ask: {}", ask.questions[0].question)
