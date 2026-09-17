@@ -3401,10 +3401,12 @@ impl acp::Agent for MvpAgent {
             }
             s if s.starts_with("x.ai/skills/") || s == "x.ai/workflows/list" => {
                 let compat = self.cfg.borrow().compat_resolved;
+                let cwd = crate::extensions::skills::request_cwd(&args);
+                let registry = self.plugin_registry_for_cwd(cwd.as_deref()).await;
                 crate::extensions::skills::handle(
                         self,
                         &args,
-                        self.plugin_registry_handle.snapshot().as_deref(),
+                        registry.as_deref(),
                         compat,
                     )
                     .await

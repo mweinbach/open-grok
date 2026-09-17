@@ -33,7 +33,7 @@ pub use search::{
 pub use search_tool::{
     DiscoveredTool, SearchToolCallBlock as IntegrationSearchToolCallBlock, discovered_tool_action,
 };
-pub use sent_message::{SentMessagePresentation, SentMessageToolCallBlock};
+pub use sent_message::{SentMessageDelivery, SentMessagePresentation, SentMessageToolCallBlock};
 pub use use_tool::UseToolCallBlock;
 pub use web_fetch::WebFetchToolCallBlock;
 pub use web_search::WebSearchToolCallBlock;

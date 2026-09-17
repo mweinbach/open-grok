@@ -299,24 +299,42 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             respond_to,
         } = request;
         let Some(child) = self.active.get_mut(request.subagent_id()) else {
-            let is_owned = self
+            let is_pending_or_queued = self
                 .pending
                 .get(request.subagent_id())
                 .is_some_and(|child| child.request.parent_session_id == parent_session_id)
                 || self.queued.iter().any(|child| {
                     child.request.id == request.subagent_id()
                         && child.request.parent_session_id == parent_session_id
-                })
-                || self
-                    .completed
-                    .get(request.subagent_id())
-                    .is_some_and(|child| child.request.parent_session_id == parent_session_id);
-            let outcome = if is_owned {
-                ActiveAgentMessageOutcome::NotActiveOrFinalizing
-            } else {
-                ActiveAgentMessageOutcome::NotFoundOrNotOwned
-            };
-            let _ = respond_to.send(outcome);
+                });
+            if is_pending_or_queued {
+                let _ = respond_to.send(ActiveAgentMessageOutcome::NotActiveOrFinalizing);
+                return;
+            }
+            let text = request.text().to_string();
+            match self.wake_completed_child(request.subagent_id(), &parent_session_id, text) {
+                Ok(wake) => {
+                    let message_id = match wake {
+                        super::wake::WakeAdmit::Started { message_id }
+                        | super::wake::WakeAdmit::Queued { message_id } => message_id,
+                    };
+                    let _ = respond_to.send(ActiveAgentMessageOutcome::Accepted { message_id });
+                }
+                Err(ActiveAgentMessageOutcome::NotFoundOrNotOwned) => {
+                    let _ = respond_to.send(ActiveAgentMessageOutcome::NotFoundOrNotOwned);
+                }
+                Err(outcome) => {
+                    let owned = self
+                        .completed
+                        .get(request.subagent_id())
+                        .is_some_and(|child| child.request.parent_session_id == parent_session_id);
+                    let _ = respond_to.send(if owned {
+                        outcome
+                    } else {
+                        ActiveAgentMessageOutcome::NotFoundOrNotOwned
+                    });
+                }
+            }
             return;
         };
         if child.request.parent_session_id != parent_session_id {

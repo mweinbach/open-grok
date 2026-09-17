@@ -290,6 +290,114 @@ fn rearm_session_overlay(app: &mut AppView, id: AgentId) {
     }
 }
 
+pub(super) fn dispatch_dashboard_open_session_picker(app: &mut AppView) -> Vec<Effect> {
+    use crate::views::session_picker::SourceFilter;
+    use crate::views::session_picker_surface::{SessionPickerHost, SessionPickerSurface};
+
+    if !app.workspace_dashboard_enabled
+        || !matches!(app.active_view, ActiveView::AgentDashboard)
+        || app.dashboard_session_picker.is_some()
+    {
+        return vec![];
+    }
+
+    let cwd = app
+        .dashboard
+        .as_ref()
+        .map_or_else(|| app.cwd.clone(), |dashboard| dashboard.cwd.clone());
+    let generation = app.alloc_picker_generation();
+    let mut surface = SessionPickerSurface::new(generation);
+    surface.source_filter = SourceFilter::Local;
+    surface.loading = true;
+    surface.list_seq += 1;
+    let seq = surface.list_seq;
+    let headless_policy = surface.source_filter.headless_policy();
+    app.dashboard_session_picker = Some(surface);
+
+    vec![Effect::FetchSessionList {
+        host: SessionPickerHost::Dashboard,
+        cwd_override: Some(cwd),
+        generation,
+        query: None,
+        seq,
+        kind_filter: Some(vec!["build".to_owned()]),
+        headless_policy,
+    }]
+}
+
+pub(super) fn dispatch_dashboard_close_session_picker(app: &mut AppView) -> Vec<Effect> {
+    if let Some(surface) = app.dashboard_session_picker.as_mut() {
+        surface.state.hit_areas = None;
+    }
+    app.dashboard_session_picker = None;
+    vec![]
+}
+
+fn dispatch_dashboard_load_local_build(
+    app: &mut AppView,
+    session_id: String,
+    cwd_hint: Option<std::path::PathBuf>,
+) -> Vec<Effect> {
+    use crate::views::dashboard::DashboardRowId;
+
+    let resolved = cwd_hint
+        .and_then(|cwd| {
+            xai_grok_shell::session::resolve_local_session(&session_id, &cwd.to_string_lossy())
+                .map(|resolved_id| (resolved_id, cwd))
+        })
+        .or_else(|| {
+            xai_grok_shell::session::resolve_local_session_any_cwd(&session_id)
+                .map(|cwd| (session_id, std::path::PathBuf::from(cwd)))
+        });
+
+    let Some((resolved_id, resolved_cwd)) = resolved else {
+        app.show_toast("Session not found locally");
+        return vec![];
+    };
+
+    #[cfg(feature = "local-workspace")]
+    {
+        app.welcome_history_load_as_build = true;
+    }
+    if let Some(existing_id) = focus_if_session_already_open(app, resolved_id.as_str(), false) {
+        #[cfg(feature = "local-workspace")]
+        {
+            app.welcome_history_load_as_build = false;
+        }
+        log_dashboard_attached(&DashboardRowId::TopLevel(existing_id));
+        return vec![];
+    }
+
+    let effects = dispatch_load_session(app, resolved_id, Some(resolved_cwd), false);
+    if let Some(new_id) = effects.iter().find_map(|effect| match effect {
+        Effect::LoadSession { agent_id, .. } => Some(*agent_id),
+        _ => None,
+    }) {
+        if let Some(dashboard) = app.dashboard.as_mut() {
+            dashboard.focus_row(DashboardRowId::TopLevel(new_id));
+            dashboard.attached_agent = Some(new_id);
+        }
+        log_dashboard_attached(&DashboardRowId::TopLevel(new_id));
+    }
+    effects
+}
+
+pub(super) fn dispatch_dashboard_pick_session(app: &mut AppView, index: usize) -> Vec<Effect> {
+    let entry = app
+        .dashboard_session_picker
+        .as_ref()
+        .and_then(|surface| surface.entries.as_ref())
+        .and_then(|entries| entries.get(index))
+        .cloned();
+    app.dashboard_session_picker = None;
+
+    let Some(entry) = entry else {
+        return vec![];
+    };
+    let cwd_hint = (!entry.cwd.is_empty()).then(|| std::path::PathBuf::from(entry.cwd));
+    dispatch_dashboard_load_local_build(app, entry.id, cwd_hint)
+}
+
 pub(super) fn dispatch_dashboard_attach(
     app: &mut AppView,
     id: crate::views::dashboard::DashboardRowId,
@@ -391,7 +499,19 @@ pub(super) fn dispatch_dashboard_attach(
             }
             return effects;
         }
-        DashboardRowId::Workspace { .. } => return vec![],
+        DashboardRowId::Workspace { session_id } => {
+            let cwd_hint = app.workspace_snapshot.as_ref().and_then(|snapshot| {
+                snapshot
+                    .members
+                    .iter()
+                    .find(|member| member.session_id.as_ref() == session_id)
+                    .and_then(|member| member.cwd.as_deref())
+                    .map(std::path::PathBuf::from)
+            });
+            let mut effects = dispatch_dashboard_load_local_build(app, session_id, cwd_hint);
+            effects.extend(provider_effects);
+            return effects;
+        }
     }
     provider_effects
 }

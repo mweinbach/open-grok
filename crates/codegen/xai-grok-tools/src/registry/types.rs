@@ -736,6 +736,7 @@ impl ToolRegistryBuilder {
                 grok_build::AskUserQuestionTool,
                 grok_build::ask_user_question::AskUserQuestionParams,
             >();
+        b.register::<grok_build::SendFeedbackTool>();
         b.register::<grok_build::MonitorTool>();
         b.register::<grok_build::SchedulerCreateTool>();
         b.register::<grok_build::SchedulerDeleteTool>();
@@ -1032,15 +1033,19 @@ impl ToolRegistryBuilder {
                 map.extend(overrides.iter().map(|(k, v)| (k.clone(), v.clone())));
             }
         }
+        let session_folder = crate::types::resources::SessionFolder(ctx.session_folder);
+        let feedback_drafts_path =
+            crate::implementations::grok_build::send_feedback::drafts_file_path(&session_folder.0);
         let renderer = TemplateRenderer::new(kind_to_name.clone(), kind_params.clone())
-            .with_system_reminders_enabled(self.system_reminders_enabled);
+            .with_system_reminders_enabled(self.system_reminders_enabled)
+            .with_feedback_drafts_path(feedback_drafts_path);
         let mut tools = Vec::new();
         let mut resources = Resources::new();
         resources.insert(crate::types::resources::Terminal(ctx.backend));
         resources.insert(crate::types::resources::FileSystem(ctx.fs));
         let cwd = ctx.cwd;
         resources.insert(crate::types::resources::Cwd(cwd.clone()));
-        resources.insert(crate::types::resources::SessionFolder(ctx.session_folder));
+        resources.insert(session_folder);
         resources.insert(crate::types::resources::SessionEnv(ctx.session_env));
         if let Some(owner_session_id) = ctx.owner_session_id.clone() {
             resources.insert(crate::types::resources::OwnerSessionId(owner_session_id));

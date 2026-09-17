@@ -27,6 +27,14 @@ pub enum SentMessagePresentation {
     Unconfirmed { reason: String },
 }
 
+/// Requested delivery on the wire. Steer is unmarked on a successful send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentMessageDelivery {
+    Steer,
+    Queue,
+    Interject,
+}
+
 impl SentMessagePresentation {
     pub(crate) fn title(&self) -> &'static str {
         match self {
@@ -34,6 +42,14 @@ impl SentMessagePresentation {
             Self::Sent => "Sent message to subagent",
             Self::Rejected { .. } => "Failed to send message to subagent",
             Self::Unconfirmed { .. } => "Message delivery unconfirmed",
+        }
+    }
+
+    fn sent_verb(delivery: Option<SentMessageDelivery>) -> &'static str {
+        match delivery {
+            None | Some(SentMessageDelivery::Steer) => "sent to",
+            Some(SentMessageDelivery::Queue) => "queued for",
+            Some(SentMessageDelivery::Interject) => "interjected to",
         }
     }
 
@@ -74,6 +90,7 @@ pub struct SentMessageToolCallBlock {
     pub presentation: SentMessagePresentation,
     pub subagent_id: Option<String>,
     pub text: Option<String>,
+    pub delivery: Option<SentMessageDelivery>,
     pub started_at: Option<std::time::Instant>,
     pub elapsed_ms: Option<i64>,
 }
@@ -88,9 +105,15 @@ impl SentMessageToolCallBlock {
             presentation,
             subagent_id,
             text,
+            delivery: None,
             started_at: None,
             elapsed_ms: None,
         }
+    }
+
+    pub fn with_delivery(mut self, delivery: Option<SentMessageDelivery>) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     pub fn is_success(&self) -> bool {
@@ -122,13 +145,28 @@ impl SentMessageToolCallBlock {
 
     pub(crate) fn searchable_text(&self) -> Option<String> {
         crate::scrollback::block::join_searchable([
-            Some(self.presentation.title().to_owned()),
+            Some(self.header_text()),
             self.subagent_id.clone(),
             self.text.clone(),
             self.presentation
                 .detail()
                 .map(|(detail, _)| detail.to_owned()),
         ])
+    }
+
+    pub(crate) fn header_text(&self) -> String {
+        let noun = self.subagent_id.as_deref().unwrap_or("subagent");
+        match &self.presentation {
+            SentMessagePresentation::Sending => format!("Message sending to {noun}"),
+            SentMessagePresentation::Sent => {
+                format!(
+                    "Message {} {noun}",
+                    SentMessagePresentation::sent_verb(self.delivery)
+                )
+            }
+            SentMessagePresentation::Rejected { .. } => format!("Message rejected · {noun}"),
+            SentMessagePresentation::Unconfirmed { .. } => format!("Message unconfirmed · {noun}"),
+        }
     }
 
     fn header(&self, theme: &Theme, is_muted: bool) -> Line<'static> {
@@ -138,7 +176,7 @@ impl SentMessageToolCallBlock {
             theme.primary()
         }
         .add_modifier(ratatui::style::Modifier::BOLD);
-        Line::from(Span::styled(self.presentation.title(), style))
+        Line::from(Span::styled(self.header_text(), style))
     }
 
     pub(crate) fn rendered_output(&self, ctx: &BlockContext) -> RenderedBlockOutput {

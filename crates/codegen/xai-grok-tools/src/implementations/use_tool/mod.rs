@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::output::{MCPOutput, ToolOutput};
 use crate::types::tool::{ToolKind, ToolNamespace};
+use crate::util::mcp_structured_content::render_structured_content;
 use crate::util::mcp_truncate::{McpTruncateContext, truncate_tool_output};
 
 /// Wire name of the MCP dispatch tool.
@@ -106,31 +107,46 @@ fn gateway_result_is_error(result: &serde_json::Value) -> bool {
 }
 
 fn gateway_result_to_text(result: serde_json::Value) -> String {
-    if let Some(content) = result.get("content").and_then(|v| v.as_array()) {
-        let parts: Vec<String> = content
-            .iter()
-            .filter_map(|item| {
-                if item.get("type").and_then(|v| v.as_str()) == Some("text") {
-                    item.get("text").and_then(|v| v.as_str()).map(str::to_owned)
-                } else if item.get("type").and_then(|v| v.as_str()) == Some("image") {
-                    let mime = item
-                        .get("mimeType")
-                        .or_else(|| item.get("mime_type"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("image/png");
-                    item.get("data")
-                        .and_then(|v| v.as_str())
-                        .map(|data| format!("data:{mime};base64,{data}"))
-                } else if item.get("type").and_then(|v| v.as_str()) == Some("resource") {
-                    serde_json::to_string(item).ok()
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !parts.is_empty() {
-            return parts.join("\n");
-        }
+    let content = result
+        .get("content")
+        .and_then(|v| v.as_array())
+        .map_or(&[][..], Vec::as_slice);
+    let mut parts: Vec<String> = content
+        .iter()
+        .filter_map(|item| {
+            if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                item.get("text").and_then(|v| v.as_str()).map(str::to_owned)
+            } else if item.get("type").and_then(|v| v.as_str()) == Some("image") {
+                let mime = item
+                    .get("mimeType")
+                    .or_else(|| item.get("mime_type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("image/png");
+                item.get("data")
+                    .and_then(|v| v.as_str())
+                    .map(|data| format!("data:{mime};base64,{data}"))
+            } else if item.get("type").and_then(|v| v.as_str()) == Some("resource") {
+                serde_json::to_string(item).ok()
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Unknown-only content: return the envelope so nothing is lost (includes structuredContent).
+    if parts.is_empty() && !content.is_empty() {
+        return match result {
+            serde_json::Value::String(s) => s,
+            other => serde_json::to_string_pretty(&other).unwrap_or_default(),
+        };
+    }
+    parts.extend(render_structured_content(
+        result
+            .get("structuredContent")
+            .or_else(|| result.get("structured_content")),
+        parts.iter().map(String::as_str),
+    ));
+    if !parts.is_empty() {
+        return parts.join("\n");
     }
 
     match result {
@@ -813,6 +829,54 @@ mod tests {
         .unwrap();
 
         assert!(result.to_prompt_format().contains("\"ok\": true"));
+    }
+
+    #[test]
+    fn gateway_structured_content_is_appended_when_content_is_only_a_summary() {
+        let folders = serde_json::json!({"folders": [{"id": "p1", "name": "Alpha"}]});
+        for key in ["structuredContent", "structured_content"] {
+            let text = gateway_result_to_text(serde_json::json!({
+                "content": [{"type": "text", "text": "7 product folders, 2 custom folders"}],
+                key: folders,
+            }));
+            assert_eq!(
+                text,
+                format!("7 product folders, 2 custom folders\n{folders}")
+            );
+        }
+    }
+
+    /// Missing `content` reads as empty, like rmcp, so the payload alone is the text.
+    #[test]
+    fn gateway_structured_content_with_empty_or_missing_content_is_the_whole_text() {
+        let folders = serde_json::json!({"folders": [{"id": "p1", "name": "Alpha"}]});
+        for result in [
+            serde_json::json!({"content": [], "structuredContent": folders}),
+            serde_json::json!({"structuredContent": folders, "isError": false}),
+        ] {
+            assert_eq!(gateway_result_to_text(result), folders.to_string());
+        }
+    }
+
+    #[test]
+    fn gateway_inlined_structured_content_is_not_duplicated() {
+        let folders = serde_json::json!({"folders": [{"id": "p1", "name": "Alpha"}]});
+        let text = gateway_result_to_text(serde_json::json!({
+            "content": [{"type": "text", "text": folders.to_string()}],
+            "structuredContent": folders,
+        }));
+        assert_eq!(text, folders.to_string());
+    }
+
+    /// Unknown-only `content` (`resource_link`, `audio`) must not collapse to the payload alone.
+    #[test]
+    fn gateway_unknown_content_blocks_keep_the_envelope_with_structured_content() {
+        let text = gateway_result_to_text(serde_json::json!({
+            "content": [{"type": "resource_link", "uri": "file:///a"}],
+            "structuredContent": {"count": 1},
+        }));
+        assert!(text.contains("file:///a"), "{text}");
+        assert!(text.contains("\"count\": 1"), "{text}");
     }
 
     #[tokio::test]

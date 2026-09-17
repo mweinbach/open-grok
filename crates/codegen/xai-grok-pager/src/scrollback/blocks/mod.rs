@@ -5,6 +5,7 @@
 mod agent;
 mod bg_task;
 mod btw;
+mod cancel_cause;
 mod code_mode_stream;
 mod context_info;
 mod credit_limit;
@@ -23,6 +24,7 @@ mod workflow;
 pub use agent::AgentMessageBlock;
 pub use bg_task::{BgTaskBlock, BgTaskKind};
 pub use btw::BtwBlock;
+pub use cancel_cause::CancelledBy;
 pub use code_mode_stream::{CodeModeStreamBlock, CodeModeStreamTool};
 pub use context_info::ContextInfoBlock;
 pub use credit_limit::{CreditLimitBlock, CreditLimitCardAction};

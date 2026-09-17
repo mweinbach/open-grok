@@ -381,6 +381,7 @@
         agent.scrollback.push_block(crate::scrollback::block::RenderBlock::session_event(
             crate::scrollback::blocks::SessionEvent::TurnCancelled {
                 elapsed: std::time::Duration::from_secs(1),
+                cause: crate::scrollback::blocks::CancelledBy::User,
             },
         ));
         assert!(

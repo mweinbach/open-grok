@@ -17,9 +17,9 @@ pub use grok_build::bash::{BashError, BashToolInput};
 pub use grok_build::{
     AskUserQuestionTool, BashTool, EnterPlanModeTool, ExitPlanModeTool, FollowupAgentTaskTool,
     GrepTool, KillTaskTool, ListAgentsTool, ListDirTool, ReadFileTool, SearchReplaceTool,
-    SendAgentMessageTool, SendSubagentMessageDisposition, SendSubagentMessageTool, SwarmWaitTool,
-    TaskOutputTool, TaskTool, TodoWriteTool, WaitAgentTool, WaitTasksTool, WebFetchTool,
-    WebRunTool, WebSearchTool,
+    SendAgentMessageTool, SendFeedbackTool, SendSubagentMessageDisposition,
+    SendSubagentMessageTool, SwarmWaitTool, TaskOutputTool, TaskTool, TodoWriteTool, WaitAgentTool,
+    WaitTasksTool, WebFetchTool, WebRunTool, WebSearchTool,
 };
 pub use memory::{ExperienceSearchImpl, MemoryGetImpl, MemorySearchImpl};
 pub use opencode::{

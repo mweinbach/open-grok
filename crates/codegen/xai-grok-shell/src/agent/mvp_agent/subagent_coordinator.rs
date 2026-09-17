@@ -163,6 +163,9 @@ impl coordinator::ChildRunner for ShellChildRunner {
         let gateway = self.agent_ref.get().gateway.clone();
         crate::agent::subagent::present_child_completion(completion, &gateway);
     }
+    fn supports_wake(&self) -> bool {
+        true
+    }
     fn deliver_root_followup(
         &self,
         root_session_id: &str,

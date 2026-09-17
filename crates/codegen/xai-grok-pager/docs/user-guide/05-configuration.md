@@ -186,8 +186,8 @@ You can also override this with `GROK_DEFAULT_SELECTED_PERMISSION`, which is han
 
 | Value | Behavior |
 |-------|----------|
-| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — it cancels a running turn, and while idle follows the clear / rewind policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
-| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). Mid-turn `Esc` is swallowed in this mode (`Ctrl+C` cancels); minimal mode keeps Esc-cancel regardless. |
+| `false` (default) | Bare-letter and `Shift+letter` keys (`j`/`k`, `h`/`l`, `g`/`G`, `y`/`Y`, `o`/`O`, `r`, `x`, `e`/`E`, `H`/`L`, plus `i`) are suppressed in the scrollback: pressing one focuses the prompt and types the character. Arrows, `Tab`, `Space`, `PageUp`/`PageDown`, and every `Ctrl+letter` shortcut still navigate. `Esc` is **not** a scrollback key — mid-turn it names `Ctrl+C` as the cancel binding, and while idle it follows the clear / rewind policy (see [Keyboard Shortcuts](03-keyboard-shortcuts.md#escape)). |
+| `true` | All vim-style scrollback bindings are active, exactly as listed in [Keyboard Shortcuts](03-keyboard-shortcuts.md). Mid-turn `Esc` is swallowed in every mode (`Ctrl+C` cancels). |
 
 Toggle `vim_mode` at runtime with `/vim-mode`, or from the settings pane
 (`/settings` → **Vim scrollback navigation**). Grok writes the change to
@@ -493,6 +493,12 @@ min_score = 0.0                       # score threshold for first-turn injection
 [memory.embedding]
 model = "embedding-model"             # embedding model name
 dimensions = 1024                     # vector dimensions
+
+# Isolated topic/observation pipeline (Grok Build 1.0.32+).
+# Selecting this does not read or write ~/.opengrok/memory/.
+[memory_v2]
+enabled = false
+# rollout = "active"                  # off | record_only | shadow | active
 ```
 
 ### Subagents

@@ -124,11 +124,11 @@ fn sent_block_uses_exact_success_title_and_renders_arguments_as_inert_text() {
 
     assert_eq!(
         rendered(&block, 120, DisplayMode::Collapsed),
-        "Sent message to subagent"
+        "Message sent to sub-123"
     );
     assert_eq!(
         rendered(&block, 120, DisplayMode::Expanded),
-        format!("Sent message to subagent\n\nSubagent ID: sub-123\n\nMessage:\n{text}")
+        format!("Message sent to sub-123\n\nSubagent ID: sub-123\n\nMessage:\n{text}")
     );
     assert!(block.image_references().is_empty());
     assert!(block.video_references().is_empty());
@@ -382,12 +382,9 @@ fn rejected_and_unconfirmed_have_distinct_failure_semantics() {
     assert!(!sending.is_success());
     assert!(!sending.is_failure());
     assert!(!sending.is_unconfirmed());
-    assert!(
-        rendered(&rejected, 120, DisplayMode::Expanded)
-            .starts_with("Failed to send message to subagent")
-    );
+    assert!(rendered(&rejected, 120, DisplayMode::Expanded).starts_with("Message rejected · null"));
     assert!(
         rendered(&unconfirmed, 120, DisplayMode::Expanded)
-            .starts_with("Message delivery unconfirmed")
+            .starts_with("Message unconfirmed · sub-123")
     );
 }

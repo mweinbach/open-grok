@@ -83,10 +83,44 @@ async fn run(
         SendSubagentMessageInput {
             subagent_id: subagent_id.to_owned(),
             text,
+            delivery: None,
+            queue: false,
         },
     ))
     .await
     .unwrap()
+}
+
+async fn backend_operation(
+    delivery: Option<SendSubagentMessageDelivery>,
+    queue: bool,
+) -> crate::implementations::grok_build::task::types::ActiveAgentMessageOperation {
+    let (backend, mut receiver) = coordinator_backend();
+    let send = completes(xai_tool_runtime::Tool::run(
+        &SendSubagentMessageTool,
+        test_ctx(resources_with_backend(backend).into_shared()),
+        SendSubagentMessageInput {
+            subagent_id: "sub-1".to_owned(),
+            text: "follow up".to_owned(),
+            delivery,
+            queue,
+        },
+    ));
+    let respond = async move {
+        let ingress = completes(receiver.active_messages.recv())
+            .await
+            .expect("expected active-message ingress");
+        let operation = ingress.request.request.operation();
+        ingress
+            .request
+            .respond_to
+            .send(ActiveAgentMessageOutcome::Accepted {
+                message_id: "message-1".to_owned(),
+            })
+            .unwrap();
+        operation
+    };
+    completes(async { tokio::join!(send, respond) }).await.1
 }
 
 async fn run_backend_outcome(outcome: ActiveAgentMessageOutcome) -> SendSubagentMessageOutput {
@@ -116,6 +150,81 @@ fn required_input_keys_are_semantically_pinned() {
         .collect::<Vec<_>>();
     required.sort_unstable();
     assert_eq!(required, ["subagent_id", "text"]);
+    assert!(schema.pointer("/properties/queue").is_none());
+    assert!(
+        schema
+            .pointer("/properties/delivery")
+            .is_some_and(serde_json::Value::is_object)
+    );
+}
+
+#[test]
+fn delivery_values_are_a_closed_snake_case_set() {
+    let values = [
+        SendSubagentMessageDelivery::Steer,
+        SendSubagentMessageDelivery::Queue,
+        SendSubagentMessageDelivery::Interject,
+    ]
+    .map(|value| serde_json::to_value(value).expect("serialize delivery"));
+    assert_eq!(values, ["steer", "queue", "interject"]);
+}
+
+#[test]
+fn unknown_delivery_value_fails_to_deserialize() {
+    let error = serde_json::from_value::<SendSubagentMessageInput>(serde_json::json!({
+        "subagent_id": "sub-1",
+        "text": "follow up",
+        "delivery": "urgent",
+    }))
+    .expect_err("an unknown delivery must fail closed");
+    assert!(
+        error.to_string().contains("unknown variant `urgent`"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resolve_delivery_prefers_explicit_delivery_over_legacy_queue() {
+    assert_eq!(
+        resolve_delivery(None, false),
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Steer
+    );
+    assert_eq!(
+        resolve_delivery(None, true),
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Queue
+    );
+    assert_eq!(
+        resolve_delivery(Some(SendSubagentMessageDelivery::Steer), true),
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Steer
+    );
+    assert_eq!(
+        resolve_delivery(Some(SendSubagentMessageDelivery::Interject), false),
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Interject
+    );
+}
+
+#[tokio::test]
+async fn legacy_queue_true_without_delivery_maps_to_queue() {
+    assert_eq!(
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Queue,
+        backend_operation(None, true).await
+    );
+}
+
+#[tokio::test]
+async fn explicit_delivery_wins_over_legacy_queue() {
+    assert_eq!(
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Steer,
+        backend_operation(Some(SendSubagentMessageDelivery::Steer), true).await
+    );
+}
+
+#[tokio::test]
+async fn delivery_interject_reaches_the_backend_as_interject() {
+    assert_eq!(
+        crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Interject,
+        backend_operation(Some(SendSubagentMessageDelivery::Interject), false).await
+    );
 }
 
 #[test]
@@ -143,6 +252,10 @@ async fn accepted_roundtrip_uses_backend_bound_parent_and_preserves_request() {
         assert_eq!(ingress.request.parent_session_id, "trusted-parent");
         assert_eq!(ingress.request.request.subagent_id(), "sub-1");
         assert_eq!(ingress.request.request.text().as_ref(), "follow up");
+        assert_eq!(
+            ingress.request.request.operation(),
+            crate::implementations::grok_build::task::types::ActiveAgentMessageOperation::Steer
+        );
         ingress
             .request
             .respond_to

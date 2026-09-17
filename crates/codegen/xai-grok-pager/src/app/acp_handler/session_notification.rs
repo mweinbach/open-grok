@@ -171,6 +171,7 @@ fn synthesize_replay_turn_marker(
             elapsed_ms,
             agent_result,
             send_now_cancel: cancel_trigger == Some("send_now"),
+            cancel_trigger,
             cancellation_category,
             error_kind,
             error_banner_present: banner,
@@ -1423,7 +1424,7 @@ pub(super) fn handle_session_notification_with_origin(
             }
             actually_changed
         }
-        XaiSessionUpdate::MemoryFiles { files } => {
+        XaiSessionUpdate::MemoryFiles { files, .. } => {
             let entries = crate::views::memory_modal::build_entries(files);
             let modal_state = crate::views::memory_modal::MemoryModalState::new(entries);
             agent.active_modal = Some(crate::views::modal::ActiveModal::MemoryBrowser {

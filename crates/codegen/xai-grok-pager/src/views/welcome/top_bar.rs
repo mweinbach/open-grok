@@ -88,39 +88,13 @@ fn process_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// Format the cwd for the welcome top bar / dashboard header: the actual
-/// working directory (tilde-collapsed), with a `(worktree of …)` suffix
-/// when `info` reports a linked worktree's main repo. Matches the session
-/// status bar (the `worktree ` badge itself is painted by [`location_line`]).
+/// Format the cwd for the welcome top bar / dashboard header: last-two-component
+/// shortening after `~` collapse. Linked worktrees use the `worktree ` badge,
+/// not a `(worktree of …)` suffix.
 ///
-/// Pure formatting over the per-cwd git probe — never spawns `git`. On a
-/// cache miss (`info == None`, e.g. the very first frame) it still shows the
-/// raw cwd path with `~` collapsed; the worktree suffix fills in once the
-/// probe lands.
-fn format_cwd_display(cwd: &Path, info: Option<&git_info::CwdGitInfo>) -> String {
-    let display = collapse_home(cwd);
-    let main_repo = info.and_then(|i| i.main_repo.as_deref());
-    format_cwd_parts(&display, main_repo)
-}
-
-/// Pure formatting for the cwd display — no global state, easy to test.
-fn format_cwd_parts(display: &str, main_repo: Option<&str>) -> String {
-    if let Some(main_repo) = main_repo {
-        format!("{display} (worktree of {main_repo})")
-    } else {
-        display.to_string()
-    }
-}
-
-fn collapse_home(dir: &std::path::Path) -> String {
-    let path = dir.display().to_string();
-    match git_info::home_dir() {
-        Some(home) => path
-            .strip_prefix(&home)
-            .map(|s| format!("~{s}"))
-            .unwrap_or(path),
-        None => path,
-    }
+/// Pure formatting over the per-cwd git probe — never spawns `git`.
+fn format_cwd_display(cwd: &Path, _info: Option<&git_info::CwdGitInfo>) -> String {
+    crate::util::display_location_path(cwd)
 }
 
 #[cfg(test)]
@@ -129,23 +103,29 @@ mod tests {
 
     #[test]
     fn format_cwd_plain_repo() {
-        assert_eq!(format_cwd_parts("~/xai", None), "~/xai");
+        assert_eq!(
+            format_cwd_display(Path::new("/work/xai"), None),
+            "/work/xai"
+        );
+        assert!(!format_cwd_display(Path::new("/work/xai"), None).contains("(worktree of"));
     }
 
-    /// A linked worktree shows the `(worktree of …)` suffix — matching the
-    /// session status bar — regardless of the worktree's human label (the
-    /// label is no longer shown here; the `worktree ` badge stands in for it).
+    /// A linked worktree keeps the `worktree ` badge and drops the main-repo suffix.
     #[test]
-    fn format_cwd_worktree_shows_main_repo() {
-        assert_eq!(
-            format_cwd_parts("~/wt/session-1", Some("~/xai")),
-            "~/wt/session-1 (worktree of ~/xai)"
-        );
+    fn format_cwd_worktree_omits_main_repo_suffix() {
+        let info = git_info::CwdGitInfo {
+            branch: Some("main".into()),
+            is_worktree: true,
+            main_repo: Some("~/xai".into()),
+            worktree_label: Some("session-1".into()),
+        };
+        let display = format_cwd_display(Path::new("/work/wt/session-1"), Some(&info));
+        assert_eq!(display, "/w/wt/session-1");
+        assert!(!display.contains("(worktree of"));
     }
 
     /// The header shows the ACTUAL cwd, not the git repo root: switching
-    /// into a subdirectory of a repo reflects the subdirectory. (`/work/...`
-    /// is outside `$HOME`, so `collapse_home` leaves it verbatim.)
+    /// into a subdirectory of a repo reflects the subdirectory, shortened.
     #[test]
     fn format_cwd_display_shows_subdir_not_repo_root() {
         let info = git_info::CwdGitInfo {
@@ -156,32 +136,32 @@ mod tests {
         };
         assert_eq!(
             format_cwd_display(Path::new("/work/xai/frontend/apps"), Some(&info)),
-            "/work/xai/frontend/apps",
+            "/w/x/frontend/apps",
         );
     }
 
-    /// A worktree subdirectory shows the `(worktree of …)` suffix (matching
-    /// the session status bar) while still showing the real subdirectory path.
+    /// A worktree subdirectory still shows the real subdirectory path with no
+    /// main-repo suffix.
     #[test]
-    fn format_cwd_display_worktree_subdir_shows_main_repo() {
+    fn format_cwd_display_worktree_subdir_omits_main_repo_suffix() {
         let info = git_info::CwdGitInfo {
             branch: Some("kevin/x".into()),
             is_worktree: true,
             main_repo: Some("~/xai".into()),
             worktree_label: Some("location-picker".into()),
         };
-        assert_eq!(
-            format_cwd_display(Path::new("/work/wt/location-picker/frontend"), Some(&info)),
-            "/work/wt/location-picker/frontend (worktree of ~/xai)",
-        );
+        let display =
+            format_cwd_display(Path::new("/work/wt/location-picker/frontend"), Some(&info));
+        assert_eq!(display, "/w/w/location-picker/frontend");
+        assert!(!display.contains("(worktree of"));
     }
 
-    /// On a cache miss (`info == None`) the header still shows the raw cwd.
+    /// On a cache miss (`info == None`) the header still shows the shortened cwd.
     #[test]
     fn format_cwd_display_cache_miss_shows_raw_cwd() {
         assert_eq!(
             format_cwd_display(Path::new("/work/xai/frontend/apps"), None),
-            "/work/xai/frontend/apps",
+            "/w/x/frontend/apps",
         );
     }
 }

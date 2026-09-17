@@ -146,6 +146,7 @@ pub fn canonical_input(input: &ToolInput) -> Option<serde_json::Value> {
         | ToolInput::DismissHandoffItems(_)
         | ToolInput::InspectMissionReadiness(_)
         | ToolInput::EndFeatureRun(_)
+        | ToolInput::SendFeedback(_)
         | ToolInput::Dynamic(_) => return None,
     })
 }
@@ -157,6 +158,8 @@ mod tests {
             crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput {
                 subagent_id: "child".into(),
                 text: "private task context".into(),
+                delivery: None,
+                queue: false,
             },
         );
         assert!(super::canonical_input(&input).is_none());

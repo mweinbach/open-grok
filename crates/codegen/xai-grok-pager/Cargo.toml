@@ -46,6 +46,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true, features = ["serde"] }
+strum = { workspace = true }
 
 # ANSI parsing (tracing pane)
 ansi-to-tui = { workspace = true }
@@ -102,6 +103,7 @@ xai-grok-config = { workspace = true }
 # (cpal is target-gated to non-Linux inside xai-grok-voice).
 xai-grok-voice = { path = "../xai-grok-voice", default-features = false, features = ["audio"] }
 xai-grok-shell = { workspace = true }
+xai-grok-feedback = { workspace = true }
 xai-grok-status-line = { path = "../xai-grok-status-line" }
 xai-grok-workspace = { workspace = true }
 xai-grok-hooks = { path = "../xai-grok-hooks" }

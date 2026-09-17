@@ -171,6 +171,7 @@ async fn fetch_session_list_sends_kind_facet_filter() {
     execute(
         Effect::FetchSessionList {
             host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+            cwd_override: None,
             generation: 1,
             query: None,
             seq: 1,
@@ -1933,6 +1934,7 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
     use crate::views::session_picker_surface::SessionPickerHost;
     let mut tasks = run(Effect::FetchSessionList {
         host: SessionPickerHost::AgentModal,
+        cwd_override: None,
         generation: 41,
         query: Some("hit".into()),
         seq: 7,
@@ -1963,6 +1965,7 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
     }
     let mut tasks = run(Effect::FetchSessionList {
         host: SessionPickerHost::Welcome,
+        cwd_override: None,
         generation: 42,
         query: None,
         seq: 8,
@@ -1982,6 +1985,7 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
     }
     let mut tasks = run(Effect::FetchSessionList {
         host: SessionPickerHost::Welcome,
+        cwd_override: None,
         generation: 43,
         query: Some("fail-me".into()),
         seq: 9,

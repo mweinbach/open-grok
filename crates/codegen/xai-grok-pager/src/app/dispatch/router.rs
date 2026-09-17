@@ -16,14 +16,15 @@ use super::custom_provider::{
 };
 use super::dashboard::{
     dispatch_dashboard_attach, dispatch_dashboard_begin_rename, dispatch_dashboard_change_location,
-    dispatch_dashboard_commit_rename, dispatch_dashboard_confirm_worktree,
-    dispatch_dashboard_create_new_agent_with_detail, dispatch_dashboard_delete,
-    dispatch_dashboard_dispatch, dispatch_dashboard_dispatch_slash,
-    dispatch_dashboard_open_location_picker, dispatch_dashboard_open_shortcuts_help,
-    dispatch_dashboard_overlay_cycle, dispatch_dashboard_overlay_exit,
-    dispatch_dashboard_overlay_stop, dispatch_dashboard_peek_cycle_mode,
-    dispatch_dashboard_peek_reply, dispatch_dashboard_permission_followup,
-    dispatch_dashboard_permission_select, dispatch_dashboard_question_answer,
+    dispatch_dashboard_close_session_picker, dispatch_dashboard_commit_rename,
+    dispatch_dashboard_confirm_worktree, dispatch_dashboard_create_new_agent_with_detail,
+    dispatch_dashboard_delete, dispatch_dashboard_dispatch, dispatch_dashboard_dispatch_slash,
+    dispatch_dashboard_open_location_picker, dispatch_dashboard_open_session_picker,
+    dispatch_dashboard_open_shortcuts_help, dispatch_dashboard_overlay_cycle,
+    dispatch_dashboard_overlay_exit, dispatch_dashboard_overlay_stop,
+    dispatch_dashboard_peek_cycle_mode, dispatch_dashboard_peek_reply,
+    dispatch_dashboard_permission_followup, dispatch_dashboard_permission_select,
+    dispatch_dashboard_pick_session, dispatch_dashboard_question_answer,
     dispatch_dashboard_reorder, dispatch_dashboard_select, dispatch_dashboard_stop,
     dispatch_dashboard_toggle_auto_approve, dispatch_dashboard_toggle_grouping,
     dispatch_dashboard_toggle_pin, dispatch_dashboard_toggle_worktree, dispatch_exit_dashboard,
@@ -40,9 +41,10 @@ use super::modes::{
     set_permission_mode, set_plan_mode, set_swarm_mode, set_yolo_mode,
 };
 use super::notes::{
-    dispatch_enter_remember_mode, dispatch_open_feedback_pane,
-    dispatch_save_remember_note_from_modal, dispatch_send_btw, dispatch_send_feedback,
-    dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_enter_remember_mode, dispatch_open_feedback_modal, dispatch_open_feedback_pane,
+    dispatch_request_feedback_draft, dispatch_save_remember_note_from_modal, dispatch_send_btw,
+    dispatch_send_feedback, dispatch_send_recap, dispatch_send_remember_note,
+    dispatch_submit_feedback_modal,
 };
 use super::permissions::{
     dispatch_permission_cancel, dispatch_permission_followup, dispatch_permission_select,
@@ -308,7 +310,15 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         } => dispatch_startup_fork_session(app, parent_session_id, parent_cwd, new_session_id),
         Action::FetchSessionList => dispatch_fetch_session_list(app),
         Action::CycleSessionSourceFilter => dispatch_cycle_session_source_filter(app),
-        Action::ShowSessionPicker => dispatch_show_session_picker(app),
+        Action::ShowSessionPicker => {
+            if app.workspace_dashboard_enabled
+                && matches!(app.active_view, ActiveView::AgentDashboard)
+            {
+                dispatch_dashboard_open_session_picker(app)
+            } else {
+                dispatch_show_session_picker(app)
+            }
+        }
         Action::SessionPickerClosed => dispatch_session_picker_closed(app),
         Action::PickSession(index) => dispatch_pick_session(app, index),
         Action::PickSessionInWorktree(index) => dispatch_pick_session_in_worktree(app, index),
@@ -1152,6 +1162,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenFeedbackPane { prefill, images } => {
             dispatch_open_feedback_pane(app, prefill, images)
         }
+        Action::OpenFeedbackModal(open) => dispatch_open_feedback_modal(app, open),
+        Action::SubmitFeedbackModal { modal_id } => dispatch_submit_feedback_modal(app, modal_id),
+        Action::RequestFeedbackDraft { request } => dispatch_request_feedback_draft(app, request),
         Action::SendFeedback {
             text,
             images,
@@ -1605,6 +1618,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
             dispatch_dashboard_create_new_agent_with_detail(app)
         }
         Action::DashboardOpenLocationPicker => dispatch_dashboard_open_location_picker(app),
+        Action::DashboardCloseSessionPicker => dispatch_dashboard_close_session_picker(app),
+        Action::DashboardPickSession(index) => dispatch_dashboard_pick_session(app, index),
         Action::DashboardCloseLocationPicker => {
             if let Some(d) = app.dashboard.as_mut() {
                 if let Some(wt) = d.location_picker.as_ref().map(|lp| lp.worktree_mode) {

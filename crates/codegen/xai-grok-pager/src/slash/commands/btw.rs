@@ -4,37 +4,20 @@
 //! fires it as an ACP ext method (`x.ai/btw`) that bypasses the prompt queue.
 
 use crate::app::actions::Action;
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand};
+use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 pub struct BtwCommand;
 
 impl SlashCommand for BtwCommand {
-    fn name(&self) -> &str {
-        "btw"
-    }
-
-    fn description(&self) -> &str {
-        "Ask a side question without interrupting"
-    }
-
-    fn session_scoped(&self) -> bool {
-        true
-    }
-
-    fn usage(&self) -> &str {
-        "/btw <question>"
-    }
-
-    fn takes_args(&self) -> bool {
-        true
-    }
-
-    fn args_required(&self) -> bool {
-        true
-    }
-
-    fn arg_placeholder(&self) -> Option<&str> {
-        Some("<question>")
+    slash_meta! {
+        name: "btw",
+        description: "Ask a side question without interrupting",
+        usage: "/btw <question>",
+        takes_args: true,
+        args_required: true,
+        session_scoped: true,
+        can_hoist_from_mid_text: true,
+        arg_placeholder: "<question>",
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

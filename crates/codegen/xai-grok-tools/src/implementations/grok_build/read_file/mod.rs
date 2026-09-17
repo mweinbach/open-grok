@@ -351,6 +351,7 @@ pub(crate) async fn run_read_file(
     }
     let joined_path = resolve_model_path(&cwd, display_cwd.as_deref(), &input.path);
     let is_skill_markdown = is_skill_markdown(&joined_path);
+    let policy_path = joined_path.clone();
     let (path, _unicode_note) = match crate::util::fs::try_canonicalize(&joined_path).await {
         Ok(p) => (p, None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -361,6 +362,11 @@ pub(crate) async fn run_read_file(
         }
         Err(_) => (joined_path, None),
     };
+    if let Err(error) =
+        crate::types::memory_v2::validate_memory_v2_read(&resources, &policy_path).await
+    {
+        return Ok(ReadFileOutput::FileReadError(error));
+    }
     let version = ReadFileVersion::from_contract(contract_version);
     let is_legacy = version.is_legacy();
     let skip_gitignore = is_legacy && versions::legacy_0_4_10::allows_gitignored_reads();
@@ -431,6 +437,11 @@ pub(crate) async fn run_read_file(
             });
         }
     };
+    if let Err(error) =
+        crate::types::memory_v2::record_memory_v2_read(&resources, &policy_path, &file_bytes).await
+    {
+        return Ok(ReadFileOutput::FileReadError(error));
+    }
     if let Ok(metadata) = bytes_to_metadata(&file_bytes)
         && metadata.is_image()
     {

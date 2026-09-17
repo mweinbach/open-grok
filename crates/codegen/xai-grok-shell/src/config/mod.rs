@@ -4,8 +4,9 @@ use crate::bundle;
 use serde::Deserialize;
 pub use xai_grok_config_types::{
     DEFAULT_RECENCY_DECAY, MemoryDreamConfig, MemoryEmbeddingConfig, MemoryFlushConfig,
-    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemorySearchConfig,
-    MemorySessionConfig, MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
+    MemoryGcConfig, MemoryIndexConfig, MemoryInitialInjectionConfig, MemoryMode,
+    MemorySearchConfig, MemorySessionConfig, MemoryV2Config, MemoryV2Rollout, MemoryV2Settings,
+    MemoryWatcherConfig, MmrConfig, PruningConfig, TemporalDecayConfig,
 };
 /// Full configuration for the memory system.
 ///
@@ -22,6 +23,9 @@ pub use xai_grok_config_types::{
 pub struct MemoryConfig {
     /// Whether memory is enabled for this session.
     pub enabled: bool,
+    /// Implementation selected for this session. `[memory_v2] enabled = true`
+    /// selects the isolated topic/observation pipeline; otherwise legacy.
+    pub mode: MemoryMode,
     /// Index / chunking settings.
     pub index: MemoryIndexConfig,
     /// Embedding provider settings.
@@ -38,6 +42,8 @@ pub struct MemoryConfig {
     pub gc: MemoryGcConfig,
     /// autoDream consolidation settings.
     pub dream: MemoryDreamConfig,
+    /// Isolated memory-v2 rollout and kill switches. Ignored in legacy mode.
+    pub v2: MemoryV2Config,
     /// Pre-compaction memory flush settings.
     ///
     /// **Note:** Configured under `[compaction.memory_flush]` in config.toml,
@@ -209,6 +215,21 @@ impl MemoryConfig {
         result.enabled = resolved.value;
         if no_memory {
             result.enabled = false;
+        }
+        let typed = xai_grok_config_types::MemoryConfig::resolve(
+            experimental_memory,
+            no_memory,
+            config,
+            remote,
+        );
+        result.mode = typed.mode;
+        result.v2 = typed.v2;
+        if typed.mode.is_v2() && typed.enabled {
+            result.enabled = true;
+        }
+        if no_memory {
+            result.enabled = false;
+            result.mode = MemoryMode::Legacy;
         }
         result
     }

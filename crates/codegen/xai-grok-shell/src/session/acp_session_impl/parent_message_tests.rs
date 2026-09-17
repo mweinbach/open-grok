@@ -1,6 +1,8 @@
 use super::*;
 use std::sync::Arc;
-use xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessage;
+use xai_grok_tools::implementations::grok_build::task::types::{
+    ActiveAgentMessage, ActiveAgentMessageOperation,
+};
 
 #[expect(
     clippy::unwrap_used,
@@ -29,44 +31,70 @@ async fn await_with_timeout<Output>(future: impl Future<Output = Output>) -> Out
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn unsupported_operation_never_reserves_or_commits() {
+async fn steer_and_interject_admit_through_the_queue_path() {
     let local = tokio::task::LocalSet::new();
     await_with_timeout(local.run_until(async {
         let (actor, _) = await_with_timeout(super::super::support::build_actor()).await;
-        let (receipt_sink, mut receipt_rx) = mpsc::channel(1);
-        let (_occupied_tx, occupied_rx) = oneshot::channel();
-        receipt_sink
-            .send(crate::agent::subagent::PromptTurnReceipt {
-                prompt_id: "occupied".into(),
-                result: occupied_rx,
-                telemetry: None,
-            })
-            .await
-            .expect("occupy receipt capacity");
-        let (respond_to, response_rx) = oneshot::channel();
-        let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
-
-        await_with_timeout(actor.admit_parent_agent_message_with(
-            message("unsupported"),
+        {
+            let mut state = actor.state.lock().await;
+            state
+                .pending_inputs
+                .push_back(super::super::support::user_item("running", "owner"));
+            state.running_task = Some(super::super::support::running_task_stub("running"));
+        }
+        for operation in [
             ActiveAgentMessageOperation::Steer,
-            receipt_sink,
-            None,
-            respond_to,
-            completion_tx,
-            |_, _| panic!("unsupported operation must not commit a queue row"),
-        ))
-        .await;
+            ActiveAgentMessageOperation::Interject,
+        ] {
+            let (receipt_sink, mut receipt_rx) = mpsc::channel(1);
+            let (respond_to, response_rx) = oneshot::channel();
+            let (completion_tx, _completion_rx) = mpsc::unbounded_channel();
+            let id = match operation {
+                ActiveAgentMessageOperation::Steer => "steer",
+                ActiveAgentMessageOperation::Interject => "interject",
+                ActiveAgentMessageOperation::Queue => unreachable!(),
+            };
 
-        assert_eq!(
-            admission_response(await_with_timeout(response_rx).await),
-            ActiveMessageAdmission::Unsupported
-        );
-        assert_eq!(
-            receipt_rx.try_recv().expect("existing receipt").prompt_id,
-            "occupied"
-        );
-        assert!(receipt_rx.try_recv().is_err());
-        assert!(actor.state.lock().await.pending_inputs.is_empty());
+            await_with_timeout(actor.admit_parent_agent_message_with(
+                message(id),
+                operation,
+                receipt_sink,
+                None,
+                respond_to,
+                completion_tx,
+                |state, item| {
+                    state.pending_inputs.push_back(item);
+                    true
+                },
+            ))
+            .await;
+
+            assert_eq!(
+                admission_response(await_with_timeout(response_rx).await),
+                ActiveMessageAdmission::Admitted
+            );
+            assert_eq!(
+                receipt_rx.try_recv().expect("receipt").prompt_id,
+                format!("parent-message-{id}")
+            );
+            assert_eq!(
+                actor
+                    .state
+                    .lock()
+                    .await
+                    .pending_inputs
+                    .back()
+                    .expect("queued")
+                    .prompt_id,
+                format!("parent-message-{id}")
+            );
+            assert_eq!(
+                actor.tool_context.parent_interject.is_pending(),
+                operation == ActiveAgentMessageOperation::Interject,
+                "only Interject raises the wait-abort signal"
+            );
+            actor.tool_context.parent_interject.set_pending(false);
+        }
     }))
     .await;
 }

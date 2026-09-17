@@ -169,6 +169,16 @@ impl JsonlStorageAdapter {
         let chat_file = dir.join(super::CHAT_HISTORY_FILE);
         self.read_chat_history_sync(chat_file, CHAT_FORMAT_VERSION)
     }
+    /// Read a durable transcript snapshot while enforcing caller-owned input caps.
+    pub(crate) fn load_chat_history_bounded_from_dir(
+        &self,
+        dir: &std::path::Path,
+        max_bytes: usize,
+        max_items: usize,
+    ) -> std::io::Result<Vec<ConversationItem>> {
+        let chat_file = dir.join(super::CHAT_HISTORY_FILE);
+        self.read_chat_history_sync_bounded(chat_file, CHAT_FORMAT_VERSION, max_bytes, max_items)
+    }
     fn session_dir(&self, info: &Info) -> PathBuf {
         match &self.dir_mode {
             SessionDirMode::FromRoot(root) => {
@@ -1000,10 +1010,40 @@ impl JsonlStorageAdapter {
         path: PathBuf,
         chat_format_version: u8,
     ) -> io::Result<Vec<ConversationItem>> {
+        self.read_chat_history_sync_bounded(path, chat_format_version, usize::MAX, usize::MAX)
+    }
+    fn read_chat_history_sync_bounded(
+        &self,
+        path: PathBuf,
+        chat_format_version: u8,
+        max_bytes: usize,
+        max_items: usize,
+    ) -> io::Result<Vec<ConversationItem>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let contents = std::fs::read(&path)?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if !metadata.file_type().is_file()
+            || metadata.len() > u64::try_from(max_bytes).unwrap_or(u64::MAX)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("chat history is not a regular file within the {max_bytes}-byte limit"),
+            ));
+        }
+        let read_limit = u64::try_from(max_bytes)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut contents = Vec::with_capacity(metadata.len() as usize);
+        std::fs::File::open(&path)?
+            .take(read_limit)
+            .read_to_end(&mut contents)?;
+        if contents.len() > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("chat history exceeds the {max_bytes}-byte read limit"),
+            ));
+        }
         let mut sibling_btc_ids_seen: std::collections::HashSet<String> =
             std::collections::HashSet::new();
         let mut upgraded_reasoning_count: usize = 0;
@@ -1063,6 +1103,12 @@ impl JsonlStorageAdapter {
                 sibling_btc_ids_seen.insert(b.id().to_string());
             }
             items.push(item);
+            if items.len() > max_items {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("chat history exceeds the {max_items}-item limit"),
+                ));
+            }
         }
         let stripped = strip_invalid_images(&mut items);
         if first_skipped.is_some() || stripped > 0 {

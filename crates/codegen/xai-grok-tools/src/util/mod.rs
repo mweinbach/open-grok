@@ -9,6 +9,7 @@ pub mod hash;
 pub mod heic;
 pub mod image_compress;
 pub mod image_validate;
+pub mod mcp_structured_content;
 pub mod mcp_truncate;
 pub mod path_suggestions;
 pub(crate) mod query_tools;

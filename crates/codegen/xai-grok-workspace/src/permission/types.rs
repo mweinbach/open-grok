@@ -401,6 +401,9 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
                 input: u.tool_input.clone(),
             },
             ToolInput::WebFetch(wf) => AccessKind::WebFetch(wf.url.clone()),
+            // Local draft I/O only. AccessKind::Tool (upstream: every call
+            // prompts) is not in this tree yet; do not remap Task/ApplyPatch.
+            ToolInput::SendFeedback(_) => AccessKind::Read(None),
             ToolInput::Dynamic(value) => access_kind_from_dynamic(value),
             #[allow(unreachable_patterns)]
             _ => AccessKind::Read(None),
@@ -419,6 +422,11 @@ fn dynamic_has_field(value: &serde_json::Value, keys: &[&str]) -> bool {
         .is_some_and(|object| keys.iter().any(|key| object.contains_key(*key)))
 }
 fn access_kind_from_dynamic(value: &serde_json::Value) -> AccessKind {
+    if let Some(name) = dynamic_string_field(value, &["name", "tool", "tool_name", "variant"])
+        && (name == "send_feedback" || name == "SendFeedback")
+    {
+        return AccessKind::Read(None);
+    }
     if let Some(path) = dynamic_string_field(value, &["filePath", "file_path", "path"]) {
         let is_mutation = dynamic_has_field(
             value,
@@ -793,6 +801,8 @@ mod tests {
         let access = AccessKind::from(&ToolInput::SendSubagentMessage(SendSubagentMessageInput {
             subagent_id: "sub-1".into(),
             text: text.into(),
+            delivery: None,
+            queue: false,
         }));
         let AccessKind::AgentMessage { subagent_id } = access else {
             panic!("active agent messages must use dedicated access")
@@ -888,6 +898,40 @@ mod tests {
         assert!(
             matches!(access, AccessKind::Edit(_)),
             "ApplyPatch should produce AccessKind::Edit, got {access:?}"
+        );
+    }
+    #[test]
+    fn send_feedback_maps_to_tool_access() {
+        use xai_grok_tools::types::ToolInput;
+        let input: ToolInput = serde_json::from_value(serde_json::json!({
+            "variant": "SendFeedback",
+            "title": "Draft",
+            "details": "What happened:\n- A bug.",
+            "type": "bug",
+        }))
+        .expect("SendFeedback input envelope");
+        assert!(
+            matches!(AccessKind::from(&input), AccessKind::Read(None)),
+            "SendFeedback is local draft I/O and maps to AccessKind::Read(None)"
+        );
+        assert!(
+            matches!(
+                AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                    "variant": "SendFeedback",
+                    "title": "Draft",
+                }))),
+                AccessKind::Read(None)
+            ),
+            "dynamic SendFeedback variant should map like the typed variant"
+        );
+        assert!(
+            matches!(
+                AccessKind::from(&ToolInput::Dynamic(serde_json::json!({
+                    "name": "send_feedback",
+                }))),
+                AccessKind::Read(None)
+            ),
+            "dynamic send_feedback name should map like the typed variant"
         );
     }
     #[test]

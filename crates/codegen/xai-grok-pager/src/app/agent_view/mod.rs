@@ -26,16 +26,13 @@
 //!       on an empty prompt) re-enters this level and runs CancelTurn.
 //!   → 3. Esc policy (try_handle_esc_policy) on Prompt or Scrollback only,
 //!       after overlays/dropdowns/selection returned Changed / stole Esc:
-//!       turn running, gate ON (`esc_cancels_turn`: minimal mode OR
-//!         `[ui].vim_mode` off) → CancelTurn (even with a draft; the draft
-//!         is preserved, unlike Ctrl+C's clear-first gesture)
-//!       turn running, gate OFF (fullscreen vim mode) → Changed (swallow)
-//!       turn cancelling → CancelTurn in every mode (retry lost ack;
-//!         Ctrl+C escalates to Quit)
+//!       turn running or already cancelling, every mode → Changed (swallow;
+//!         while running, toast / one system line names the registry
+//!         CancelTurn key; Esc never cancels)
 //!       idle + non-empty prompt, prompt pane only → ArmPending ClearPrompt (2× within 800ms, hint)
 //!       idle + empty + messages, either pane (Normal composer mode, no
 //!         needs-input overlay pending, no open history search, and not
-//!         within ESC_CANCEL_REWIND_GRACE of an Esc-fired cancel) →
+//!         within ESC_CANCEL_REWIND_GRACE of a mid-turn Esc) →
 //!         ArmPending RewindShowPicker (2×, silent)
 //!       idle otherwise (scrollback-pane draft / latent mode / pending overlay /
 //!         open history search / post-cancel grace, or empty + no messages) →
@@ -43,10 +40,10 @@
 //!   → 4. return Unchanged → bubbles to app_view for global actions (quit)
 //! ```
 //!
-//! The mid-turn cancel is the only Esc-policy branch gated on `[ui].vim_mode`
-//! (scrollback nav); everything else — and all of it with respect to
-//! `[ui].simple_mode` (prompt editor) — is mode-independent. Tab remains
-//! leave-prompt in both modes.
+//! Mid-turn Esc never cancels. Ctrl+C (the registry CancelTurn binding) is
+//! the cancel gesture in every mode. Everything else — and all of it with
+//! respect to `[ui].simple_mode` (prompt editor) — is mode-independent. Tab
+//! remains leave-prompt in both modes.
 //!
 //! ## Future: data/view split
 //!
@@ -139,6 +136,7 @@ pub use crate::views::agent::{ActivePane, AgentViewLayout, InputMode, PaneAreas}
 use crate::views::block_viewer::BlockViewerPane;
 use crate::views::elicitation_view::ElicitationViewState;
 use crate::views::extensions_modal::ExtensionsModalState;
+use crate::views::feedback_modal::FeedbackModalState;
 use crate::views::file_search::line_viewer::LineViewerState;
 use crate::views::modal::{self, ActiveModal, ModalButtonHit};
 use crate::views::permission_view::{PermissionViewState, SubagentInfo};
@@ -177,7 +175,9 @@ pub(in crate::app) use prompt_stash::prompt_history_text;
 pub use prompt_stash::{PromptStashEntry, StashCause};
 mod queue;
 mod render;
-pub use render::AppRenderParams;
+pub use render::{AppRenderParams, OverlayHeader};
+#[cfg(test)]
+mod header_tests;
 mod rewind;
 mod selection;
 mod session;
@@ -909,11 +909,17 @@ pub struct AgentView {
     pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
     pub dock_cursor: usize,
+    pub dock_workflows_expanded: bool,
     pub dock_subagents_expanded: bool,
     pub dock_tasks_expanded: bool,
     pub dock_watchers_expanded: bool,
     pub dock_queued_expanded: bool,
+    /// Last frame: dock replaced Tasks/Queue, even if every section is empty.
+    pub dock_on: bool,
+    /// Last frame: dock painted (`dock_on` and ≥1 non-empty section).
     pub dock_shown: bool,
+    /// Sticky: Ctrl+G hid the dock; paint stays off until the next Ctrl+G.
+    pub dock_hidden: bool,
     /// Current mode of the prompt widget (normal vs editing a queued prompt).
     pub prompt_mode: PromptMode,
     /// Current special prompt input mode (Normal/Bash/Remember).
@@ -1194,6 +1200,13 @@ pub struct AgentView {
     pub hit_response_top_indicator: HitArea,
     /// CWD / worktree path in the status bar (click to copy).
     pub hit_cwd: HitArea,
+    /// `[Dashboard]` on the status bar: opens the dashboard, or returns to it
+    /// when this view is the dashboard's session overlay.
+    pub hit_dashboard: HitArea,
+    /// Overlay switcher `‹` on the status bar (cycles to the previous agent).
+    pub hit_overlay_prev: HitArea,
+    /// Overlay switcher `›` on the status bar (cycles to the next agent).
+    pub hit_overlay_next: HitArea,
     /// Cancel button in turn status line (`[stop]`).
     pub hit_cancel_button: HitArea,
     /// Still-running watcher cue on the turn-status row (click opens the
@@ -1362,6 +1375,15 @@ pub struct AgentView {
     /// Active question view (from `AskUserQuestion` tool). When `Some`, the
     /// prompt area shows a structured question UI and input is modal.
     pub(crate) question_view: Option<QuestionViewState>,
+    /// Isolated `/feedback` editor. When `Some`, it owns keys and paints over the agent.
+    pub(crate) feedback_modal: Option<FeedbackModalState>,
+    #[allow(dead_code)]
+    pending_feedback_trace_uploads:
+        std::collections::VecDeque<crate::views::feedback_modal::FeedbackSubmissionId>,
+    parked_feedback_trace_consents: std::collections::VecDeque<(
+        crate::views::feedback_modal::FeedbackSubmissionId,
+        crate::views::feedback_modal::ParkedFeedbackTraceConsent,
+    )>,
     pub(crate) elicitation_view: Option<ElicitationViewState>,
     pub(crate) pending_elicitation: Option<(
         xai_grok_tools::mcp_elicitation::McpElicitExtRequest,
@@ -1475,11 +1497,10 @@ pub struct AgentView {
     /// agent and persist to `[ui].cancel_subagents_on_turn_cancel`; when unset,
     /// cancel falls back to that UI/config field, then the prompt panel.
     pub(crate) cancel_subagents_preference: Option<bool>,
-    /// What gesture triggered the pending turn-cancel (Ctrl+C / mouse; Esc
-    /// via the mid-turn cancel in minimal / non-vim mode and the cancel-retry
-    /// path while TurnCancelling).
-    /// Set by the key/mouse handler, consumed by `do_cancel_turn` / the
-    /// cancel-retry path so `session/cancel` carries `_meta.cancelTrigger`.
+    /// What gesture triggered the pending turn-cancel (Ctrl+C / mouse /
+    /// dashboard stop). Esc never stamps this: it only hints at the registry
+    /// cancel binding. Set by the key/mouse handler, consumed by
+    /// `do_cancel_turn` so `session/cancel` carries `_meta.cancelTrigger`.
     pub(crate) cancel_trigger_hint: Option<crate::app::actions::CancelTrigger>,
     pub(crate) rewind_state: Option<crate::views::rewind::RewindState>,
     pub(crate) rewind_points: Option<Vec<crate::views::rewind::RewindPointInfo>>,
@@ -1550,13 +1571,18 @@ pub struct AgentView {
     /// Cleared on any non-`d` key press, after 500ms expiry, or once
     /// `try_handle_esc_policy` consumes the Esc. `pub(crate)` for policy tests.
     pub(crate) esc_pressed_at: Option<std::time::Instant>,
-    /// Post-cancel grace deadline: while `now` is before it, the Esc policy
-    /// holds the idle rewind ARM so Esc-mashing past a cancel cannot
+    /// Mid-turn Esc grace deadline: while `now` is before it, the Esc policy
+    /// holds the idle rewind ARM so Esc-mashing past a turn's end cannot
     /// silently arm the rewind picker. Set (`now + ESC_CANCEL_REWIND_GRACE`)
-    /// by `suppress_rewind_arm` on every Esc-fired cancel, consumed and
+    /// by `suppress_rewind_arm` on every mid-turn Esc, consumed and
     /// retired-on-expiry by `rewind_arm_suppressed`. `pub(crate)` for policy
     /// tests.
     pub(crate) rewind_suppress_deadline: Option<std::time::Instant>,
+    /// Minimal only: the `scrollback.turn_count()` at which the mid-turn Esc
+    /// hint was last committed. The hint is a permanent scrollback line
+    /// there, so a mash across streamed blocks must not add another before
+    /// the next user turn.
+    pub(crate) minimal_cancel_hint_turn: Option<usize>,
     /// First prompt to enqueue once the session finishes loading replay.
     /// Set by `/fork` when a directive is provided; drained in the
     /// `TaskResult::SessionLoaded` arm via `enqueue_prompt_front` so the

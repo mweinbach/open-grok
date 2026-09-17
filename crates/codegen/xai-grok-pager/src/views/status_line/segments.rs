@@ -94,12 +94,10 @@ pub fn compose_builtin(
                 .map(|usd| StatusSegment::dim(format!("${usd:.2}"))),
             StatusLineItem::TurnTimer => {
                 let secs = turn_elapsed?.as_secs();
-                let text = match secs {
-                    0 => return None,
-                    s if s < 60 => format!("{s}s"),
-                    s => format!("{}m{:02}s", s / 60, s % 60),
-                };
-                Some(StatusSegment::dim(text))
+                if secs == 0 {
+                    return None;
+                }
+                Some(StatusSegment::dim(crate::views::dock::fmt_elapsed(secs)))
             }
             StatusLineItem::SessionName => {
                 let name = ctx.session_name.as_deref().filter(|s| !s.is_empty())?;

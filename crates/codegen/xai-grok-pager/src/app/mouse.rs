@@ -254,6 +254,25 @@ impl AgentView {
                         xai_grok_telemetry::events::AnnouncementCtaSurface::Header,
                     ));
                 }
+                if self.hit_dashboard.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(if self.in_dashboard_overlay {
+                        Action::DashboardOverlayExit
+                    } else {
+                        Action::OpenDashboard
+                    });
+                }
+                if self.hit_overlay_prev.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::DashboardOverlayPrev);
+                }
+                if self.hit_overlay_next.contains(mouse.column, mouse.row)
+                    && !self.pos_occluded(mouse.column, mouse.row)
+                {
+                    return InputOutcome::Action(Action::DashboardOverlayNext);
+                }
                 if self.hit_cwd.contains(mouse.column, mouse.row) {
                     let path = self.session.cwd.display().to_string();
                     self.copy_to_clipboard(&path);
@@ -452,18 +471,13 @@ impl AgentView {
                 }
                 match self.pane_areas.hit_test(mouse.column, mouse.row) {
                     Some(AgentPane::Dock) => {
-                        self.set_active_pane(AgentPane::Dock, false);
                         let row = mouse.row.saturating_sub(self.pane_areas.dock.y);
-                        let items = self.dock_items();
                         if let Some(item) = crate::views::dock::item_at(&self.dock_counts(), row) {
-                            if let Some(index) =
-                                items.iter().position(|candidate| *candidate == item)
-                            {
-                                self.dock_cursor = index;
-                            }
-                            self.dock_activate(item);
+                            self.handle_dock_click(item)
+                        } else {
+                            self.set_active_pane(AgentPane::Dock, false);
+                            InputOutcome::Changed
                         }
-                        InputOutcome::Changed
                     }
                     Some(AgentPane::Todo) => {
                         self.set_active_pane(AgentPane::Todo, false);
@@ -1154,6 +1168,9 @@ impl AgentView {
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_dashboard.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_overlay_prev.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_overlay_next.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_upgrade_cta.update_hover(mouse.column, mouse.row);
                 {
                     let new_kill = self

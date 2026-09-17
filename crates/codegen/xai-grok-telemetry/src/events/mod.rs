@@ -14,8 +14,10 @@ use super::enums::PermissionMode;
 pub use super::enums::PrCreationSource;
 
 mod active_agent_message;
+mod feedback;
 mod permission_analytics;
 pub use active_agent_message::*;
+pub use feedback::*;
 pub use permission_analytics::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
@@ -1803,7 +1805,11 @@ pub struct CodingDataConsentSelected {
 #[serde(rename_all = "snake_case")]
 pub enum FeedbackTraceConsentChoice {
     TurnOn,
+    /// Upload only the session attached to this feedback report.
+    SendThisSession,
     NoUpload,
+    /// Close the in-modal trace prompt without choosing.
+    Dismissed,
     NeverAsk,
 }
 
@@ -2466,6 +2472,8 @@ telemetry_event!(
     external = crate::external::schema::map_user_prompt
 );
 telemetry_event!(UserFeedback, "user_feedback");
+telemetry_event!(FeedbackModalOpened, "feedback_modal_opened");
+telemetry_event!(FeedbackDraftOp, "feedback_draft_op");
 telemetry_event!(RolloutSurvey, "rollout_survey");
 telemetry_event!(PrCreated, "pr_created");
 telemetry_event!(PrMerged, "pr_merged");
@@ -2632,6 +2640,34 @@ telemetry_event!(
     crate::memory_telemetry::MemorySessionSummary,
     "memory_session_summary"
 );
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2ControlsPinned,
+    "memory_v2_controls_pinned"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2CaptureLifecycle,
+    "memory_v2_capture_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FlushResult,
+    "memory_v2_flush_result"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2DreamLifecycle,
+    "memory_v2_dream_lifecycle"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2GcCompleted,
+    "memory_v2_gc_completed"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2Forgotten,
+    "memory_v2_forgotten"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2FailClosed,
+    "memory_v2_fail_closed"
+);
 
 #[cfg(test)]
 mod tests {
@@ -2659,6 +2695,7 @@ mod tests {
         const SOURCES: &[&str] = &[
             include_str!("mod.rs"),
             include_str!("active_agent_message.rs"),
+            include_str!("feedback.rs"),
             include_str!("permission_analytics.rs"),
             include_str!("../session_metrics.rs"),
             include_str!("../memory_telemetry.rs"),
@@ -2781,6 +2818,8 @@ mod tests {
             ("TurnCompletedLifecycle", "session_id"),
             ("TurnCompletedLifecycle", "turn_number"),
             ("UserFeedback", "session_id"),
+            ("FeedbackDraftOp", "session_id"),
+            ("FeedbackModalOpened", "session_id"),
         ];
         let allowed: std::collections::BTreeSet<(String, String)> = ALLOWED
             .iter()

@@ -1,6 +1,8 @@
 use super::*;
-use crate::tools::tool_context::BlockingWaitState;
+use crate::tools::tool_context::{BlockingWaitState, ParentInterjectSignal};
+use std::time::Duration;
 use xai_grok_tools::types::output::ToolOutput;
+use xai_interjection_core::{InterjectionBuffer, PendingInterjection};
 use xai_tool_types::TaskOutputOutput;
 
 fn ids(xs: &[&str]) -> Vec<String> {
@@ -9,10 +11,13 @@ fn ids(xs: &[&str]) -> Vec<String> {
 
 #[test]
 fn interrupted_wait_result_is_cancelled_not_error() {
-    let result = interrupted_wait_tool_result(&serde_json::json!({
-        "task_ids": ["bg-9"],
-        "timeout_ms": 60_000
-    }));
+    let result = interrupted_wait_tool_result(
+        &serde_json::json!({
+            "task_ids": ["bg-9"],
+            "timeout_ms": 60_000
+        }),
+        WaitInterruptCause::HumanInterjection,
+    );
     assert!(result.prompt_text.contains(WAIT_INTERRUPTED_HEAD));
     match &result.output {
         ToolOutput::TaskOutput(TaskOutputOutput::Result(res)) => {
@@ -26,10 +31,13 @@ fn interrupted_wait_result_is_cancelled_not_error() {
 
 #[test]
 fn interrupted_wait_result_does_not_list_ids() {
-    let result = interrupted_wait_tool_result(&serde_json::json!({
-        "task_ids": ["wait-a", "wait-b", "wait-c"],
-        "timeout_ms": 600_000
-    }));
+    let result = interrupted_wait_tool_result(
+        &serde_json::json!({
+            "task_ids": ["wait-a", "wait-b", "wait-c"],
+            "timeout_ms": 600_000
+        }),
+        WaitInterruptCause::HumanInterjection,
+    );
     for id in ["wait-a", "wait-b", "wait-c"] {
         assert!(
             !result.prompt_text.contains(id),
@@ -54,7 +62,10 @@ fn interrupted_wait_result_does_not_list_ids() {
 
 #[test]
 fn empty_wait_interrupt_result_is_head_line_only() {
-    let result = interrupted_wait_tool_result(&serde_json::json!({}));
+    let result = interrupted_wait_tool_result(
+        &serde_json::json!({}),
+        WaitInterruptCause::HumanInterjection,
+    );
     assert_eq!(result.prompt_text, WAIT_INTERRUPTED_HEAD);
     assert!(!result.prompt_text.contains("Interrupted wait set"));
     match &result.output {
@@ -393,5 +404,98 @@ fn empty_requested_ids_do_not_consume_the_set() {
     assert_eq!(
         state.interrupted_wait_ids().as_deref(),
         Some(ids(&["orig-a"]).as_slice())
+    );
+}
+
+#[test]
+fn parent_interject_wait_result_is_cancelled_with_the_agent_head() {
+    let result = interrupted_wait_tool_result(
+        &serde_json::json!({"task_ids": ["bg-9"], "timeout_ms": 60_000}),
+        WaitInterruptCause::ParentInterject,
+    );
+    assert!(
+        result
+            .prompt_text
+            .starts_with(WAIT_INTERRUPTED_BY_AGENT_MESSAGE_HEAD)
+    );
+    assert_eq!(
+        interrupted_wait_prompt(true, WaitInterruptCause::ParentInterject),
+        result.prompt_text
+    );
+    match &result.output {
+        ToolOutput::TaskOutput(TaskOutputOutput::Result(res)) => {
+            assert_eq!(res.task_id, "bg-9");
+            assert_eq!(res.status, "cancelled");
+        }
+        other => panic!("expected TaskOutput Result, got {other:?}"),
+    }
+}
+
+fn user_message() -> PendingInterjection<agent_client_protocol::ImageContent> {
+    PendingInterjection {
+        text: "user message".to_owned(),
+        attachments: Vec::new(),
+    }
+}
+
+async fn race_wait(
+    human: &InterjectionBuffer<agent_client_protocol::ImageContent>,
+    parent: &ParentInterjectSignal,
+    wait: impl Future<Output = &'static str>,
+) -> Result<&'static str, WaitInterruptCause> {
+    tokio::select! {
+        biased;
+        result = wait => Ok(result),
+        cause = wait_for_wait_interrupt(human, parent) => Err(cause),
+    }
+}
+
+async fn never_finishes() -> &'static str {
+    tokio::time::sleep(Duration::from_secs(3600)).await;
+    "wait-result"
+}
+
+#[tokio::test(start_paused = true)]
+async fn human_interjection_aborts_an_in_flight_wait() {
+    let human = InterjectionBuffer::new();
+    let parent = ParentInterjectSignal::default();
+    human.push(user_message());
+    assert_eq!(
+        Err(WaitInterruptCause::HumanInterjection),
+        race_wait(&human, &parent, never_finishes()).await
+    );
+    assert_eq!(
+        Ok("wait-result"),
+        race_wait(&human, &parent, async { "wait-result" }).await
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn parent_interject_signal_aborts_an_in_flight_wait() {
+    let human = InterjectionBuffer::new();
+    let parent = ParentInterjectSignal::default();
+    parent.set_pending(true);
+    assert_eq!(
+        Err(WaitInterruptCause::ParentInterject),
+        race_wait(&human, &parent, never_finishes()).await
+    );
+    parent.set_pending(false);
+    let unresolved = tokio::time::timeout(
+        Duration::from_millis(500),
+        race_wait(&human, &parent, never_finishes()),
+    )
+    .await;
+    assert!(unresolved.is_err(), "cleared parent signal must not abort");
+}
+
+#[tokio::test(start_paused = true)]
+async fn human_interjection_wins_when_both_lanes_are_pending() {
+    let human = InterjectionBuffer::new();
+    let parent = ParentInterjectSignal::default();
+    human.push(user_message());
+    parent.set_pending(true);
+    assert_eq!(
+        Err(WaitInterruptCause::HumanInterjection),
+        race_wait(&human, &parent, never_finishes()).await
     );
 }

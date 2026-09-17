@@ -28,6 +28,7 @@ use crate::implementations::grok_build::image_gen::ImageGenInput;
 use crate::implementations::grok_build::list_dir::ListDirInput;
 use crate::implementations::grok_build::read_file::ReadFileInput;
 use crate::implementations::grok_build::search_replace::SearchReplaceInput;
+use crate::implementations::grok_build::send_feedback::SendFeedbackInput;
 use crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput;
 use crate::implementations::grok_build::session_collaboration::{
     ListSessionsInput, MessageSessionInput, ReadSessionInput,
@@ -131,6 +132,7 @@ pub enum ToolInput {
         crate::implementations::grok_build::mission::InspectMissionReadinessInput,
     ),
     EndFeatureRun(crate::implementations::grok_build::mission::EndFeatureRunInput),
+    SendFeedback(SendFeedbackInput),
     /// Dynamic input for runtime-registered tools (MCP, etc.)
     Dynamic(serde_json::Value),
 }

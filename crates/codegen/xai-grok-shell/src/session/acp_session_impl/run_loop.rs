@@ -322,6 +322,7 @@ pub(super) async fn run_session(
         SessionActor::maybe_start_running_task(session_for_mcp.clone(), completion_tx_for_mcp)
             .await;
     });
+    session.resume_v2_capture().await;
     let mut model_switch_rx = session.models_manager.subscribe_model_switch();
     let _ = *model_switch_rx.borrow_and_update();
     let idle_flush_sleep = match session.idle_flush_timeout {
@@ -339,7 +340,7 @@ pub(super) async fn run_session(
                 biased;
                 // Idle flush timer fired — run background flush.
                 _ = &mut idle_flush_sleep, if session.idle_flush_timeout.is_some()
-                    && session.memory.is_enabled()
+                    && session.memory.uses_legacy_pipeline()
                     && !session.memory.is_flushing.load(std::sync::atomic::Ordering::Relaxed) => {
                     // Skip if no new messages since last idle flush
                     let current_len = session.chat_state_handle.get_conversation_len().await;
@@ -370,7 +371,7 @@ pub(super) async fn run_session(
                 }
                 // Dream check timer — periodically run dream consolidation.
                 _ = &mut dream_check_sleep, if session.dream_check_timeout.is_some()
-                    && session.memory.is_enabled() => {
+                    && session.memory.uses_legacy_pipeline() => {
                     tracing::debug!(target: xai_grok_telemetry::memory_log::TARGET,
                         "MEMORY_DREAM_CHECK: timer fired");
                     tokio::task::spawn_local({
@@ -503,8 +504,34 @@ pub(super) async fn run_session(
                             ..
                         })
                     );
+                    let v2_capture_eligible = super::memory_capture::is_successful_query_loop(
+                        &result,
+                    ) && {
+                        let state = session.state.lock().await;
+                        state.pending_inputs.front().is_some_and(|input| {
+                            input.prompt_id == prompt_id
+                                && input.queue_meta.is_some()
+                                && !input.origin.is_synthetic()
+                                && crate::session::slash_authority::parse_slash_prefix(
+                                    &input.prompt_blocks,
+                                )
+                                .is_none()
+                        })
+                    };
+                    let v2_capture_source_prompt_index = if v2_capture_eligible {
+                        Some(*session.tool_context.prompt_index.lock().await)
+                    } else {
+                        None
+                    };
                     let completed_prompt_id = prompt_id.clone();
                     let owned_completion = session.handle_completion(prompt_id, epoch, &task_identity, result, elapsed_ms).await;
+                    if owned_completion
+                        && let Some(source_prompt_index) = v2_capture_source_prompt_index
+                    {
+                        session
+                            .enqueue_v2_completed_turn(source_prompt_index)
+                            .await;
+                    }
                     #[cfg(test)]
                     if let Some(processed) = processed { let _ = processed.send(()); }
                     session.auto_exit_swarm_mode().await;
@@ -573,6 +600,8 @@ pub(super) async fn run_session(
                         // session-end `Stop`. Hooks fire BEFORE memory auto-save per plan contract.
                         turn_end_queue.flush().await;
                         fire_session_end_hooks(&session, "channel_closed").await;
+                        session.memory.stop_capture_worker().await;
+                        session.memory.dream_workers.cancel_and_join().await;
                         session
                             .run_session_end_memory_pipeline(
                                 "channel closed, session summary saved",
@@ -1149,7 +1178,15 @@ pub(super) async fn run_session(
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
                                 if s.memory.is_enabled() {
-                                    let did_flush = s.run_memory_flush("user_requested", None).await;
+                                    let did_flush =
+                                        if s.memory.mode() == Some(crate::config::MemoryMode::V2) {
+                                            matches!(
+                                                s.flush_v2_capture().await,
+                                                crate::session::memory::v2_capture::FlushResult::Success
+                                            )
+                                        } else {
+                                            s.run_memory_flush("user_requested", None).await
+                                        };
                                     let _ = respond_to.send(Ok(did_flush));
                                 } else {
                                     let _ = respond_to.send(Err(
@@ -1157,6 +1194,17 @@ pub(super) async fn run_session(
                                             .data("memory is not enabled for this session".to_string())
                                     ));
                                 }
+                            });
+                        }
+                        SessionCommand::MemoryForget {
+                            path,
+                            expected_content_hash,
+                            respond_to,
+                        } => {
+                            let s = session.clone();
+                            tokio::task::spawn_local(async move {
+                                let response = s.memory_forget(&path, &expected_content_hash).await;
+                                let _ = respond_to.send(response);
                             });
                         }
                         SessionCommand::SetYoloMode { enabled } => {
@@ -1693,7 +1741,7 @@ pub(super) async fn run_session(
                                         schema,
                                         meta,
                                     );
-                                    if let Some(reg) = mcp_tool.into_registration() {
+                                    if let Ok(reg) = mcp_tool.into_registration() {
                                         mcp_state
                                             .disabled_tool_registrations
                                             .insert(qualified.clone(), reg);
@@ -2433,6 +2481,8 @@ pub(super) async fn run_session(
                             // Hooks fire BEFORE memory auto-save per plan contract.
                             turn_end_queue.flush().await;
                             fire_session_end_hooks(&session, "shutdown").await;
+                            session.memory.stop_capture_worker().await;
+                            session.memory.dream_workers.cancel_and_join().await;
                             session
                                 .run_session_end_memory_pipeline("session summary saved")
                                 .await;

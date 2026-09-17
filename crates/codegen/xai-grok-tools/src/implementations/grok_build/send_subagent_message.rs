@@ -1,15 +1,67 @@
 use crate::implementations::grok_build::task::backend::SubagentBackendResource;
 use crate::implementations::grok_build::task::types::{
-    ActiveAgentMessageOutcome, ActiveAgentMessageRequest, SubagentDepthCounter,
+    ActiveAgentMessageOperation, ActiveAgentMessageOutcome, ActiveAgentMessageRequest,
+    SubagentDepthCounter,
 };
 use crate::types::tool::{ToolKind, ToolNamespace};
 
 pub const SEND_SUBAGENT_MESSAGE_TOOL_NAME: &str = "send_subagent_message";
 
+/// How the message reaches an active subagent.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SendSubagentMessageDelivery {
+    /// Join the current turn at its next safe point (default).
+    Steer,
+    /// Wait as a later turn.
+    Queue,
+    /// Urgent: delivered ahead of pending steers; also interrupts a wait on
+    /// background work once the child runtime admits it.
+    Interject,
+}
+
+impl From<SendSubagentMessageDelivery> for ActiveAgentMessageOperation {
+    fn from(delivery: SendSubagentMessageDelivery) -> Self {
+        match delivery {
+            SendSubagentMessageDelivery::Steer => ActiveAgentMessageOperation::Steer,
+            SendSubagentMessageDelivery::Queue => ActiveAgentMessageOperation::Queue,
+            SendSubagentMessageDelivery::Interject => ActiveAgentMessageOperation::Interject,
+        }
+    }
+}
+
+/// The one place the legacy `queue` flag becomes an operation.
+pub fn resolve_delivery(
+    delivery: Option<SendSubagentMessageDelivery>,
+    legacy_queue: bool,
+) -> ActiveAgentMessageOperation {
+    match delivery {
+        Some(delivery) => ActiveAgentMessageOperation::from(delivery),
+        None if legacy_queue => ActiveAgentMessageOperation::Queue,
+        None => ActiveAgentMessageOperation::Steer,
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SendSubagentMessageInput {
     pub subagent_id: String,
     pub text: String,
+    /// Delivery operation; omitted means `steer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<SendSubagentMessageDelivery>,
+    /// Legacy `queue: true`; accepted on the wire, hidden from the schema,
+    /// ignored when `delivery` is present.
+    #[serde(default)]
+    #[schemars(skip)]
+    pub queue: bool,
+}
+
+impl SendSubagentMessageInput {
+    pub fn operation(&self) -> ActiveAgentMessageOperation {
+        resolve_delivery(self.delivery, self.queue)
+    }
 }
 
 #[derive(
@@ -135,7 +187,7 @@ impl crate::types::tool_metadata::ToolMetadata for SendSubagentMessageTool {
     }
 
     fn description_template(&self) -> &str {
-        "Send a follow-up message to an active subagent owned by this session. The subagent must still be active and accepting messages."
+        "Send a follow-up message to an active subagent owned by this session. The subagent must still be active and accepting messages. `delivery` selects how the message lands: `steer` (default) joins the current turn at its next safe point; `queue` waits as a later turn; `interject` is urgent — it is delivered ahead of pending steers and interrupts a subagent blocked waiting on background work."
     }
 }
 
@@ -187,7 +239,12 @@ impl xai_tool_runtime::Tool for SendSubagentMessageTool {
         let (Some(0), Some(backend)) = (depth, backend) else {
             return Ok(SendSubagentMessageOutput::Unsupported);
         };
-        let request = match ActiveAgentMessageRequest::try_new(input.subagent_id, input.text) {
+        let operation = input.operation();
+        let request = match ActiveAgentMessageRequest::try_new_with_operation(
+            input.subagent_id,
+            input.text,
+            operation,
+        ) {
             Ok(request) => request,
             Err(outcome) => return Ok(outcome.into()),
         };

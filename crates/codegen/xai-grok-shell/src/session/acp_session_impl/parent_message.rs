@@ -40,10 +40,6 @@ impl SessionActor {
         completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
         commit: impl FnOnce(&mut State, InputItem) -> bool,
     ) {
-        if operation != ActiveAgentMessageOperation::Queue {
-            let _ = respond_to.send(ActiveMessageAdmission::Unsupported);
-            return;
-        }
         let receipt_permit = match receipt_sink.reserve_owned().await {
             Ok(permit) => permit,
             Err(_) => {
@@ -110,6 +106,9 @@ impl SessionActor {
             }),
         });
         let _ = respond_to.send(ActiveMessageAdmission::Admitted);
+        if operation == ActiveAgentMessageOperation::Interject {
+            self.tool_context.parent_interject.set_pending(true);
+        }
         Self::maybe_start_running_task(self.clone(), completion_tx).await;
     }
 

@@ -2,15 +2,15 @@
 #[allow(unused_imports)]
 use super::common::*;
 
-/// **1× Esc from the PROMPT pane cancels a running turn even with a non-empty
-/// draft, and the draft is PRESERVED** (unlike Ctrl+C, which clears the draft
-/// first). The harness spawns with the default (non-vim) config, so the
-/// Esc-cancel gate is on. Proves the real binary routes a bare Esc through
-/// `try_handle_esc_policy`'s turn-running branch before the idle clear/rewind
-/// branches, and that cancel does not wipe the composer.
+/// **1× Esc from the PROMPT pane does not cancel a running turn.** The
+/// draft is preserved and the stream keeps going. Ctrl+C (empty composer)
+/// is the cancel gesture. The harness spawns with the default (non-vim)
+/// config. Proves the real binary routes a bare Esc through
+/// `try_handle_esc_policy`'s mid-turn hint branch before the idle
+/// clear/rewind branches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn esc_cancels_running_turn_from_prompt_preserves_draft() {
+async fn esc_mid_turn_from_prompt_hints_instead_of_cancelling() {
     let content = ContentController::start().await.expect("start content");
     // Long paced stream so the turn is still visibly running when Esc lands.
     let long_response = format!(
@@ -44,26 +44,24 @@ async fn esc_cancels_running_turn_from_prompt_preserves_draft() {
         .wait_for_text(draft, Duration::from_secs(10))
         .expect("draft renders in the composer");
 
-    // 1× Esc cancels immediately (turn-running branch wins over idle clear).
+    // 1× Esc must hint, not cancel.
     harness.inject_keys(keys::ESC).expect("press esc");
     harness.update(Duration::from_millis(200));
-
-    harness
-        .wait_for_text("Turn cancelled by user", Duration::from_secs(15))
-        .expect("turn cancelled marker");
 
     harness.update(Duration::from_millis(600));
     let screen = harness.screen_contents();
 
-    // The draft must survive the cancel — Esc cancels, it does not clear.
+    assert!(
+        !screen.contains("Turn cancelled by user"),
+        "mid-turn Esc must not cancel\nscreen:\n{screen}"
+    );
     assert!(
         screen.contains(draft),
-        "Esc cancel must preserve the draft (not clear it like Ctrl+C)\nscreen:\n{screen}"
+        "mid-turn Esc must preserve the draft\nscreen:\n{screen}"
     );
-    // No double-press confirm leaked into the bar — single Esc was enough.
     assert!(
         !screen.contains("press again to clear"),
-        "running-turn Esc must cancel, never arm the idle clear\nscreen:\n{screen}"
+        "running-turn Esc must not arm the idle clear\nscreen:\n{screen}"
     );
     assert!(
         !harness.contains_text("panicked"),

@@ -7,8 +7,8 @@ use serde_json::json;
 use xai_grok_mcp::rmcp;
 use xai_grok_mcp::rmcp::ServerHandler;
 use xai_grok_mcp::rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ErrorData as McpError, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData as McpError,
+    JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 
 #[derive(Clone)]
@@ -67,8 +67,7 @@ impl ServerHandler for TestMcpServer {
         async move {
             Ok(ListToolsResult {
                 tools: (*tools).clone(),
-                next_cursor: None,
-                meta: None,
+                ..Default::default()
             })
         }
     }
@@ -77,7 +76,7 @@ impl ServerHandler for TestMcpServer {
         &self,
         request: CallToolRequestParams,
         _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         match request.name.as_ref() {
             "echo" => {
                 let args: EchoArgs = match request.arguments {
@@ -98,10 +97,9 @@ impl ServerHandler for TestMcpServer {
                     }
                 };
 
-                Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-                    "ECHO: {}",
-                    args.message
-                ))]))
+                Ok(CallToolResponse::Complete(CallToolResult::success(vec![
+                    ContentBlock::text(format!("ECHO: {}", args.message)),
+                ])))
             }
             other => Err(McpError::invalid_params(
                 format!("unknown tool: {other}"),
@@ -182,7 +180,7 @@ mod mcp_apps_tests {
             Arc::new(schema),
         );
         let meta_map: JsonObject = serde_json::from_value(json!({ "ui": ui_meta })).unwrap();
-        tool.meta = Some(rmcp::model::Meta(meta_map));
+        tool.meta = Some(rmcp::model::MetaObject::from(meta_map));
         tool
     }
 

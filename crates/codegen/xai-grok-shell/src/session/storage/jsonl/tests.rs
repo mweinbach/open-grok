@@ -34,6 +34,28 @@ fn create_test_notification() -> acp::SessionNotification {
 fn create_test_plan_state() -> TodoState {
     TodoState::default()
 }
+#[test]
+fn bounded_chat_history_read_rejects_byte_and_item_overflow() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join(crate::session::storage::CHAT_HISTORY_FILE);
+    let line = serde_json::to_string(&ConversationItem::user("bounded")).unwrap();
+    std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+    let adapter = JsonlStorageAdapter::with_explicit_session_dir(temp_dir.path().to_path_buf());
+    assert!(
+        adapter
+            .load_chat_history_bounded_from_dir(temp_dir.path(), line.len(), 10)
+            .unwrap_err()
+            .to_string()
+            .contains("byte")
+    );
+    assert!(
+        adapter
+            .load_chat_history_bounded_from_dir(temp_dir.path(), 1_024, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("item")
+    );
+}
 #[tokio::test]
 async fn write_compaction_segment_numbers_and_indexes_resume_safely() {
     use crate::extensions::notification::CompactionSegmentFile;

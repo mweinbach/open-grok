@@ -974,8 +974,9 @@ pub(crate) async fn spawn_session_actor(
     // Local storage/FTS is provider-neutral. The user may also keep xAI
     // connected as the semantic embedding backend while chatting through
     // Codex, so this path is intentionally independent of the chat provider.
-    let memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
-        if mc.flat_memory_root
+    let mut memory_storage_for_session = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
+        if mc.mode.is_legacy()
+            && mc.flat_memory_root
             && let Some(ref root) = mc.root_dir_override
         {
             return crate::session::memory::MemoryStorage::new_flat(
@@ -983,20 +984,59 @@ pub(crate) async fn spawn_session_actor(
                 root,
             );
         }
-        crate::session::memory::MemoryStorage::new(
+        crate::session::memory::MemoryStorage::new_for_mode(
             tool_context.cwd.as_path(),
             mc.root_dir_override.as_deref(),
+            mc.mode,
         )
     });
+    if memory_storage_for_session
+        .as_ref()
+        .is_some_and(|storage| storage.mode().is_v2() && storage.is_ephemeral())
+    {
+        tracing::info!(
+            target: xai_grok_telemetry::memory_log::TARGET,
+            cwd = %tool_context.cwd.as_path().display(),
+            "MEMORY_INIT: memory-v2 is disabled for ephemeral (temp-dir) workspaces"
+        );
+        memory_storage_for_session = None;
+    }
     let memory_initial_injection_config = memory_config
         .as_ref()
         .map_or_else(Default::default, |mc| mc.initial_injection.clone());
     let mut memory_backend_params_for_session: Option<crate::session::memory::MemoryBackendParams> =
         None;
     let mut memory_search_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>> = None;
+    let mut memory_v2_access = None;
+    if let Some(storage) = memory_storage_for_session
+        .as_ref()
+        .filter(|storage| storage.mode().is_v2())
+    {
+        match crate::session::memory::V2MemoryAccessPolicy::new(
+            storage.global_dir(),
+            storage.workspace_dir(),
+        ) {
+            Ok(policy) => {
+                memory_v2_access = Some(xai_grok_tools::types::memory_v2::MemoryV2AccessResource(
+                    std::sync::Arc::new(policy),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: xai_grok_telemetry::memory_log::TARGET,
+                    error = %error,
+                    "MEMORY_INIT: memory-v2 file access policy failed; memory is disabled for this session"
+                );
+                memory_storage_for_session = None;
+            }
+        }
+    }
     let memory_backend_for_spec: Option<
         std::sync::Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
-    > = if let Some(ref storage) = memory_storage_for_session {
+    > = if let Some(ref storage) = memory_storage_for_session
+        .as_ref()
+        .filter(|storage| storage.mode().is_legacy())
+    {
         if let Err(e) = storage.ensure_initialized() {
             tracing::warn!(
                 target: xai_grok_telemetry::memory_log::TARGET,
@@ -1005,7 +1045,7 @@ pub(crate) async fn spawn_session_actor(
             );
         }
         {
-            let gc_storage = storage.clone();
+            let gc_storage = (*storage).clone();
             let gc_max_age = memory_config.as_ref().map_or(30, |mc| mc.gc.max_age_days);
             tokio::task::spawn_blocking(move || match gc_storage.gc(gc_max_age) {
                 Ok(removed) if removed > 0 => {
@@ -1066,7 +1106,7 @@ pub(crate) async fn spawn_session_actor(
             embedding_credentials,
         };
         let backend = crate::session::memory::MemoryBackendImpl::from_session_params(
-            storage.clone(),
+            (*storage).clone(),
             &params,
         );
         memory_search_counter = Some(backend.search_counter.clone());
@@ -1109,6 +1149,34 @@ pub(crate) async fn spawn_session_actor(
             },
         );
         Some(backend)
+    } else if memory_storage_for_session
+        .as_ref()
+        .is_some_and(|storage| storage.mode().is_v2())
+    {
+        if let Some(storage) = memory_storage_for_session.clone() {
+            match crate::session::memory_state::initialize_memory_storage(storage).await {
+                Ok(()) => {
+                    if let Some(storage) = memory_storage_for_session.as_ref() {
+                        tracing::info!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            workspace = %storage.workspace_dir().display(),
+                            global = %storage.global_dir().display(),
+                            "MEMORY_INIT: memory-v2 storage created"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: xai_grok_telemetry::memory_log::TARGET,
+                        error = %error,
+                        "MEMORY_INIT: memory-v2 initialization failed; memory is disabled for this session"
+                    );
+                    memory_storage_for_session = None;
+                    memory_v2_access = None;
+                }
+            }
+        }
+        None
     } else {
         tracing::debug!(
             target: xai_grok_telemetry::memory_log::TARGET,
@@ -1201,6 +1269,10 @@ pub(crate) async fn spawn_session_actor(
             .as_ref()
             .map(|s| s.workspace_memory_file().to_string_lossy().into_owned()),
         memory_backend: memory_backend_for_spec,
+        memory_v2_access,
+        memory_v2_exposed: memory_config
+            .as_ref()
+            .is_some_and(|mc| mc.enabled && mc.mode.is_v2() && mc.v2.can_expose_memory()),
         web_search: parking_lot::RwLock::new(web_search_state.clone()),
         active_sampling_config: parking_lot::RwLock::new(sampling_config.clone()),
         chat_state_handle: chat_state_handle.clone(),
@@ -1927,41 +1999,71 @@ pub(crate) async fn spawn_session_actor(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
-        memory: super::memory_state::SessionMemory {
-            experience_run_id: uuid::Uuid::now_v7().to_string(),
-            experience_prior_tool_result_ids,
-            embedding_provider: sampling_config.provider,
-            active_provider: std::cell::Cell::new(sampling_config.provider),
-            flush_config: memory_config.as_ref().map_or_else(
-                || crate::config::MemoryFlushConfig {
-                    enabled: false,
-                    ..Default::default()
+        memory: {
+            let is_v2 = memory_config.as_ref().is_some_and(|mc| mc.mode.is_v2());
+            super::memory_state::SessionMemory {
+                experience_run_id: uuid::Uuid::now_v7().to_string(),
+                experience_prior_tool_result_ids,
+                embedding_provider: sampling_config.provider,
+                active_provider: std::cell::Cell::new(sampling_config.provider),
+                flush_config: if is_v2 {
+                    crate::config::MemoryFlushConfig {
+                        enabled: false,
+                        ..Default::default()
+                    }
+                } else {
+                    memory_config.as_ref().map_or_else(
+                        || crate::config::MemoryFlushConfig {
+                            enabled: false,
+                            ..Default::default()
+                        },
+                        |mc| mc.flush.clone(),
+                    )
                 },
-                |mc| mc.flush.clone(),
-            ),
-            is_flushing: std::sync::atomic::AtomicBool::new(false),
-            last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
-            storage: std::cell::RefCell::new(memory_storage_for_session),
-            save_on_end: memory_config
-                .as_ref()
-                .is_none_or(|mc| mc.session.save_on_end),
-            backend_params: memory_backend_params_for_session,
-            initial_injection_config: memory_initial_injection_config,
-            context_injected: std::sync::atomic::AtomicBool::new(false),
-            flush_count: std::sync::atomic::AtomicU64::new(0),
-            last_flush_content: std::cell::RefCell::new(None),
-            flush_success_count: std::sync::atomic::AtomicU64::new(0),
-            flush_error_count: std::sync::atomic::AtomicU64::new(0),
-            search_counter: std::cell::RefCell::new(memory_search_counter),
-            injection_count: std::sync::atomic::AtomicU64::new(0),
-            compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
-            chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            dream_config: memory_config
-                .as_ref()
-                .map_or_else(Default::default, |mc| mc.dream),
-            dream_count: std::sync::atomic::AtomicU64::new(0),
-            dream_success_count: std::sync::atomic::AtomicU64::new(0),
-            dream_error_count: std::sync::atomic::AtomicU64::new(0),
+                is_flushing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+                configured_storage: memory_storage_for_session.clone(),
+                storage: std::cell::RefCell::new(memory_storage_for_session),
+                save_on_end: !is_v2
+                    && memory_config
+                        .as_ref()
+                        .is_none_or(|mc| mc.session.save_on_end),
+                backend_params: memory_backend_params_for_session,
+                initial_injection_config: if is_v2 {
+                    crate::config::MemoryInitialInjectionConfig {
+                        enabled: false,
+                        ..Default::default()
+                    }
+                } else {
+                    memory_initial_injection_config
+                },
+                context_injected: std::sync::atomic::AtomicBool::new(false),
+                capture_worker: std::cell::RefCell::new(None),
+                dream_workers: super::memory_state::V2DreamWorkers::default(),
+                last_capture_failure: std::cell::RefCell::new(None),
+                init_reindex_handle: std::cell::RefCell::new(None),
+                token_totals: Default::default(),
+                flush_count: std::sync::atomic::AtomicU64::new(0),
+                last_flush_content: std::cell::RefCell::new(None),
+                flush_success_count: std::sync::atomic::AtomicU64::new(0),
+                flush_error_count: std::sync::atomic::AtomicU64::new(0),
+                search_counter: std::cell::RefCell::new(memory_search_counter),
+                injection_count: std::sync::atomic::AtomicU64::new(0),
+                compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
+                chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                dream_config: if is_v2 {
+                    Default::default()
+                } else {
+                    memory_config
+                        .as_ref()
+                        .map_or_else(Default::default, |mc| mc.dream)
+                },
+                dream_count: std::sync::atomic::AtomicU64::new(0),
+                dream_success_count: std::sync::atomic::AtomicU64::new(0),
+                dream_error_count: std::sync::atomic::AtomicU64::new(0),
+                configured_mode: memory_config.as_ref().map(|mc| mc.mode),
+                v2_config: memory_config.as_ref().map(|mc| mc.v2).unwrap_or_default(),
+            }
         },
         session_start: std::time::Instant::now(),
         status_wake: Default::default(),

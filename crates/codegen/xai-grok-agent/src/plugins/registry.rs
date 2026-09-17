@@ -331,6 +331,12 @@ impl SharedPluginRegistryHandle {
         self.inner.read().unwrap().clone()
     }
 
+    /// Replace the shared "latest" registry with one built elsewhere (e.g. on a blocking thread via
+    /// [`Self::refresh_and_build_for_cwd`]), so the decision to publish can stay with the caller.
+    pub fn publish(&self, registry: Option<std::sync::Arc<PluginRegistry>>) {
+        *self.inner.write().unwrap() = registry;
+    }
+
     /// Build a fresh registry for a specific session cwd.
     ///
     /// Pure registry construction (no disk mutation): also used by the read-only

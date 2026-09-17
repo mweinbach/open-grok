@@ -719,6 +719,16 @@ async fn prepare_grep(
     // Use display_cwd for output paths so model sees stable paths.
     let display_base = display_cwd_or_cwd(&cwd, display_cwd.as_deref());
     let cwd_display = display_base.display().to_string();
+    if let Err(error) = crate::types::memory_v2::validate_memory_v2_read(&resources, &workdir).await
+    {
+        return Ok(GrepStep::Early(GrepSearchOutput {
+            stdout: Vec::new(),
+            stderr: error.into_bytes(),
+            exit_code: 2,
+            match_count: 0,
+            file_matches: Vec::new(),
+        }));
+    }
 
     // Pre-check: if the search path doesn't exist, return enriched hints
     // before rg runs. We intentionally pre-check with metadata() rather

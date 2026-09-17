@@ -1196,18 +1196,21 @@ mod tests {
                 source: "global".into(),
                 size_bytes: 100,
                 modified_epoch_secs: Some(1_700_000_000),
+                generated: false,
             },
             MemoryFileInfo {
                 path: "/workspace/MEMORY.md".into(),
                 source: "workspace".into(),
                 size_bytes: 200,
                 modified_epoch_secs: Some(1_700_000_000),
+                generated: false,
             },
             MemoryFileInfo {
                 path: "/sessions/log1.md".into(),
                 source: "session".into(),
                 size_bytes: 50,
                 modified_epoch_secs: None,
+                generated: false,
             },
         ];
 

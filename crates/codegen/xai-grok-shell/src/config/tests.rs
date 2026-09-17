@@ -989,6 +989,45 @@ max_results = 8
             );
     });
 }
+#[test]
+fn memory_v2_toml_selects_isolated_mode() {
+    without_grok_memory(|| {
+        let config: toml::Value = toml::from_str("[memory_v2]\nenabled = true").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert!(mem.enabled);
+        assert_eq!(mem.mode, MemoryMode::V2);
+        assert!(mem.v2.can_capture());
+        assert!(mem.v2.can_expose_memory());
+    });
+}
+#[test]
+fn memory_legacy_toml_does_not_select_v2() {
+    without_grok_memory(|| {
+        let config: toml::Value = toml::from_str("[memory]\nenabled = true").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert!(mem.enabled);
+        assert_eq!(mem.mode, MemoryMode::Legacy);
+    });
+}
+#[test]
+fn memory_v2_false_falls_back_to_legacy() {
+    without_grok_memory(|| {
+        let config: toml::Value =
+            toml::from_str("[memory]\nenabled = true\n[memory_v2]\nenabled = false").unwrap();
+        let mem = MemoryConfig::resolve(false, false, &config, None);
+        assert!(mem.enabled);
+        assert_eq!(mem.mode, MemoryMode::Legacy);
+    });
+}
+#[test]
+fn no_memory_disables_v2() {
+    without_grok_memory(|| {
+        let config: toml::Value = toml::from_str("[memory_v2]\nenabled = true").unwrap();
+        let mem = MemoryConfig::resolve(false, true, &config, None);
+        assert!(!mem.enabled);
+        assert_eq!(mem.mode, MemoryMode::Legacy);
+    });
+}
 /// Mutex to serialize tests that touch the GROK_SUBAGENTS env var.
 static SUBAGENTS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with GROK_SUBAGENTS explicitly unset.

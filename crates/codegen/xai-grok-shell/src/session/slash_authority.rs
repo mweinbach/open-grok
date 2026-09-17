@@ -48,7 +48,7 @@ pub(super) fn resolve<'a>(
 }
 
 /// Extract `(name, args)` if the first text block starts with `/`.
-fn parse_slash_prefix(prompt_blocks: &[acp::ContentBlock]) -> Option<(&str, &str)> {
+pub(crate) fn parse_slash_prefix(prompt_blocks: &[acp::ContentBlock]) -> Option<(&str, &str)> {
     let text = prompt_blocks.iter().find_map(|block| match block {
         acp::ContentBlock::Text(text) => Some(text.text.as_str()),
         _ => None,

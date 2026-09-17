@@ -1,4 +1,4 @@
-//! Modal input handlers: agents/persona modals and the extensions modal
+//! Modal input handlers: the feedback modal, agents/persona modals, and the extensions modal
 //! (hooks, plugins, marketplace, skills, MCP servers) with its actions.
 
 use super::AgentView;
@@ -6,10 +6,176 @@ use super::AgentView;
 use super::test_fixtures;
 use crate::app::actions::Action;
 use crate::app::app_view::InputOutcome;
+use crate::views::feedback_modal::{FeedbackModalDisplacement, FeedbackModalOutcome};
 use crate::views::file_search::line_viewer::LineViewerState;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+
+#[allow(dead_code)]
+const MAX_CONCURRENT_FEEDBACK_TRACE_UPLOADS: usize = 8;
 
 impl AgentView {
+    /// The sole feedback-open guard for already-present blocking surfaces.
+    pub(crate) fn feedback_modal_open_blocker(&self) -> Option<&'static str> {
+        if self.feedback_modal.is_some() {
+            Some("The feedback form is already open")
+        } else if self.active_subagent.is_some() {
+            Some("Close the subagent view before sending feedback")
+        } else if self.question_view.is_some() {
+            Some("Finish answering the current question first")
+        } else if !self.no_input_overlay_pending()
+            || self.modal_owns_input()
+            || self.key_owner() != super::KeyOwner::Pane
+        {
+            Some("Close or answer what's open before sending feedback")
+        } else {
+            None
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn has_feedback_trace_capacity(&self) -> bool {
+        self.pending_feedback_trace_uploads.len() + self.parked_feedback_trace_consents.len()
+            < MAX_CONCURRENT_FEEDBACK_TRACE_UPLOADS
+    }
+
+    pub(crate) fn register_pending_trace_upload(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) {
+        self.pending_feedback_trace_uploads.push_back(submission_id);
+    }
+
+    pub(crate) fn park_feedback_trace_consent(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+        consent: crate::views::feedback_modal::ParkedFeedbackTraceConsent,
+    ) {
+        self.parked_feedback_trace_consents
+            .push_back((submission_id, consent));
+    }
+
+    pub(crate) fn take_parked_feedback_trace_consent(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) -> Option<crate::views::feedback_modal::ParkedFeedbackTraceConsent> {
+        let position = self
+            .parked_feedback_trace_consents
+            .iter()
+            .position(|(parked, _)| *parked == submission_id)?;
+        self.parked_feedback_trace_consents
+            .remove(position)
+            .map(|(_, consent)| consent)
+    }
+
+    pub(crate) fn take_pending_trace_upload(
+        &mut self,
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+    ) -> bool {
+        if let Some(position) = self
+            .pending_feedback_trace_uploads
+            .iter()
+            .position(|pending| *pending == submission_id)
+        {
+            let _ = self.pending_feedback_trace_uploads.remove(position);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn displace_feedback_modal(&mut self, reason: FeedbackModalDisplacement) -> bool {
+        let Some(modal) = self.feedback_modal.take() else {
+            return false;
+        };
+        let draft_disposition = if modal.is_draft_submit_pending() {
+            "The feedback send is still in progress; its outcome will appear here."
+        } else {
+            "Your draft was discarded."
+        };
+        let notice = format!("{} {draft_disposition}", reason.notice());
+        self.scrollback
+            .push_block(crate::scrollback::block::RenderBlock::system(notice));
+        true
+    }
+
+    pub(super) fn handle_feedback_modal_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        if self.feedback_modal.is_none() {
+            return InputOutcome::Unchanged;
+        }
+        let Some(modal) = self.feedback_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = modal.handle_key(key);
+        if let Some(request) = modal.take_pending_request() {
+            return InputOutcome::Action(Action::RequestFeedbackDraft { request });
+        }
+        match outcome {
+            FeedbackModalOutcome::Cancel => {
+                self.feedback_modal = None;
+                InputOutcome::Changed
+            }
+            FeedbackModalOutcome::Submit => InputOutcome::Action(Action::SubmitFeedbackModal {
+                modal_id: modal.id(),
+            }),
+            FeedbackModalOutcome::Changed => InputOutcome::Changed,
+        }
+    }
+
+    pub(super) fn handle_feedback_modal_mouse(&mut self, mouse: &MouseEvent) -> InputOutcome {
+        let Some(modal) = self.feedback_modal.as_mut() else {
+            return InputOutcome::Unchanged;
+        };
+        let outcome = modal.handle_mouse(mouse);
+        if let Some(request) = modal.take_pending_request() {
+            return InputOutcome::Action(Action::RequestFeedbackDraft { request });
+        }
+        if outcome == FeedbackModalOutcome::Cancel {
+            self.feedback_modal = None;
+        }
+        InputOutcome::Changed
+    }
+
+    pub(super) fn handle_feedback_modal_paste(&mut self, text: &str) -> InputOutcome {
+        if self
+            .feedback_modal
+            .as_ref()
+            .is_some_and(|modal| modal.blocks_composer_input())
+            && self.feedback_modal.as_ref().is_some_and(|modal| {
+                modal.active_tab() != crate::views::feedback_modal::FeedbackTab::Drafts
+            })
+        {
+            return InputOutcome::Unchanged;
+        }
+        if let Some(wrap) = crate::wrap_clipboard_image::try_decode_wrap_host_image_paste(text) {
+            return match wrap {
+                crate::wrap_clipboard_image::WrapImagePaste::Image(data) => {
+                    let pasted = crate::prompt_images::from_clipboard_data(&data);
+                    let outcome = self
+                        .feedback_modal
+                        .as_mut()
+                        .map(|modal| modal.insert_image(pasted));
+                    match outcome {
+                        Some(Ok(())) => InputOutcome::Changed,
+                        Some(Err(message)) => {
+                            if let Some(modal) = self.feedback_modal.as_mut() {
+                                modal.set_error(message);
+                            }
+                            InputOutcome::Changed
+                        }
+                        None => InputOutcome::Unchanged,
+                    }
+                }
+                crate::wrap_clipboard_image::WrapImagePaste::NoImage => InputOutcome::Unchanged,
+            };
+        }
+        if let Some(modal) = self.feedback_modal.as_mut() {
+            modal.handle_paste(text);
+            InputOutcome::Changed
+        } else {
+            InputOutcome::Unchanged
+        }
+    }
+
     // -- Agents modal input handling --
 
     pub(super) fn handle_agents_modal_key(

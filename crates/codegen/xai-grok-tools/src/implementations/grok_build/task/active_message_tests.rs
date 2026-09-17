@@ -78,4 +78,14 @@ fn try_new_defaults_to_queue_and_preserves_explicit_operation() {
     )
     .unwrap();
     assert_eq!(steered.operation(), ActiveAgentMessageOperation::Steer);
+    let interjected = ActiveAgentMessageRequest::try_new_with_operation(
+        "sub-1",
+        "follow up",
+        ActiveAgentMessageOperation::Interject,
+    )
+    .unwrap();
+    assert_eq!(
+        interjected.operation(),
+        ActiveAgentMessageOperation::Interject
+    );
 }

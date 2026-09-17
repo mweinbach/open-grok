@@ -2319,6 +2319,28 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
         agent.plugin_registry_handle.snapshot().is_none(),
         "snapshot must start empty (boot discovery deferred past initialize)"
     );
+    let list_req = acp::ExtRequest::new(
+        "x.ai/plugins/list",
+        serde_json::value::to_raw_value(&serde_json::json!({ "sessionId": "no-such-session" }))
+            .unwrap()
+            .into(),
+    );
+    let resp = crate::extensions::plugins::handle(&agent, &list_req)
+        .await
+        .expect("plugins/list");
+    let listed: serde_json::Value = serde_json::from_str(resp.0.get()).unwrap();
+    let names: Vec<&str> = listed
+        .get("result")
+        .and_then(|r| r.get("plugins"))
+        .and_then(|p| p.as_array())
+        .expect("plugins array")
+        .iter()
+        .filter_map(|p| p.get("name").and_then(|n| n.as_str()))
+        .collect();
+    assert!(
+        names.contains(&"regr-lazy-mcp-plugin"),
+        "session-less plugins/list must populate the snapshot first, got {names:?}"
+    );
     agent.ensure_plugin_registry();
     let snapshot = agent
         .plugin_registry_handle
@@ -2335,6 +2357,63 @@ async fn ensure_plugin_registry_lazily_populates_snapshot() {
             .snapshot()
             .is_some_and(|s| s.get("regr-lazy-mcp-plugin").is_some()),
         "repeat call must keep the populated snapshot"
+    );
+}
+/// Regression: the shared snapshot was built from the boot-time in-memory
+/// `[plugins]` config, which `config.toml` edits never refresh. A plugin
+/// toggled after the agent started (marketplace install, plugin enable/disable,
+/// a client editing the file) kept its boot-time `enabled` for session-less
+/// `x.ai/plugins/list` / `x.ai/skills/list` callers until restart, while
+/// per-session registries, which read disk, were right. The shared rebuild
+/// must read disk too.
+///
+/// Exercised through a project `.opengrok/config.toml` (merged by
+/// `resolve_effective_plugins_config` for the given cwd): `grok_home()` is a
+/// process-wide `OnceLock`, so the user layer cannot be isolated per test.
+#[tokio::test]
+async fn shared_plugin_registry_snapshot_reads_plugins_config_from_disk() {
+    use crate::agent::config::Config as AgentConfig;
+    use crate::auth::{AuthManager, GrokComConfig};
+    let plugin_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        plugin_dir.path().join("plugin.json"),
+        r#"{"name": "regr-disk-disabled"}"#,
+    )
+    .unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    git2::Repository::init(repo.path()).unwrap();
+    let project_config_dir = repo.path().join(".opengrok");
+    std::fs::create_dir_all(&project_config_dir).unwrap();
+    let auth_home = tempfile::tempdir().unwrap();
+    let auth_manager =
+        std::sync::Arc::new(AuthManager::new(auth_home.path(), GrokComConfig::default()));
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let gateway = GatewaySender::new(tx);
+    let mut cfg = AgentConfig::default();
+    cfg.plugins.cli_plugin_dirs = vec![plugin_dir.path().to_path_buf()];
+    let agent = MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config");
+    let rebuild = |label: &str| {
+        let (trusted, disk_cfg) = MvpAgent::registry_build_inputs(repo.path(), None);
+        agent
+            .plugin_registry_handle
+            .reload(Some(repo.path()), &disk_cfg, trusted, true);
+        agent
+            .plugin_registry_handle
+            .snapshot()
+            .unwrap_or_else(|| panic!("{label}: snapshot must be populated"))
+            .get("regr-disk-disabled")
+            .unwrap_or_else(|| panic!("{label}: plugin must be discovered"))
+            .enabled
+    };
+    assert!(rebuild("baseline"), "nothing disables the plugin yet");
+    std::fs::write(
+        project_config_dir.join("config.toml"),
+        "[plugins]\ndisabled = [\"regr-disk-disabled\"]\n",
+    )
+    .unwrap();
+    assert!(
+        !rebuild("after disk edit"),
+        "rebuild must take `disabled` from config on disk, not the boot-time config"
     );
 }
 #[cfg(unix)]

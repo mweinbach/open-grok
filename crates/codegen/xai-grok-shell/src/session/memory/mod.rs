@@ -9,11 +9,15 @@
 //! `crate::sampling` and `crate::session::helpers::session_compact`) and is
 //! not part of the relocatable core engine.
 
+pub(crate) mod capture_transcript;
 pub(crate) mod experience_ledger;
 pub mod hooks;
+pub(crate) mod v2_capture;
 
 pub use xai_grok_memory::{
     EndpointScopedCredentials, MemoryBackendImpl, MemoryBackendParams, MemoryIndex, MemoryScope,
-    MemoryStorage, archive, backend, chunker, dream, dream_lock, embed_missing_chunks, embedding,
-    index, init_sqlite_vec, mmr, query_expansion, schema, search, storage, text_utils, watcher,
+    MemorySearchSource, MemoryStorage, SaveRememberNoteError, V2AccessError, V2ManifestBudget,
+    V2MemoryAccessPolicy, V2MemoryScope, V2PathClass, archive, backend, chunker, dream, dream_lock,
+    embed_missing_chunks, embedding, index, init_sqlite_vec, mmr, noop_memory_observation_sink,
+    query_expansion, regenerate_scope_manifest, schema, search, storage, text_utils, v2, watcher,
 };

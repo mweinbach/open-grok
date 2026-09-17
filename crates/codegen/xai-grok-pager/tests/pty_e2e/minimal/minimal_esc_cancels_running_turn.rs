@@ -2,13 +2,13 @@
 #[allow(unused_imports)]
 use crate::common::*;
 
-/// Esc cancels a running turn in minimal mode (the prompt is always focused, so
-/// the turn-running Esc branch wins; minimal enables the Esc-cancel gate
-/// regardless of vim mode). The cancellation marker is finalized and committed
-/// to native scrollback like any other block.
+/// Esc does not cancel a running turn in minimal mode. It commits one
+/// "Press Ctrl+c to cancel the turn" system line and leaves the stream
+/// running. The prompt is always focused, so the turn-running Esc branch
+/// wins over idle clear/rewind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn minimal_esc_cancels_running_turn() {
+async fn minimal_esc_mid_turn_hints_instead_of_cancelling() {
     let content = ContentController::start().await.expect("start content");
     // Paced, long stream so the turn is provably still running when Esc lands.
     let long = format!(
@@ -28,13 +28,16 @@ async fn minimal_esc_cancels_running_turn() {
         .wait_for_text(MOCK_RESPONSE_SENTINEL, Duration::from_secs(30))
         .expect("turn streaming in the live tail");
 
-    harness.inject_keys(keys::ESC).expect("press esc to cancel");
+    harness.inject_keys(keys::ESC).expect("press esc");
 
-    // Full-text: minimal commits the cancel marker to native scrollback, so it
-    // may sit above the pinned viewport — check scrollback + screen.
     harness
-        .wait_for_full_text("Turn cancelled by user", Duration::from_secs(15))
-        .expect("cancellation marker committed to scrollback");
+        .wait_for_full_text("Press Ctrl+c to cancel the turn", Duration::from_secs(10))
+        .expect("minimal mid-turn Esc must commit the Ctrl+C hint");
+    assert!(
+        !harness.contains_text("Turn cancelled by user"),
+        "minimal Esc must not cancel\nscreen:\n{}",
+        harness.screen_contents()
+    );
     assert!(
         !harness.contains_text("panicked"),
         "pager panicked\nscreen:\n{}",

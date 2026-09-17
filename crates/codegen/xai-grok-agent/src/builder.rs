@@ -80,8 +80,10 @@ pub struct AgentBuilder {
     compaction_policy: CompactionPolicy,
     reminder_policy: ReminderPolicy,
     memory_enabled: bool,
+    memory_v2_enabled: bool,
     memory_global_path: Option<String>,
     memory_workspace_path: Option<String>,
+    memory_v2_access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
     is_non_interactive: bool,
     system_prompt_label: String,
     session_env: Option<Arc<HashMap<String, String>>>,
@@ -234,8 +236,10 @@ impl AgentBuilder {
             compaction_policy: CompactionPolicy::default(),
             reminder_policy: ReminderPolicy::default(),
             memory_enabled: false,
+            memory_v2_enabled: false,
             memory_global_path: None,
             memory_workspace_path: None,
+            memory_v2_access: None,
             is_non_interactive: false,
             system_prompt_label: crate::prompt::context::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
             session_env: None,
@@ -422,6 +426,22 @@ impl AgentBuilder {
         backend: Arc<dyn xai_grok_tools::types::memory_backend::MemoryBackend>,
     ) -> Self {
         self.memory_backend = Some(backend);
+        self
+    }
+    /// Install the isolated memory-v2 filesystem policy and, when `exposed`,
+    /// surface the topic/observation roots in the system prompt.
+    pub fn with_memory_v2_access(
+        mut self,
+        access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+        exposed: bool,
+    ) -> Self {
+        if let Some(access) = access.as_ref() {
+            let [global_root, workspace_root] = access.0.scope_roots();
+            self.memory_global_path = Some(global_root.to_string_lossy().into_owned());
+            self.memory_workspace_path = Some(workspace_root.to_string_lossy().into_owned());
+        }
+        self.memory_v2_enabled = exposed && access.is_some();
+        self.memory_v2_access = access;
         self
     }
     /// Set a custom filesystem backend for the ToolBridge.
@@ -809,6 +829,26 @@ impl AgentBuilder {
                 .tools
                 .extend(xai_grok_tools::implementations::codex::context_management::tool_configs());
         }
+        let is_parent_grok_build = matches!(
+            definition.builtin_name,
+            Some(
+                BuiltinAgentName::GrokBuild
+                    | BuiltinAgentName::GrokBuildPlan
+                    | BuiltinAgentName::GrokBuildPlanNoSubagents
+                    | BuiltinAgentName::GrokBuildAskUser
+            )
+        );
+        if self.prompt_audience == PromptAudience::Primary
+            && is_parent_grok_build
+            && !tool_config
+                .tools
+                .iter()
+                .any(|tool| tool.kind == Some(ToolKind::Feedback))
+        {
+            tool_config
+                .tools
+                .push((&xai_grok_tools::implementations::grok_build::SendFeedbackTool).into());
+        }
         if definition.inject_default_tools {
             if self.memory_backend.is_some() {
                 use xai_grok_tools::implementations::memory;
@@ -910,6 +950,20 @@ impl AgentBuilder {
             );
             tool_config.tools.retain(|tc| {
                 tc.id != mem_search_id && tc.id != experience_search_id && tc.id != mem_get_id
+            });
+        }
+        if self.prompt_audience == PromptAudience::Subagent {
+            let feedback_id = xai_grok_tools::registry::types::ToolConfig::for_tool::<
+                xai_grok_tools::implementations::grok_build::SendFeedbackTool,
+            >()
+            .id;
+            let feedback_name =
+                xai_grok_tools::implementations::grok_build::SEND_FEEDBACK_TOOL_NAME;
+            tool_config.tools.retain(|tool| {
+                tool.kind != Some(ToolKind::Feedback)
+                    && tool.id != feedback_id
+                    && tool.id != feedback_name
+                    && tool.name_override.as_deref() != Some(feedback_name)
             });
         }
         if self.prompt_audience == PromptAudience::Subagent || !self.ask_user_question_enabled {
@@ -1272,6 +1326,9 @@ impl AgentBuilder {
         )
         .await
         .map_err(|e| AgentBuildError::ToolError(e.to_string()))?;
+        if let Some(access) = self.memory_v2_access.clone() {
+            tool_bridge.update_resource(access).await;
+        }
         tool_bridge
             .update_resource(
                 xai_grok_tools::implementations::codex::multi_agent_v2::NativeAgentsEnabled(
@@ -1400,6 +1457,7 @@ impl AgentBuilder {
             persona_summaries: self.persona_summaries,
             build_timestamp_utc: now.to_rfc3339(),
             memory_enabled: self.memory_enabled,
+            memory_v2_enabled: self.memory_v2_enabled,
             memory_global_path: self.memory_global_path,
             memory_workspace_path: self.memory_workspace_path,
             role_instructions: self.role_instructions,
@@ -2048,6 +2106,7 @@ mod tests {
         for profile in [
             crate::config::AgentDefinition::explore(),
             crate::config::AgentDefinition::codex(),
+            crate::config::AgentDefinition::default_grok_build(),
         ] {
             let label = profile.name.clone();
             let agent = build_pager_agent(profile, false, true, PromptAudience::Subagent).await;
@@ -2064,6 +2123,10 @@ mod tests {
             assert!(
                 !names.contains(&"ask_user_question"),
                 "[{label}] subagent must not expose root-only human questions: {names:?}"
+            );
+            assert!(
+                !names.contains(&"send_feedback"),
+                "[{label}] subagent must not expose send_feedback; got tools: {names:?}"
             );
         }
     }
@@ -2220,6 +2283,10 @@ mod tests {
             assert!(
                 names.contains(&"exit_plan_mode"),
                 "[{label}] exit_plan_mode must always be present (TUI plan-mode keybind needs it); got tools: {names:?}"
+            );
+            assert!(
+                names.contains(&"send_feedback"),
+                "[{label}] parent grok-build sessions must advertise send_feedback; got tools: {names:?}"
             );
         }
     }

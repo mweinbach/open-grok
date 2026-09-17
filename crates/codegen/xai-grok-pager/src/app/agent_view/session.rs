@@ -136,11 +136,14 @@ impl AgentView {
             finished_wake_prompts: HashSet::new(),
             active_pane: ActivePane::Prompt,
             dock_cursor: 0,
+            dock_workflows_expanded: true,
             dock_subagents_expanded: true,
             dock_tasks_expanded: true,
             dock_watchers_expanded: true,
             dock_queued_expanded: true,
+            dock_on: false,
             dock_shown: false,
+            dock_hidden: false,
             prompt_mode: PromptMode::Normal,
             prompt_input_mode: PromptInputMode::Normal,
             multiline_mode: false,
@@ -247,6 +250,9 @@ impl AgentView {
             hit_follow_indicator: Default::default(),
             hit_response_top_indicator: Default::default(),
             hit_cwd: Default::default(),
+            hit_dashboard: Default::default(),
+            hit_overlay_prev: Default::default(),
+            hit_overlay_next: Default::default(),
             hit_cancel_button: Default::default(),
             hit_watching_cue: Default::default(),
             watching_cue_toast_shown: false,
@@ -303,6 +309,9 @@ impl AgentView {
             hit_sb_copy: Default::default(),
             hit_sb_view: Default::default(),
             question_view: None,
+            feedback_modal: None,
+            pending_feedback_trace_uploads: std::collections::VecDeque::new(),
+            parked_feedback_trace_consents: std::collections::VecDeque::new(),
             elicitation_view: None,
             pending_elicitation: None,
             elicit_hits: Vec::new(),
@@ -365,6 +374,7 @@ impl AgentView {
             input_log: crate::input_log::InputRingBuffer::new(),
             esc_pressed_at: None,
             rewind_suppress_deadline: None,
+            minimal_cancel_hint_turn: None,
             pending_first_prompt: None,
             pending_fork_banner: None,
             loading_placeholder_id: None,
@@ -748,7 +758,7 @@ impl AgentView {
     ///
     /// `/compact` is intentionally excluded — CancelTurn would work, but the
     /// overlay gesture arms the two-press close instead (matching idle /
-    /// cancelling). Compact cancel stays on Ctrl+C, Esc, and the *confirmed*
+    /// cancelling). Compact cancel stays on Ctrl+C and the *confirmed*
     /// overlay stop (`dispatch_dashboard_overlay_stop`).
     pub(crate) fn arm_dashboard_stop(&mut self) -> bool {
         let cancel = self.session.state.is_turn_running()

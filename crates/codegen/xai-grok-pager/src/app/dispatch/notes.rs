@@ -1,7 +1,7 @@
 //! Feedback, remember-note, btw, and recap dispatchers.
 
 use super::ctx::{NO_SESSION_NOTICE, with_active_agent};
-use crate::app::actions::Effect;
+use crate::app::actions::{Effect, FeedbackSendOrigin};
 use crate::app::agent::AgentId;
 use crate::app::agent_view::{AgentView, PromptInputMode};
 use crate::app::app_view::{ActiveView, AppView};
@@ -9,6 +9,7 @@ use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
 use crate::views::question_view::{LocalQuestionKind, QuestionViewState};
 use std::sync::atomic::{AtomicU64, Ordering};
+use xai_grok_feedback::{FeedbackSource, FeedbackTaxonomy, structured_feedback};
 use xai_grok_tools::implementations::grok_build::ask_user_question::Question;
 
 /// Monotonic counter for correlating async rewrite responses with the modal
@@ -22,6 +23,10 @@ fn next_rewrite_nonce() -> u64 {
 
 /// Bare `/feedback` pane label (first paragraph of the question chrome).
 pub(crate) const FEEDBACK_QUESTION_LABEL: &str = "How can we improve Open Grok?";
+
+/// One copy of the send-time thank-you, shared by the immediate and modal commit paths.
+pub(crate) const FEEDBACK_THANKS_NOTICE: &str =
+    "Thanks for the feedback! The Open Grok team is on it.";
 
 /// Minimal mode has no toast surface, so the notice goes to the transcript instead.
 fn feedback_notice(app: &mut AppView, message: &str) {
@@ -106,6 +111,276 @@ pub(super) fn dispatch_open_feedback_pane(
     vec![]
 }
 
+/// Open the feedback modal (every screen mode). Every refusal is visible.
+pub(super) fn dispatch_open_feedback_modal(
+    app: &mut AppView,
+    open: crate::views::feedback_modal::OpenFeedbackModal,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        if matches!(app.active_view, ActiveView::AgentDashboard)
+            && let Some(dashboard) = app.dashboard.as_mut()
+        {
+            dashboard.dispatch.set_text("");
+            dashboard.set_error_toast(NO_SESSION_NOTICE);
+        }
+        return vec![];
+    };
+    let blocked = {
+        let Some(agent) = app.agents.get(&id) else {
+            return vec![];
+        };
+        agent.feedback_modal_open_blocker().or_else(|| {
+            agent
+                .session
+                .session_id
+                .is_none()
+                .then_some(NO_SESSION_NOTICE)
+        })
+    };
+    if let Some(message) = blocked {
+        feedback_notice(app, message);
+        return vec![];
+    }
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let draft_id = open.draft_id.clone();
+    let modal = crate::views::feedback_modal::FeedbackModalState::new(open);
+    let modal_id = modal.id();
+    let rehydrations = modal.image_rehydration_requests();
+    agent.feedback_modal = Some(modal);
+    let mut effects = rehydrations
+        .into_iter()
+        .map(|(image_identity, path)| Effect::RehydrateFeedbackImage {
+            agent_id: id,
+            modal_id,
+            image_identity,
+            path,
+        })
+        .collect::<Vec<_>>();
+    if draft_id.is_none()
+        && let Some(modal) = agent.feedback_modal.as_mut()
+    {
+        modal.start_open_draft_list();
+        if let Some(request) = modal.take_pending_request()
+            && let Some(session_id) = agent.session.session_id.clone()
+        {
+            effects.push(Effect::FeedbackDraftRequest {
+                agent_id: id,
+                session_id,
+                request,
+            });
+        }
+    }
+    if let Some(draft_id) = draft_id
+        && let Some(modal) = agent.feedback_modal.as_mut()
+    {
+        modal.start_external_draft_load(draft_id);
+        if let Some(request) = modal.take_pending_request() {
+            let Some(session_id) = agent.session.session_id.clone() else {
+                return effects;
+            };
+            effects.push(Effect::FeedbackDraftRequest {
+                agent_id: id,
+                session_id,
+                request,
+            });
+        }
+    }
+    effects
+}
+
+/// Submit the open feedback modal. Trace upload stays off until the shell
+/// mints a one-shot token; this path still posts taxonomy metadata.
+pub(super) fn dispatch_submit_feedback_modal(
+    app: &mut AppView,
+    modal_id: crate::views::feedback_modal::FeedbackModalId,
+) -> Vec<Effect> {
+    if !app.uses_xai_access_controls() {
+        if let ActiveView::Agent(id) = app.active_view
+            && let Some(agent) = app.agents.get(&id)
+            && let Some(modal) = agent.feedback_modal.as_ref()
+            && modal.matches_id(modal_id)
+            && !modal.images().is_empty()
+        {
+            feedback_notice(
+                app,
+                "Feedback attachments are unavailable for this provider.",
+            );
+            return vec![];
+        }
+    }
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return vec![];
+    };
+    let session_id = agent.session.session_id.clone();
+    let Some(modal) = agent.feedback_modal.as_mut() else {
+        return vec![];
+    };
+    if !modal.matches_id(modal_id) {
+        return vec![];
+    }
+    if modal.in_trace_step() && modal.decided_trace_choice().is_none() {
+        return vec![];
+    }
+    let Some(session_id) = session_id else {
+        modal.set_error(NO_SESSION_NOTICE.to_string());
+        return vec![];
+    };
+    if !modal.is_sendable() {
+        modal.set_error(crate::views::feedback_modal::FEEDBACK_EMPTY_SUBMIT_ERROR.to_string());
+        return vec![];
+    }
+    let text = modal.submitted_text().trim().to_string();
+    modal.reconcile_feedback_images();
+    let (encoded_images, dropped) = encode_feedback_image_slice(modal.images());
+    if text.is_empty() && encoded_images.is_empty() {
+        if let Some(notice) = dropped {
+            modal.set_error(notice);
+        } else {
+            modal.set_error(crate::views::feedback_modal::FEEDBACK_EMPTY_SUBMIT_ERROR.to_string());
+        }
+        return vec![];
+    }
+    let draft_id = modal.draft_id().cloned();
+    let draft_fields = modal.draft_body();
+    if draft_id.is_some() && draft_fields.is_none() {
+        modal.cancel_draft_submit_pending("Choose a type before sending this draft.".to_owned());
+        return vec![];
+    }
+    let draft = draft_id
+        .clone()
+        .zip(draft_fields)
+        .map(
+            |(draft_id, fields)| crate::app::actions::DraftFeedbackBody {
+                draft_id,
+                title: fields.title,
+                details: text.clone(),
+                area: fields.area,
+                r#type: fields.r#type,
+                task_category: fields.task_category,
+                failure_mode: fields.failure_mode,
+                images: encoded_images.clone(),
+            },
+        );
+    let metadata = Some(modal.structured_feedback_metadata());
+    let images = if draft.is_some() {
+        Default::default()
+    } else {
+        modal.take_images()
+    };
+    let submission_id = crate::views::feedback_modal::FeedbackSubmissionId::next();
+    if draft_id.is_some() {
+        modal.mark_draft_submit_pending();
+    } else {
+        agent.feedback_modal = None;
+    }
+    if let Some(notice) = dropped {
+        agent.scrollback.push_block(RenderBlock::system(notice));
+    }
+    if draft_id.is_none() {
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(FEEDBACK_THANKS_NOTICE.to_string()));
+    }
+    vec![feedback_send_effect(
+        id,
+        session_id,
+        text,
+        images,
+        metadata,
+        false,
+        draft,
+        FeedbackSendOrigin::Modal {
+            submission_id,
+            modal_id,
+            is_draft: draft_id.is_some(),
+        },
+    )]
+}
+
+pub(super) fn dispatch_request_feedback_draft(
+    app: &mut AppView,
+    request: crate::views::feedback_modal::FeedbackDraftRequest,
+) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let Some(agent) = app.agents.get(&id) else {
+        return vec![];
+    };
+    let Some(session_id) = agent.session.session_id.clone() else {
+        return vec![];
+    };
+    vec![Effect::FeedbackDraftRequest {
+        agent_id: id,
+        session_id,
+        request,
+    }]
+}
+
+fn encode_feedback_image_slice(
+    images: &[crate::prompt_images::PastedImage],
+) -> (Vec<xai_grok_shell::session::FeedbackImage>, Option<String>) {
+    use base64::Engine as _;
+
+    let loaded: Vec<Option<(Vec<u8>, String)>> = images
+        .iter()
+        .map(crate::prompt_images::load_for_send)
+        .collect();
+    let (accepted, notice) = super::inline_feedback::select_feedback_images(&loaded);
+    let encoded = accepted
+        .into_iter()
+        .filter_map(|index| {
+            let (bytes, mime_type) = loaded.get(index).and_then(Option::as_ref)?;
+            Some(xai_grok_shell::session::FeedbackImage {
+                data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                mime_type: mime_type.clone(),
+                file_name: images
+                    .get(index)
+                    .and_then(|img| img.source_path.as_deref())
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned()),
+            })
+        })
+        .collect();
+    (encoded, notice)
+}
+
+fn feedback_send_effect(
+    agent_id: AgentId,
+    session_id: agent_client_protocol::SessionId,
+    text: String,
+    images: crate::views::prompt_widget::FeedbackImages,
+    metadata: Option<serde_json::Value>,
+    request_trace_upload_token: bool,
+    draft: Option<crate::app::actions::DraftFeedbackBody>,
+    origin: FeedbackSendOrigin,
+) -> Effect {
+    crate::unified_log::info(
+        "feedback.send",
+        Some(session_id.0.as_ref()),
+        Some(serde_json::json!({
+            "chars": text.chars().count(),
+            "images": images.len(),
+            "modal": matches!(origin, FeedbackSendOrigin::Modal { .. }),
+        })),
+    );
+    Effect::SendFeedback {
+        agent_id,
+        session_id,
+        feedback_text: text,
+        images,
+        metadata,
+        request_trace_upload_token,
+        draft,
+        origin,
+    }
+}
+
 /// Enter remember mode: visual change to prompt bar (remember accent, `#` prefix).
 /// No side effects — the user types a memory note and presses Enter to send.
 pub(super) fn dispatch_enter_remember_mode(app: &mut AppView) -> Vec<Effect> {
@@ -153,16 +428,23 @@ pub(super) fn dispatch_send_feedback(
         return vec![];
     };
 
-    agent.scrollback.push_block(RenderBlock::system(
-        "Thanks for the feedback! The Open Grok team is on it.".to_string(),
-    ));
+    agent
+        .scrollback
+        .push_block(RenderBlock::system(FEEDBACK_THANKS_NOTICE.to_string()));
 
-    vec![Effect::SendFeedback {
-        agent_id: id,
+    vec![feedback_send_effect(
+        id,
         session_id,
-        feedback_text: trimmed,
+        trimmed,
         images,
-    }]
+        Some(structured_feedback(
+            FeedbackSource::Write,
+            FeedbackTaxonomy::default(),
+        )),
+        false,
+        None,
+        FeedbackSendOrigin::Immediate,
+    )]
 }
 
 /// Send a raw remember note for LLM-powered rewriting via `x.ai/memory/rewrite`.

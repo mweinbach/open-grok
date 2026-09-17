@@ -1824,6 +1824,7 @@ fn chat_mode_debounce_expiry_fetches_current_and_drops_stale() {
                 seq: 1,
                 kind_filter: None,
                 headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy::Exclude,
+                ..
             }] if query == "abc" && *generation == app.session_picker_generation
         ),
         "current debounce expiry must fetch with the query, got {effects:?}"
@@ -2092,6 +2093,7 @@ fn chat_mode_force_search_fetches_immediately_and_empty_query_unfilters() {
                 seq: 1,
                 kind_filter: None,
                 headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy::Exclude,
+                ..
             }] if query == "abc" && *generation == app.session_picker_generation
         ),
         "forced search must fetch without debouncing, got {effects:?}"
@@ -2112,6 +2114,7 @@ fn chat_mode_force_search_fetches_immediately_and_empty_query_unfilters() {
                 seq: 2,
                 kind_filter: None,
                 headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy::Exclude,
+                ..
             }] if *generation == app.session_picker_generation
         ),
         "cleared query must refetch the unfiltered list immediately (no debounce), got {effects:?}"
@@ -3673,6 +3676,7 @@ fn plain_picker_fetch_carries_no_query_and_bumps_seq() {
                 seq: 2,
                 kind_filter: None,
                 headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy::Exclude,
+                ..
             }] if *generation == app.session_picker_generation
         ),
         "picker fetch must be unfiltered and supersede the search, got {effects:?}"

@@ -57,7 +57,7 @@ fn initial_injection_backend_params_preserve_default_zero_min_score() {
     assert!((0.0 - effective_min_score as f32).abs() < f32::EPSILON);
 }
 #[allow(clippy::field_reassign_with_default)]
-async fn create_test_actor_with_memory(
+pub(super) async fn create_test_actor_with_memory(
     total_tokens: u64,
     context_window: u64,
     threshold_percent: u8,
@@ -79,10 +79,13 @@ async fn create_test_actor_with_memory(
         tokio_util::sync::CancellationToken::new(),
     );
     let tool_context = ToolContext::new(cwd.clone(), None, None, fs, terminal, hunk_tracker_handle);
-    let memory_storage = memory_config
-        .as_ref()
-        .filter(|mc| mc.enabled)
-        .map(|_| crate::session::memory::MemoryStorage::new(&cwd_path, None));
+    let memory_storage = memory_config.as_ref().filter(|mc| mc.enabled).map(|mc| {
+        crate::session::memory::MemoryStorage::new_for_mode(
+            &cwd_path,
+            mc.root_dir_override.as_deref(),
+            mc.mode,
+        )
+    });
     let state = TokioMutex::new(State {
         running_task: None,
         pending_inputs: VecDeque::new(),
@@ -185,32 +188,18 @@ async fn create_test_actor_with_memory(
             cancel: Default::default(),
         },
         memory: crate::session::memory_state::SessionMemory {
-            experience_run_id: uuid::Uuid::now_v7().to_string(),
-            experience_prior_tool_result_ids: std::collections::HashSet::new(),
-            embedding_provider: xai_grok_sampling_types::ModelProvider::Xai,
-            active_provider: std::cell::Cell::new(xai_grok_sampling_types::ModelProvider::Xai),
             flush_config: memory_config
                 .as_ref()
                 .map_or_else(Default::default, |mc| mc.flush.clone()),
-            is_flushing: std::sync::atomic::AtomicBool::new(false),
-            last_flush_compaction: std::sync::atomic::AtomicU64::new(0),
+            configured_storage: memory_storage.clone(),
             storage: std::cell::RefCell::new(memory_storage),
-            save_on_end: true,
-            backend_params: None,
             initial_injection_config: memory_initial_injection_config,
-            context_injected: std::sync::atomic::AtomicBool::new(false),
-            flush_count: std::sync::atomic::AtomicU64::new(0),
-            last_flush_content: std::cell::RefCell::new(None),
-            flush_success_count: std::sync::atomic::AtomicU64::new(0),
-            flush_error_count: std::sync::atomic::AtomicU64::new(0),
-            search_counter: std::cell::RefCell::new(None),
-            injection_count: std::sync::atomic::AtomicU64::new(0),
-            compaction_recovery_count: std::sync::atomic::AtomicU64::new(0),
-            chunks_added: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            dream_config: Default::default(),
-            dream_count: std::sync::atomic::AtomicU64::new(0),
-            dream_success_count: std::sync::atomic::AtomicU64::new(0),
-            dream_error_count: std::sync::atomic::AtomicU64::new(0),
+            configured_mode: memory_config.as_ref().map(|mc| mc.mode),
+            v2_config: memory_config
+                .as_ref()
+                .map(|mc| mc.v2.clone())
+                .unwrap_or_default(),
+            ..crate::session::memory_state::SessionMemory::empty()
         },
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),

@@ -334,6 +334,14 @@ pub trait SlashCommand: Send + Sync {
         false
     }
 
+    /// A mid-text `/name` token runs this command with the whole message as its
+    /// args: `prose /name q` is `/name prose q`. Opt in only when the whole
+    /// message is the argument; `submission_refusal` only sees a leading `/`
+    /// and is bypassed.
+    fn can_hoist_from_mid_text(&self) -> bool {
+        false
+    }
+
     /// Which render modes this command functions in.
     ///
     /// Minimal mode (`open-grok --minimal`) deletes the interactive fullscreen
@@ -430,6 +438,7 @@ macro_rules! slash_meta {
         $(session_scoped: $session_scoped:expr,)?
         $(offered_when_session_less: $offered_when_session_less:expr,)?
         $(dashboard_only: $dashboard_only:expr,)?
+        $(can_hoist_from_mid_text: $can_hoist_from_mid_text:expr,)?
         $(mode_support: $mode_support:expr,)?
         $(arg_placeholder: $arg_placeholder:expr,)?
         $(required_tools: $required_tools:expr,)?
@@ -468,6 +477,10 @@ macro_rules! slash_meta {
 
         $(fn dashboard_only(&self) -> bool {
             $dashboard_only
+        })?
+
+        $(fn can_hoist_from_mid_text(&self) -> bool {
+            $can_hoist_from_mid_text
         })?
 
         $(fn mode_support(&self) -> crate::slash::mode_support::ModeSupport {

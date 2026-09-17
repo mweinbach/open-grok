@@ -178,6 +178,7 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
                 elapsed_ms,
                 agent_result,
                 send_now_cancel,
+                cancel_trigger,
                 cancellation_category,
                 error_kind: None,
                 error_banner_present: false,

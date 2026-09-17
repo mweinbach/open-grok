@@ -944,10 +944,20 @@ pub enum Action {
     },
     /// Enable swarm mode for exactly this prompt, then submit it normally.
     StartSwarmTask(String),
-    /// Open the freeform feedback bottom pane (bare `/feedback`).
+    /// Open the freeform feedback bottom pane (legacy `/feedback` path).
     OpenFeedbackPane {
         prefill: Option<String>,
         images: crate::views::prompt_widget::FeedbackImages,
+    },
+    /// Open the isolated feedback modal (every screen mode).
+    OpenFeedbackModal(crate::views::feedback_modal::OpenFeedbackModal),
+    /// Submit the open feedback modal's report.
+    SubmitFeedbackModal {
+        modal_id: crate::views::feedback_modal::FeedbackModalId,
+    },
+    /// Execute one modal-scoped draft list/get/delete/update request.
+    RequestFeedbackDraft {
+        request: crate::views::feedback_modal::FeedbackDraftRequest,
     },
     /// Submit feedback text (inline `/feedback <text>` or pane submit).
     SendFeedback {
@@ -1158,6 +1168,10 @@ pub enum Action {
     /// the working directory. Routed from Esc, the modal-chrome
     /// `CloseRequested` outcome, and a click outside the modal.
     DashboardCloseLocationPicker,
+    /// Close the workspace-dashboard `/resume` picker without loading a session.
+    DashboardCloseSessionPicker,
+    /// Load the workspace-dashboard `/resume` picker's selected local build.
+    DashboardPickSession(usize),
     /// Change the working directory for newly dispatched dashboard
     /// sessions. `input` is the raw path text — a picker row's path, a
     /// path typed into the picker's query field, or the `/cd <path>`
@@ -1382,6 +1396,29 @@ pub enum PlanModeKind {
     /// Agent in `SessionMode::Default`.
     Off,
 }
+/// Which surface issued a feedback POST, echoed back on its completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedbackSendOrigin {
+    Immediate,
+    Modal {
+        submission_id: crate::views::feedback_modal::FeedbackSubmissionId,
+        modal_id: crate::views::feedback_modal::FeedbackModalId,
+        is_draft: bool,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DraftFeedbackBody {
+    pub draft_id: xai_grok_feedback::FeedbackDraftId,
+    pub title: String,
+    pub details: String,
+    pub area: Option<String>,
+    pub r#type: xai_grok_feedback::FeedbackType,
+    pub task_category: Option<xai_grok_feedback::FeedbackTaskCategory>,
+    pub failure_mode: Option<xai_grok_feedback::FeedbackFailureMode>,
+    pub images: Vec<xai_grok_shell::session::FeedbackImage>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedbackTraceChoice {
     AlwaysUpload,
@@ -1968,6 +2005,10 @@ pub enum Effect {
     FetchSessionList {
         /// The picker this fetch was issued for; the result routes back to this host's storage only.
         host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Directory the list request should use. `None` keeps the process cwd
+        /// (welcome / in-session pickers). Dashboard `/resume` passes the
+        /// dashboard location so a `/cd` does not leak into the process cwd.
+        cwd_override: Option<std::path::PathBuf>,
         /// Live generation of the requesting picker at dispatch time.
         generation: u64,
         /// Text search pushed down to `x.ai/session/list` as `query` (chat mode: forwarded to the backend conversations search).
@@ -2479,6 +2520,21 @@ pub enum Effect {
         session_id: acp::SessionId,
         feedback_text: String,
         images: crate::views::prompt_widget::FeedbackImages,
+        metadata: Option<serde_json::Value>,
+        request_trace_upload_token: bool,
+        draft: Option<DraftFeedbackBody>,
+        origin: FeedbackSendOrigin,
+    },
+    FeedbackDraftRequest {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        request: crate::views::feedback_modal::FeedbackDraftRequest,
+    },
+    RehydrateFeedbackImage {
+        agent_id: AgentId,
+        modal_id: crate::views::feedback_modal::FeedbackModalId,
+        image_identity: u64,
+        path: std::path::PathBuf,
     },
     /// Save a remember note to global MEMORY.md (async file write).
     SaveMemoryNote {
@@ -3675,11 +3731,44 @@ pub enum TaskResult {
     /// Feedback submitted successfully (fire-and-forget).
     FeedbackComplete {
         agent_id: AgentId,
+        origin: FeedbackSendOrigin,
+        outcome: xai_grok_shell::session::FeedbackOutcome,
+        trace_upload_token: Option<String>,
     },
     /// Feedback submission failed. The shell already persisted the report locally, so only the error is surfaced.
     FeedbackFailed {
         agent_id: AgentId,
+        origin: FeedbackSendOrigin,
+        feedback_text: String,
+        image_count: usize,
         error: String,
+    },
+    FeedbackDraftListComplete {
+        agent_id: AgentId,
+        modal_id: crate::views::feedback_modal::FeedbackModalId,
+        generation: u64,
+        result: Result<Vec<xai_grok_feedback::FeedbackDraft>, String>,
+    },
+    FeedbackDraftLoadComplete {
+        agent_id: AgentId,
+        load: crate::views::feedback_modal::FeedbackDraftLoad,
+        result: Result<xai_grok_feedback::FeedbackDraft, String>,
+    },
+    FeedbackDraftDeleteComplete {
+        agent_id: AgentId,
+        delete: crate::views::feedback_modal::FeedbackDraftDelete,
+        result: Result<(), String>,
+    },
+    FeedbackDraftUpdateComplete {
+        agent_id: AgentId,
+        update: crate::views::feedback_modal::FeedbackDraftUpdate,
+        result: Result<(), String>,
+    },
+    FeedbackImageRehydrated {
+        agent_id: AgentId,
+        modal_id: crate::views::feedback_modal::FeedbackModalId,
+        image_identity: u64,
+        result: Result<Vec<u8>, String>,
     },
     /// Memory note saved to global MEMORY.md.
     MemoryNoteSaved {

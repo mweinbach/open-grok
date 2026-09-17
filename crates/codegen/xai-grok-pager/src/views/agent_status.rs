@@ -68,14 +68,34 @@ impl<'a> AgentStatusBar<'a> {
         self.items.push(StatusEntry { id, line, width });
     }
 
+    /// Prepend an item sized with [`Self::room_for_front`], so it can never
+    /// push the items already pushed off the row.
+    pub fn push_front(&mut self, id: &'static str, line: Line<'static>) {
+        let width = line.width() as u16;
+        self.items.insert(0, StatusEntry { id, line, width });
+    }
+
+    /// Columns a prepended item may take in a row `area_width` wide: what the
+    /// current group and its joining separator leave.
+    pub fn room_for_front(&self, area_width: u16) -> u16 {
+        let joining_sep = if self.items.is_empty() {
+            0
+        } else {
+            SEPARATOR_WIDTH
+        };
+        area_width.saturating_sub(self.right_pad + self.width() + joining_sep)
+    }
+
+    /// Columns the group occupies: items plus the separators between them.
+    fn width(&self) -> u16 {
+        let items: u16 = self.items.iter().map(|e| e.width).sum();
+        let seps = (self.items.len() as u16).saturating_sub(1);
+        items + seps * SEPARATOR_WIDTH
+    }
+
     /// Build a separator span: ` │ ` in dim color.
     fn separator(&self) -> Span<'static> {
-        Span::styled(
-            format!(" {SEPARATOR} "),
-            Style::default()
-                .fg(self.theme.gray_dim)
-                .bg(self.theme.bg_base),
-        )
+        separator(self.theme)
     }
 
     /// Render all items right-aligned into the given area.
@@ -134,6 +154,15 @@ impl<'a> AgentStatusBar<'a> {
         areas
     }
 }
+
+/// ` │ ` a step fainter than the chips it divides — the divider between
+/// status-bar items and between the header's title and location.
+pub(crate) fn separator(theme: &Theme) -> Span<'static> {
+    Span::styled(format!(" {SEPARATOR} "), theme.faint().bg(theme.bg_base))
+}
+
+/// Display width of [`separator`].
+const SEPARATOR_WIDTH: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Goal status line

@@ -87,3 +87,21 @@ fn context_segment_warns_near_compaction() {
     ctx.context_window.used_percentage = Some(70);
     assert_eq!(tone(&ctx), SegmentTone::Warn);
 }
+
+fn turn_timer(secs: u64) -> String {
+    compose_builtin(
+        &context(),
+        Some(Duration::from_secs(secs)),
+        &[StatusLineItem::TurnTimer],
+    )
+    .first()
+    .expect("TurnTimer segment")
+    .text
+    .clone()
+}
+
+#[test]
+fn turn_timer_values() {
+    assert_eq!(turn_timer(59), "59s");
+    assert_eq!(turn_timer(194 * 60 + 4), "3h14m");
+}

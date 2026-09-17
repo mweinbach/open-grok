@@ -65,6 +65,47 @@ pub fn format_memory_reminder(results: &[MemorySearchResult]) -> Option<String> 
     Some(section)
 }
 
+pub struct V2InjectedContext {
+    pub content: String,
+    pub global_entry_count: usize,
+    pub workspace_entry_count: usize,
+}
+
+/// Regenerate and format both bounded v2 manifests for model context.
+pub fn format_v2_memory_context(
+    storage: &crate::session::memory::MemoryStorage,
+) -> Result<V2InjectedContext, String> {
+    let global = crate::session::memory::regenerate_scope_manifest(
+        storage.global_dir(),
+        crate::session::memory::V2MemoryScope::Global,
+        crate::session::memory::V2ManifestBudget::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let workspace = crate::session::memory::regenerate_scope_manifest(
+        storage.workspace_dir(),
+        crate::session::memory::V2MemoryScope::Workspace,
+        crate::session::memory::V2ManifestBudget::default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let content = format!(
+        "{MEMORY_CONTEXT_OPEN_TAG}\n\
+         ## Global memory manifest\n\
+         **Scope root:** `{}`\n\n{}\n\
+         ## Workspace memory manifest\n\
+         **Scope root:** `{}`\n\n{}\n\
+         {MEMORY_CONTEXT_CLOSE_TAG}",
+        storage.global_dir().display(),
+        global.content,
+        storage.workspace_dir().display(),
+        workspace.content,
+    );
+    Ok(V2InjectedContext {
+        content,
+        global_entry_count: global.included_entries,
+        workspace_entry_count: workspace.included_entries,
+    })
+}
+
 pub(crate) fn format_memory_reminder_with_experience(
     results: &[MemorySearchResult],
     experience_briefing: Option<&str>,

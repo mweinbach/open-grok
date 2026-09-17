@@ -52,6 +52,29 @@ pub struct AppRenderParams<'a> {
     /// advertises `Esc cancel` while an app-level owner would consume it.
     pub esc_owned_before_agent: bool,
     pub status_line: crate::views::status_line::StatusLineFrame,
+    /// Header chrome the dashboard adds when this view is its session overlay:
+    /// the agent's title (omitted when the session is unnamed) and its `i/n`
+    /// position in the overlay's cycle order. A lone agent gets
+    /// `Some((1, 1))`, so the switcher gates on [`OverlayHeader::can_cycle`],
+    /// not `is_some`.
+    pub overlay_header: OverlayHeader<'a>,
+}
+/// What the dashboard overlay contributes to the header row (see
+/// [`AppRenderParams::overlay_header`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OverlayHeader<'a> {
+    pub title: Option<&'a str>,
+    pub position: Option<(usize, usize)>,
+}
+impl OverlayHeader<'_> {
+    /// The `i/n` position when `‹`/`›` have anything to cycle through.
+    pub fn cycle_position(&self) -> Option<(usize, usize)> {
+        self.position.filter(|(_, n)| *n > 1)
+    }
+    /// Whether the header shows the switcher and the footer its prev/next hint.
+    pub fn can_cycle(&self) -> bool {
+        self.cycle_position().is_some()
+    }
 }
 /// What the bottom shortcuts bar renders this frame.
 enum ShortcutsBarContent {
@@ -584,6 +607,10 @@ impl AgentView {
         scratch: &mut ScratchBuffer,
         theme: &Theme,
         bundle_state: &crate::app::bundle::BundleState,
+        in_dashboard_overlay: bool,
+        overlay_header: OverlayHeader<'_>,
+        esc_owned_before_agent: bool,
+        status_line: crate::views::status_line::StatusLineFrame,
     ) -> (
         Option<(u16, u16)>,
         Option<crate::terminal::overlay::PostFlush>,
@@ -805,10 +832,15 @@ impl AgentView {
                 false,
                 super::BannerSlotParams::none(),
                 bundle_state,
-                false,
-                false,
+                in_dashboard_overlay,
+                overlay_header.can_cycle(),
                 &mut Vec::new(),
-                AppRenderParams::default(),
+                AppRenderParams {
+                    esc_owned_before_agent,
+                    status_line,
+                    overlay_header,
+                    ..AppRenderParams::default()
+                },
             );
             child_post_flush = post_flush;
         }
@@ -905,10 +937,11 @@ impl AgentView {
             voice_interim,
             esc_owned_before_agent,
             status_line,
+            overlay_header,
         } = app_params;
         self.scrollback.begin_frame();
         self.in_dashboard_overlay = in_dashboard_overlay;
-        self.overlay_can_cycle = overlay_can_cycle;
+        self.overlay_can_cycle = overlay_header.can_cycle() || overlay_can_cycle;
         let super::BannerSlotParams {
             height: banner_height,
             announcements: banner_announcements,
@@ -970,6 +1003,9 @@ impl AgentView {
             self.hit_announcement_hide.clear();
             self.hit_announcement_cta.clear();
             self.hit_upgrade_cta.clear();
+            self.hit_dashboard.clear();
+            self.hit_overlay_prev.clear();
+            self.hit_overlay_next.clear();
             self.privacy_banner.clear_hits();
             return self.draw_subagent_fullscreen(
                 &child_sid.clone(),
@@ -979,6 +1015,10 @@ impl AgentView {
                 scratch,
                 &theme,
                 bundle_state,
+                in_dashboard_overlay,
+                overlay_header,
+                esc_owned_before_agent,
+                status_line,
             );
         }
         if let Some(esc) = self.take_subagent_inline_media_clear_escapes() {
@@ -1326,6 +1366,7 @@ impl AgentView {
         let dock_on = crate::views::dock::enabled()
             && !viewer_open
             && area.height > agent::SHORT_TERMINAL_ROWS;
+        self.dock_on = dock_on;
         let tasks_height = if viewer_open || dock_on {
             0
         } else {
@@ -1403,30 +1444,7 @@ impl AgentView {
             _ => 1,
         };
         let follow_ups_height = u16::from(self.follow_ups.is_some());
-        let mut dock_data = dock_on.then(|| crate::views::dock::DockData {
-            subagents: self
-                .dock_subagent_rows()
-                .into_iter()
-                .map(|(_, _, row)| row)
-                .collect(),
-            tasks: self
-                .dock_task_rows()
-                .into_iter()
-                .map(|(_, row)| row)
-                .collect(),
-            watchers: self
-                .dock_watcher_rows()
-                .into_iter()
-                .map(|(_, row)| row)
-                .collect(),
-            queued: self.visible_held_queue_len(),
-            subagents_expanded: self.dock_subagents_expanded,
-            tasks_expanded: self.dock_tasks_expanded,
-            watchers_expanded: self.dock_watchers_expanded,
-            focused: self.active_pane == ActivePane::Dock,
-            cursor: 0,
-            queue_body_rows: self.queue.desired_height(),
-        });
+        let mut dock_data = (dock_on && !self.dock_hidden).then(|| self.dock_snapshot());
         if let Some(data) = &mut dock_data {
             let max = crate::views::dock::visible_items(data)
                 .len()
@@ -1589,18 +1607,17 @@ impl AgentView {
         }
         use crate::views::agent_status::AgentStatusBar;
         use crate::views::context_bar;
-        let mut status = AgentStatusBar::new(&theme);
-        if let Some(url) = self.highlighted_link_url() {
-            let max_len = layout.status_bar.width.saturating_sub(20) as usize;
-            let display = if url.len() > max_len {
-                let truncated: String = url.chars().take(max_len.saturating_sub(1)).collect();
-                format!("{truncated}\u{2026}")
+        let bg = Style::default().bg(theme.bg_base);
+        let dim = theme.dim().bg(theme.bg_base);
+        let faint = theme.faint().bg(theme.bg_base);
+        let hover_or = |hovered: bool, resting: Style| {
+            if hovered {
+                bg.fg(theme.text_primary)
             } else {
-                url.to_string()
-            };
-            let link_style = Style::default().fg(theme.link_fg).bg(theme.bg_base);
-            status.push("link_url", Line::from(Span::styled(display, link_style)));
-        }
+                resting
+            }
+        };
+        let mut status = AgentStatusBar::new(&theme);
         if !dock_on {
             let task_counts = self.tasks.status_counts(
                 &self.session.bg_tasks,
@@ -1724,6 +1741,49 @@ impl AgentView {
         ) {
             status.push("badge", Line::from(badge_spans));
         }
+        if let Some((cur, total)) = overlay_header.cycle_position() {
+            status.push(
+                "switcher",
+                Line::from(vec![
+                    Span::styled(
+                        crate::glyphs::chevron_left(),
+                        hover_or(self.hit_overlay_prev.hovered, faint),
+                    ),
+                    Span::styled(format!(" {cur}/{total} "), bg.fg(theme.gray)),
+                    Span::styled(
+                        crate::glyphs::chevron(),
+                        hover_or(self.hit_overlay_next.hovered, faint),
+                    ),
+                ]),
+            );
+        }
+        let dashboard_available = in_dashboard_overlay
+            || self
+                .prompt
+                .slash_controller
+                .registry()
+                .dashboard_dispatchable();
+        if dashboard_available {
+            status.push(
+                "dashboard",
+                Line::from(Span::styled(
+                    "[Dashboard]",
+                    hover_or(self.hit_dashboard.hovered, bg.fg(theme.gray)),
+                )),
+            );
+        }
+        if let Some(url) = self.highlighted_link_url() {
+            const LOCATION_FLOOR: u16 = 24;
+            const LINK_MIN: u16 = 12;
+            let max_len = status
+                .room_for_front(layout.status_bar.width)
+                .saturating_sub(LOCATION_FLOOR);
+            if max_len >= LINK_MIN {
+                let display = crate::util::truncate_to_width(&url, max_len as usize).into_owned();
+                let link_style = Style::default().fg(theme.link_fg).bg(theme.bg_base);
+                status.push_front("link_url", Line::from(Span::styled(display, link_style)));
+            }
+        }
         let areas = status.render(buf, layout.status_bar);
         self.hit_bg_status.rect = areas.get("bg_tasks").copied();
         self.hit_goal_status.rect = areas.get("goal").copied();
@@ -1732,74 +1792,22 @@ impl AgentView {
         self.hit_plan_button.rect = areas.get("plan").copied();
         self.hit_queue_badge.rect = areas.get("queue").copied();
         self.hit_badge.rect = areas.get("badge").copied();
-        let home = std::env::var("HOME").ok();
-        let display = self.session.cwd.display().to_string();
-        let short = match &home {
-            Some(h) if display.starts_with(h.as_str()) => {
-                format!("~{}", &display[h.len()..])
-            }
-            _ => display,
-        };
-        let cwd_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
-        use unicode_width::UnicodeWidthStr;
-        let mut parts: Vec<Span> = Vec::new();
-        let mut path_offset: u16 = 0;
-        let lazy_git = crate::git_info::cwd_git_info_lazy(&self.session.cwd);
-        let branch = self
-            .current_branch
-            .clone()
-            .or_else(|| lazy_git.as_ref().and_then(|i| i.branch.clone()));
-        let git_text = branch.map(|b| {
-            let icon = crate::git_info::branch_icon();
-            if b.is_empty() {
-                format!("{icon} detached")
-            } else {
-                format!("{icon} {b}")
-            }
-        });
-        if let Some(git_text) = git_text {
-            let git_style = Style::default()
-                .fg(theme.text_primary)
-                .bg(theme.bg_base)
-                .add_modifier(ratatui::style::Modifier::DIM);
-            path_offset += git_text.width() as u16;
-            parts.push(Span::styled(git_text, git_style));
-            path_offset += 1;
-            parts.push(Span::styled(" ", Style::default().bg(theme.bg_base)));
-        }
-        let show_worktree_label = self.is_worktree
-            || self.session.is_worktree
-            || lazy_git.as_ref().is_some_and(|i| i.is_worktree);
-        if show_worktree_label {
-            let label_style = Style::default().fg(theme.accent_user).bg(theme.bg_base);
-            path_offset += "worktree ".width() as u16;
-            parts.push(Span::styled("worktree ", label_style));
-        }
-        if let Some(profile) = xai_grok_sandbox::profile_name() {
-            let sandbox_text = format!("sandbox:{profile} ");
-            let sandbox_style = Style::default().fg(theme.warning).bg(theme.bg_base);
-            path_offset += sandbox_text.width() as u16;
-            parts.push(Span::styled(sandbox_text, sandbox_style));
-        }
-        let path_width = short.width() as u16;
-        let path_style = if self.hit_cwd.hovered {
-            Style::default().fg(theme.text_primary).bg(theme.bg_base)
-        } else {
-            cwd_style
-        };
-        parts.push(Span::styled(short, path_style));
-        let main_repo_display = self
-            .main_repo
-            .clone()
-            .or_else(|| lazy_git.as_ref().and_then(|i| i.main_repo.clone()));
-        if let Some(main_repo) = main_repo_display {
-            parts.push(Span::styled(
-                format!(" (worktree of {main_repo})"),
-                cwd_style,
-            ));
-        }
-        let cwd_line = Line::from(parts);
-        let max_cwd_width = areas
+        let dropdown_open = self.prompt.any_dropdown_open();
+        self.hit_dashboard
+            .set_unless_dropdown(areas.get("dashboard").copied(), dropdown_open);
+        let switcher_rect = areas.get("switcher").copied();
+        self.hit_overlay_prev
+            .set_unless_dropdown(switcher_rect.map(|r| Rect { width: 1, ..r }), dropdown_open);
+        self.hit_overlay_next.set_unless_dropdown(
+            switcher_rect.map(|r| Rect {
+                x: r.x + r.width.saturating_sub(1),
+                width: 1,
+                ..r
+            }),
+            dropdown_open,
+        );
+        let short = crate::util::display_location_path(&self.session.cwd);
+        let left_budget = areas
             .values()
             .map(|r| r.x)
             .min()
@@ -1810,10 +1818,60 @@ impl AgentView {
         let upgrade_reserve = upgrade_cta.map_or(0u16, |(_, label, _)| {
             1 + crate::views::announcements::upgrade_cta_reserve(label, None)
         });
-        let cwd_line = truncate_line(
-            cwd_line,
-            max_cwd_width.saturating_sub(upgrade_reserve) as usize,
+        let location_budget = left_budget.saturating_sub(upgrade_reserve);
+        use unicode_width::UnicodeWidthStr;
+        let mut location: Vec<Span> = Vec::new();
+        let lazy_git = crate::git_info::cwd_git_info_lazy(&self.session.cwd);
+        let branch = self
+            .current_branch
+            .clone()
+            .or_else(|| lazy_git.as_ref().and_then(|i| i.branch.clone()))
+            .map(crate::views::location::branch_label);
+        if let Some(branch) = branch {
+            location.push(Span::styled(branch, dim));
+            location.push(Span::styled(" ", bg));
+        }
+        let show_worktree_label = self.is_worktree
+            || self.session.is_worktree
+            || lazy_git.as_ref().is_some_and(|i| i.is_worktree);
+        if show_worktree_label {
+            location.push(crate::views::location::worktree_badge(&theme).patch_style(bg));
+        }
+        if let Some(profile) = xai_grok_sandbox::profile_name() {
+            location.push(Span::styled(
+                format!("sandbox:{profile} "),
+                bg.fg(theme.warning),
+            ));
+        }
+        let prefix_width: u16 = location.iter().map(|s| s.width() as u16).sum();
+        let path_width = short.width() as u16;
+        let title = overlay_header.title.and_then(|title| {
+            const PATH_MIN: u16 = 12;
+            let sep_width = crate::views::agent_status::separator(&theme).width() as u16;
+            let location_min = prefix_width + path_width.min(PATH_MIN) + sep_width;
+            let title_cap = (location_budget / 2).min(location_budget.saturating_sub(location_min));
+            let title = crate::util::truncate_to_width(title, title_cap as usize);
+            (!title.is_empty()).then(|| title.into_owned())
+        });
+        let path_style = hover_or(
+            self.hit_cwd.hovered,
+            if title.is_some() {
+                dim
+            } else {
+                bg.fg(theme.text_secondary)
+            },
         );
+        location.push(Span::styled(short, path_style));
+        let mut parts: Vec<Span> = Vec::new();
+        let mut path_offset: u16 = prefix_width;
+        if let Some(title) = title {
+            let sep = crate::views::agent_status::separator(&theme);
+            path_offset += (title.width() + sep.width()) as u16;
+            parts.push(Span::styled(title, bg.fg(theme.text_secondary)));
+            parts.push(sep);
+        }
+        parts.extend(location);
+        let cwd_line = truncate_line(Line::from(parts), location_budget as usize);
         let cwd_width = cwd_line.width() as u16;
         buf.set_line_safe(
             layout.status_bar.x,
@@ -1829,6 +1887,7 @@ impl AgentView {
             width: visible_path_width,
             height: 1,
         });
+        let max_cwd_width = left_budget;
         let mut upgrade_cta_rect = None;
         if let Some((_owner, label, _url)) = upgrade_cta {
             let avail = max_cwd_width.saturating_sub(cwd_width);
@@ -1852,7 +1911,6 @@ impl AgentView {
                 );
             }
         }
-        let dropdown_open = self.prompt.any_dropdown_open();
         self.hit_upgrade_cta
             .set_unless_dropdown(upgrade_cta_rect, dropdown_open);
         let mut inline_edit_cursor: Option<(u16, u16)> = None;
@@ -4219,6 +4277,22 @@ impl AgentView {
             ShortcutsBar::new(&hints).render(layout.shortcuts, buf);
             self.pane_areas = layout.pane_areas();
             return (prompt_cursor_pos, prompt_post_flush);
+        }
+        if let Some(ref mut modal) = self.feedback_modal {
+            let overlay_area = Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: layout.shortcuts.y.saturating_sub(area.y).saturating_sub(1),
+            };
+            let compact = self.scrollback.appearance().prompt.compact;
+            let theme = Theme::current();
+            let rendered = modal.render(buf, overlay_area, &theme, compact);
+            self.pane_areas = layout.pane_areas();
+            return match rendered {
+                Some(result) => (result.cursor, result.post_flush),
+                None => (None, crate::terminal::overlay::clear().map(Into::into)),
+            };
         }
         if let Some(ref mut modal_state) = self.agents_modal {
             let overlay_area = Rect {

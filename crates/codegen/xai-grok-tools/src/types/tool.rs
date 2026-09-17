@@ -105,6 +105,7 @@ pub enum ToolKind {
     GoalUpdate,
     Workflow,
     ActiveAgentMessage,
+    Feedback,
     #[serde(other)]
     Other,
 }

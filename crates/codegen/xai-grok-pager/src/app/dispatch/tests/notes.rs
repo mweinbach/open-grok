@@ -901,6 +901,9 @@ fn feedback_failed_reports_the_error_and_spares_the_composer() {
     let _ = dispatch(
         Action::TaskComplete(crate::app::actions::TaskResult::FeedbackFailed {
             agent_id: id,
+            origin: crate::app::actions::FeedbackSendOrigin::Immediate,
+            feedback_text: String::new(),
+            image_count: 0,
             error: "disabled".into(),
         }),
         &mut app,
@@ -1200,5 +1203,67 @@ fn send_feedback_preserves_composer_draft() {
         app.agents.get(&id).unwrap().prompt.text(),
         "keep this draft",
         "composer draft must survive SendFeedback"
+    );
+}
+
+/// A loaded draft must POST `FeedbackDraftSendRequest`, not a plain text body.
+#[test]
+fn feedback_modal_loaded_draft_sends_draft_body() {
+    let id = AgentId(0);
+    let mut app = test_app_with_agent();
+    let _ = dispatch(
+        Action::OpenFeedbackModal(crate::views::feedback_modal::OpenFeedbackModal {
+            text: Some("edited details".into()),
+            ..Default::default()
+        }),
+        &mut app,
+    );
+    let draft_id =
+        xai_grok_feedback::FeedbackDraftId::from("01931111-aaaa-7bbb-8ccc-ddddeeeeffff".to_owned());
+    let modal_id = {
+        let agent = app.agents.get_mut(&id).unwrap();
+        let modal = agent.feedback_modal.as_mut().expect("modal open");
+        modal.start_external_draft_load(draft_id.clone());
+        let load = match modal.take_pending_request() {
+            Some(crate::views::feedback_modal::FeedbackDraftRequest::Load(load)) => load,
+            other => panic!("expected load request, got {other:?}"),
+        };
+        assert!(modal.apply_draft_load(
+            &load,
+            xai_grok_feedback::FeedbackDraft {
+                id: draft_id.clone(),
+                title: "edited title".into(),
+                details: "edited details".into(),
+                area: Some("editing".into()),
+                r#type: Some(xai_grok_feedback::FeedbackType::Bug),
+                task_category: Some(xai_grok_feedback::FeedbackTaskCategory::Debug),
+                failure_mode: Some(xai_grok_feedback::FeedbackFailureMode::Hallucinated),
+                created_at: 1,
+                revision: 1,
+            },
+        ));
+        modal.id()
+    };
+
+    let effects = dispatch(Action::SubmitFeedbackModal { modal_id }, &mut app);
+    match effects.as_slice() {
+        [
+            Effect::SendFeedback {
+                draft: Some(draft),
+                feedback_text,
+                ..
+            },
+        ] => {
+            assert_eq!(draft.draft_id, draft_id);
+            assert_eq!(draft.title, "edited title");
+            assert_eq!(draft.details, "edited details");
+            assert_eq!(draft.r#type, xai_grok_feedback::FeedbackType::Bug);
+            assert_eq!(feedback_text, "edited details");
+        }
+        other => panic!("expected draft SendFeedback, got {other:?}"),
+    }
+    assert!(
+        app.agents[&id].feedback_modal.is_some(),
+        "draft submit keeps the modal open until the POST settles"
     );
 }

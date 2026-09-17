@@ -73,6 +73,7 @@ impl ToolKind {
             ToolKind::Monitor => "Monitor",
             ToolKind::GoalUpdate => "Update Goal",
             ToolKind::Workflow => "Workflow",
+            ToolKind::Feedback => "Feedback",
             ToolKind::Other => "Tool",
         }
     }
@@ -119,6 +120,7 @@ impl ToolKind {
             | ToolKind::Monitor
             | ToolKind::GoalUpdate
             | ToolKind::Workflow
+            | ToolKind::Feedback
             | ToolKind::Other => false,
         }
     }
@@ -142,6 +144,7 @@ pub const WRITING_TOOL_WIRE_NAMES: &[(&str, ToolKind)] = &[
     ("image_to_video", ToolKind::ImageToVideo),
     ("reference_to_video", ToolKind::ReferenceToVideo),
     ("ask_user_question", ToolKind::AskUser),
+    ("send_feedback", ToolKind::Feedback),
 ];
 
 /// Return the semantic kind for a long-argument first-party tool wire name.

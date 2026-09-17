@@ -7,6 +7,7 @@ pub(crate) mod chat_conversation_history;
 pub mod code_nav;
 pub mod debug;
 pub mod feedback;
+mod feedback_drafts;
 pub mod fs;
 pub mod git;
 pub mod hooks;

@@ -12,6 +12,7 @@ pub mod acp_command;
 pub mod command;
 pub mod commands;
 pub mod matcher;
+pub(crate) mod mid_text_hoist;
 pub mod mode_support;
 pub mod mru;
 pub mod registry;

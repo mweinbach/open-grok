@@ -219,6 +219,9 @@ struct Bucket<'e> {
     /// one subagent count once; a burst of terminal rows counts each
     /// distinct subagent).
     sources: std::collections::HashSet<&'e str>,
+    /// Distinct child ids whose Subagent row is still `is_running`. Empty for
+    /// other kinds so a finished-only set does not inherit group-wide Running.
+    running_sources: std::collections::HashSet<&'e str>,
 }
 
 /// Walk the verb-group run starting at `header_idx` (same [`run_step`] rules
@@ -332,6 +335,7 @@ impl<'e> BucketAccumulator<'e> {
                     kind,
                     calls: 0,
                     sources: std::collections::HashSet::new(),
+                    running_sources: std::collections::HashSet::new(),
                 });
                 self.buckets.len() - 1
             }
@@ -356,6 +360,9 @@ impl<'e> BucketAccumulator<'e> {
             }
             RenderBlock::Subagent(sb) => {
                 bucket.sources.insert(sb.child_session_id.as_str());
+                if entry.is_running {
+                    bucket.running_sources.insert(sb.child_session_id.as_str());
+                }
                 // Cancelled is deliberate, not an error — only Failed feeds
                 // the red suffix.
                 if matches!(sb.kind, SubagentBlockKind::Failed { .. }) {
@@ -385,13 +392,33 @@ impl<'e> BucketAccumulator<'e> {
             } else {
                 bucket.sources.len()
             };
-            let segment = format!(
-                "{}{} {} {}",
-                if i == 0 { "" } else { ", " },
-                bucket.kind.verb(self.running),
-                count,
-                bucket.kind.noun(count)
-            );
+            let sep = if i == 0 { "" } else { ", " };
+            // Subagent tense is per-bucket: a finished-only set must not inherit
+            // group-wide Running.
+            let segment = match bucket.kind {
+                VerbGroupKind::Subagent => {
+                    let running_n = bucket.running_sources.len();
+                    let done_n = count.saturating_sub(running_n);
+                    if running_n > 0 && done_n > 0 {
+                        format!(
+                            "{sep}{} {running_n} {}, {done_n} completed",
+                            bucket.kind.verb(true),
+                            bucket.kind.noun(running_n),
+                        )
+                    } else {
+                        format!(
+                            "{sep}{} {count} {}",
+                            bucket.kind.verb(running_n > 0),
+                            bucket.kind.noun(count),
+                        )
+                    }
+                }
+                _ => format!(
+                    "{sep}{} {count} {}",
+                    bucket.kind.verb(self.running),
+                    bucket.kind.noun(count),
+                ),
+            };
             text.push_str(&segment);
             spans.push(Span::styled(segment, text_style));
         }
@@ -480,6 +507,12 @@ mod tests {
         subagent(SubagentBlock::started(
             "task", child_sid, "explore", None, None, None, /*is_background=*/ true,
         ))
+    }
+
+    fn running_sub(child_sid: &str) -> ScrollbackEntry {
+        let mut entry = sub_started(child_sid);
+        entry.is_running = true;
+        entry
     }
 
     fn sub_completed(child_sid: &str) -> ScrollbackEntry {
@@ -838,10 +871,38 @@ mod tests {
 
     #[test]
     fn running_subagent_flips_group_tense() {
-        let mut entries = vec![read("a.rs"), sub_started("child-A")];
-        entries[1].is_running = true;
+        let entries = vec![read("a.rs"), running_sub("child-A")];
         let l = label(&entries);
         assert_eq!(l.text, "Reading 1 file, Running 1 subagent");
+        assert!(l.running);
+    }
+
+    #[test]
+    fn mixed_subagents_show_running_and_completed_counts() {
+        let l = label(&[
+            running_sub("a"),
+            running_sub("b"),
+            sub_completed("c"),
+            sub_completed("d"),
+            sub_completed("e"),
+        ]);
+        assert_eq!(l.text, "Running 2 subagents, 3 completed");
+        assert!(l.running);
+
+        let l = label(&[running_sub("a"), sub_completed("b")]);
+        assert_eq!(l.text, "Running 1 subagent, 1 completed");
+        assert!(l.running);
+    }
+
+    #[test]
+    fn finished_subagents_do_not_claim_running_when_another_kind_is() {
+        let mut entries = vec![read("a.rs"), sub_completed("child-A")];
+        let Some(file) = entries.get_mut(0) else {
+            panic!("expected two entries: {entries:?}");
+        };
+        file.is_running = true;
+        let l = label(&entries);
+        assert_eq!(l.text, "Reading 1 file, Ran 1 subagent");
         assert!(l.running);
     }
 }

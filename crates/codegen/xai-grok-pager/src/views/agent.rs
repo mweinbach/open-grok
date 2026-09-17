@@ -1917,21 +1917,20 @@ mod tests {
             );
         }
     }
-    /// Running-turn cancel hint key tracks `esc_would_cancel_turn` — the
-    /// input-routing predicate computed by the caller: Esc when a bare press
-    /// would reach the policy's mid-turn cancel, the registry Ctrl+C binding
-    /// otherwise. (The predicate itself — gate, panes, and higher-priority
-    /// Esc consumers — is pinned by `esc_would_cancel_turn_tests` in
-    /// `agent_view::input`.)
+    /// The running-turn cancel hint always names the registry Ctrl+C binding:
+    /// Esc never cancels a turn (it only hints at this key), in every mode
+    /// and pane.
     #[test]
-    fn running_turn_cancel_hint_key_tracks_esc_predicate() {
+    fn running_turn_cancel_hint_is_always_ctrl_c() {
         let prompt = PromptWidget::default();
         let registry = ActionRegistry::defaults();
-        for (esc_would_cancel_turn, expected) in
-            [(true, crate::key!(Esc)), (false, crate::key!('c', CONTROL))]
-        {
+        for (vim_mode, pane) in [
+            (false, ActivePane::Prompt),
+            (true, ActivePane::Prompt),
+            (false, ActivePane::Scrollback),
+        ] {
             let hints = build_hints(
-                ActivePane::Prompt,
+                pane,
                 prompt_focus_hint(),
                 &prompt,
                 &registry,
@@ -1946,10 +1945,10 @@ mod tests {
                 false,
                 false,
                 false,
-                true,
+                vim_mode,
                 false,
                 true,
-                esc_would_cancel_turn,
+                false,
                 false,
                 false,
                 false,
@@ -1962,9 +1961,15 @@ mod tests {
                 .find(|h| h.label == "cancel")
                 .expect("running turn must surface the cancel hint");
             assert_eq!(
+                vec![crate::key!('c', CONTROL)],
                 cancel.keys,
-                vec![expected],
-                "cancel hint key for esc_would_cancel_turn={esc_would_cancel_turn}"
+                "cancel hint key for vim_mode={vim_mode} pane={pane:?}"
+            );
+            assert!(
+                !hints
+                    .iter()
+                    .any(|h| h.label == "cancel" && h.keys == vec![crate::key!(Esc)]),
+                "no hint may advertise Esc as the turn cancel (vim_mode={vim_mode} pane={pane:?})"
             );
         }
     }

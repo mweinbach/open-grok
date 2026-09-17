@@ -292,11 +292,10 @@ impl MvpAgent {
     ///
     /// Memoizes the single [`folder_trust::resolve_launch_dir_trust`] gather (see
     /// it for the dedup + TOCTOU contract) so the two one-shot init helpers
-    /// (`ensure_plugin_registry` and `ensure_local_workspace_ops`) share it
-    /// instead of each re-scanning. They share a single point-in-time verdict
-    /// rather than two independent re-scans; the sub-millisecond, startup-only
-    /// window between them is intentional (the cross-session TOCTOU re-scan is
-    /// preserved per the contract).
+    /// (`ensure_local_workspace_ops`) share it instead of each re-scanning.
+    /// Plugin registry builds do not reuse this primer: they read disk config
+    /// through the trust gate, so they resolve (and record) afresh right before
+    /// the read — see [`Self::registry_build_inputs`].
     fn prime_launch_dir_trust(&self) -> (&std::path::Path, bool) {
         let trust = *self
             .launch_dir_trust
@@ -358,21 +357,122 @@ impl MvpAgent {
     /// critical path — on the first session-creating call. Runs the discovery
     /// walk once; per-session `build_for_cwd` still re-resolves project-scoped
     /// plugins for each session's own cwd.
-    pub(super) fn ensure_plugin_registry(&self) {
+    pub(crate) fn ensure_plugin_registry(&self) {
         if self.plugin_registry_initialized.replace(true) {
             return;
         }
-        let (cwd, trusted) = self.prime_launch_dir_trust();
-        let mut plugins = self.cfg.borrow().plugins.clone();
-        plugins.merge_claude_enabled_plugins(Some(cwd));
-        let disk_config = plugins.to_discovery_config();
-        let count = self
-            .plugin_registry_handle
-            .reload(Some(cwd), &disk_config, trusted, false);
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let (trusted, disk_config) =
+            Self::registry_build_inputs(&self.launch_cwd, remote_settings.as_ref());
+        let count = self.plugin_registry_handle.reload(
+            Some(&self.launch_cwd),
+            &disk_config,
+            trusted,
+            false,
+        );
         tracing::debug!(
             plugin_count = count,
             "lazily populated plugin registry snapshot"
         );
+    }
+    /// Inputs for a registry build scoped to `cwd`: a fresh real-remote trust
+    /// verdict, then `[plugins]` from disk. Self-free so callers can run it on
+    /// a blocking thread.
+    ///
+    /// `cfg.plugins` is boot-time state that `config.toml` edits never refresh,
+    /// so a snapshot built from it reports stale `enabled` flags to session-less
+    /// `x.ai/plugins/list` / `x.ai/skills/list`.
+    ///
+    /// Order is load-bearing: the disk read consults the folder-trust gate,
+    /// whose cold-key backstop resolves remote-less and records a durable
+    /// verdict that would make an org kill-switch unliftable for the process;
+    /// resolving first (recording, with the real `RemoteSettings`) makes the
+    /// read a cache hit.
+    pub(crate) fn registry_build_inputs(
+        cwd: &std::path::Path,
+        remote_settings: Option<&crate::util::config::RemoteSettings>,
+    ) -> (bool, xai_grok_agent::plugins::discovery::DiscoveryConfig) {
+        let trusted = folder_trust::resolve_and_record(cwd, remote_settings, false);
+        (
+            trusted,
+            crate::config::resolve_effective_plugins_config(cwd).to_discovery_config(),
+        )
+    }
+    /// The directory the agent was launched in; the shared registry snapshot
+    /// is built for it.
+    pub(crate) fn launch_cwd(&self) -> &std::path::Path {
+        &self.launch_cwd
+    }
+    /// An explicit rebuild populated the shared snapshot; the lazy boot build
+    /// must not run after it (it would rebuild with the startup primer's
+    /// memoized trust, undoing a fresh reload verdict).
+    pub(crate) fn mark_plugin_registry_initialized(&self) {
+        self.plugin_registry_initialized.set(true);
+    }
+    /// [`Self::ensure_plugin_registry`] for async callers: the trust gather,
+    /// config read and discovery walk run on a blocking thread so a pre-session
+    /// pull never stalls the runtime. The result is published back on the
+    /// runtime, and only if nothing else (a concurrent explicit
+    /// `x.ai/plugins/reload`) initialized the registry meanwhile — the newer
+    /// build wins.
+    pub(crate) async fn ensure_plugin_registry_async(&self) {
+        if self.plugin_registry_initialized.get() {
+            return;
+        }
+        let launch_cwd = self.launch_cwd.clone();
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let handle = self.plugin_registry_handle.clone();
+        let built = tokio::task::spawn_blocking(move || {
+            let (trusted, disk_config) =
+                Self::registry_build_inputs(&launch_cwd, remote_settings.as_ref());
+            handle.refresh_and_build_for_cwd(&launch_cwd, &disk_config, &[], trusted)
+        })
+        .await;
+        match built {
+            Ok(_) if self.plugin_registry_initialized.get() => {}
+            Ok(registry) => {
+                tracing::debug!(
+                    plugin_count = registry.as_ref().map_or(0, |r| r.len()),
+                    "lazily populated plugin registry snapshot"
+                );
+                self.plugin_registry_handle.publish(registry);
+                self.plugin_registry_initialized.set(true);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "plugin registry build task failed")
+            }
+        }
+    }
+    /// Plugin registry for a pre-session pull (`x.ai/skills/*`,
+    /// `x.ai/commands/list`) scoped to `cwd`: a fresh, non-shared build for
+    /// that cwd when one is given — the launch dir is unrelated to the user's
+    /// workspace in desktop-to-docker and ssh setups — else the shared
+    /// launch-dir snapshot, built on demand. Trust is resolved before the disk
+    /// read either way, and the walks run on a blocking thread.
+    pub(crate) async fn plugin_registry_for_cwd(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Option<std::sync::Arc<xai_grok_agent::plugins::PluginRegistry>> {
+        let Some(cwd) = cwd else {
+            self.ensure_plugin_registry_async().await;
+            return self.plugin_registry_handle.snapshot();
+        };
+        let cwd = cwd.to_path_buf();
+        let remote_settings = self.cfg.borrow().remote_settings.clone();
+        let handle = self.plugin_registry_handle.clone();
+        match tokio::task::spawn_blocking(move || {
+            let (trusted, disk_cfg) =
+                Self::registry_build_inputs(&cwd, remote_settings.as_ref());
+            handle.build_for_cwd(&cwd, &disk_cfg, &[], trusted)
+        })
+        .await
+        {
+            Ok(registry) => registry,
+            Err(err) => {
+                tracing::warn!(error = %err, "plugin registry build task failed");
+                None
+            }
+        }
     }
     /// Admit client servers and merge local / plugin / client sources.
     ///

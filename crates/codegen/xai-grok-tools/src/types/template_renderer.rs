@@ -70,6 +70,8 @@ struct TemplateContext {
     /// on this so the promise is only made when it can be kept. Defaults
     /// to `true` (prod CLI behavior).
     system_reminders_enabled: bool,
+    /// Absolute path to this session's drafts file, when known.
+    feedback_drafts_path: String,
 }
 
 /// Shared render implementation: fast-path check + MiniJinja render.
@@ -218,8 +220,17 @@ impl TemplateRenderer {
                 shell_uses_semicolon: xai_grok_config::shell::chain_separator() == ";",
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
+                feedback_drafts_path: String::new(),
             },
         }
+    }
+
+    /// Set the absolute drafts-file path advertised in `send_feedback`.
+    /// An empty path omits the drafts-file sentence from the description.
+    #[must_use]
+    pub fn with_feedback_drafts_path(mut self, path: impl Into<String>) -> Self {
+        self.ctx.feedback_drafts_path = path.into();
+        self
     }
 
     /// Override whether templates see `system_reminders_enabled` as true.
@@ -689,7 +700,7 @@ mod tests {
 
 Usage notes:
 - Use the task_id from a command run with ${{ params.execute.is_background }}=true, or a subagent launched with ${{ params.task.run_in_background }}=true
-- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~10 min)."#;
+- Omit timeout_ms (or pass 0) for a non-blocking status poll; set a positive timeout_ms to wait up to that many milliseconds for completion (capped at ~1 h)."#;
         let rendered = r.render(desc).expect("task_output description must render");
         let _ = std::fs::write("/tmp/task_output_tool_description.txt", &rendered);
         assert!(

@@ -173,6 +173,8 @@ pub(crate) struct AgentRebuildSpec {
     pub memory_global_path: Option<String>,
     pub memory_workspace_path: Option<String>,
     pub memory_backend: Option<Arc<dyn MemoryBackend>>,
+    pub memory_v2_access: Option<xai_grok_tools::types::memory_v2::MemoryV2AccessResource>,
+    pub memory_v2_exposed: bool,
     pub web_search: parking_lot::RwLock<ResolvedWebSearchState>,
     pub active_sampling_config: parking_lot::RwLock<xai_grok_sampler::SamplerConfig>,
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
@@ -326,6 +328,8 @@ impl AgentRebuildSpec {
             memory_global_path,
             memory_workspace_path,
             memory_backend,
+            memory_v2_access,
+            memory_v2_exposed,
             web_search,
             active_sampling_config,
             chat_state_handle,
@@ -403,6 +407,7 @@ impl AgentRebuildSpec {
         .with_reminder_policy(reminder_policy.clone())
         .with_memory_enabled(*memory_enabled)
         .with_memory_paths(memory_global_path.clone(), memory_workspace_path.clone())
+        .with_memory_v2_access(memory_v2_access.clone(), *memory_v2_exposed)
         .with_is_non_interactive(*is_non_interactive)
         .with_system_prompt_label(system_prompt_label.clone())
         .with_session_env(session_env.clone())
@@ -680,6 +685,8 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_global_path: None,
         memory_workspace_path: None,
         memory_backend: None,
+        memory_v2_access: None,
+        memory_v2_exposed: false,
         web_search: parking_lot::RwLock::new(ResolvedWebSearchState::resolved_for(
             crate::tools::config::WebSearchCandidates::disabled(),
             &active_sampling_config,
