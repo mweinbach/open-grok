@@ -33,7 +33,7 @@ impl SessionActor {
     async fn admit_parent_agent_message_with(
         self: &Arc<Self>,
         message: ActiveAgentMessage,
-        _operation: ActiveAgentMessageOperation,
+        operation: ActiveAgentMessageOperation,
         receipt_sink: mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
         telemetry: Option<crate::session::telemetry::ActiveAgentMessageParentTelemetry>,
         respond_to: oneshot::Sender<ActiveMessageAdmission>,
@@ -106,6 +106,9 @@ impl SessionActor {
             }),
         });
         let _ = respond_to.send(ActiveMessageAdmission::Admitted);
+        if operation == ActiveAgentMessageOperation::Interject {
+            self.tool_context.parent_interject.set_pending(true);
+        }
         Self::maybe_start_running_task(self.clone(), completion_tx).await;
     }
 

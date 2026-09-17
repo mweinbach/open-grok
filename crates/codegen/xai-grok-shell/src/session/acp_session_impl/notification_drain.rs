@@ -295,6 +295,9 @@ impl SessionActor {
             )
         };
         self.apply_tool_overrides_update(tool_overrides_update);
+        if matches!(origin, super::PromptOrigin::ParentAgentMessage { .. }) {
+            self.tool_context.parent_interject.set_pending(false);
+        }
         if matches!(origin, super::PromptOrigin::User) {
             if let Some(gate) = &self.tool_context.task_wake_suppressed {
                 gate.set(false);

@@ -7,8 +7,9 @@
 //! the parent module's private helpers.
 use super::hooks::RewriteProblem;
 use super::wait_interrupt::{
-    InterruptedWaitFilter, apply_interrupted_wait_filter, finished_wait_ids,
-    interrupted_wait_tool_result, record_interruptible_wait_outcome, wait_task_ids_from_args,
+    InterruptedWaitFilter, WaitInterruptCause, apply_interrupted_wait_filter, finished_wait_ids,
+    interrupted_wait_tool_result, record_interruptible_wait_outcome, wait_for_wait_interrupt,
+    wait_task_ids_from_args,
 };
 use super::*;
 use futures::StreamExt;
@@ -140,14 +141,6 @@ fn is_interruptible_wait_tool(tool_name: &str, args: &serde_json::Value) -> bool
         "wait_tasks" | "wait_commands_or_subagents" | "wait_tasks_or_subagents" => true,
         "Await" | "AwaitShell" => true,
         _ => false,
-    }
-}
-async fn wait_for_pending_interjection(buf: &InterjectionBuffer<acp::ImageContent>) {
-    loop {
-        if !buf.is_empty() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 use crate::tools::tool_context::BlockingWaitGuard;
@@ -702,6 +695,7 @@ impl SessionActor {
         let shared_codex_recovery = Arc::new(tokio::sync::OnceCell::<bool>::const_new());
         let workspace_ops = self.workspace_ops.clone();
         let pending_interjections = self.pending_interjections.clone();
+        let parent_interject = self.tool_context.parent_interject.clone();
         let native_agents_enabled = {
             let sampling = self.rebuild_spec.active_sampling_config.read();
             self.models_manager
@@ -721,6 +715,7 @@ impl SessionActor {
                 let workspace_ops = workspace_ops.clone();
                 let session_id = session_id.clone();
                 let pending_interjections = pending_interjections.clone();
+                let parent_interject = parent_interject.clone();
                 let blocking_wait_depth = self.tool_context.blocking_wait_depth.clone();
                 let interruptible =
                     is_interruptible_wait_tool(&prepared.tool_name, &prepared.parsed_args)
@@ -774,11 +769,15 @@ impl SessionActor {
                                 &prepared.tool_name,
                                 run_tool,
                             ) => (result, false),
-                            _ = wait_for_pending_interjection(&pending_interjections) => {
+                            cause = wait_for_wait_interrupt(&pending_interjections, &parent_interject) => {
                                 tracing::info!(
                                     tool = %prepared.tool_name,
+                                    ?cause,
                                     "abort wait tool: interjection pending"
                                 );
+                                if cause == WaitInterruptCause::ParentInterject {
+                                    parent_interject.set_pending(false);
+                                }
                                 if native_agents_enabled && prepared.tool_name == "wait_agent" {
                                     let value = serde_json::json!({"updates": [], "interrupted": true, "timed_out": false});
                                     (Ok(ToolRunResult {
@@ -787,7 +786,7 @@ impl SessionActor {
                                         effective_tool_name: None,
                                     }), true)
                                 } else {
-                                    (Ok(interrupted_wait_tool_result(&prepared.parsed_args)), true)
+                                    (Ok(interrupted_wait_tool_result(&prepared.parsed_args, cause)), true)
                                 }
                             }
                         }
@@ -1278,8 +1277,14 @@ impl SessionActor {
                 &prepared.tool_name,
                 dispatch,
             ) => (result, false, false),
-            _ = wait_for_pending_interjection(&self.pending_interjections), if interruptible => {
-                (Ok(interrupted_wait_tool_result(&prepared.parsed_args)), false, true)
+            cause = wait_for_wait_interrupt(
+                &self.pending_interjections,
+                &self.tool_context.parent_interject
+            ), if interruptible => {
+                if cause == WaitInterruptCause::ParentInterject {
+                    self.tool_context.parent_interject.set_pending(false);
+                }
+                (Ok(interrupted_wait_tool_result(&prepared.parsed_args, cause)), false, true)
             }
         };
         if let Some(guard) = wait_guard.as_ref() {
@@ -4685,9 +4690,10 @@ mod plan_approval_helper_tests {
 #[cfg(test)]
 mod wait_interrupt_tests {
     use super::{
-        BlockingWaitGuard, interrupted_wait_tool_result, is_interruptible_wait_tool,
-        wait_for_pending_interjection,
+        BlockingWaitGuard, WaitInterruptCause, interrupted_wait_tool_result,
+        is_interruptible_wait_tool, wait_for_wait_interrupt,
     };
+    use crate::tools::tool_context::ParentInterjectSignal;
     use xai_grok_tools::types::output::ToolOutput;
     use xai_tool_types::TaskOutputOutput;
     /// The interruptible-wait select arms: a pending interjection aborts an
@@ -4699,10 +4705,11 @@ mod wait_interrupt_tests {
         use xai_interjection_core::PendingInterjection;
         let buf: InterjectionBuffer<agent_client_protocol::ImageContent> =
             InterjectionBuffer::default();
+        let parent = ParentInterjectSignal::default();
         let out = tokio::select! {
             biased;
             r = async { "wait-result" } => r,
-            _ = wait_for_pending_interjection(&buf) => "aborted",
+            _ = wait_for_wait_interrupt(&buf, &parent) => "aborted",
         };
         assert_eq!(out, "wait-result");
         buf.push(PendingInterjection {
@@ -4715,15 +4722,26 @@ mod wait_interrupt_tests {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
                 "wait-result"
             } => r,
-            _ = wait_for_pending_interjection(&buf) => "aborted",
+            _ = wait_for_wait_interrupt(&buf, &parent) => "aborted",
         };
         assert_eq!(out, "aborted");
         let out = tokio::select! {
             biased;
             r = async { "wait-result" } => r,
-            _ = wait_for_pending_interjection(&buf) => "aborted",
+            _ = wait_for_wait_interrupt(&buf, &parent) => "aborted",
         };
         assert_eq!(out, "wait-result");
+        buf.drain_all();
+        parent.set_pending(true);
+        let out = tokio::select! {
+            biased;
+            r = async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                "wait-result"
+            } => r,
+            _ = wait_for_wait_interrupt(&buf, &parent) => "aborted",
+        };
+        assert_eq!(out, "aborted");
     }
     #[test]
     fn interruptible_wait_tool_only_when_timeout_positive() {
@@ -4750,10 +4768,13 @@ mod wait_interrupt_tests {
     }
     #[test]
     fn interrupted_wait_result_is_cancelled_not_error() {
-        let r = interrupted_wait_tool_result(&serde_json::json!({
-            "task_ids": ["bg-9"],
-            "timeout_ms": 60_000
-        }));
+        let r = interrupted_wait_tool_result(
+            &serde_json::json!({
+                "task_ids": ["bg-9"],
+                "timeout_ms": 60_000
+            }),
+            WaitInterruptCause::HumanInterjection,
+        );
         assert!(
             r.prompt_text
                 .contains("Wait interrupted: the user sent a message.")

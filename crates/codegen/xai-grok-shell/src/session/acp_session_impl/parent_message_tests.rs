@@ -35,6 +35,13 @@ async fn steer_and_interject_admit_through_the_queue_path() {
     let local = tokio::task::LocalSet::new();
     await_with_timeout(local.run_until(async {
         let (actor, _) = await_with_timeout(super::super::support::build_actor()).await;
+        {
+            let mut state = actor.state.lock().await;
+            state
+                .pending_inputs
+                .push_back(super::super::support::user_item("running", "owner"));
+            state.running_task = Some(super::super::support::running_task_stub("running"));
+        }
         for operation in [
             ActiveAgentMessageOperation::Steer,
             ActiveAgentMessageOperation::Interject,
@@ -81,6 +88,12 @@ async fn steer_and_interject_admit_through_the_queue_path() {
                     .prompt_id,
                 format!("parent-message-{id}")
             );
+            assert_eq!(
+                actor.tool_context.parent_interject.is_pending(),
+                operation == ActiveAgentMessageOperation::Interject,
+                "only Interject raises the wait-abort signal"
+            );
+            actor.tool_context.parent_interject.set_pending(false);
         }
     }))
     .await;

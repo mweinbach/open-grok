@@ -11,6 +11,7 @@ use crate::terminal::AsyncTerminalRunner;
 use agent_client_protocol as acp;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 use xai_grok_paths::AbsPathBuf;
 use xai_grok_tools::implementations::grok_build::task::types::ForegroundWaitKind;
@@ -73,6 +74,24 @@ impl TaskOutputTokenBudget {
         (state.spent, state.incomplete)
     }
 }
+/// Dedicated wait-abort flag for a parent Interject. The message itself stays
+/// on `pending_inputs` so it is not also drained through
+/// `pending_interjections` (that would double-deliver).
+#[derive(Default)]
+pub(crate) struct ParentInterjectSignal {
+    has_pending: AtomicBool,
+}
+
+impl ParentInterjectSignal {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.has_pending.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_pending(&self, has_pending: bool) {
+        self.has_pending.store(has_pending, Ordering::Relaxed);
+    }
+}
+
 pub struct BlockingWaitState(std::sync::Mutex<BlockingWaitInner>);
 #[derive(Default)]
 struct BlockingWaitInner {
@@ -287,6 +306,9 @@ pub struct ToolContext {
     /// [`BlockingWaitGuard`]). `queue_input` reads it: a prompt arriving while
     /// non-zero takes the send-now path.
     pub blocking_wait_depth: Arc<BlockingWaitState>,
+    /// Parent Interject wait-abort flag. Separate from `pending_interjections`
+    /// so the follow-up is not drained twice.
+    pub(crate) parent_interject: Arc<ParentInterjectSignal>,
     /// Fired when a user message arrives during an orchestration wait so
     /// `agent_swarm` / `swarm_wait` can detach without cancelling members.
     pub orchestration_steer:
@@ -382,6 +404,7 @@ impl ToolContext {
             auto_wake_enabled: true,
             goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             blocking_wait_depth: Arc::new(BlockingWaitState::new()),
+            parent_interject: Arc::new(ParentInterjectSignal::default()),
             orchestration_steer: xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
             swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
             task_output_token_budget: None,
@@ -476,6 +499,7 @@ mod tests {
                 auto_wake_enabled: true,
                 goal_loop_active_gate: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 blocking_wait_depth: Arc::new(BlockingWaitState::new()),
+                parent_interject: Arc::new(super::ParentInterjectSignal::default()),
                 orchestration_steer: xai_grok_tools::implementations::grok_build::task::types::OrchestrationSteerSignal::new(),
                 swarm_registry: xai_grok_tools::implementations::grok_build::SwarmRegistry::new(),
                 task_output_token_budget: None,

@@ -1,7 +1,36 @@
+use std::time::Duration;
+
 use xai_grok_tools::types::output::{ToolOutput as ToolsToolOutput, ToolRunResult};
+use xai_interjection_core::InterjectionBuffer;
 use xai_tool_types::{TaskOutputOutput, TaskOutputResult};
 
-use crate::tools::tool_context::BlockingWaitState;
+use crate::tools::tool_context::{BlockingWaitState, ParentInterjectSignal};
+
+/// Why an interruptible wait tool was aborted before it produced its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WaitInterruptCause {
+    HumanInterjection,
+    ParentInterject,
+}
+
+const WAIT_INTERRUPT_POLL: Duration = Duration::from_millis(50);
+
+/// Human first, then parent. Parent Interject uses a dedicated flag so the
+/// follow-up is not also pushed into `pending_interjections`.
+pub(super) async fn wait_for_wait_interrupt(
+    human: &InterjectionBuffer<agent_client_protocol::ImageContent>,
+    parent: &ParentInterjectSignal,
+) -> WaitInterruptCause {
+    loop {
+        if !human.is_empty() {
+            return WaitInterruptCause::HumanInterjection;
+        }
+        if parent.is_pending() {
+            return WaitInterruptCause::ParentInterject;
+        }
+        tokio::time::sleep(WAIT_INTERRUPT_POLL).await;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum InterruptedWaitFilter {
@@ -125,20 +154,31 @@ pub(super) fn record_interruptible_wait_outcome(
 
 pub(super) const WAIT_INTERRUPTED_HEAD: &str = "Wait interrupted: the user sent a message.";
 
-fn interrupted_wait_prompt(has_ids: bool) -> String {
+/// Sender-neutral: the parent lane also carries a human's message relayed through the parent.
+pub(super) const WAIT_INTERRUPTED_BY_AGENT_MESSAGE_HEAD: &str =
+    "Wait interrupted: an agent message is pending.";
+
+pub(super) fn interrupted_wait_prompt(has_ids: bool, cause: WaitInterruptCause) -> String {
+    let head = match cause {
+        WaitInterruptCause::HumanInterjection => WAIT_INTERRUPTED_HEAD,
+        WaitInterruptCause::ParentInterject => WAIT_INTERRUPTED_BY_AGENT_MESSAGE_HEAD,
+    };
     if !has_ids {
-        return WAIT_INTERRUPTED_HEAD.to_string();
+        return head.to_owned();
     }
     format!(
-        "{WAIT_INTERRUPTED_HEAD}\n\n\
+        "{head}\n\n\
          If you choose to wait on these tasks again, resume with the called task_ids only. \
          Newly spawned background work auto-wakes when it finishes and doesn't need to be added to this wait."
     )
 }
 
-pub(super) fn interrupted_wait_tool_result(args: &serde_json::Value) -> ToolRunResult {
+pub(super) fn interrupted_wait_tool_result(
+    args: &serde_json::Value,
+    cause: WaitInterruptCause,
+) -> ToolRunResult {
     let ids = wait_task_ids_from_args(args);
-    let msg = interrupted_wait_prompt(!ids.is_empty());
+    let msg = interrupted_wait_prompt(!ids.is_empty(), cause);
     let task_id = ids.first().cloned().unwrap_or_default();
     let result = TaskOutputResult {
         task_id,
