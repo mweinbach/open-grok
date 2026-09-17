@@ -909,6 +909,7 @@ pub struct AgentView {
     pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
     pub dock_cursor: usize,
+    pub dock_workflows_expanded: bool,
     pub dock_subagents_expanded: bool,
     pub dock_tasks_expanded: bool,
     pub dock_watchers_expanded: bool,

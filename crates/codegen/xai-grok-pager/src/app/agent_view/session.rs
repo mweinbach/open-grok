@@ -136,6 +136,7 @@ impl AgentView {
             finished_wake_prompts: HashSet::new(),
             active_pane: ActivePane::Prompt,
             dock_cursor: 0,
+            dock_workflows_expanded: true,
             dock_subagents_expanded: true,
             dock_tasks_expanded: true,
             dock_watchers_expanded: true,

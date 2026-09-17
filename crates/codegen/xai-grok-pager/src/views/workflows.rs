@@ -96,6 +96,29 @@ impl WorkflowRunSnapshot {
         self.agents.iter().filter(|a| a.state == "running").count()
     }
 
+    pub fn activity_label(&self) -> String {
+        if self.is_active() {
+            let phase = self
+                .current_phase
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty());
+            let agents = match self.active_agent_count() {
+                0 => None,
+                1 => Some("1 agent".to_owned()),
+                n => Some(format!("{n} agents")),
+            };
+            match (phase, agents) {
+                (Some(p), Some(a)) => format!("{p} · {a}"),
+                (Some(p), None) => p.to_owned(),
+                (None, Some(a)) => a,
+                (None, None) => "running".to_owned(),
+            }
+        } else {
+            self.status.replace('_', " ")
+        }
+    }
+
     pub fn live_elapsed_ms(&self) -> u64 {
         let base = self.elapsed_ms;
         if self.is_active() {
@@ -1156,6 +1179,14 @@ mod tests {
             &WorkflowAgentLiveMap::default(),
         );
         buf_text(&buf, area)
+    }
+
+    #[test]
+    fn activity_label_uses_phase_while_active_and_status_otherwise() {
+        let running = make_run("wf-1", "learn-traces-2", "active");
+        assert_eq!(running.activity_label(), "Research · 1 agent");
+        let paused = make_run("wf-1", "learn-traces-2", "user_paused");
+        assert_eq!(paused.activity_label(), "user paused");
     }
 
     #[test]

@@ -313,6 +313,25 @@ impl AgentView {
             InputOutcome::Unchanged
         }
     }
+    pub(crate) fn dock_workflow_rows(&self) -> Vec<(String, crate::views::dock::DockRow)> {
+        self.workflow_runs_newest_first()
+            .into_iter()
+            .filter(|run| !run.is_terminal())
+            .map(|run| {
+                let activity = run.activity_label();
+                (
+                    run.run_id.clone(),
+                    crate::views::dock::DockRow {
+                        kind: "Workflow".into(),
+                        description: run.name.clone(),
+                        activity: (!activity.is_empty()).then_some(activity),
+                        meta: crate::views::dock::fmt_elapsed(run.live_elapsed_ms() / 1000),
+                        killable: run.can_stop(),
+                    },
+                )
+            })
+            .collect()
+    }
     pub(crate) fn dock_subagent_rows(&self) -> Vec<(String, String, crate::views::dock::DockRow)> {
         let mut infos: Vec<&crate::app::subagent::SubagentInfo> = self
             .subagent_sessions
@@ -441,6 +460,7 @@ impl AgentView {
                 .count()
         };
         crate::views::dock::DockCounts {
+            workflows: self.dock_workflow_rows().len(),
             subagents: self
                 .subagent_sessions
                 .values()
@@ -449,6 +469,7 @@ impl AgentView {
             tasks: running_bg(false),
             watchers: running_bg(true) + self.session.scheduled_tasks.len(),
             queued: self.visible_held_queue_len(),
+            workflows_expanded: self.dock_workflows_expanded,
             subagents_expanded: self.dock_subagents_expanded,
             tasks_expanded: self.dock_tasks_expanded,
             watchers_expanded: self.dock_watchers_expanded,
@@ -460,6 +481,10 @@ impl AgentView {
     pub(crate) fn dock_activate(&mut self, item: crate::views::dock::DockItem) -> InputOutcome {
         use crate::views::dock::{DockItem, Section};
         match item {
+            DockItem::Header(Section::Workflows) => {
+                self.dock_workflows_expanded = !self.dock_workflows_expanded;
+                InputOutcome::Changed
+            }
             DockItem::Header(Section::Subagents) => {
                 self.dock_subagents_expanded = !self.dock_subagents_expanded;
                 InputOutcome::Changed
@@ -475,6 +500,15 @@ impl AgentView {
             DockItem::Header(Section::Queued) => {
                 self.dock_queued_expanded = !self.dock_queued_expanded;
                 InputOutcome::Changed
+            }
+            DockItem::Row(Section::Workflows, index) => {
+                if let Some((run_id, _)) = self.dock_workflow_rows().get(index) {
+                    let run_id = run_id.clone();
+                    self.open_workflow_detail_by_run_id(&run_id);
+                    InputOutcome::Changed
+                } else {
+                    InputOutcome::Unchanged
+                }
             }
             DockItem::Row(Section::Subagents, index) => {
                 if let Some((child_sid, _, _)) = self.dock_subagent_rows().get(index) {
@@ -508,6 +542,16 @@ impl AgentView {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.dock_activate(items[self.dock_cursor]),
             KeyCode::Char('x') => match items[self.dock_cursor] {
+                DockItem::Row(Section::Workflows, index) => self
+                    .dock_workflow_rows()
+                    .get(index)
+                    .filter(|(_, row)| row.killable)
+                    .map_or(InputOutcome::Unchanged, |(_, row)| {
+                        InputOutcome::Action(Action::SendSlashCommandPreservingDraft(format!(
+                            "/workflow stop {}",
+                            row.description
+                        )))
+                    }),
                 DockItem::Row(Section::Subagents, index) => self
                     .dock_subagent_rows()
                     .get(index)
@@ -1010,6 +1054,111 @@ mod dock_tests {
             agent.handle_dock_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
             InputOutcome::Unchanged
         ));
+    }
+
+    fn workflow_run(
+        run_id: &str,
+        name: &str,
+        status: &str,
+    ) -> crate::views::workflows::WorkflowRunSnapshot {
+        crate::views::workflows::WorkflowRunSnapshot {
+            run_id: run_id.to_string(),
+            name: name.to_string(),
+            objective: "obj".to_string(),
+            status: status.to_string(),
+            management_available: true,
+            builtin: false,
+            phases: Vec::new(),
+            current_phase: Some("Research".to_string()),
+            agents: vec![crate::views::workflows::WorkflowAgentRowView {
+                agent_id: "a1".into(),
+                label: "researcher".into(),
+                phase: Some("Research".into()),
+                model: None,
+                state: "running".into(),
+                tokens_used: 0,
+                duration_ms: 0,
+            }],
+            agent_budget: None,
+            agents_used: 1,
+            agents_reserved: 0,
+            agents_remaining: None,
+            agent_usage_incomplete: false,
+            active_agents: 1,
+            elapsed_ms: 95_000,
+            received_at: std::time::Instant::now(),
+            pause_message: None,
+            result_summary: None,
+        }
+    }
+
+    #[test]
+    fn dock_workflow_row_opens_detail_and_stop_preserves_draft() {
+        let mut agent = make_agent();
+        agent.prompt.set_text("unfinished request");
+        agent
+            .workflow_runs
+            .push(workflow_run("wf-1", "deep-research", "active"));
+        agent
+            .workflow_runs
+            .push(workflow_run("wf-done", "old-run", "complete"));
+        agent.dock_workflows_expanded = true;
+
+        let rows = agent.dock_workflow_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "wf-1");
+        assert_eq!(rows[0].1.kind, "Workflow");
+        assert_eq!(rows[0].1.description, "deep-research");
+        assert_eq!(rows[0].1.activity.as_deref(), Some("Research · 1 agent"));
+        assert!(rows[0].1.killable);
+        assert_eq!(agent.dock_counts().workflows, 1);
+        assert_eq!(
+            agent.dock_items().first(),
+            Some(&DockItem::Header(Section::Workflows))
+        );
+        assert_eq!(
+            agent.dock_items().get(1),
+            Some(&DockItem::Row(Section::Workflows, 0))
+        );
+
+        assert!(matches!(
+            agent.dock_activate(DockItem::Row(Section::Workflows, 0)),
+            InputOutcome::Changed
+        ));
+        assert!(agent.show_workflows);
+        assert_eq!(agent.workflows_view.detail_run_id.as_deref(), Some("wf-1"));
+
+        agent.dock_cursor = agent
+            .dock_items()
+            .iter()
+            .position(|item| *item == DockItem::Row(Section::Workflows, 0))
+            .unwrap();
+        let outcome = agent.handle_dock_key(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::SendSlashCommandPreservingDraft(ref command))
+                if command == "/workflow stop deep-research"
+        ));
+        assert_eq!(agent.prompt.text(), "unfinished request");
+    }
+
+    #[test]
+    fn dock_workflow_header_toggles_without_opening_detail() {
+        let mut agent = make_agent();
+        agent
+            .workflow_runs
+            .push(workflow_run("wf-1", "deep-research", "active"));
+        agent.dock_workflows_expanded = true;
+        assert!(matches!(
+            agent.dock_activate(DockItem::Header(Section::Workflows)),
+            InputOutcome::Changed
+        ));
+        assert!(!agent.dock_workflows_expanded);
+        assert!(!agent.show_workflows);
+        assert_eq!(
+            agent.dock_items(),
+            vec![DockItem::Header(Section::Workflows)]
+        );
     }
 }
 

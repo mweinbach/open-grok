@@ -1444,6 +1444,11 @@ impl AgentView {
         };
         let follow_ups_height = u16::from(self.follow_ups.is_some());
         let mut dock_data = dock_on.then(|| crate::views::dock::DockData {
+            workflows: self
+                .dock_workflow_rows()
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
             subagents: self
                 .dock_subagent_rows()
                 .into_iter()
@@ -1460,6 +1465,7 @@ impl AgentView {
                 .map(|(_, row)| row)
                 .collect(),
             queued: self.visible_held_queue_len(),
+            workflows_expanded: self.dock_workflows_expanded,
             subagents_expanded: self.dock_subagents_expanded,
             tasks_expanded: self.dock_tasks_expanded,
             watchers_expanded: self.dock_watchers_expanded,

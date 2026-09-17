@@ -22,6 +22,7 @@ pub struct DockRow {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Section {
+    Workflows,
     Subagents,
     Tasks,
     Watchers,
@@ -31,6 +32,7 @@ pub enum Section {
 impl Section {
     fn label(self) -> &'static str {
         match self {
+            Section::Workflows => "Workflows",
             Section::Subagents => "Subagents",
             Section::Tasks => "Tasks",
             Section::Watchers => "Watchers",
@@ -47,18 +49,21 @@ pub enum DockItem {
 
 #[derive(Default, Clone, Copy)]
 pub struct DockCounts {
+    pub workflows: usize,
     pub subagents: usize,
     pub tasks: usize,
     pub watchers: usize,
     pub queued: usize,
+    pub workflows_expanded: bool,
     pub subagents_expanded: bool,
     pub tasks_expanded: bool,
     pub watchers_expanded: bool,
 }
 
 impl DockCounts {
-    fn row_sections(self) -> [(Section, usize, bool); 3] {
+    fn row_sections(self) -> [(Section, usize, bool); 4] {
         [
+            (Section::Workflows, self.workflows, self.workflows_expanded),
             (Section::Subagents, self.subagents, self.subagents_expanded),
             (Section::Tasks, self.tasks, self.tasks_expanded),
             (Section::Watchers, self.watchers, self.watchers_expanded),
@@ -68,10 +73,12 @@ impl DockCounts {
 
 #[derive(Default)]
 pub struct DockData {
+    pub workflows: Vec<DockRow>,
     pub subagents: Vec<DockRow>,
     pub tasks: Vec<DockRow>,
     pub watchers: Vec<DockRow>,
     pub queued: usize,
+    pub workflows_expanded: bool,
     pub subagents_expanded: bool,
     pub tasks_expanded: bool,
     pub watchers_expanded: bool,
@@ -83,10 +90,12 @@ pub struct DockData {
 impl DockData {
     pub fn counts(&self) -> DockCounts {
         DockCounts {
+            workflows: self.workflows.len(),
             subagents: self.subagents.len(),
             tasks: self.tasks.len(),
             watchers: self.watchers.len(),
             queued: self.queued,
+            workflows_expanded: self.workflows_expanded,
             subagents_expanded: self.subagents_expanded,
             tasks_expanded: self.tasks_expanded,
             watchers_expanded: self.watchers_expanded,
@@ -95,6 +104,7 @@ impl DockData {
 
     fn rows(&self, section: Section) -> &[DockRow] {
         match section {
+            Section::Workflows => &self.workflows,
             Section::Subagents => &self.subagents,
             Section::Tasks => &self.tasks,
             Section::Watchers => &self.watchers,
@@ -196,6 +206,7 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
         match visual {
             Visual::Header(section) => {
                 let (count, expanded) = match section {
+                    Section::Workflows => (counts.workflows, counts.workflows_expanded),
                     Section::Subagents => (counts.subagents, counts.subagents_expanded),
                     Section::Tasks => (counts.tasks, counts.tasks_expanded),
                     Section::Watchers => (counts.watchers, counts.watchers_expanded),
@@ -217,7 +228,7 @@ pub fn render(buf: &mut Buffer, area: Rect, theme: &Theme, data: &DockData) {
                     theme,
                     &data.rows(section)[index],
                     selected,
-                    section == Section::Subagents,
+                    section == Section::Workflows || section == Section::Subagents,
                 );
                 if selected {
                     highlight_row(buf, area, row_y, theme);
@@ -344,6 +355,8 @@ mod tests {
 
     fn sample() -> DockData {
         DockData {
+            workflows: Vec::new(),
+            workflows_expanded: false,
             subagents: vec![
                 DockRow {
                     kind: "Explore".into(),
@@ -494,6 +507,47 @@ mod tests {
         );
         assert_eq!(item_at(&counts, 6), Some(DockItem::Header(Section::Queued)));
         assert_eq!(item_at(&counts, 7), None, "past the end / queue body");
+    }
+
+    #[test]
+    fn empty_workflows_do_not_shift_item_at() {
+        let data = sample();
+        assert_eq!(data.counts().workflows, 0);
+        assert_eq!(
+            item_at(&data.counts(), 0),
+            Some(DockItem::Header(Section::Subagents))
+        );
+    }
+
+    #[test]
+    fn workflows_section_is_first_and_openable() {
+        let theme = Theme::tokyonight();
+        let mut data = sample();
+        data.workflows = vec![row("Workflow", "deep-research", "1m35s", true)];
+        data.workflows_expanded = true;
+        data.focused = true;
+        data.cursor = 1;
+        let counts = data.counts();
+        assert_eq!(
+            item_at(&counts, 0),
+            Some(DockItem::Header(Section::Workflows))
+        );
+        assert_eq!(
+            item_at(&counts, 1),
+            Some(DockItem::Row(Section::Workflows, 0))
+        );
+        assert_eq!(
+            item_at(&counts, 2),
+            Some(DockItem::Header(Section::Subagents))
+        );
+
+        let area = Rect::new(0, 0, 100, 10);
+        let mut buf = Buffer::empty(area);
+        render(&mut buf, area, &theme, &data);
+        assert!(row_text(&buf, 0).starts_with("▾ Workflows 1 ─"));
+        let first = row_text(&buf, 1);
+        assert!(first.contains("Workflow deep-research"), "{first}");
+        assert!(first.trim_end().ends_with("[↗] [stop]"), "{first}");
     }
 
     #[test]
