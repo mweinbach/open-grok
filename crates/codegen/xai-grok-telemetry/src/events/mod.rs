@@ -2691,6 +2691,7 @@ mod tests {
         const SOURCES: &[&str] = &[
             include_str!("mod.rs"),
             include_str!("active_agent_message.rs"),
+            include_str!("feedback.rs"),
             include_str!("permission_analytics.rs"),
             include_str!("../session_metrics.rs"),
             include_str!("../memory_telemetry.rs"),
