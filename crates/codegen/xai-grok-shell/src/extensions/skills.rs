@@ -16,6 +16,15 @@ struct CwdParams {
     cwd: Option<String>,
 }
 
+/// The `cwd` a skills request is scoped to, if it names one (every request
+/// shape carries the field under the same name; unknown fields are ignored).
+pub(crate) fn request_cwd(args: &acp::ExtRequest) -> Option<std::path::PathBuf> {
+    serde_json::from_str::<CwdParams>(args.params.get())
+        .ok()
+        .and_then(|p| p.cwd)
+        .map(std::path::PathBuf::from)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillsAddRequest {
@@ -547,6 +556,29 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_cwd_reads_the_field_from_any_request_shape() {
+        let req = |json: &str| {
+            acp::ExtRequest::new(
+                "x.ai/skills/list",
+                serde_json::value::to_raw_value(
+                    &serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                )
+                .unwrap()
+                .into(),
+            )
+        };
+        assert_eq!(
+            request_cwd(&req(r#"{"cwd": "/project"}"#)),
+            Some(std::path::PathBuf::from("/project"))
+        );
+        assert_eq!(
+            request_cwd(&req(r#"{"path": "/skills", "cwd": "/project"}"#)),
+            Some(std::path::PathBuf::from("/project"))
+        );
+        assert_eq!(request_cwd(&req(r#"{}"#)), None);
+    }
 
     #[test]
     fn test_add_request_with_cwd() {
