@@ -319,11 +319,7 @@ fn paint_row(
 }
 
 pub fn fmt_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    }
+    crate::views::goal_detail::format_elapsed(secs.saturating_mul(1000))
 }
 
 #[cfg(test)]
@@ -498,6 +494,13 @@ mod tests {
         );
         assert_eq!(item_at(&counts, 6), Some(DockItem::Header(Section::Queued)));
         assert_eq!(item_at(&counts, 7), None, "past the end / queue body");
+    }
+
+    #[test]
+    fn fmt_elapsed_rolls_over_into_hours() {
+        assert_eq!(fmt_elapsed(59), "59s");
+        assert_eq!(fmt_elapsed(83), "1m23s");
+        assert_eq!(fmt_elapsed(194 * 60 + 4), "3h14m");
     }
 
     #[test]
