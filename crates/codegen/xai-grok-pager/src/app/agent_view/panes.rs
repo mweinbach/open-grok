@@ -478,6 +478,67 @@ impl AgentView {
     pub(crate) fn dock_items(&self) -> Vec<crate::views::dock::DockItem> {
         crate::views::dock::items(&self.dock_counts())
     }
+    pub(crate) fn is_dock_section_expanded(&self, section: crate::views::dock::Section) -> bool {
+        match section {
+            crate::views::dock::Section::Workflows => self.dock_workflows_expanded,
+            crate::views::dock::Section::Subagents => self.dock_subagents_expanded,
+            crate::views::dock::Section::Tasks => self.dock_tasks_expanded,
+            crate::views::dock::Section::Watchers => self.dock_watchers_expanded,
+            crate::views::dock::Section::Queued => self.dock_queued_expanded,
+        }
+    }
+    pub(crate) fn handle_dock_click(&mut self, item: crate::views::dock::DockItem) -> InputOutcome {
+        use crate::views::dock::DockItem;
+        let collapsing_header = matches!(
+            item,
+            DockItem::Header(section) if self.is_dock_section_expanded(section)
+        );
+        if !collapsing_header {
+            self.set_active_pane(AgentPane::Dock, false);
+            if let Some(index) = self
+                .dock_items()
+                .iter()
+                .position(|candidate| *candidate == item)
+            {
+                self.dock_cursor = index;
+            }
+        } else if self.active_pane == AgentPane::Dock {
+            self.set_active_pane(AgentPane::Prompt, false);
+        }
+        self.dock_activate(item)
+    }
+    pub(crate) fn dock_snapshot(&self) -> crate::views::dock::DockData {
+        crate::views::dock::DockData {
+            workflows: self
+                .dock_workflow_rows()
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+            subagents: self
+                .dock_subagent_rows()
+                .into_iter()
+                .map(|(_, _, row)| row)
+                .collect(),
+            tasks: self
+                .dock_task_rows()
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+            watchers: self
+                .dock_watcher_rows()
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect(),
+            queued: self.visible_held_queue_len(),
+            workflows_expanded: self.dock_workflows_expanded,
+            subagents_expanded: self.dock_subagents_expanded,
+            tasks_expanded: self.dock_tasks_expanded,
+            watchers_expanded: self.dock_watchers_expanded,
+            focused: self.active_pane == ActivePane::Dock,
+            cursor: self.dock_cursor,
+            queue_body_rows: self.queue.desired_height(),
+        }
+    }
     pub(crate) fn dock_activate(&mut self, item: crate::views::dock::DockItem) -> InputOutcome {
         use crate::views::dock::{DockItem, Section};
         match item {
@@ -1158,6 +1219,89 @@ mod dock_tests {
         assert_eq!(
             agent.dock_items(),
             vec![DockItem::Header(Section::Workflows)]
+        );
+    }
+
+    fn header_row(agent: &AgentView, section: Section) -> u16 {
+        agent
+            .dock_items()
+            .iter()
+            .position(|item| *item == DockItem::Header(section))
+            .expect("section header") as u16
+    }
+
+    fn painted_header_bg(agent: &AgentView, section: Section) -> ratatui::style::Color {
+        let theme = crate::theme::Theme::tokyonight();
+        let data = agent.dock_snapshot();
+        let area = ratatui::layout::Rect::new(0, 0, 80, crate::views::dock::desired_height(&data));
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        crate::views::dock::render(&mut buf, area, &theme, &data);
+        buf[(0, header_row(agent, section))].bg
+    }
+
+    #[test]
+    fn clicking_a_section_header_clears_selection_after_collapse() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_tasks_expanded = true;
+        agent.active_pane = AgentPane::Prompt;
+        let tasks = Section::Tasks;
+
+        let outcome = agent.handle_dock_click(DockItem::Header(tasks));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.dock_tasks_expanded);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert!(!agent.dock_snapshot().focused);
+        assert_ne!(
+            painted_header_bg(&agent, tasks),
+            crate::theme::Theme::tokyonight().bg_highlight
+        );
+
+        let outcome = agent.handle_dock_click(DockItem::Header(tasks));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.dock_tasks_expanded);
+        assert_eq!(agent.active_pane, AgentPane::Dock);
+        assert!(agent.dock_snapshot().focused);
+    }
+
+    #[test]
+    fn clicking_a_focused_section_header_returns_to_prompt() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_tasks_expanded = true;
+        agent.active_pane = AgentPane::Dock;
+        let tasks = Section::Tasks;
+
+        let outcome = agent.handle_dock_click(DockItem::Header(tasks));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.dock_tasks_expanded);
+        assert_eq!(agent.active_pane, AgentPane::Prompt);
+        assert!(!agent.dock_snapshot().focused);
+        assert_ne!(
+            painted_header_bg(&agent, tasks),
+            crate::theme::Theme::tokyonight().bg_highlight
+        );
+    }
+
+    #[test]
+    fn keyboard_collapse_keeps_dock_focus_on_the_header() {
+        let mut agent = make_agent();
+        super::super::test_fixtures::add_running_bg_task(&mut agent);
+        agent.dock_tasks_expanded = true;
+        agent.active_pane = AgentPane::Dock;
+        agent.dock_cursor = agent
+            .dock_items()
+            .iter()
+            .position(|item| *item == DockItem::Header(Section::Tasks))
+            .unwrap();
+        let outcome = agent.handle_dock_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(!agent.dock_tasks_expanded);
+        assert_eq!(agent.active_pane, AgentPane::Dock);
+        assert!(agent.dock_snapshot().focused);
+        assert_eq!(
+            painted_header_bg(&agent, Section::Tasks),
+            crate::theme::Theme::tokyonight().bg_highlight
         );
     }
 }
