@@ -76,6 +76,10 @@ pub enum PromptCompletionKind {
 pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
 pub const MAX_TURNS_REACHED_CATEGORY: &str = "max_turns_reached";
 pub const ACTION_STATIONARITY_CATEGORY: &str = "action_stationarity";
+/// `_meta.cancellationCategory` of a permission reject that ended the turn.
+pub const PERMISSION_REJECTED_CATEGORY: &str = "PermissionRejected";
+/// `_meta.cancellationCategory` of a dismissed permission prompt that ended the turn.
+pub const PERMISSION_CANCELLED_CATEGORY: &str = "PermissionCancelled";
 
 pub fn meta_category_str(
     category: xai_grok_session_events::types::CancellationCategory,
@@ -83,8 +87,8 @@ pub fn meta_category_str(
     use xai_grok_session_events::types::CancellationCategory;
     match category {
         CancellationCategory::HookDenied => HOOK_DENIED_CATEGORY,
-        CancellationCategory::PermissionRejected => "PermissionRejected",
-        CancellationCategory::PermissionCancelled => "PermissionCancelled",
+        CancellationCategory::PermissionRejected => PERMISSION_REJECTED_CATEGORY,
+        CancellationCategory::PermissionCancelled => PERMISSION_CANCELLED_CATEGORY,
         CancellationCategory::MidTurnAbort => "MidTurnAbort",
     }
 }
@@ -290,6 +294,15 @@ impl CancelTrigger {
             Self::SessionDelete => "session_delete",
             Self::Client(s) => s,
         }
+    }
+    /// Wire names that are a user Stop. One list for the shell and the pager banner.
+    pub fn is_user_gesture_name(name: &str) -> bool {
+        matches!(name, "esc" | "ctrl_c" | "mouse" | "dashboard_stop")
+    }
+    /// Stop click / key only. Unknown `Client` strings stay programmatic so a
+    /// new wire name cannot claim "by user".
+    pub fn is_user_gesture(&self) -> bool {
+        Self::is_user_gesture_name(self.as_str())
     }
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1046,5 +1059,22 @@ mod cancel_trigger_tests {
         ] {
             assert_eq!(trigger.kind(), expected, "{trigger:?}");
         }
+    }
+
+    #[test]
+    fn user_gestures_are_named_stop_clicks() {
+        assert!(CancelTrigger::is_user_gesture_name("esc"));
+        assert!(CancelTrigger::is_user_gesture_name("mouse"));
+        assert!(!CancelTrigger::is_user_gesture_name("send_now"));
+        assert!(CancelTrigger::Esc.is_user_gesture());
+        assert!(CancelTrigger::CtrlC.is_user_gesture());
+        assert!(CancelTrigger::from_client("mouse").is_user_gesture());
+        assert!(CancelTrigger::from_client("dashboard_stop").is_user_gesture());
+        assert!(!CancelTrigger::from_client("some_future_gesture").is_user_gesture());
+        assert!(!CancelTrigger::from_client("host_interrupt").is_user_gesture());
+        assert!(!CancelTrigger::SendNow.is_user_gesture());
+        assert!(!CancelTrigger::Shutdown.is_user_gesture());
+        assert!(!CancelTrigger::SessionClose.is_user_gesture());
+        assert!(!CancelTrigger::SessionDelete.is_user_gesture());
     }
 }

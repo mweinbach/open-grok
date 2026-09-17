@@ -1400,6 +1400,7 @@ pub(super) fn handle_prompt_response(
                         elapsed_ms: crate::app::turn_completion::duration_to_elapsed_ms(elapsed),
                         agent_result: None,
                         send_now_cancel,
+                        cancel_trigger: wire_cancel_trigger.as_deref(),
                         cancellation_category: wire_cancellation_category.as_deref(),
                         error_kind: None,
                         error_banner_present: false,

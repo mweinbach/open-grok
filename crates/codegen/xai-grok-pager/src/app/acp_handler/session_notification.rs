@@ -171,6 +171,7 @@ fn synthesize_replay_turn_marker(
             elapsed_ms,
             agent_result,
             send_now_cancel: cancel_trigger == Some("send_now"),
+            cancel_trigger,
             cancellation_category,
             error_kind,
             error_banner_present: banner,

@@ -563,6 +563,7 @@ pub(crate) fn reconcile_overdue_turn_ends(app: &mut AppView) -> Option<Vec<Effec
                 elapsed_ms,
                 agent_result: pending.agent_result.as_deref(),
                 send_now_cancel,
+                cancel_trigger: pending.cancel_trigger.as_deref(),
                 cancellation_category: pending.cancellation_category.as_deref(),
                 error_kind: pending.error_kind,
                 error_banner_present: !was_cancelling

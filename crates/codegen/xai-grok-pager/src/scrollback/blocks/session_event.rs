@@ -37,10 +37,12 @@ pub enum SessionEvent {
         /// renders without a duration rather than lying with "0.0s".
         elapsed: Option<Duration>,
     },
-    /// Agent turn was cancelled by the user.
+    /// Agent turn was cancelled.
     TurnCancelled {
         /// Wall-clock elapsed time before cancellation.
         elapsed: Duration,
+        /// Named from `_meta.cancelTrigger` / `_meta.cancellationCategory`.
+        cause: crate::scrollback::blocks::CancelledBy,
     },
     TurnBlockedByHook {
         elapsed: Duration,
@@ -166,8 +168,8 @@ impl SessionEvent {
                 format!("Worked for {}", format_duration(*elapsed))
             }
             SessionEvent::TurnCompleted { elapsed: None } => "Turn completed.".to_string(),
-            SessionEvent::TurnCancelled { elapsed } => {
-                format!("Turn cancelled by user in {}.", format_duration(*elapsed))
+            SessionEvent::TurnCancelled { elapsed, cause } => {
+                format!("{} in {}.", cause.phrase(), format_duration(*elapsed))
             }
             SessionEvent::TurnBlockedByHook { elapsed } => {
                 format!("Turn blocked by a hook in {}.", format_duration(*elapsed))
@@ -698,8 +700,26 @@ mod tests {
     fn turn_cancelled_message() {
         let event = SessionEvent::TurnCancelled {
             elapsed: Duration::from_secs(10),
+            cause: crate::scrollback::blocks::CancelledBy::User,
         };
         assert_eq!(event.message(), "Turn cancelled by user in 10s.");
+    }
+
+    #[test]
+    fn turn_cancelled_message_names_passive_cause() {
+        let event = SessionEvent::TurnCancelled {
+            elapsed: Duration::from_secs(10),
+            cause: crate::scrollback::blocks::CancelledBy::SessionClosed,
+        };
+        assert_eq!(
+            event.message(),
+            "Turn cancelled because the session closed in 10s."
+        );
+        let event = SessionEvent::TurnCancelled {
+            elapsed: Duration::from_secs(4),
+            cause: crate::scrollback::blocks::CancelledBy::Unspecified,
+        };
+        assert_eq!(event.message(), "Turn cancelled in 4.0s.");
     }
 
     #[test]

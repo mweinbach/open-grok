@@ -80,6 +80,8 @@ pub(crate) struct TerminalMarkerInput<'a> {
     pub elapsed_ms: Option<u64>,
     pub agent_result: Option<&'a str>,
     pub send_now_cancel: bool,
+    /// `_meta.cancelTrigger` (`"ctrl_c"`, `"session_close"`, …). Names the cancel banner.
+    pub cancel_trigger: Option<&'a str>,
     pub cancellation_category: Option<&'a str>,
     /// Typed kind of a failed stop; picks error-specific failure copy.
     pub error_kind: Option<WireErrorType>,
@@ -107,6 +109,7 @@ pub(crate) fn terminal_marker(input: TerminalMarkerInput<'_>) -> Option<SessionE
         | TurnStopReason::Unknown => Some(SessionEvent::TurnCompleted { elapsed }),
         TurnStopReason::Cancelled if input.send_now_cancel => None,
         TurnStopReason::Cancelled => Some(cancelled_turn_event(
+            input.cancel_trigger,
             input.cancellation_category,
             required_elapsed(input.elapsed_ms),
         )),
@@ -138,17 +141,23 @@ pub(super) fn failed_turn_event(
     }
 }
 
-/// The turn-cancelled terminal marker for a cancel of `category`.
-/// The hook-denied category renders [`SessionEvent::TurnBlockedByHook`], anything else the user-cancel copy.
-/// One chooser for all rails so the wording can't drift between the driver, viewer, reconcile, and wake paths.
+/// Hook-denied renders [`SessionEvent::TurnBlockedByHook`]; everything else names the cause.
+/// One chooser for the driver, viewer, reconcile, and wake rails.
 pub(super) fn cancelled_turn_event(
+    cancel_trigger: Option<&str>,
     cancellation_category: Option<&str>,
     elapsed: std::time::Duration,
 ) -> SessionEvent {
     if cancellation_category == Some(HOOK_DENIED_CATEGORY) {
         SessionEvent::TurnBlockedByHook { elapsed }
     } else {
-        SessionEvent::TurnCancelled { elapsed }
+        SessionEvent::TurnCancelled {
+            elapsed,
+            cause: crate::scrollback::blocks::CancelledBy::from_meta(
+                cancel_trigger,
+                cancellation_category,
+            ),
+        }
     }
 }
 
@@ -578,6 +587,7 @@ pub(super) fn finalize_turn_from_terminal(
         elapsed_ms,
         agent_result,
         send_now_cancel,
+        cancel_trigger,
         cancellation_category,
         error_kind,
         error_banner_present: super::dispatch::scrollback_has_recent_error_banner(
