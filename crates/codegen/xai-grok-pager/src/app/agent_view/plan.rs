@@ -186,7 +186,35 @@ impl AgentView {
         self.line_viewer = Some(viewer);
         self.casual_commenting_range = Some(0..1);
     }
+    /// Same gate the queued-row editor applies before Enter (`queue_edit.rs`), so dispatch parity holds:
+    /// raw text, registry-known, dispatchable, args complete.
+    fn is_freeform_builtin_slash_command(&self) -> bool {
+        crate::slash::is_complete_builtin_invocation(
+            self.prompt.text(),
+            self.prompt.slash_controller.registry(),
+        )
+    }
     pub(crate) fn approve_plan(&mut self) -> InputOutcome {
+        if self.is_freeform_builtin_slash_command()
+            && let Some(pav) = self.plan_approval_view.as_mut()
+        {
+            let msg = match pav.focus {
+                PlanApprovalFocus::Commenting => {
+                    "The comment in progress is a slash command: finish or discard it before approving."
+                }
+                PlanApprovalFocus::Preview | PlanApprovalFocus::Prompt => {
+                    pav.focus = PlanApprovalFocus::Prompt;
+                    "Run the slash command in the notes with Enter, or clear it, before approving."
+                }
+            };
+            if crate::app::minimal_mode_active() {
+                self.scrollback
+                    .push_block(crate::scrollback::block::RenderBlock::system(msg));
+            } else {
+                self.show_toast(msg);
+            }
+            return InputOutcome::Changed;
+        }
         let Some(mut pav) = self.plan_approval_view.take() else {
             return InputOutcome::Changed;
         };
@@ -449,6 +477,23 @@ impl AgentView {
                     .as_ref()
                     .is_some_and(|pav| pav.focus == PlanApprovalFocus::Prompt);
                 if prompt_focused {
+                    if self.is_freeform_builtin_slash_command() {
+                        let text = self.prompt.text().to_owned();
+                        if let Some(pav) = self.plan_approval_view.as_mut() {
+                            let consumed_text = pav.stashed_prompt.text.trim() == text.trim();
+                            let consumed_images = self.prompt.images.iter().any(|live| {
+                                pav.stashed_prompt
+                                    .images
+                                    .iter()
+                                    .any(|stashed| Self::same_image_payload(stashed, live))
+                            });
+                            if consumed_text || consumed_images {
+                                pav.stashed_prompt =
+                                    crate::views::prompt_widget::StashedPrompt::default();
+                            }
+                        }
+                        return InputOutcome::Action(Action::SendPrompt(text));
+                    }
                     if freeform_text.trim().is_empty() && !has_comments {
                         self.show_toast("Type revision notes, or press a to approve.");
                         return InputOutcome::Changed;
@@ -971,9 +1016,29 @@ mod plan_approval_enter_tests {
     fn enter_key() -> KeyEvent {
         KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
     }
+    fn stashed_text(text: &str) -> crate::views::prompt_widget::StashedPrompt {
+        let mut stash = crate::views::prompt_widget::StashedPrompt::default();
+        stash.text = text.to_owned();
+        stash.cursor = text.len();
+        stash
+    }
+    fn toast_text(agent: &AgentView) -> Option<&str> {
+        agent.toast.as_ref().map(|(msg, _)| msg.as_str())
+    }
+    const APPROVE_REFUSAL: &str =
+        "Run the slash command in the notes with Enter, or clear it, before approving.";
+    const APPROVE_REFUSAL_COMMENTING: &str =
+        "The comment in progress is a slash command: finish or discard it before approving.";
     fn agent_with_revise_prompt() -> AgentView {
+        agent_with_revise_prompt_and_response().0
+    }
+    /// Like [`agent_with_revise_prompt`] but keeps the shell-side receiver so a test can prove nothing was sent.
+    fn agent_with_revise_prompt_and_response() -> (
+        AgentView,
+        tokio::sync::oneshot::Receiver<xai_acp_lib::AcpResult<agent_client_protocol::ExtResponse>>,
+    ) {
         let mut agent = make_agent();
-        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
         let request = crate::views::plan_approval_view::ExitPlanModeExtRequest {
             session_id: "test-session".into(),
             tool_call_id: "call-1".into(),
@@ -981,20 +1046,13 @@ mod plan_approval_enter_tests {
         };
         let mut pav = crate::views::plan_approval_view::PlanApprovalViewState::new(
             request,
-            crate::views::prompt_widget::StashedPrompt {
-                text: String::new(),
-                cursor: 0,
-                images: Vec::new(),
-                chip_elements: Vec::new(),
-                image_counter: 0,
-                image_undo_stash: Vec::new(),
-            },
+            stashed_text(""),
             tx,
         );
         pav.focus = PlanApprovalFocus::Prompt;
         agent.plan_approval_view = Some(pav);
         agent.prompt.set_text("");
-        agent
+        (agent, rx)
     }
     #[test]
     fn empty_enter_on_revise_prompt_does_not_approve() {
@@ -1382,6 +1440,126 @@ mod plan_approval_enter_tests {
             agent.toast.as_ref().map(|(msg, _)| msg.as_str()),
             Some("Type revision notes, or press a to approve.")
         );
+    }
+    #[test]
+    fn enter_with_builtin_slash_returns_send_prompt_and_keeps_review_open() {
+        let (mut agent, mut rx) = agent_with_revise_prompt_and_response();
+        let text = "/feedback grok does not understand plan mode";
+        agent.prompt.set_text(text);
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        match outcome {
+            InputOutcome::Action(Action::SendPrompt(sent)) => assert_eq!(text, sent),
+            other => {
+                panic!("a complete builtin must dispatch as a prompt, got {other:?}")
+            }
+        }
+        assert_eq!(
+            text,
+            agent.prompt.text(),
+            "dispatch clears the composer, not the overlay"
+        );
+        assert!(
+            agent.plan_approval_view.is_some(),
+            "a slash command never decides the plan"
+        );
+        assert_eq!(
+            Some(PlanApprovalFocus::Prompt),
+            agent.plan_approval_view.as_ref().map(|pav| pav.focus)
+        );
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "the shell must not see a revision"
+        );
+        assert_ne!(Some("Plan revision sent."), toast_text(&agent));
+    }
+    #[test]
+    fn enter_with_unedited_slash_prefill_empties_session_draft() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.stashed_prompt = stashed_text("/feedback x");
+        }
+        agent.prompt.set_text("/feedback x");
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(
+            outcome,
+            InputOutcome::Action(Action::SendPrompt(_))
+        ));
+        assert!(
+            agent
+                .plan_approval_view
+                .as_ref()
+                .is_some_and(|pav| pav.stashed_prompt.is_effectively_empty()),
+            "a consumed prefill must not be restored and re-run on close"
+        );
+    }
+    #[test]
+    fn enter_with_unknown_slash_still_revises() {
+        let (mut agent, mut rx) = agent_with_revise_prompt_and_response();
+        agent.prompt.set_text("/nope x");
+        let outcome = agent.handle_plan_feedback_key(&enter_key());
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert!(agent.plan_approval_view.is_none());
+        assert_eq!(Some("Plan revision sent."), toast_text(&agent));
+        let raw = rx
+            .try_recv()
+            .expect("revision response must be sent")
+            .expect("Ok");
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw.0.get()).expect("revision response is JSON");
+        assert_eq!(
+            Some(&serde_json::json!("cancelled")),
+            parsed.pointer("/outcome")
+        );
+        assert_eq!(
+            Some(&serde_json::json!("/nope x")),
+            parsed.pointer("/feedback")
+        );
+    }
+    #[test]
+    fn approve_with_builtin_slash_freeform_refuses() {
+        let (mut agent, mut rx) = agent_with_revise_prompt_and_response();
+        agent.prompt.set_text("/feedback x");
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.focus = PlanApprovalFocus::Preview;
+        }
+        let outcome = agent.approve_plan();
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "no interjection may carry the command, got {outcome:?}"
+        );
+        assert!(agent.plan_approval_view.is_some());
+        assert_eq!(
+            Some(PlanApprovalFocus::Prompt),
+            agent.plan_approval_view.as_ref().map(|pav| pav.focus),
+            "refusal moves focus to the notes box so Enter runs the command"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(Some(APPROVE_REFUSAL), toast_text(&agent));
+        assert_eq!("/feedback x", agent.prompt.text());
+    }
+    #[test]
+    fn approve_in_commenting_focus_with_slash_comment_keeps_commenting() {
+        let mut agent = agent_with_revise_prompt();
+        if let Some(ref mut pav) = agent.plan_approval_view {
+            pav.focus = PlanApprovalFocus::Commenting;
+            pav.commenting_range = Some(0..1);
+            pav.stashed_feedback_prompt = Some(stashed_text("notes"));
+        }
+        agent.prompt.set_text("/feedback x");
+        let outcome = agent.approve_plan();
+        assert!(matches!(outcome, InputOutcome::Changed));
+        assert_eq!(
+            Some(PlanApprovalFocus::Commenting),
+            agent.plan_approval_view.as_ref().map(|pav| pav.focus),
+            "the composer still holds the in-progress comment"
+        );
+        assert_eq!(Some(APPROVE_REFUSAL_COMMENTING), toast_text(&agent));
     }
 }
 /// The mode indicator renders
