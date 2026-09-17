@@ -355,9 +355,15 @@ fn dispatch_dashboard_load_local_build(
         return vec![];
     };
 
-    app.welcome_history_load_as_build = true;
+    #[cfg(feature = "local-workspace")]
+    {
+        app.welcome_history_load_as_build = true;
+    }
     if let Some(existing_id) = focus_if_session_already_open(app, resolved_id.as_str(), false) {
-        app.welcome_history_load_as_build = false;
+        #[cfg(feature = "local-workspace")]
+        {
+            app.welcome_history_load_as_build = false;
+        }
         log_dashboard_attached(&DashboardRowId::TopLevel(existing_id));
         return vec![];
     }
