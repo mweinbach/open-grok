@@ -175,7 +175,7 @@ pub(in crate::app) use prompt_stash::prompt_history_text;
 pub use prompt_stash::{PromptStashEntry, StashCause};
 mod queue;
 mod render;
-pub use render::AppRenderParams;
+pub use render::{AppRenderParams, OverlayHeader};
 #[cfg(test)]
 mod header_tests;
 mod rewind;
@@ -1197,6 +1197,10 @@ pub struct AgentView {
     /// `[Dashboard]` on the status bar: opens the dashboard, or returns to it
     /// when this view is the dashboard's session overlay.
     pub hit_dashboard: HitArea,
+    /// Overlay switcher `‹` on the status bar (cycles to the previous agent).
+    pub hit_overlay_prev: HitArea,
+    /// Overlay switcher `›` on the status bar (cycles to the next agent).
+    pub hit_overlay_next: HitArea,
     /// Cancel button in turn status line (`[stop]`).
     pub hit_cancel_button: HitArea,
     /// Still-running watcher cue on the turn-status row (click opens the

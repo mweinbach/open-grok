@@ -5091,14 +5091,6 @@ impl AppView {
         self.maybe_trigger_small_screen_tip();
         self.maybe_trigger_ssh_wrap_tip();
         let compact = self.appearance.prompt.compact;
-        let (header_pad_left, header_pad_right, header_pad_top) = {
-            let layout_cfg = &self.appearance.scrollback.layout;
-            (
-                layout_cfg.eff_hpad_left(compact),
-                layout_cfg.eff_hpad_right(compact),
-                layout_cfg.eff_outer_vpad(compact),
-            )
-        };
         let zdr_blocked_for_draw = self.is_zdr_blocked();
         let has_access = self.has_access();
         let privacy_banner = self.privacy_banner_should_show();
@@ -5440,47 +5432,21 @@ impl AppView {
                                 None
                             };
                         let overlay_can_cycle = position.is_some_and(|(_, n)| n > 1);
-                        let (agent_area, header) = if overlay_active {
-                            let theme = crate::theme::Theme::current();
-                            let title = agents
-                                .get(&id)
-                                .map(crate::views::session_title::entry_title)
-                                .unwrap_or_else(|| "(session)".to_string());
-                            let (hover_prev, hover_next, hover_close) = self
-                                .dashboard
-                                .as_ref()
-                                .map(|d| {
-                                    (
-                                        d.overlay_prev_hit.hovered,
-                                        d.overlay_next_hit.hovered,
-                                        d.overlay_close_hit.hovered,
-                                    )
-                                })
-                                .unwrap_or((false, false, false));
-                            let header = crate::views::dashboard::render_dashboard_session_header(
-                                f.buffer_mut(),
-                                view_area,
-                                &theme,
-                                &title,
-                                position,
-                                hover_prev,
-                                hover_next,
-                                hover_close,
-                                header_pad_left,
-                                header_pad_right,
-                                header_pad_top,
-                            );
-                            match header {
-                                Some(chrome) => (chrome.content, Some(chrome)),
-                                None => (view_area, None),
-                            }
-                        } else {
-                            (view_area, None)
+                        let overlay_title = overlay_active
+                            .then(|| {
+                                agents
+                                    .get(&id)
+                                    .and_then(crate::views::session_title::named_title)
+                            })
+                            .flatten();
+                        let overlay_header = crate::app::agent_view::OverlayHeader {
+                            title: overlay_title.as_deref(),
+                            position,
                         };
                         if let Some(d) = self.dashboard.as_mut() {
-                            d.overlay_close_hit.set(header.and_then(|c| c.close_rect));
-                            d.overlay_prev_hit.set(header.and_then(|c| c.prev_rect));
-                            d.overlay_next_hit.set(header.and_then(|c| c.next_rect));
+                            d.overlay_close_hit.clear();
+                            d.overlay_prev_hit.clear();
+                            d.overlay_next_hit.clear();
                         }
                         if let Some(d) = self.dashboard.as_mut()
                             && d.peek_viewport.is_some()
@@ -5509,7 +5475,7 @@ impl AppView {
                                 0
                             };
                             let result = agent.draw(
-                                agent_area,
+                                view_area,
                                 f.buffer_mut(),
                                 registry,
                                 scratch,
@@ -5537,6 +5503,7 @@ impl AppView {
                                     voice_interim: voice_interim.as_deref(),
                                     esc_owned_before_agent,
                                     status_line: status_line_frame.clone(),
+                                    overlay_header,
                                 },
                             );
                             if let Some(modal) = self.import_claude_modal.as_mut() {

@@ -412,6 +412,12 @@ impl CommandRegistry {
         self.set_command_visible("dashboard", visible);
     }
 
+    /// Whether `/dashboard` would run if typed, so header affordances follow
+    /// the same gate as the command.
+    pub fn dashboard_dispatchable(&self) -> bool {
+        self.get_for_dispatch("dashboard").is_some()
+    }
+
     /// Show or hide the `/recap` command (shell `sessionRecap` gate).
     /// Hidden by default in [`Self::new`]; revealed from initialize meta.
     pub fn set_recap_visible(&mut self, visible: bool) {

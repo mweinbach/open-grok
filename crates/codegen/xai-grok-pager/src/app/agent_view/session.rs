@@ -248,6 +248,8 @@ impl AgentView {
             hit_response_top_indicator: Default::default(),
             hit_cwd: Default::default(),
             hit_dashboard: Default::default(),
+            hit_overlay_prev: Default::default(),
+            hit_overlay_next: Default::default(),
             hit_cancel_button: Default::default(),
             hit_watching_cue: Default::default(),
             watching_cue_toast_shown: false,

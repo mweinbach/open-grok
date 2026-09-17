@@ -21,29 +21,8 @@ const MAX_TITLE_CHARS: usize = 60;
 /// Centralised so every surface that shows a session name agrees on the same
 /// precedence. Trimming and truncation happen in this single place to avoid drift.
 pub fn entry_title(agent: &AgentView) -> String {
-    if let Some(name) = agent.display_name.as_deref() {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return truncate_title(&sanitize_display_text(trimmed));
-        }
-    }
-    if let Some(title) = agent.generated_session_title.as_deref() {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            let clean =
-                xai_grok_tools::implementations::skills::skill::extract_skill_display_text(trimmed);
-            let text = clean.as_deref().unwrap_or(trimmed);
-            return truncate_title(&sanitize_display_text(text));
-        }
-    }
-    if let Some(text) = first_user_prompt_text(agent) {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            let clean =
-                xai_grok_tools::implementations::skills::skill::extract_skill_display_text(trimmed);
-            let display = clean.as_deref().unwrap_or(trimmed);
-            return truncate_title(&sanitize_display_text(display));
-        }
+    if let Some(title) = named_title(agent) {
+        return title;
     }
     match agent.session.session_id.as_ref() {
         Some(sid) => {
@@ -52,6 +31,41 @@ pub fn entry_title(agent: &AgentView) -> String {
         }
         None => "loading...".to_string(),
     }
+}
+
+/// The first three tiers of [`entry_title`] — a title the user or model
+/// actually gave the session — or `None` for a session that has only its id.
+/// Surfaces that should show nothing rather than `session abc12345` (the
+/// header row) read this.
+pub fn named_title(agent: &AgentView) -> Option<String> {
+    agent
+        .display_name
+        .as_deref()
+        .and_then(|name| clean_title(name, false))
+        .or_else(|| {
+            agent
+                .generated_session_title
+                .as_deref()
+                .and_then(|title| clean_title(title, true))
+        })
+        .or_else(|| first_user_prompt_text(agent).and_then(|text| clean_title(&text, true)))
+}
+
+/// Trim, optionally unwrap a skill invocation, sanitise, and cap one title
+/// source; `None` when it is blank.
+fn clean_title(raw: &str, unwrap_skill: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unwrapped = unwrap_skill
+        .then(|| {
+            xai_grok_tools::implementations::skills::skill::extract_skill_display_text(trimmed)
+        })
+        .flatten();
+    Some(truncate_title(&sanitize_display_text(
+        unwrapped.as_deref().unwrap_or(trimmed),
+    )))
 }
 
 /// Real session title for rename prefill / `/rename` ghost-prefill.
