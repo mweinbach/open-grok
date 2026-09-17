@@ -5,8 +5,8 @@
 
 use agent_client_protocol as acp;
 use xai_grok_tools::implementations::grok_build::send_subagent_message::{
-    SEND_SUBAGENT_MESSAGE_TOOL_NAME, SendSubagentMessageDisposition, SendSubagentMessageInput,
-    SendSubagentMessageOutput,
+    SEND_SUBAGENT_MESSAGE_TOOL_NAME, SendSubagentMessageDelivery, SendSubagentMessageDisposition,
+    SendSubagentMessageInput, SendSubagentMessageOutput,
 };
 use xai_grok_tools::tool_taxonomy::{CanonicalToolMeta, TOOL_META_KEY, TOOL_META_VERSION};
 use xai_grok_tools::types::output::ToolOutput;
@@ -14,7 +14,7 @@ use xai_grok_tools::types::tool::ToolKind;
 
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::tool::{
-    SentMessagePresentation, SentMessageToolCallBlock, ToolCallBlock,
+    SentMessageDelivery, SentMessagePresentation, SentMessageToolCallBlock, ToolCallBlock,
 };
 
 pub(super) fn is_tool(tool_call: &acp::ToolCall) -> bool {
@@ -52,15 +52,30 @@ pub(super) fn to_block(tool_call: &acp::ToolCall) -> RenderBlock {
                 },
             );
     let presentation = presentation(tool_call, output);
-    let (subagent_id, text) = input.map_or((None, None), |input| {
-        (Some(input.subagent_id), Some(input.text))
+    let (subagent_id, text, delivery) = input.map_or((None, None, None), |input| {
+        (
+            Some(input.subagent_id),
+            Some(input.text),
+            recognized_delivery(input.delivery.as_ref(), input.queue),
+        )
     });
 
-    RenderBlock::ToolCall(ToolCallBlock::SentMessage(SentMessageToolCallBlock::new(
-        presentation,
-        subagent_id,
-        text,
-    )))
+    RenderBlock::ToolCall(ToolCallBlock::SentMessage(
+        SentMessageToolCallBlock::new(presentation, subagent_id, text).with_delivery(delivery),
+    ))
+}
+
+fn recognized_delivery(
+    delivery: Option<&SendSubagentMessageDelivery>,
+    legacy_queue: bool,
+) -> Option<SentMessageDelivery> {
+    match delivery {
+        Some(SendSubagentMessageDelivery::Steer) => Some(SentMessageDelivery::Steer),
+        Some(SendSubagentMessageDelivery::Queue) => Some(SentMessageDelivery::Queue),
+        Some(SendSubagentMessageDelivery::Interject) => Some(SentMessageDelivery::Interject),
+        None if legacy_queue => Some(SentMessageDelivery::Queue),
+        None => Some(SentMessageDelivery::Steer),
+    }
 }
 
 fn presentation(

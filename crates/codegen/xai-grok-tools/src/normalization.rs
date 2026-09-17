@@ -158,6 +158,8 @@ mod tests {
             crate::implementations::grok_build::send_subagent_message::SendSubagentMessageInput {
                 subagent_id: "child".into(),
                 text: "private task context".into(),
+                delivery: None,
+                queue: false,
             },
         );
         assert!(super::canonical_input(&input).is_none());

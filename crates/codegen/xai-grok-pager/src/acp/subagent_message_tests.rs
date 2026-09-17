@@ -8,7 +8,9 @@ use xai_grok_tools::types::tool::{ToolKind, ToolNamespace};
 use super::*;
 use crate::acp::meta::NotificationMeta;
 use crate::acp::tracker::AcpUpdateTracker;
-use crate::scrollback::blocks::tool::{SentMessagePresentation, ToolCallBlock};
+use crate::scrollback::blocks::tool::{
+    SentMessageDelivery, SentMessagePresentation, ToolCallBlock,
+};
 use crate::scrollback::state::ScrollbackState;
 
 fn raw_output(output: SendSubagentMessageOutput) -> serde_json::Value {
@@ -108,6 +110,52 @@ fn direct_and_enveloped_wire_inputs_preserve_exact_arguments() {
         ));
         assert_eq!(block.subagent_id.as_deref(), Some("sub-123"));
         assert_eq!(block.text.as_deref(), Some("follow up"));
+        assert_eq!(block.delivery, Some(SentMessageDelivery::Steer));
+    }
+}
+
+#[test]
+fn delivery_verbs_follow_the_wire_and_legacy_queue_flag() {
+    use crate::scrollback::blocks::tool::SentMessageDelivery;
+
+    let accepted = Some(SendSubagentMessageOutput::Accepted {
+        message_id: "message-1".into(),
+    });
+    let cases = [
+        (
+            serde_json::json!({"subagent_id": "sub-123", "text": "follow up"}),
+            SentMessageDelivery::Steer,
+            "Message sent to sub-123",
+        ),
+        (
+            serde_json::json!({"subagent_id": "sub-123", "text": "follow up", "delivery": "queue"}),
+            SentMessageDelivery::Queue,
+            "Message queued for sub-123",
+        ),
+        (
+            serde_json::json!({"subagent_id": "sub-123", "text": "follow up", "delivery": "interject"}),
+            SentMessageDelivery::Interject,
+            "Message interjected to sub-123",
+        ),
+        (
+            serde_json::json!({"subagent_id": "sub-123", "text": "follow up", "queue": true}),
+            SentMessageDelivery::Queue,
+            "Message queued for sub-123",
+        ),
+        (
+            serde_json::json!({"subagent_id": "sub-123", "text": "follow up", "delivery": "steer", "queue": true}),
+            SentMessageDelivery::Steer,
+            "Message sent to sub-123",
+        ),
+    ];
+    for (raw, delivery, header) in cases {
+        let block = block(&call(
+            acp::ToolCallStatus::Completed,
+            Some(raw),
+            accepted.clone(),
+        ));
+        assert_eq!(block.delivery, Some(delivery), "{header}");
+        assert_eq!(block.header_text(), header);
     }
 }
 

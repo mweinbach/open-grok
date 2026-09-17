@@ -10,6 +10,9 @@ pub const MAX_ACTIVE_AGENT_MESSAGE_BYTES: usize = 32 * 1024;
 pub enum ActiveAgentMessageOperation {
     Queue,
     Steer,
+    /// Urgent: delivered ahead of pending steers; also interrupts a wait on
+    /// background work once the child runtime admits it.
+    Interject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

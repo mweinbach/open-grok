@@ -464,11 +464,6 @@ impl ChildControl for ShellChildRuntime {
     ) -> grok_build::task::coordinator::SendBoxFuture<
         grok_build::task::coordinator::ActiveMessageAdmission,
     > {
-        if delivery.operation() != grok_build::task::types::ActiveAgentMessageOperation::Queue {
-            return Box::pin(async {
-                grok_build::task::coordinator::ActiveMessageAdmission::Unsupported
-            });
-        }
         let command_tx = self.child_handle.cmd_tx.clone();
         let receipt_sink = self.receipt_sink.clone();
         let telemetry = self.active_message_telemetry.capture();

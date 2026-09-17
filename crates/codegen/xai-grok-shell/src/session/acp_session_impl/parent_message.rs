@@ -33,17 +33,13 @@ impl SessionActor {
     async fn admit_parent_agent_message_with(
         self: &Arc<Self>,
         message: ActiveAgentMessage,
-        operation: ActiveAgentMessageOperation,
+        _operation: ActiveAgentMessageOperation,
         receipt_sink: mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
         telemetry: Option<crate::session::telemetry::ActiveAgentMessageParentTelemetry>,
         respond_to: oneshot::Sender<ActiveMessageAdmission>,
         completion_tx: mpsc::UnboundedSender<TurnCompletionMsg>,
         commit: impl FnOnce(&mut State, InputItem) -> bool,
     ) {
-        if operation != ActiveAgentMessageOperation::Queue {
-            let _ = respond_to.send(ActiveMessageAdmission::Unsupported);
-            return;
-        }
         let receipt_permit = match receipt_sink.reserve_owned().await {
             Ok(permit) => permit,
             Err(_) => {
