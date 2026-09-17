@@ -6816,52 +6816,82 @@ pub(crate) fn execute(
             images,
             metadata,
             request_trace_upload_token,
-            draft: _,
+            draft,
             origin,
         } => {
             use xai_grok_shell::session::ClientType;
-            use xai_grok_shell::session::acp_types::ClientFeedbackInput;
+            use xai_grok_shell::session::acp_types::{
+                ClientFeedbackInput, FeedbackDraftEditedBody, FeedbackDraftSendRequest,
+            };
             let terminal_info = Some(
                 crate::terminal::terminal_context().feedback_info(),
             );
             let tx = acp_tx.clone();
             tasks
                 .spawn(async move {
-                    let image_count = images.len();
-                    let images = match tokio::task::spawn_blocking(move || encode_feedback_images(images)).await {
-                        Ok(Ok(images)) => images,
-                        Ok(Err(error)) => return TaskResult::FeedbackFailed {
-                            agent_id,
-                            origin,
-                            feedback_text,
-                            image_count,
-                            error,
-                        },
-                        Err(_) => return TaskResult::FeedbackFailed {
-                            agent_id,
-                            origin,
-                            feedback_text,
-                            image_count,
-                            error: "Could not prepare feedback attachments.".to_owned(),
-                        },
+                    let image_count = draft
+                        .as_ref()
+                        .map(|draft| draft.images.len())
+                        .unwrap_or_else(|| images.len());
+                    let images = if draft.is_some() {
+                        Vec::new()
+                    } else {
+                        match tokio::task::spawn_blocking(move || encode_feedback_images(images)).await {
+                            Ok(Ok(images)) => images,
+                            Ok(Err(error)) => return TaskResult::FeedbackFailed {
+                                agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
+                                error,
+                            },
+                            Err(_) => return TaskResult::FeedbackFailed {
+                                agent_id,
+                                origin,
+                                feedback_text,
+                                image_count,
+                                error: "Could not prepare feedback attachments.".to_owned(),
+                            },
+                        }
                     };
-                    let input = ClientFeedbackInput {
-                        session_id: session_id.0.to_string(),
-                        client_type: ClientType::Tui,
-                        rating_type: None,
-                        rating_value: None,
-                        feedback_text: Some(feedback_text.clone()),
-                        feedback_categories: vec![],
-                        images,
-                        context_type: None,
-                        turn_number: None,
-                        request_id: None,
-                        client_version: Some(xai_grok_version::version().to_string()),
-                        metadata,
-                        terminal_info,
-                        request_trace_upload_token,
+                    let raw_params = if let Some(draft) = draft {
+                        serde_json::value::to_raw_value(&FeedbackDraftSendRequest {
+                            session_id: session_id.0.to_string(),
+                            draft_id: draft.draft_id,
+                            request_trace_upload_token,
+                            edited_body: FeedbackDraftEditedBody {
+                                input: xai_grok_feedback::FeedbackDraftInput {
+                                    title: draft.title,
+                                    details: draft.details,
+                                    area: draft.area,
+                                    r#type: draft.r#type,
+                                    task_category: draft.task_category,
+                                    failure_mode: draft.failure_mode,
+                                },
+                                images: draft.images,
+                                client_version: Some(xai_grok_version::version().to_string()),
+                                terminal_info,
+                            },
+                        })
+                    } else {
+                        serde_json::value::to_raw_value(&ClientFeedbackInput {
+                            session_id: session_id.0.to_string(),
+                            client_type: ClientType::Tui,
+                            rating_type: None,
+                            rating_value: None,
+                            feedback_text: Some(feedback_text.clone()),
+                            feedback_categories: vec![],
+                            images,
+                            context_type: None,
+                            turn_number: None,
+                            request_id: None,
+                            client_version: Some(xai_grok_version::version().to_string()),
+                            metadata,
+                            terminal_info,
+                            request_trace_upload_token,
+                        })
                     };
-                    let raw_params = match serde_json::value::to_raw_value(&input) {
+                    let raw_params = match raw_params {
                         Ok(v) => v,
                         Err(e) => {
                             return TaskResult::FeedbackFailed {

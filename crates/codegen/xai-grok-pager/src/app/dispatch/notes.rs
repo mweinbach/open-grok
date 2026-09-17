@@ -246,12 +246,32 @@ pub(super) fn dispatch_submit_feedback_modal(
         return vec![];
     }
     let draft_id = modal.draft_id().cloned();
-    if draft_id.is_some() && modal.draft_body().is_none() {
+    let draft_fields = modal.draft_body();
+    if draft_id.is_some() && draft_fields.is_none() {
         modal.cancel_draft_submit_pending("Choose a type before sending this draft.".to_owned());
         return vec![];
     }
+    let draft = draft_id
+        .clone()
+        .zip(draft_fields)
+        .map(
+            |(draft_id, fields)| crate::app::actions::DraftFeedbackBody {
+                draft_id,
+                title: fields.title,
+                details: text.clone(),
+                area: fields.area,
+                r#type: fields.r#type,
+                task_category: fields.task_category,
+                failure_mode: fields.failure_mode,
+                images: encoded_images.clone(),
+            },
+        );
     let metadata = Some(modal.structured_feedback_metadata());
-    let images = modal.take_images();
+    let images = if draft.is_some() {
+        Default::default()
+    } else {
+        modal.take_images()
+    };
     let submission_id = crate::views::feedback_modal::FeedbackSubmissionId::next();
     if draft_id.is_some() {
         modal.mark_draft_submit_pending();
@@ -273,7 +293,7 @@ pub(super) fn dispatch_submit_feedback_modal(
         images,
         metadata,
         false,
-        None,
+        draft,
         FeedbackSendOrigin::Modal {
             submission_id,
             modal_id,
