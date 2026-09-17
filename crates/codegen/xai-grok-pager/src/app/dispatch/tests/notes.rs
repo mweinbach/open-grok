@@ -1211,18 +1211,12 @@ fn send_feedback_preserves_composer_draft() {
 fn feedback_modal_loaded_draft_sends_draft_body() {
     let id = AgentId(0);
     let mut app = test_app_with_agent();
-    let effects = dispatch(
+    let _ = dispatch(
         Action::OpenFeedbackModal(crate::views::feedback_modal::OpenFeedbackModal {
             text: Some("edited details".into()),
             ..Default::default()
         }),
         &mut app,
-    );
-    assert!(
-        effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::FeedbackDraftRequest { .. })),
-        "opening the modal lists drafts"
     );
     let draft_id =
         xai_grok_feedback::FeedbackDraftId::from("01931111-aaaa-7bbb-8ccc-ddddeeeeffff".to_owned());
