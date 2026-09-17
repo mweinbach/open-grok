@@ -14521,6 +14521,7 @@ dependencies = [
  "xai-grok-config",
  "xai-grok-config-types",
  "xai-grok-extra-ca",
+ "xai-grok-feedback",
  "xai-grok-foreign-sessions",
  "xai-grok-hooks",
  "xai-grok-http",

@@ -14,8 +14,10 @@ use super::enums::PermissionMode;
 pub use super::enums::PrCreationSource;
 
 mod active_agent_message;
+mod feedback;
 mod permission_analytics;
 pub use active_agent_message::*;
+pub use feedback::*;
 pub use permission_analytics::*;
 
 /// Binds a product event name to a struct. Implement via `telemetry_event!` below.
@@ -2466,6 +2468,8 @@ telemetry_event!(
     external = crate::external::schema::map_user_prompt
 );
 telemetry_event!(UserFeedback, "user_feedback");
+telemetry_event!(FeedbackModalOpened, "feedback_modal_opened");
+telemetry_event!(FeedbackDraftOp, "feedback_draft_op");
 telemetry_event!(RolloutSurvey, "rollout_survey");
 telemetry_event!(PrCreated, "pr_created");
 telemetry_event!(PrMerged, "pr_merged");
@@ -2809,6 +2813,8 @@ mod tests {
             ("TurnCompletedLifecycle", "session_id"),
             ("TurnCompletedLifecycle", "turn_number"),
             ("UserFeedback", "session_id"),
+            ("FeedbackDraftOp", "session_id"),
+            ("FeedbackModalOpened", "session_id"),
         ];
         let allowed: std::collections::BTreeSet<(String, String)> = ALLOWED
             .iter()

@@ -13,6 +13,7 @@ use std::sync::Arc;
 use agent_client_protocol as acp;
 use tokio::sync::oneshot;
 
+pub use super::feedback_drafts::draft_op_error;
 use super::{ExtResult, parse_params};
 use crate::agent::MvpAgent;
 use crate::session::persistence::{LocalFeedbackEntry, UserFeedbackEntry};
@@ -31,7 +32,12 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             tracing::info!("handling /btw side question");
             handle_btw(agent, args).await
         }
-        "x.ai/feedback" | "x.ai/feedback/dismiss" => {
+        "x.ai/feedback"
+        | "x.ai/feedback/dismiss"
+        | "x.ai/feedback/drafts/list"
+        | "x.ai/feedback/drafts/get"
+        | "x.ai/feedback/drafts/delete"
+        | "x.ai/feedback/drafts/update" => {
             tracing::info!("handling user feedback");
             handle_feedback(agent, args).await
         }
@@ -173,6 +179,16 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
     }
 
     match args.method.as_ref() {
+        "x.ai/feedback/drafts/list" => {
+            super::feedback_drafts::list_feedback_drafts(agent, args).await
+        }
+        "x.ai/feedback/drafts/get" => super::feedback_drafts::get_feedback_draft(agent, args).await,
+        "x.ai/feedback/drafts/delete" => {
+            super::feedback_drafts::delete_feedback_draft(agent, args).await
+        }
+        "x.ai/feedback/drafts/update" => {
+            super::feedback_drafts::update_feedback_draft(agent, args).await
+        }
         "x.ai/feedback" => {
             let feedback_input = parse_feedback_input(args.params.get())?;
 
