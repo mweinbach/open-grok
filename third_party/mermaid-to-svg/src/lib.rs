@@ -246,6 +246,269 @@ mod tests {
         assert_eq!(arrowheads, 1, "exactly one real edge");
     }
 
+    fn flowchart_nodes(
+        statements: &[crate::ast::Statement],
+    ) -> std::collections::HashMap<String, crate::ast::Node> {
+        use crate::ast::{Node, Statement};
+        let mut out = std::collections::HashMap::<String, Node>::new();
+        for stmt in statements {
+            match stmt {
+                Statement::Node(node) => {
+                    let keep_existing = out
+                        .get(&node.id)
+                        .is_some_and(|existing| existing.label.is_some() && node.label.is_none());
+                    if !keep_existing {
+                        out.insert(node.id.clone(), node.clone());
+                    }
+                }
+                Statement::Subgraph(subgraph) => {
+                    out.extend(flowchart_nodes(&subgraph.statements));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn flowchart_edges(statements: &[crate::ast::Statement]) -> Vec<(String, String)> {
+        use crate::ast::Statement;
+        let mut out = Vec::new();
+        for stmt in statements {
+            match stmt {
+                Statement::Edge(edge) => out.push((edge.from.clone(), edge.to.clone())),
+                Statement::Subgraph(subgraph) => {
+                    out.extend(flowchart_edges(&subgraph.statements));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn flowchart_class_annotation_keeps_shape_and_label() {
+        let graph = crate::parser::parse_mermaid(
+            "flowchart TB\n    PIN{machine already claimed?}:::cond\n    PIN -->|yes| REUSE[keep that machine]",
+        )
+        .expect("class-annotated diamond parses");
+        let nodes = flowchart_nodes(&graph.statements);
+        let pin = nodes.get("PIN").expect("PIN");
+        assert_eq!(pin.label.as_deref(), Some("machine already claimed?"));
+        assert_eq!(pin.shape, crate::ast::NodeShape::Diamond);
+        assert_eq!(
+            nodes.get("REUSE").and_then(|n| n.label.as_deref()),
+            Some("keep that machine")
+        );
+    }
+
+    #[test]
+    fn flowchart_quoted_diamond_with_parens_in_label() {
+        let graph = crate::parser::parse_mermaid(
+            "flowchart TB\n    CTX{\"running a rush order?<br/>(walk-in → main)\"}:::cond",
+        )
+        .expect("quoted diamond parses");
+        let ctx = flowchart_nodes(&graph.statements)
+            .remove("CTX")
+            .expect("CTX");
+        assert_eq!(ctx.shape, crate::ast::NodeShape::Diamond);
+        assert_eq!(
+            ctx.label.as_deref(),
+            Some("running a rush order?\n(walk-in → main)")
+        );
+    }
+
+    #[test]
+    fn flowchart_ampersand_is_cartesian_not_a_literal_node() {
+        let graph = crate::parser::parse_mermaid("flowchart TB\n    A & B --> C\n    C --> D & E")
+            .expect("ampersand groups parse");
+        let nodes = flowchart_nodes(&graph.statements);
+        assert!(
+            nodes.keys().all(|id| !id.contains('&')),
+            "ampersand must not become a node id: {:?}",
+            nodes.keys().collect::<Vec<_>>()
+        );
+        let edges = flowchart_edges(&graph.statements);
+        for expected in [("A", "C"), ("B", "C"), ("C", "D"), ("C", "E")] {
+            assert!(
+                edges
+                    .iter()
+                    .any(|(f, t)| f == expected.0 && t == expected.1),
+                "missing {expected:?} in {edges:?}"
+            );
+        }
+        assert_eq!(edges.len(), 4);
+    }
+
+    #[test]
+    fn flowchart_ampersand_inside_quoted_label_is_literal() {
+        let graph = crate::parser::parse_mermaid(
+            "flowchart TB\n    REP[\"GET /v1/widgets?sku=&status=READY\"]:::dark",
+        )
+        .expect("quoted ampersand parses");
+        let rep = flowchart_nodes(&graph.statements)
+            .remove("REP")
+            .expect("REP");
+        assert_eq!(
+            rep.label.as_deref(),
+            Some("GET /v1/widgets?sku=&status=READY")
+        );
+    }
+
+    #[test]
+    fn flowchart_classdef_applies_fill_and_text_color() {
+        let svg = render_mermaid_to_svg(
+            "flowchart LR\n    classDef dark fill:#111,color:#fff,stroke:#000\n    A[\"POST /v1/pack\"]:::dark",
+            None,
+        )
+        .expect("classDef flowchart renders");
+        assert!(svg.contains("POST /v1/pack"), "{svg}");
+        assert!(svg.contains("fill=\"#111\""), "node fill missing: {svg}");
+        assert!(
+            svg.contains("stroke=\"#000\""),
+            "node stroke missing: {svg}"
+        );
+        assert!(
+            svg.contains("fill=\"#fff\""),
+            "classDef color must paint node text: {svg}"
+        );
+    }
+
+    #[test]
+    fn flowchart_class_and_ampersand_diagram_keeps_labels() {
+        const SRC: &str = r#"flowchart TB
+    classDef dark fill:#111,color:#fff,stroke:#000
+    START([Operator starts a run]) --> ASK
+    subgraph P1["1 · Pick a machine"]
+        ASK{machine already claimed?}:::cond
+        ASK -->|yes| KEEP[keep that machine]
+        ASK -->|no| RUSH{job in the<br/>night shift?}:::cond
+        RUSH -->|no| MAIN[MAIN line]
+        RUSH -->|yes| CTX{"running a rush order?<br/>(walk-in → main)"}:::cond
+        CTX -->|no| MAIN
+        CTX -->|yes| SPAREQ{spare line for this<br/>shift exists?}:::cond
+        SPAREQ -->|yes| SPARE[SPARE line]
+        SPAREQ -->|no| SPIN["POST /v1/lines/{id}/spin-up"]:::dark
+        SPIN -->|ok| SPARE
+        SPIN -->|error| MAIN
+    end
+    MAIN & SPARE & KEEP --> MIX
+    subgraph P2["2 · Mix"]
+        MIX["GET /v1/widgets/{name}"]:::dark
+        MIX --> LOCK["PATCH /v1/widgets/{id}/lock"]:::dark
+        LOCK --> ENV["POST /v1/widgets/{id}/env"]:::dark
+    end
+    ENV --> NEED
+    subgraph P3["3 · Pack"]
+        NEED{needs a crate?}:::cond
+        NEED -->|no| FILES
+        NEED -->|"yes, crate ready"| JOIN
+        NEED -->|"yes, none yet"| WHERE{line?}:::cond
+        WHERE -->|main| NEW["POST /v1/crates/open"]:::dark
+        WHERE -->|spare| OLD["GET /v1/crates"]:::dark
+        NEW & OLD --> JOIN["POST /v1/crates/{id}/seal"]:::dark
+    end
+    JOIN --> FILES
+    subgraph P4["4 · Ship"]
+        FILES["POST /v1/parcels"]:::dark --> SEND["POST /v1/shipments"]:::dark
+        SEND --> POLL["GET /v1/shipments/{id}"]:::dark
+        POLL -->|ERROR| LOGS["GET /v1/shipments/{id}/events"]:::dark
+        POLL -->|READY| LIVE[parcel live]
+    end
+    LIVE -.-> NOTE & TAG & HOLD
+    subgraph P6["6 · After"]
+        NOTE["Add a note"]:::dark
+        TAG["Add a tag"]:::dark
+        HOLD["Hold / recall"]:::dark
+        BACK["Release / resume"]:::dark
+    end
+    HOLD -.-> BACK
+    subgraph P7["7 · Idle"]
+        USAGE["Hourly: GET /v1/counts"]:::dark
+        LIST["inventory.json"]
+    end
+"#;
+        let graph = crate::parser::parse_mermaid(SRC).expect("mock flowchart parses");
+        let nodes = flowchart_nodes(&graph.statements);
+        assert!(
+            nodes.keys().all(|id| !id.contains('&')),
+            "ampersand group leaked as a node id: {:?}",
+            nodes.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            nodes.get("ASK").and_then(|n| n.label.as_deref()),
+            Some("machine already claimed?")
+        );
+        assert_eq!(
+            nodes.get("SPIN").and_then(|n| n.label.as_deref()),
+            Some("POST /v1/lines/{id}/spin-up")
+        );
+        assert_eq!(
+            nodes.get("USAGE").and_then(|n| n.label.as_deref()),
+            Some("Hourly: GET /v1/counts")
+        );
+        assert_eq!(
+            nodes.get("LIST").and_then(|n| n.label.as_deref()),
+            Some("inventory.json")
+        );
+        assert_eq!(
+            nodes.get("HOLD").and_then(|n| n.label.as_deref()),
+            Some("Hold / recall")
+        );
+        let edges = flowchart_edges(&graph.statements);
+        for src in ["MAIN", "SPARE", "KEEP"] {
+            assert!(
+                edges.iter().any(|(f, t)| f == src && t == "MIX"),
+                "missing {src}→MIX in {edges:?}"
+            );
+        }
+        for dst in ["NOTE", "TAG", "HOLD"] {
+            assert!(
+                edges.iter().any(|(f, t)| f == "LIVE" && t == dst),
+                "missing LIVE→{dst} in {edges:?}"
+            );
+        }
+        let svg = render_mermaid_to_svg(SRC, None).expect("mock flowchart renders");
+        let visible = svg_visible_text(&svg);
+        assert!(
+            !visible.contains("MAIN & SPARE"),
+            "ampersand group rendered as a node: {visible}"
+        );
+        for needle in [
+            "machine already claimed?",
+            "MAIN line",
+            "keep that machine",
+            "SPARE line",
+            "parcel live",
+            "Hold / recall",
+            "Hourly:",
+            "inventory.json",
+        ] {
+            assert!(visible.contains(needle), "missing {needle:?} in {visible}");
+        }
+    }
+
+    fn svg_visible_text(svg: &str) -> String {
+        let mut out = String::new();
+        let mut in_tag = false;
+        for c in svg.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => {
+                    in_tag = false;
+                    out.push(' ');
+                }
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        let decoded = out
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"");
+        decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
     #[test]
     fn test_cjk_display_width_counts_wide_chars_as_two_units() {
         use crate::text_wrap::{display_width_units, line_width};

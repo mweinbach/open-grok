@@ -18,6 +18,7 @@ tokio = { workspace = true, features = ["process", "rt", "macros", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+xai-dirs = { path = "../xai-dirs" }
 xai-grok-config = { workspace = true }
 xai-grok-extra-ca = { workspace = true }
 xai-grok-sandbox = { path = "../xai-grok-sandbox", default-features = false }

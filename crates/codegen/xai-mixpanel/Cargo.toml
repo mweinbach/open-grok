@@ -14,3 +14,5 @@ xai-grok-secrets = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tokio = { workspace = true }
+wiremock = { workspace = true }

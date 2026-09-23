@@ -447,6 +447,13 @@ pub struct FeedbackSubmission {
     )]
     pub model_fingerprint: Option<String>,
 
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::serde_helpers::empty_string_as_none"
+    )]
+    pub reasoning_effort: Option<String>,
+
     /// Context type for the feedback
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_type: Option<ContextType>,
@@ -582,6 +589,7 @@ impl FeedbackSubmission {
     pub fn strip_metadata(&mut self) {
         self.model_id = None;
         self.resolved_model_id = None;
+        self.reasoning_effort = None;
         self.turn_number = None;
         self.last_user_message = None;
         self.last_assistant_message = None;

@@ -55,6 +55,7 @@ xai-tty-utils = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 
 [dev-dependencies]
+xai-interjection-core = { workspace = true }
 reqwest = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing = { workspace = true }

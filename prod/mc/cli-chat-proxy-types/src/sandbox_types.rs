@@ -79,10 +79,6 @@ mod tests {
             r#""SANDBOX_MODE_WORKSPACE_SERVER""#
         );
         assert_eq!(
-            serde_json::to_string(&SandboxMode::Bare).unwrap(),
-            r#""SANDBOX_MODE_BARE""#
-        );
-        assert_eq!(
             serde_json::to_string(&SandboxMode::Invalid).unwrap(),
             r#""SANDBOX_MODE_INVALID""#
         );
@@ -94,7 +90,6 @@ mod tests {
             SandboxMode::Invalid,
             SandboxMode::Agent,
             SandboxMode::WorkspaceServer,
-            SandboxMode::Bare,
         ] {
             let json = serde_json::to_string(&mode).unwrap();
             let back: SandboxMode = serde_json::from_str(&json).unwrap();
@@ -287,8 +282,6 @@ pub enum SandboxMode {
     Agent,
     #[serde(rename = "SANDBOX_MODE_WORKSPACE_SERVER")]
     WorkspaceServer,
-    #[serde(rename = "SANDBOX_MODE_BARE")]
-    Bare,
 }
 
 /// Request body for starting a sandbox session (non-TUI).

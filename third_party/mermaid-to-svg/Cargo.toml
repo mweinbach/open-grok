@@ -120,6 +120,18 @@
 #     stays unsupported (ignored). Covered by `xychart_diagram::tests` here and
 #     the `categorical_xychart_*` raster test in
 #     crates/codegen/xai-grok-mermaid/tests/pure_engine.rs.
+# 13. LOCAL MODIFICATION (src/parser.rs + src/layout.rs + src/svg_renderer.rs):
+#     flowchart `:::classname` (and `classDef`) plus Mermaid's `A & B --> C`
+#     ampersand groups. Upstream required the node string to *end* on the shape
+#     closer, so `PIN{label}:::cond` and `A["POST /v1/{id}"]:::dark` dropped
+#     the label (the PNG showed the id, or a slice of the label up to the
+#     first `(`). `A & B & C --> D` was parsed as one node named
+#     "A & B & C". `extract_node_id` now takes the first shape
+#     delimiter in string order (quote-aware) instead of preferring `(` over
+#     `{`. classDef `fill`/`stroke`/`color` are applied via the existing
+#     `style` path so `color` paints node text. Covered by the
+#     `flowchart_class_*` / `flowchart_ampersand_*` /
+#     `flowchart_class_and_ampersand_diagram_*` tests in src/lib.rs.
 #
 # Re-audit checklist:
 #  - This crate's own source contains no `unsafe` and no filesystem / network I/O.

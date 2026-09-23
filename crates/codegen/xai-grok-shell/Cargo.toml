@@ -9,8 +9,15 @@ default = []
 dhat-heap = ["dep:dhat"]
 # Session synthesis + in-process e2e harness (`session::testkit`) for soak,
 # load, and bench tests. Off by default; the tests/benches that use it declare
-# it via `required-features`.
-test-support = []
+# it via `required-features`. Forwards sampler and workspace `test-support`
+# so downstream test builds see those crates' test seams
+# (`isolated_spawn_e2e` uses `WorkspaceOps::for_test`).
+# (Upstream also forwards `xai-grok-login/test-support`; the fork omits the
+# login crate and maps its auth surface onto fork auth instead.)
+test-support = [
+    "xai-grok-sampler/test-support",
+    "xai-grok-workspace/test-support",
+]
 # Local Computer Hub workspace_server (own/attach + crash-restart). Requires
 local-workspace = []
 default-bazel = [
@@ -143,6 +150,8 @@ xai-chat-state = { path = "../xai-chat-state" }
 xai-compaction-transcript = { workspace = true }
 xai-grok-compaction = { path = "../../common/xai-grok-compaction" }
 xai-grok-extra-ca = { workspace = true }
+# Leader lock: bounded flock polling behind the machine-local acquire slot.
+xai-grok-file-lock = { workspace = true }
 xai-grok-sampler = { path = "../xai-grok-sampler" }
 xai-grok-session-search = { workspace = true }
 xai-sqlite-journal = { workspace = true }
@@ -224,6 +233,8 @@ serial_test = { workspace = true }
 # Test-only builds expose `env::EnvVarGuard` and the cpu_profile test seams to
 # this crate's test targets.
 xai-grok-shell-base = { workspace = true, features = ["test-support"] }
+# Exposes sampler's `notify_on_submit` mock to lib tests via feature unification.
+xai-grok-sampler = { path = "../xai-grok-sampler", features = ["test-support"] }
 xai-grok-test-support = { workspace = true, features = [] }
 xai-test-utils = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` (paused virtual
@@ -270,6 +281,9 @@ required-features = ["test-support"]
 [[test]]
 name = "testkit_synth_roundtrip"
 required-features = ["test-support"]
+
+# NOTE(1.0.41-replay): upstream adds `tool_call_trace` + `tool_call_trace_off`
+# test targets; re-add when slice-shell-session ports those files.
 
 [lints]
 workspace = true
