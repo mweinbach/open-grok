@@ -125,6 +125,12 @@ impl AgentView {
         registry: &ActionRegistry,
         prompt_paging: bool,
     ) -> InputOutcome {
+        // Taken first so only a stash made after this key leaves the next Ctrl+Z armed
+        let stash_undo_armed = self
+            .prompt_stash
+            .as_mut()
+            .is_some_and(|entry| std::mem::take(&mut entry.undo_armed));
+
         // Dismiss transient toasts on any keypress so error messages don't
         // linger while the user is already typing. Sticky status banners
         // (`sticky_toast`) are unaffected; ephemeral tips intentionally
@@ -625,12 +631,14 @@ impl AgentView {
                                 self.deferred_send = Some(AgentDeferredSend::Interject);
                                 return InputOutcome::Changed;
                             }
+                            let image_notice = self.unbound_image_placeholder_notice();
                             let images = self.prompt.drain_images();
                             self.prompt.set_text("");
                             self.prompt_input_mode = PromptInputMode::Normal;
                             return InputOutcome::Action(Action::SendPromptNow {
                                 text: text.trim().to_string(),
                                 images,
+                                image_notice,
                             });
                         }
                         let action = action_mode.send_action(text);
@@ -697,10 +705,15 @@ impl AgentView {
                                 return InputOutcome::Changed;
                             }
                             // Drain images BEFORE set_text("") wipes the chip elements.
+                            let image_notice = self.unbound_image_placeholder_notice();
                             let images = self.prompt.drain_images();
                             self.prompt.set_text("");
                             self.note_draft_consumed();
-                            return InputOutcome::Action(Action::SendPromptNow { text, images });
+                            return InputOutcome::Action(Action::SendPromptNow {
+                                text,
+                                images,
+                                image_notice,
+                            });
                         }
                     } else if turn_running
                         && let Some(outcome) = self.try_send_now_queued_from_prompt()
@@ -792,6 +805,9 @@ impl AgentView {
         // 3. Let the widget handle text editing (chars, paste, cursor, undo, newline).
         // (Skip if already handled by file search intercept above.)
         if !self.prompt.file_search_visible() {
+            if stash_undo_armed && let Some(outcome) = self.pop_stash_on_undo_key(key) {
+                return outcome;
+            }
             // The undo tip advertises ctrl+z; an undo keypress while it is on
             // screen is the user acting on it. Captured before the widget runs
             // so a bare ctrl+z (no tip up, or the tip disabled) emits nothing.
@@ -1030,10 +1046,10 @@ impl AgentView {
     fn populate_prompt_from_history(&mut self, text: &str) {
         if let Some(cmd) = text.strip_prefix("! ") {
             self.prompt_input_mode = PromptInputMode::Bash;
-            self.prompt.set_text(cmd);
+            self.prompt.set_text_discarding_images(cmd);
         } else {
             self.prompt_input_mode = PromptInputMode::Normal;
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         }
         let len = self.prompt.textarea.text().len();
         self.prompt.textarea.set_cursor(len);
@@ -1061,12 +1077,12 @@ impl AgentView {
             && let Some(cmd) = text.strip_prefix("! ")
         {
             self.prompt_input_mode = PromptInputMode::Bash;
-            self.prompt.set_text(cmd);
+            self.prompt.set_text_discarding_images(cmd);
         } else if self.prompt_input_mode == PromptInputMode::Bash {
             self.prompt_input_mode = PromptInputMode::Normal;
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         } else {
-            self.prompt.set_text(text);
+            self.prompt.set_text_discarding_images(text);
         }
 
         let len = self.prompt.textarea.text().len();
@@ -1349,6 +1365,47 @@ mod slash_menu_enter_tests {
             "got {outcome:?}; prompt={:?}",
             agent.prompt.text()
         );
+    }
+}
+
+#[cfg(test)]
+mod delivered_super_enter_tests {
+    use crate::app::app_view::InputOutcome;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn agent_with_draft() -> super::AgentView {
+        let mut agent = super::test_fixtures::make_agent();
+        agent.prompt.set_text("hello");
+        agent.prompt.set_cursor(agent.prompt.text().len());
+        agent
+    }
+
+    /// Delivered SUPER+Enter misses SendPrompt (bare Enter) and is_mod_enter;
+    /// the composer inserts a newline instead of sending.
+    #[test]
+    fn delivered_super_enter_inserts_newline_and_does_not_send() {
+        let mut agent = agent_with_draft();
+        let outcome =
+            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "SUPER+Enter must not send, got {outcome:?}"
+        );
+        assert_eq!(agent.prompt.text(), "hello\n");
+    }
+
+    /// Multiline swap is Shift/Alt only. SUPER+Enter must stay a newline, not send.
+    #[test]
+    fn delivered_super_enter_stays_newline_in_multiline_mode() {
+        let mut agent = agent_with_draft();
+        agent.multiline_mode = true;
+        let outcome =
+            agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        assert!(
+            matches!(outcome, InputOutcome::Changed),
+            "multiline SUPER+Enter must not send, got {outcome:?}"
+        );
+        assert_eq!(agent.prompt.text(), "hello\n");
     }
 }
 

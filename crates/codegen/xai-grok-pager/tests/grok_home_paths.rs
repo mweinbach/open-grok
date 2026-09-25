@@ -59,8 +59,13 @@ fn disk_usage_run_creates_no_grok_home() {
     }
 
     for json in [false, true] {
-        xai_grok_pager::disk_usage_cmd::run(xai_grok_pager::disk_usage_cmd::DiskUsageArgs { json })
-            .expect("a missing home is not an error");
+        xai_grok_pager::disk_usage_cmd::run(xai_grok_pager::disk_usage_cmd::DiskUsageArgs {
+            json,
+            clean: false,
+            clean_orphaned: false,
+            yes: false,
+        })
+        .expect("a missing home is not an error");
         assert!(
             !ghost.exists(),
             "open-grok du must not create the home it reports on (json={json})"

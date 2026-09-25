@@ -292,18 +292,6 @@ pub(super) fn dispatch_rewind_dismiss_error(app: &mut AppView) -> Vec<Effect> {
     dispatch_rewind_dismiss(app)
 }
 
-/// The single place the inline-edit resubmit gets armed: called right
-/// before every `Effect::RewindExecute` emission in the rewind flow. If the
-/// inline editor is open, the (trimmed) edited text is stashed for
-/// `dispatch_rewind_success` to resubmit after the rewind lands. Dismiss /
-/// error / empty-points paths never arm it, so they need no clearing — the
-/// editor simply stays open there.
-fn stash_inline_resubmit_if_editing(agent: &mut crate::app::agent_view::AgentView) {
-    if let Some(ref edit) = agent.inline_edit {
-        agent.pending_inline_resubmit = Some(edit.textarea.text().trim().to_string());
-    }
-}
-
 /// Enter `Executing` and emit `RewindExecute` (shared by confirm Yes and
 /// immediate execute when confirm-before-rewind is off).
 fn enter_executing(
@@ -329,7 +317,6 @@ fn enter_executing(
         stashed_draft: draft,
         selected_prompt_index: None,
     });
-    stash_inline_resubmit_if_editing(agent);
     vec![Effect::RewindExecute {
         agent_id,
         session_id,
@@ -363,57 +350,6 @@ fn begin_rewind(
     enter_executing(agent, agent_id, target, anchor, draft)
 }
 
-pub(super) fn dispatch_inline_edit_submit(app: &mut AppView) -> Vec<Effect> {
-    let ActiveView::Agent(id) = app.active_view else {
-        return vec![];
-    };
-    let Some(agent) = app.agents.get_mut(&id) else {
-        return vec![];
-    };
-    let Some(session_id) = agent.session.session_id.clone() else {
-        app.show_toast(NO_SESSION_NOTICE);
-        return vec![];
-    };
-    let Some(edit) = agent.inline_edit.as_ref() else {
-        return vec![];
-    };
-
-    // Unchanged/empty edits have nothing to submit: just close the editor.
-    let text = edit.textarea.text().trim().to_string();
-    if text.is_empty() || text == edit.original.trim() {
-        agent.exit_inline_edit();
-        return vec![];
-    }
-
-    let target = edit.prompt_index;
-    let anchor = agent
-        .scrollback
-        .index_of_id(edit.entry_id)
-        .or_else(|| agent.scrollback.selected())
-        .unwrap_or(0);
-    let draft = stash_prompt(&mut agent.prompt);
-
-    if agent.session.state.is_busy() {
-        // Mid-turn submit: the same cancel-offer `/rewind` raises, over the
-        // still-open editor. Confirm cancels the turn and re-enters the
-        // flow; dismiss returns to the editor.
-        agent.rewind_state = Some(RewindState::new_cancel_offer(anchor, draft, Some(target)));
-        return vec![];
-    }
-
-    agent.rewind_state = Some(RewindState {
-        phase: RewindPhase::Loading,
-        anchor_entry_idx: anchor,
-        stashed_draft: draft,
-        selected_prompt_index: Some(target),
-    });
-
-    vec![Effect::FetchRewindPoints {
-        agent_id: id,
-        session_id,
-    }]
-}
-
 pub(super) fn dispatch_rewind_success(
     app: &mut AppView,
     agent_id: crate::app::agent::AgentId,
@@ -422,10 +358,6 @@ pub(super) fn dispatch_rewind_success(
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
-
-    // Inline-edit resubmit text; taken unconditionally so a failed rewind
-    // drops it.
-    let inline_resubmit = agent.pending_inline_resubmit.take();
 
     if !response.success {
         let err = response.error.unwrap_or_else(|| "unknown error".into());
@@ -441,16 +373,7 @@ pub(super) fn dispatch_rewind_success(
             stashed_draft: draft,
             selected_prompt_index: None,
         });
-        // Note: the inline editor (if any) stays open — dismissing the
-        // error returns to editing.
         return vec![];
-    }
-
-    // The rewind went through: the inline editor's job is done. Close it
-    // before the truncation below removes its entry.
-    if inline_resubmit.is_some() {
-        agent.inline_edit = None;
-        agent.scrollback.set_inline_edit_height(None);
     }
 
     let target = response.target_prompt_index;
@@ -481,27 +404,18 @@ pub(super) fn dispatch_rewind_success(
         crate::memory_release::release_retained_memory_with("rewind-truncate");
     }
 
-    // An inline resubmit skips the confirmation — the edited prompt
-    // re-appearing at the same spot is self-explanatory.
-    if inline_resubmit.is_none() {
-        const MSG: &str = "Reverted conversation";
-        if app.screen_mode.is_minimal() {
-            // Minimal has no toast surface and can't erase committed lines, so the confirmation stays in scrollback there.
-            agent
-                .scrollback
-                .push_block(RenderBlock::system(MSG.to_string()));
-        } else {
-            agent.show_toast(MSG);
-        }
+    const MSG: &str = "Reverted conversation";
+    if app.screen_mode.is_minimal() {
+        // Minimal has no toast surface and can't erase committed lines, so the confirmation stays in scrollback there.
+        agent
+            .scrollback
+            .push_block(RenderBlock::system(MSG.to_string()));
+    } else {
+        agent.show_toast(MSG);
     }
 
-    if inline_resubmit.is_some() {
-        // Restore the full draft before a non-consuming resubmit.
-        if let Some(draft) = stashed_draft {
-            agent.prompt.restore(draft);
-        }
-    } else if let Some(ref prompt_text) = response.prompt_text {
-        agent.prompt.set_text(prompt_text);
+    if let Some(ref prompt_text) = response.prompt_text {
+        agent.prompt.set_text_discarding_images(prompt_text);
     } else if let Some(draft) = stashed_draft {
         agent.prompt.restore(draft);
     }
@@ -510,28 +424,6 @@ pub(super) fn dispatch_rewind_success(
 
     agent.rewind_points = None;
     agent.scrollback.goto_bottom();
-
-    if let Some(text) = inline_resubmit {
-        if app.active_view == ActiveView::Agent(agent_id) {
-            // Resubmit from the rewound point; `consume_input=false` keeps
-            // the composer draft, `literal=true` sends slash-lookalike text
-            // as a prompt (the transcript is already truncated — running it
-            // as a command would swallow the resubmit).
-            return super::prompt::dispatch_send_prompt_inner(
-                app, text, /* consume_input */ false, /* literal */ true,
-                /* is_follow_up */ false,
-            );
-        }
-        // View switched mid-rewind: fall back to prefilling that composer,
-        // appending so an existing draft isn't clobbered.
-        if let Some(agent) = app.agents.get_mut(&agent_id) {
-            if agent.prompt.text().trim().is_empty() {
-                agent.prompt.set_text(&text);
-            } else {
-                agent.prompt.append_text(&format!("\n{text}"));
-            }
-        }
-    }
 
     vec![]
 }
@@ -620,9 +512,6 @@ pub(super) fn handle_rewind_execute_failed(
     let Some(agent) = app.agents.get_mut(&agent_id) else {
         return vec![];
     };
-    // A pending inline resubmit dies with its rewind; the editor itself
-    // stays open so dismissing the error returns to editing.
-    agent.pending_inline_resubmit = None;
     let anchor = agent
         .rewind_state
         .as_ref()

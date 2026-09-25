@@ -61,18 +61,6 @@ impl AgentView {
             self.highlighted_link_idx = None;
             return InputOutcome::Action(Action::OpenLink(target));
         }
-        if crate::app::inline_edit::INLINE_EDIT_ENABLED
-            && key!(Enter).matches(key)
-            && !self.scrollback.is_selected_group_header()
-            && let Some(idx) = self.scrollback.selected()
-            && self
-                .scrollback
-                .entry(idx)
-                .is_some_and(|e| e.block.is_user_prompt())
-            && self.enter_inline_edit(idx)
-        {
-            return InputOutcome::Changed;
-        }
         if key!(Enter).matches(key)
             && !self.scrollback.is_selected_group_header()
             && let Some(idx) = self.scrollback.selected()
@@ -659,6 +647,18 @@ impl AgentView {
                 }
                 DockItem::Row(Section::Queued, _) | DockItem::Header(_) => InputOutcome::Unchanged,
             },
+            KeyCode::Char('y') => {
+                let (col, row) = self.last_mouse_pos;
+                if self.pane_areas.queue.area() > 0
+                    && self.pane_areas.queue.contains((col, row).into())
+                    && let Some((_, text)) = self.queue.yank_copy_target()
+                {
+                    self.copy_to_clipboard(&text);
+                    InputOutcome::Changed
+                } else {
+                    InputOutcome::Unchanged
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.set_active_pane(AgentPane::Scrollback, false);
                 InputOutcome::Changed

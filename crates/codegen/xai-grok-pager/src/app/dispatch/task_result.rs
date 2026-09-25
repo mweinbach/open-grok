@@ -19,8 +19,8 @@ use super::ctx::{
 };
 use super::notes::{handle_btw_response, handle_memory_note_saved};
 use super::prompt::{
-    defer_to_open_reload_window, handle_compact_complete, handle_prompt_response,
-    handle_suggestion_debounce_expired,
+    defer_to_open_reload_window, handle_compact_complete, handle_memory_command_complete,
+    handle_prompt_response, handle_suggestion_debounce_expired,
 };
 use super::queue::push_and_page_flip;
 use super::rewind::{
@@ -48,13 +48,14 @@ use super::settings::ui::{apply_setting_rollback, refresh_open_settings_modals};
 use super::status::{
     handle_coding_data_sharing_failed, handle_coding_data_sharing_updated,
     handle_context_info_complete, handle_session_cache_result, handle_session_usage_result,
-    scrub_error_for_toast, usage_modal_state_mut,
+    scrub_error_for_toast, toast_persist_failure, usage_modal_state_mut,
 };
 use super::transcript::{
     handle_hooks_list_loaded, handle_marketplace_list_loaded, handle_marketplace_updates_available,
     handle_mcp_toggle_done, handle_plugins_list_loaded, handle_skills_toggle_done,
 };
-use super::turn::handle_bg_task_killed;
+use super::turn::{clear_pending_kill, handle_bg_task_killed};
+use crate::app::acp_handler::task_view_by_session_id;
 use crate::app::actions::{
     ClipboardPasteCompletion, ClipboardPasteContext, ClipboardPasteFailure, ClipboardPasteTarget,
     DoctorFixTarget, DoctorPlanningOutcome, Effect, ProbedAttachment, SubagentKillOutcome,
@@ -63,7 +64,9 @@ use crate::app::actions::{
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentDeferredSend;
 use crate::app::app_view::{ActiveView, AppView, AuthState, PrimaryProvider};
+use crate::app::dispatch::settings;
 use crate::scrollback::block::RenderBlock;
+use crate::scrollback::blocks::MemoryCommandKind;
 use agent_client_protocol as acp;
 pub(super) fn unregister_session_effect(session_id: Option<acp::SessionId>) -> Vec<Effect> {
     session_id
@@ -567,10 +570,12 @@ fn handle_kimi_model_rebind_complete(
         // the pager now considers current before releasing the queue.
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -815,10 +820,12 @@ fn handle_fireworks_model_rebind_complete(
         // model the pager now considers current before releasing the queue.
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1048,10 +1055,12 @@ fn handle_deepseek_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1262,10 +1271,12 @@ fn handle_meta_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1469,10 +1480,12 @@ fn handle_wafer_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -1806,10 +1819,12 @@ fn handle_runinfra_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2014,10 +2029,12 @@ fn handle_gemini_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2091,10 +2108,12 @@ fn handle_zai_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2312,10 +2331,12 @@ fn handle_opencode_go_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -2545,10 +2566,12 @@ fn handle_openrouter_model_rebind_complete(
     if !still_owned || !agent.session.provider_rebind_pending {
         agent.session.model_switch_pending = false;
         let Some(target_model) = agent.session.models.current.clone() else {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         };
         if target_model == model_id {
-            return crate::app::dispatch::maybe_drain_queue(agent).effects;
+            return crate::app::dispatch::maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects;
         }
         let Some(current_session_id) = agent.session.session_id.clone() else {
             agent.session.provider_rebind_pending = true;
@@ -3047,9 +3070,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 after_gemini_session_ready(app, agent_id, effects)
             }
         }
-        TaskResult::SessionFailed { agent_id, error } => {
-            handle_session_failed(app, agent_id, error)
-        }
+        TaskResult::SessionFailed {
+            agent_id,
+            error,
+            timed_out,
+        } => handle_session_failed(app, agent_id, error, timed_out),
         TaskResult::WorktreeSessionCreated {
             agent_id,
             session_id,
@@ -3111,8 +3136,13 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_degree,
             resume_session_id,
         ),
-        TaskResult::WorktreeSessionFailed { agent_id, error } => {
-            handle_worktree_session_failed(app, agent_id, error)
+        TaskResult::WorktreeSessionFailed {
+            agent_id,
+            error,
+            orphaned_worktree_root,
+            timed_out,
+        } => {
+            handle_worktree_session_failed(app, agent_id, error, orphaned_worktree_root, timed_out)
         }
         TaskResult::ForkSessionReady {
             agent_id,
@@ -3620,6 +3650,18 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::CompactComplete { agent_id, result } => {
             handle_compact_complete(app, agent_id, result)
         }
+        TaskResult::MemoryFlushComplete { agent_id, result } => handle_memory_command_complete(
+            app,
+            agent_id,
+            MemoryCommandKind::Flush,
+            result.map(|r| (r.summary(), r.succeeded())),
+        ),
+        TaskResult::MemoryDreamComplete { agent_id, result } => handle_memory_command_complete(
+            app,
+            agent_id,
+            MemoryCommandKind::Dream,
+            result.map(|r| (r.summary(), r.succeeded())),
+        ),
         TaskResult::SwitchModelComplete {
             agent_id,
             model_id,
@@ -4736,11 +4778,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             error,
         } => {
             tracing::warn!(task_id = %task_id, error = %error, "Failed to kill bg task");
-            if let Some(agent) = find_agent_by_session_id(&mut app.agents, &session_id)
-                && let Some(task) = agent.session.bg_tasks.get_mut(&task_id)
-            {
-                task.pending_kill = false;
-                task.kill_requested_at = None;
+            if let Some((session, _)) = task_view_by_session_id(app, &session_id) {
+                clear_pending_kill(session, &task_id);
             }
             vec![]
         }
@@ -4951,6 +4990,60 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::PluginsListLoaded { agent_id, result } => {
             handle_plugins_list_loaded(app, agent_id, result)
         }
+        TaskResult::MemoryListLoaded { agent_id, result } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                match result {
+                    Ok(_)
+                        if !matches!(
+                            agent.active_modal,
+                            None | Some(crate::views::modal::ActiveModal::MemoryBrowser { .. })
+                        ) => {}
+                    Ok(listing) => {
+                        agent.active_modal =
+                            Some(crate::views::modal::ActiveModal::MemoryBrowser {
+                                state: Box::new(
+                                    crate::views::memory_modal::MemoryModalState::from_listing(
+                                        listing,
+                                    ),
+                                ),
+                            });
+                    }
+                    Err(error) => {
+                        agent.scrollback.push_block(RenderBlock::system(error));
+                    }
+                }
+            }
+            vec![]
+        }
+        TaskResult::MemoryToggleResult { agent_id, result } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                if let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+                {
+                    state.apply_toggle_result(result);
+                } else {
+                    let text = match result {
+                        Ok(response) => response.message,
+                        Err(error) => error,
+                    };
+                    agent.scrollback.push_block(RenderBlock::system(text));
+                }
+            }
+            vec![]
+        }
+        TaskResult::MemoryForgetResult {
+            agent_id,
+            path,
+            result,
+        } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id)
+                && let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+            {
+                state.apply_forget_result(&path, result);
+            }
+            vec![]
+        }
         TaskResult::HooksActionResult { agent_id, result }
         | TaskResult::PluginsActionResult { agent_id, result }
         | TaskResult::MarketplaceActionResult { agent_id, result } => {
@@ -5136,9 +5229,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::CodingDataSharingFailed {
             agent_id,
             error,
-            rollback_to_opted_in,
             seq,
-        } => handle_coding_data_sharing_failed(app, agent_id, error, rollback_to_opted_in, seq),
+        } => handle_coding_data_sharing_failed(app, agent_id, error, seq),
         TaskResult::RenameSessionComplete { agent_id, title } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
                 let safe = crate::views::session_title::sanitize_display_text(&title);
@@ -5663,7 +5755,14 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             agent_id,
             result,
             minimal_request_id,
-        } => handle_btw_response(app, agent_id, result, minimal_request_id),
+            skipped_image_numbers,
+        } => handle_btw_response(
+            app,
+            agent_id,
+            result,
+            minimal_request_id,
+            &skipped_image_numbers,
+        ),
         TaskResult::InterjectQueued { .. } => vec![],
         TaskResult::WorkingDirectoryMutated {
             agent_id,
@@ -5719,28 +5818,39 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         TaskResult::InterjectFailed {
             agent_id,
             error,
-            text,
-            blocks,
+            remaining,
         } => {
             if let Some(agent) = app.agents.get_mut(&agent_id) {
-                let id = agent.session.next_queue_id;
-                agent.session.next_queue_id += 1;
-                agent
-                    .session
-                    .pending_prompts
-                    .push_front(crate::app::agent::QueuedPrompt {
-                        id,
-                        text,
-                        kind: crate::app::agent::QueueEntryKind::Prompt,
-                        wire_blocks: blocks,
-                        images: Vec::new(),
-                        display_as_skill: false,
-                        task_id: None,
-                        human_schedule: None,
-                        chip_elements: Vec::new(),
-                        skill_token_ranges: Vec::new(),
-                        combined_texts: Vec::new(),
-                    });
+                for (text, interjection_id, _blocks) in remaining.into_iter().rev() {
+                    agent.self_interjection_ids.remove(&interjection_id);
+                    if let Some(entry_id) =
+                        agent.interjection_painted_blocks.remove(&interjection_id)
+                    {
+                        agent.scrollback.remove_entry(entry_id);
+                    }
+                    let images = agent
+                        .interjection_retry_images
+                        .remove(&interjection_id)
+                        .unwrap_or_default();
+                    let id = agent.session.next_queue_id;
+                    agent.session.next_queue_id += 1;
+                    agent
+                        .session
+                        .pending_prompts
+                        .push_front(crate::app::agent::QueuedPrompt {
+                            id,
+                            text,
+                            kind: crate::app::agent::QueueEntryKind::Prompt,
+                            wire_blocks: None,
+                            images,
+                            display_as_skill: false,
+                            task_id: None,
+                            human_schedule: None,
+                            chip_elements: Vec::new(),
+                            skill_token_ranges: Vec::new(),
+                            combined_texts: Vec::new(),
+                        });
+                }
                 agent.show_toast(&format!("Interjection failed — requeued: {error}"));
             }
             vec![]
@@ -6175,6 +6285,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             if crate::settings::is_local_feature_flag(key) {
                 refresh_open_settings_modals(app);
             }
+            settings::handle_setting_persisted(app, key, value);
             vec![]
         }
         TaskResult::SettingPersistFailed {
@@ -6184,8 +6295,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         } => {
             let rollback_effects = apply_setting_rollback(app, key, &rollback_value);
             tracing::warn!(target: "settings", ?key, ?rollback_value, %error, "setting persist failed; rolled back");
-            let scrubbed = scrub_error_for_toast(&error);
-            app.show_toast(&format!("\u{2717} Could not save {key}: {scrubbed}"));
+            toast_persist_failure(app, key, &error);
             rollback_effects
         }
         TaskResult::SettingPersistFailedBestEffort { key, error } => {
@@ -6194,9 +6304,11 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 ?key, %error,
                 "setting persist failed (best-effort); in-memory state stays at optimistic value",
             );
-            let scrubbed = scrub_error_for_toast(&error);
-            app.show_toast(&format!("\u{2717} Could not save {key}: {scrubbed}"));
+            toast_persist_failure(app, key, &error);
             vec![]
+        }
+        TaskResult::FeatureOverridePersisted { feature, result } => {
+            settings::handle_feature_override_persisted(app, feature, result)
         }
     }
 }

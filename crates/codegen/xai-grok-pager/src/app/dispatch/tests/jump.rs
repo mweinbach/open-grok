@@ -68,23 +68,6 @@ fn show_picker_refused_while_rewind_open() {
 }
 
 #[test]
-fn show_picker_refused_while_inline_edit_open() {
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    push_turns(&mut app, id, 3);
-    assert!(
-        app.agents.get_mut(&id).unwrap().enter_inline_edit(0),
-        "entered inline edit on the first prompt"
-    );
-
-    dispatch(Action::JumpShowPicker, &mut app);
-    assert!(
-        app.agents[&id].jump_state.is_none(),
-        "picker must not stack on an open inline edit (wheel scroll would leak)"
-    );
-}
-
-#[test]
 fn show_picker_refused_while_input_overlay_pending() {
     // A pending permission / question / cancel-turn / plan-approval overlay
     // suppresses the picker's rendering, so opening one would be invisible but
@@ -355,31 +338,6 @@ fn rewind_dismisses_open_jump_picker() {
         before_offset,
         "the jump viewport was restored before rewind took over"
     );
-}
-
-#[test]
-fn inline_edit_dismisses_open_jump_picker() {
-    // The mirror of `show_picker_refused_while_inline_edit_open`: entering
-    // inline edit while the picker is open dismisses it so it can't reappear
-    // stale. (Inline edit re-centers on the edited entry, so only the picker
-    // teardown is asserted, not the viewport.)
-    let mut app = test_app_with_agent();
-    let id = AgentId(0);
-    push_turns(&mut app, id, 3);
-    app.agents.get_mut(&id).unwrap().scrollback.goto_bottom();
-
-    dispatch(Action::JumpShowPicker, &mut app);
-    assert!(app.agents[&id].jump_state.is_some());
-
-    let entered = app.agents.get_mut(&id).unwrap().enter_inline_edit(0);
-    assert!(entered, "entered inline edit on the first prompt");
-
-    let agent = &app.agents[&id];
-    assert!(
-        agent.jump_state.is_none(),
-        "entering inline edit dismissed the jump picker"
-    );
-    assert!(agent.inline_edit.is_some(), "inline edit opened");
 }
 
 #[test]

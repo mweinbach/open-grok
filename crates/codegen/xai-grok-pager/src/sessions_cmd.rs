@@ -112,11 +112,7 @@ pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
                 resp.results.iter().map(|r| r.session_id.as_str()).collect();
 
             for hit in &resp.results {
-                let title = if hit.title.is_empty() {
-                    "(untitled)"
-                } else {
-                    &hit.title
-                };
+                let title = summary_or_untitled(&hit.title);
                 let time = chrono::DateTime::from_timestamp(hit.updated_at_unix, 0)
                     .map(|dt| {
                         dt.with_timezone(&chrono::Local)
@@ -143,11 +139,7 @@ pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
                 if local_ids.contains(r.session_id.as_str()) {
                     continue;
                 }
-                let title = if r.summary.is_empty() {
-                    "(untitled)"
-                } else {
-                    &r.summary
-                };
+                let title = summary_or_untitled(&r.summary);
                 let time = chrono::DateTime::parse_from_rfc3339(&r.updated_at)
                     .map(|dt| {
                         dt.with_timezone(&chrono::Local)
@@ -201,6 +193,15 @@ pub async fn run(args: SessionsArgs, agent_config: &AgentConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The placeholder every session listing shows for a blank title
+pub(crate) fn summary_or_untitled(title: &str) -> &str {
+    if title.trim().is_empty() {
+        "(untitled)"
+    } else {
+        title
+    }
 }
 
 /// Print sessions grouped by worktree label, preserving the original table

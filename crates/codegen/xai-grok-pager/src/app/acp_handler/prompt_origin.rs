@@ -18,7 +18,7 @@ pub(crate) fn is_scheduler_fired_prompt(prompt_id: &str) -> bool {
 }
 
 /// Decides which replayed turns close without a terminal marker.
-/// A wake stays markerless when it streamed nothing visible; a wake that errored always keeps its marker.
+/// A wake stays markerless when it streamed nothing visible or when it errored, matching live.
 /// A direct-bash turn keeps its marker only for cancel and error, matching live.
 /// Every other server-initiated synthetic turn stays markerless, except `/loop` fires, which keep their markers.
 pub(crate) fn suppress_replay_marker_for_origin(
@@ -31,10 +31,8 @@ pub(crate) fn suppress_replay_marker_for_origin(
         return matches!(stop, crate::app::turn_completion::TurnStopReason::EndTurn);
     }
     if is_wake_prompt(prompt_id) {
-        if matches!(stop, crate::app::turn_completion::TurnStopReason::Error) {
-            return false;
-        }
-        return !had_visible_output;
+        return matches!(stop, crate::app::turn_completion::TurnStopReason::Error)
+            || !had_visible_output;
     }
     is_server_initiated_prompt(prompt_id) && !is_scheduler_fired_prompt(prompt_id)
 }
@@ -83,6 +81,106 @@ pub(crate) fn should_adopt_running_prompt(prompt_id: &str) -> bool {
     !is_server_initiated_prompt(prompt_id) || is_scheduler_fired_prompt(prompt_id)
 }
 
+/// `TurnCancelling` with no id, or this id, stays cancelling. Ended and superseded ids do not replace the current turn.
+/// A command in flight is left alone. Returns false when the update belongs to a turn that already ended.
+/// `turn_start_ms` is this chunk's `turnStartMs`, not the view's stamp.
+pub(super) fn note_child_live_prompt(
+    child: &mut AgentView,
+    prompt_id: Option<&str>,
+    turn_start_ms: Option<i64>,
+    is_replay: bool,
+) -> bool {
+    if is_replay || child.session.loading_replay {
+        return true;
+    }
+    let prompt_id = prompt_id.filter(|pid| !pid.is_empty());
+    // Same start as the closed nameless turn. A late id matches while the
+    // stored prompt is still None; that id is recorded so a later prompt does not.
+    let is_closed_turn = child
+        .unidentified_child_turn_closed_ms
+        .is_some_and(|closed_start| {
+            let closed_pid = child.unidentified_child_turn_closed_prompt.as_deref();
+            turn_start_ms == Some(closed_start)
+                && (closed_pid.is_none() || prompt_id.is_none() || closed_pid == prompt_id)
+        });
+    if is_closed_turn {
+        if let Some(pid) = prompt_id {
+            child.ended_child_prompt_ids.insert(pid.to_owned());
+            if child.unidentified_child_turn_closed_prompt.is_none() {
+                child.unidentified_child_turn_closed_prompt = Some(pid.to_owned());
+            }
+        }
+        return false;
+    }
+    let Some(pid) = prompt_id else {
+        // A nameless leftover keeps the previous turn's start. Once a named
+        // prompt owns the clock, applying it restamps that anchor and lands
+        // the rows on the follow-up.
+        if let (Some(chunk_start), Some(live_pid)) =
+            (turn_start_ms, child.session.current_prompt_id.as_deref())
+            && child.turn_start_ms_prompt.as_deref() == Some(live_pid)
+            && child.turn_start_ms.is_some_and(|live| live != chunk_start)
+        {
+            return false;
+        }
+        return true;
+    };
+    if child.ended_child_prompt_ids.contains(pid) || child.superseded_child_prompt_ids.contains(pid)
+    {
+        return false;
+    }
+    if child.session.state.command_in_flight().is_some() {
+        return true;
+    }
+    let same = child.session.current_prompt_id.as_deref() == Some(pid);
+    let missing = child.session.current_prompt_id.is_none();
+    if matches!(child.session.state, AgentState::TurnCancelling) {
+        if !same {
+            adopt_child_prompt_id(child, pid);
+        }
+        if same || missing {
+            return true;
+        }
+        child.session.state = AgentState::TurnRunning;
+        return true;
+    }
+    if !same {
+        adopt_child_prompt_id(child, pid);
+    }
+    if !child.session.state.is_turn_running() {
+        child.session.state = AgentState::TurnRunning;
+    }
+    true
+}
+
+fn adopt_child_prompt_id(child: &mut AgentView, pid: &str) {
+    if let Some(prev) = child.session.current_prompt_id.replace(pid.to_string())
+        && prev != pid
+    {
+        child.superseded_child_prompt_ids.insert(prev);
+        // Later updates for `prev` are dropped. Finish its rows now; the terminal still pushes the marker.
+        child.session.tracker.finish_turn(&mut child.scrollback);
+        child.scrollback.finish_all_running();
+    }
+    child.turn_started_at = None;
+}
+
+pub(super) fn backdate_child_turn_clock(child: &mut AgentView) {
+    if child.turn_started_at.is_some() {
+        return;
+    }
+    let Some(pid) = child.session.current_prompt_id.as_deref() else {
+        return;
+    };
+    if child.turn_start_ms_prompt.as_deref() != Some(pid) {
+        return;
+    }
+    let Some(start_ms) = child.turn_start_ms else {
+        return;
+    };
+    child.turn_started_at = Some(viewer_turn_anchor(Some(start_ms)));
+}
+
 /// Compute the monotonic anchor a viewer should use as its turn-start time.
 ///
 /// A viewer adopts the driver's turn mid-stream, so stamping `Instant::now()` would undercount elapsed by the wait for the first delta.
@@ -108,28 +206,38 @@ pub(super) fn viewer_turn_anchor(turn_start_ms: Option<i64>) -> std::time::Insta
 /// `cancel_trigger` is `_meta.cancelTrigger`: `"send_now"` marks an internal cancel-and-send, so the `TurnCancelled` marker is suppressed.
 /// The wire trigger wins; `expect_send_now_cancel` is the fallback for older shells.
 /// `cancellation_category` is `_meta.cancellationCategory`: `"HookDenied"` picks the blocked-by-a-hook marker.
-/// `error_kind` is the terminal's typed failure kind; it picks error-specific failure copy.
 pub(super) struct WakeTerminal<'a> {
     pub stop_reason: &'a str,
     pub agent_result: Option<&'a str>,
     pub cancel_trigger: Option<&'a str>,
     pub cancellation_category: Option<&'a str>,
-    pub error_kind: Option<crate::app::error_display::WireErrorType>,
+}
+
+/// Errored wakes close like a success (no scrollback row); the trace log is their only record.
+pub(super) fn log_failed_wake(prompt_id: &str, agent_result: Option<&str>, rail: &str) {
+    tracing::info!(
+        prompt_id,
+        rail,
+        reason = agent_result.unwrap_or("unknown error"),
+        "background wake turn failed; closing without a marker"
+    );
 }
 
 /// Close out a wake turn. This is the only place that flushes its streamed entries still in flight, because wake turns skip `PromptResponse`.
-/// A wake with visible output closes with a marker; a silent one closes with none.
-/// Failures are the exception and still get a marker when silent, because the user's standing instruction stopped executing invisibly.
-/// A silent rate limit stays quiet and defers to the retry notifications, as real turns do.
+/// An errored wake closes silently (see [`log_failed_wake`]); a chatty rate-limited wake keeps its upgrade-URL row.
 /// A hook-denied wake follows the cancelled policy.
 /// The `HookAnnotation` warning attributes the deny but is not turn output, so a silently blocked wake closes without a marker.
-pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal: WakeTerminal<'_>) {
+/// Returns true when the wake closed with a visible `TurnCompleted` marker (chatty EndTurn).
+pub(super) fn finish_wake_turn(
+    agent: &mut AgentView,
+    prompt_id: &str,
+    terminal: WakeTerminal<'_>,
+) -> bool {
     let WakeTerminal {
         stop_reason,
         agent_result,
         cancel_trigger,
         cancellation_category,
-        error_kind,
     } = terminal;
 
     let had_output = agent.session.tracker.output_since_last_finish();
@@ -152,21 +260,18 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
     let already_failed = agent.failed_wake_marker_for.as_deref() == Some(prompt_id);
     let elapsed_ms = crate::app::turn_completion::duration_to_elapsed_ms(elapsed);
     let event = match stop_reason {
-        "error" | "rate_limit"
-            if already_failed || (stop_reason == "rate_limit" && !had_output) =>
-        {
+        "error" => {
+            if !already_failed {
+                agent.failed_wake_marker_for = Some(prompt_id.to_string());
+                log_failed_wake(prompt_id, agent_result, "idle");
+            }
             None
         }
-        "error" | "rate_limit" => {
+        "rate_limit" if already_failed || !had_output => None,
+        "rate_limit" => {
             agent.failed_wake_marker_for = Some(prompt_id.to_string());
             if crate::app::dispatch::scrollback_has_recent_error_banner(&agent.scrollback) {
                 None
-            } else if stop_reason == "error" {
-                Some(crate::app::turn_completion::failed_turn_event(
-                    error_kind,
-                    agent_result,
-                    elapsed,
-                ))
             } else {
                 Some(rate_limited_wake_failure_event(agent_result, elapsed))
             }
@@ -180,11 +285,13 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
                 send_now_cancel,
                 cancel_trigger,
                 cancellation_category,
+                // The error arm above closed silently, so this Error arm is unreachable
                 error_kind: None,
                 error_banner_present: false,
             },
         ),
     };
+    let notify = matches!(&event, Some(SessionEvent::TurnCompleted { .. }));
     if event.is_some() {
         crate::app::turn_completion::push_turn_terminal_marker(agent, event, Some(prompt_id));
     }
@@ -194,6 +301,7 @@ pub(super) fn finish_wake_turn(agent: &mut AgentView, prompt_id: &str, terminal:
         cancellation_category,
         None,
     );
+    notify
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier};
+use unicode_width::UnicodeWidthStr as _;
 
 use xai_grok_pager::app::app_view::AppView;
 use xai_grok_pager::minimal_api;
@@ -180,51 +181,193 @@ fn render_entry_to_ansi(
     out.push('\n');
 }
 
+/// Last glyph column. Trailing spaces — including painted diff/code pads — are not
+/// visible for ANSI serialization, so `/transcript` and commit emit stay short in a
+/// narrower pager. [`trim_trailing_pads`] still keeps those painted cells in the buffer.
+pub(crate) fn last_visible_column(buf: &Buffer, y: u16) -> Option<u16> {
+    let area = buf.area;
+    for x in (area.x..area.x.saturating_add(area.width)).rev() {
+        if let Some(cell) = buf.cell((x, y)) {
+            if cell.skip {
+                continue;
+            }
+            let s = cell.symbol();
+            if !s.is_empty() && s != " " {
+                return Some(x);
+            }
+        }
+    }
+    None
+}
+
+fn row_fills_width(buf: &Buffer, y: u16, last_x: u16) -> bool {
+    let last_col = buf.area.x.saturating_add(buf.area.width.saturating_sub(1));
+    if last_x >= last_col {
+        return true;
+    }
+    let Some(cell) = buf.cell((last_x, y)) else {
+        return false;
+    };
+    // Ratatui 0.29 stores a wide glyph's covered cell as `" "`, not `""`.
+    // Width-aware coverage still treats CJK/emoji that end at the margin as full.
+    let extra = cell.symbol().width().saturating_sub(1);
+    let covered = last_x.saturating_add(u16::try_from(extra).unwrap_or(0));
+    if covered < last_col {
+        return false;
+    }
+    (last_x.saturating_add(1)..=last_col).all(|x| {
+        buf.cell((x, y)).is_some_and(|c| {
+            let s = c.symbol();
+            s.is_empty() || s == " "
+        })
+    })
+}
+
+/// Skip trailing pads; leave wide-glyph continuation cells and semantic line-bg spaces.
+pub(crate) fn trim_trailing_pads(buf: &mut Buffer) {
+    let area = buf.area;
+    for y in area.y..area.y.saturating_add(area.height) {
+        let last_glyph = last_visible_column(buf, y);
+        let mut start = last_glyph.map(|x| x.saturating_add(1)).unwrap_or(area.x);
+        if let Some(x) = last_glyph
+            && let Some(cell) = buf.cell((x, y))
+        {
+            let extra = cell.symbol().width().saturating_sub(1);
+            if extra > 0 {
+                start = start.saturating_add(u16::try_from(extra).unwrap_or(0));
+            }
+        }
+        for x in start..area.x.saturating_add(area.width) {
+            let Some(cell) = buf.cell_mut((x, y)) else {
+                continue;
+            };
+            if cell.symbol().is_empty() {
+                continue;
+            }
+            // Diff insert/delete bands live on these spaces; resetting them drops the color from committed ANSI.
+            if cell.bg != Color::Reset {
+                continue;
+            }
+            cell.reset();
+            cell.skip = true;
+        }
+    }
+}
+
+/// Visit painted glyphs through `last_x`, skipping wide-glyph continuation cells
+/// (`""` or Ratatui 0.29 `" "`).
+fn for_each_row_glyph(
+    buf: &Buffer,
+    y: u16,
+    last_x: u16,
+    mut visit: impl FnMut(&str, Color, Color, Modifier),
+) {
+    let mut skip = 0usize;
+    for x in buf.area.x..=last_x {
+        let Some(cell) = buf.cell((x, y)) else {
+            continue;
+        };
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        let sym = cell.symbol();
+        if sym.is_empty() {
+            continue;
+        }
+        skip = sym.width().saturating_sub(1);
+        visit(sym, cell.fg, cell.bg, cell.modifier);
+    }
+}
+
+/// Write styled glyphs through `last_x` with no trailing newline or reset.
+fn write_row_ansi(buf: &Buffer, y: u16, last_x: u16, out: &mut String) {
+    // Track the current style as the raw (fg, bg, modifier) tuple and only build the escape string on a run boundary
+    // Comparing three Copy fields per cell is far cheaper than building and comparing an SGR string per cell
+    // The per-cell string build was the hot spot on long transcripts
+    let mut cur: Option<(Color, Color, Modifier)> = None;
+    let mut sgr = String::with_capacity(32);
+    for_each_row_glyph(buf, y, last_x, |sym, fg, bg, modifier| {
+        let style = (fg, bg, modifier);
+        if cur != Some(style) {
+            cell_sgr(style.0, style.1, style.2, &mut sgr);
+            out.push_str(&sgr);
+            cur = Some(style);
+        }
+        out.push_str(sym);
+    });
+}
+
 /// Serialize a rendered cell [`Buffer`] to ANSI text (one `\n`-terminated line
 /// per row), emitting an SGR sequence whenever the style changes and resetting
 /// at each row end. Trailing blank cells are trimmed so lines stay short.
 fn buffer_to_ansi(buf: &Buffer, out: &mut String) {
     let area = buf.area;
     for y in area.y..area.y.saturating_add(area.height) {
-        // Last column carrying a visible glyph (trim trailing spaces).
-        let mut last: Option<u16> = None;
-        for x in (area.x..area.x.saturating_add(area.width)).rev() {
-            if let Some(cell) = buf.cell((x, y)) {
-                let s = cell.symbol();
-                if !s.is_empty() && s != " " {
-                    last = Some(x);
-                    break;
-                }
-            }
-        }
-        if let Some(last_x) = last {
-            // Track the current style as the raw (fg, bg, modifier) tuple and
-            // only build the escape string on a run boundary — comparing three
-            // Copy fields per cell is far cheaper than building + comparing an
-            // SGR string per cell (the previous hot spot on long transcripts).
-            let mut cur: Option<(Color, Color, Modifier)> = None;
-            let mut sgr = String::with_capacity(32);
-            for x in area.x..=last_x {
-                let Some(cell) = buf.cell((x, y)) else {
-                    continue;
-                };
-                let sym = cell.symbol();
-                if sym.is_empty() {
-                    // Continuation cell of a wide glyph — already emitted.
-                    continue;
-                }
-                let style = (cell.fg, cell.bg, cell.modifier);
-                if cur != Some(style) {
-                    cell_sgr(style.0, style.1, style.2, &mut sgr);
-                    out.push_str(&sgr);
-                    cur = Some(style);
-                }
-                out.push_str(sym);
-            }
+        if let Some(last_x) = last_visible_column(buf, y) {
+            write_row_ansi(buf, y, last_x, out);
             out.push_str("\x1b[0m");
         }
         out.push('\n');
     }
+}
+
+/// `(ansi without trailing newline, fills the last column, soft-wraps onto the next row)`.
+/// `wraps` is the renderer joiner / WRAPLINE signal, not "row is full-width".
+pub(crate) type SemanticRow = (String, bool, bool);
+
+fn row_wraps(wraps: &[bool], area_y: u16, y: u16) -> bool {
+    y.checked_sub(area_y)
+        .and_then(|i| wraps.get(usize::from(i)).copied())
+        .unwrap_or(false)
+}
+
+/// Trim pads. Soft-wrap only when `wraps` says the next row is a continuation.
+pub(crate) fn buffer_to_semantic_rows(buf: &Buffer, wraps: &[bool]) -> Vec<SemanticRow> {
+    let area = buf.area;
+    let mut rows = Vec::with_capacity(area.height as usize);
+    for y in area.y..area.y.saturating_add(area.height) {
+        match last_visible_column(buf, y) {
+            Some(last_x) => {
+                let mut ansi = String::new();
+                write_row_ansi(buf, y, last_x, &mut ansi);
+                let fills = row_fills_width(buf, y, last_x);
+                let next_y = y.saturating_add(1);
+                let next_has = next_y < area.y.saturating_add(area.height)
+                    && last_visible_column(buf, next_y).is_some();
+                let wraps_row = row_wraps(wraps, area.y, y);
+                // Omit the trailing reset only when xenl will consume: CSI would clear wrap-pending.
+                // A short joiner (wraps, not full-width) still hard-breaks.
+                if !(wraps_row && fills && next_has) {
+                    ansi.push_str("\x1b[0m");
+                }
+                rows.push((ansi, fills, wraps_row));
+            }
+            None => rows.push((String::new(), false, false)),
+        }
+    }
+    rows
+}
+
+#[cfg(test)]
+pub(crate) fn buffer_to_semantic_copy(buf: &Buffer, wraps: &[bool]) -> String {
+    let area = buf.area;
+    let mut out = String::new();
+    for y in area.y..area.y.saturating_add(area.height) {
+        match last_visible_column(buf, y) {
+            Some(last_x) => {
+                for_each_row_glyph(buf, y, last_x, |s, _, _, _| out.push_str(s));
+                let next_y = y.saturating_add(1);
+                let next_empty = next_y >= area.y.saturating_add(area.height)
+                    || last_visible_column(buf, next_y).is_none();
+                if !row_wraps(wraps, area.y, y) || next_empty {
+                    out.push('\n');
+                }
+            }
+            None => out.push('\n'),
+        }
+    }
+    out
 }
 
 /// Build a full SGR sequence (leading reset, then modifiers + fg + bg) for a
@@ -455,6 +598,23 @@ mod tests {
         assert_eq!(sgr, "\x1b[0;31;49m");
     }
 
+    fn strip_sgr(ansi: &str) -> String {
+        let mut out = String::new();
+        let mut chars = ansi.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for d in chars.by_ref() {
+                    if d.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+            out.push(c);
+        }
+        out
+    }
+
     #[test]
     fn buffer_to_ansi_trims_trailing_and_terminates_rows() {
         // A 6-wide, 2-row buffer: "hi" on row 0, blank row 1.
@@ -477,6 +637,209 @@ mod tests {
             !lines[0].contains("  "),
             "trailing spaces not trimmed: {:?}",
             lines[0]
+        );
+    }
+
+    /// Painted insert/delete pads stay in the buffer, but transcript/ANSI/copy stop at the last glyph
+    /// so a 100-col render does not reflow in an 80-col `$PAGER`.
+    #[test]
+    fn transcript_ansi_does_not_reflow_from_painted_pad_spaces() {
+        let band = Color::Rgb(0, 40, 0);
+        let width = FULL_VIEW_WIDTH;
+        let mut buf = Buffer::empty(Rect::new(0, 0, width, 1));
+        for x in 0..width {
+            let Some(cell) = buf.cell_mut((x, 0)) else {
+                continue;
+            };
+            cell.set_bg(band);
+            if x == 0 {
+                cell.set_symbol("h");
+            } else if x == 1 {
+                cell.set_symbol("i");
+            } else {
+                cell.set_symbol(" ");
+            }
+        }
+        trim_trailing_pads(&mut buf);
+
+        let last_pad = buf.cell((width.saturating_sub(1), 0)).expect("last pad");
+        assert_eq!(last_pad.bg, band, "commit paint keeps the diff-band pad");
+        assert!(!last_pad.skip, "painted pad is not a skip cell");
+        assert_eq!(
+            last_visible_column(&buf, 0),
+            Some(1),
+            "serialization visibility stops at the last glyph"
+        );
+
+        let mut transcript = String::new();
+        buffer_to_ansi(&buf, &mut transcript);
+        let visible = strip_sgr(&transcript);
+        assert_eq!(
+            visible, "hi\n",
+            "transcript must not emit a full-width space band: {transcript:?}"
+        );
+        assert!(
+            visible.trim_end_matches('\n').chars().count() < 80,
+            "an 80-col pager must not reflow this row: {visible:?}"
+        );
+        assert!(
+            transcript.contains("48;2;0;40;0"),
+            "glyph cells still carry the insert-band SGR: {transcript:?}"
+        );
+
+        let copy = buffer_to_semantic_copy(&buf, &[false]);
+        assert_eq!(copy, "hi\n", "native copy must not include painted pads");
+
+        let rows = buffer_to_semantic_rows(&buf, &[false]);
+        let Some((ansi, fills, _)) = rows.first() else {
+            panic!("expected a serialized row");
+        };
+        assert_eq!(strip_sgr(ansi), "hi");
+        assert!(
+            !fills,
+            "short painted-pad row must not fill the width: {ansi:?}"
+        );
+        assert!(
+            ansi.contains("48;2;0;40;0"),
+            "committed ANSI keeps the insert-band SGR on glyphs: {ansi:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_full_width_before_blank_stays_a_paragraph() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("a");
+        buf.cell_mut((1, 0)).unwrap().set_symbol("b");
+        buf.cell_mut((2, 0)).unwrap().set_symbol("c");
+        buf.cell_mut((3, 0)).unwrap().set_symbol("d");
+        buf.cell_mut((0, 2)).unwrap().set_symbol("x");
+        let copy = buffer_to_semantic_copy(&buf, &[]);
+        assert_eq!(copy, "abcd\n\nx\n");
+    }
+
+    #[test]
+    fn semantic_copy_exact_width_hard_break_does_not_join() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("a");
+        buf.cell_mut((1, 0)).unwrap().set_symbol("b");
+        buf.cell_mut((2, 0)).unwrap().set_symbol("c");
+        buf.cell_mut((3, 0)).unwrap().set_symbol("d");
+        buf.cell_mut((0, 1)).unwrap().set_symbol("x");
+        buf.cell_mut((1, 1)).unwrap().set_symbol("y");
+        let copy = buffer_to_semantic_copy(&buf, &[]);
+        assert_eq!(copy, "abcd\nxy\n");
+        assert!(
+            !copy.contains("abcdxy"),
+            "exact-width hard break must not join: {copy:?}"
+        );
+    }
+
+    #[test]
+    fn semantic_copy_joins_soft_wrapped_rows() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("a");
+        buf.cell_mut((1, 0)).unwrap().set_symbol("b");
+        buf.cell_mut((2, 0)).unwrap().set_symbol("c");
+        buf.cell_mut((3, 0)).unwrap().set_symbol("d");
+        buf.cell_mut((0, 1)).unwrap().set_symbol("e");
+        let copy = buffer_to_semantic_copy(&buf, &[true, false]);
+        assert_eq!(copy, "abcde\n");
+
+        let mut transcript = String::new();
+        buffer_to_ansi(&buf, &mut transcript);
+        assert!(
+            transcript.contains('\n'),
+            "transcript still terminates every visual row"
+        );
+        let visual_rows: Vec<&str> = transcript.split('\n').collect();
+        assert!(
+            visual_rows.len() >= 2,
+            "transcript keeps one newline per buffer row: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn trim_preserves_wide_glyph_wrap() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        buf.cell_mut((0, 0)).unwrap().set_symbol("a");
+        buf.cell_mut((1, 0)).unwrap().set_symbol("b");
+        buf.cell_mut((2, 0)).unwrap().set_symbol("中");
+        buf.cell_mut((3, 0)).unwrap().set_symbol("");
+        buf.cell_mut((0, 1)).unwrap().set_symbol("x");
+        buf.cell_mut((1, 1)).unwrap().set_symbol("y");
+        trim_trailing_pads(&mut buf);
+
+        let cont = buf.cell((3, 0)).expect("continuation");
+        assert!(
+            cont.symbol().is_empty(),
+            "wide-glyph spacer must survive trim"
+        );
+        assert!(!cont.skip, "continuation is not a pad");
+
+        let wraps = [true, false];
+        let rows = buffer_to_semantic_rows(&buf, &wraps);
+        let first = rows.first().expect("row 0");
+        assert!(first.1, "CJK wrap row must still fill the width");
+        assert!(first.2, "CJK wrap row carries the joiner signal");
+        let copy = buffer_to_semantic_copy(&buf, &wraps);
+        assert!(
+            copy.starts_with("ab中xy"),
+            "wide-glyph wrap must join, not hard-break: {copy:?}"
+        );
+    }
+
+    /// Ratatui 0.29 stores the covered cell as `" "`. That must still fill the row.
+    #[test]
+    fn ratatui_wide_glyph_space_continuation_fills_width() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 2));
+        buf.set_string(0, 0, "ab中", ratatui::style::Style::default());
+        buf.set_string(0, 1, "xy", ratatui::style::Style::default());
+        let cont = buf.cell((3, 0)).expect("continuation");
+        assert_eq!(
+            cont.symbol(),
+            " ",
+            "precondition: ratatui 0.29 covers a wide glyph with a space cell"
+        );
+
+        trim_trailing_pads(&mut buf);
+        let cont = buf.cell((3, 0)).expect("continuation after trim");
+        assert!(!cont.skip, "space continuation must survive trim: {cont:?}");
+        assert_eq!(cont.symbol(), " ", "continuation stays a space cell");
+
+        let wraps = [true, false];
+        let rows = buffer_to_semantic_rows(&buf, &wraps);
+        let first = rows.first().expect("row 0");
+        assert!(
+            first.1,
+            "CJK/emoji row ending at the margin must fill_width: {rows:?}"
+        );
+        let copy = buffer_to_semantic_copy(&buf, &wraps);
+        assert!(
+            copy.starts_with("ab中xy"),
+            "wide-glyph wrap must join, not hard-break: {copy:?}"
+        );
+    }
+
+    #[test]
+    fn mid_row_wide_glyph_space_continuation_is_not_emitted() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.set_string(0, 0, "中xy", ratatui::style::Style::default());
+        assert_eq!(
+            buf.cell((1, 0)).map(|c| c.symbol().to_string()).as_deref(),
+            Some(" "),
+            "precondition: covered cell is a space"
+        );
+        let mut transcript = String::new();
+        buffer_to_ansi(&buf, &mut transcript);
+        assert_eq!(
+            strip_sgr(&transcript),
+            "中xy\n",
+            "continuation space must not serialize: {transcript:?}"
+        );
+        let copy = buffer_to_semantic_copy(&buf, &[false]);
+        assert_eq!(
+            copy, "中xy\n",
+            "native copy must not keep a spacer: {copy:?}"
         );
     }
 }

@@ -24,8 +24,7 @@ pub enum RosterActivity {
     Dead,
 }
 
-/// Origin of a roster entry (local leader vs. a remote host). We don't
-/// render origin yet, but must parse it without failing.
+/// Origin of a roster entry (the local leader or a remote host).
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RosterOrigin {
     #[serde(default)]

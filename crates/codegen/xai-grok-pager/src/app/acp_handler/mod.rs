@@ -62,12 +62,15 @@ use permissions::{
 };
 
 // Hub + child modules (via `use super::*`) need sibling symbols in this scope.
+pub(crate) use routing::task_view_by_session_id;
 use routing::{
     SessionMatch, find_session_match, interaction_target_agent, is_matched_agent_active,
-    mcp_target_agent, resolve_notif_agent, resolve_target_view,
+    mcp_target_agent, resolve_notif_agent, resolve_target_view, setup_phase_target_agent,
 };
 
-use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
+use prompt_origin::{
+    backdate_child_turn_clock, finish_wake_turn, note_child_live_prompt, viewer_turn_anchor,
+};
 pub(crate) use prompt_origin::{
     is_scheduler_fired_prompt, is_server_initiated_prompt, is_wake_prompt,
     should_adopt_running_prompt,
@@ -155,6 +158,11 @@ use workflow_ingest::*;
 /// background agent must still land in its own scrollback so the user sees
 /// the full turn after switching back.
 pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
+    let state_changed = handle_inner(msg, app);
+    let flushed = app.flush_image_notices_if_root();
+    state_changed || flushed
+}
+fn handle_inner(msg: AcpClientMessage, app: &mut AppView) -> bool {
     match msg {
         AcpClientMessage::SessionNotification(notif) => {
             let mut meta = NotificationMeta::from_json(notif.request.meta.as_ref());
@@ -565,6 +573,17 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                     if workflows_modal_refresh {
                         queue_open_workflows_modal_refresh(app, id);
                     }
+                    if mutated
+                        && !meta.is_replay
+                        && app
+                            .agents
+                            .get(&id)
+                            .is_some_and(|agent| !agent.session.loading_replay)
+                    {
+                        let flush =
+                            crate::app::dispatch::flush_held_local_queue_into_wait(app, Some(id));
+                        app.pending_effects.extend(flush);
+                    }
 
                     // Mutation always happens; redraw only when the matched
                     // agent is the visible one.
@@ -587,16 +606,49 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         if let Some(tokens) = meta.total_tokens {
                             confirm_context_used(child_view, tokens);
                         }
-                        if let Some(ts) = meta.turn_start_ms {
-                            child_view.turn_start_ms = Some(ts);
-                        }
-                        child_view.session.handle_update(
-                            notif.request.update,
-                            &meta,
-                            &mut child_view.scrollback,
-                        );
-                        for entry_id in child_view.session.tracker.take_pending_edit_hl() {
-                            child_view.submit_edit_highlight(entry_id);
+                        let ended = !meta.is_replay
+                            && meta.prompt_id.as_deref().is_some_and(|pid| {
+                                child_view.ended_child_prompt_ids.contains(pid)
+                                    || child_view.superseded_child_prompt_ids.contains(pid)
+                            });
+                        if !ended {
+                            let is_live = !meta.is_replay && !child_view.session.loading_replay;
+                            let apply = !is_live
+                                || note_child_live_prompt(
+                                    child_view,
+                                    meta.prompt_id.as_deref(),
+                                    meta.turn_start_ms,
+                                    meta.is_replay,
+                                );
+                            if apply {
+                                if is_live {
+                                    if let Some(ts) = meta.turn_start_ms {
+                                        let named = meta
+                                            .prompt_id
+                                            .as_deref()
+                                            .is_some_and(|pid| !pid.is_empty());
+                                        if named
+                                            || child_view.turn_start_ms_prompt.is_none()
+                                            || child_view.turn_start_ms == Some(ts)
+                                        {
+                                            child_view.turn_start_ms = Some(ts);
+                                            if named {
+                                                child_view.turn_start_ms_prompt =
+                                                    meta.prompt_id.clone();
+                                            }
+                                        }
+                                    }
+                                    backdate_child_turn_clock(child_view);
+                                }
+                                child_view.session.handle_update(
+                                    notif.request.update,
+                                    &meta,
+                                    &mut child_view.scrollback,
+                                );
+                                for entry_id in child_view.session.tracker.take_pending_edit_hl() {
+                                    child_view.submit_edit_highlight(entry_id);
+                                }
+                            }
                         }
                         subagent_activity_label(child_view)
                     };
@@ -738,6 +790,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
         "x.ai/git_head_changed" => handle_git_head_changed(notif, app),
         "x.ai/leader/version_mismatch" => handle_version_mismatch(notif, app),
         "x.ai/mcp/init_progress" => handle_mcp_init_progress(notif, app),
+        "x.ai/session/setup" => handle_session_setup_phase(notif, app),
         "x.ai/mcp/tools_changed" | "x.ai/mcp_initialized" => handle_mcp_tools_changed(notif, app),
         "x.ai/mcp/server_status" if push_server_status_enabled() => {
             handle_mcp_server_status(notif, app)
@@ -748,6 +801,38 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
     }
 }
 
+/// Record the shell's latest `session/new` setup step so a create timeout can name where it stalled.
+fn handle_session_setup_phase(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Payload {
+        #[serde(default)]
+        method: Option<String>,
+        phase: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+    let Ok(payload) = serde_json::from_str::<Payload>(notif.params.get()) else {
+        return false;
+    };
+    if payload.method.as_deref() != Some("session/new") {
+        return false;
+    }
+    let Ok(phase) = payload
+        .phase
+        .parse::<xai_grok_shell::agent::SessionSetupPhase>()
+    else {
+        return false;
+    };
+    let Some(session_id) = payload.session_id.as_deref() else {
+        return false;
+    };
+    let Some(agent) = setup_phase_target_agent(app, session_id) else {
+        return false;
+    };
+    agent.session_new_phase = Some(phase);
+    false
+}
 fn handle_version_mismatch(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let Some(banner) = crate::acp::version_mismatch_banner(notif.params.get()) else {
         tracing::warn!("ignoring x.ai/leader/version_mismatch without usable versions");
@@ -799,6 +884,8 @@ fn handle_interjection(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
         // Send Now (a plain user-prompt block in `send_now_painted_blocks`) must
         // instead be converted to interjection styling.
         if agent.self_interjection_ids.remove(iid) {
+            agent.interjection_painted_blocks.remove(iid);
+            agent.interjection_retry_images.remove(iid);
             return false;
         }
         // `edited` is ignored: the painted block already holds the authoritative

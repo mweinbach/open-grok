@@ -293,7 +293,6 @@ async fn load_card_detail_echoes_identity_and_zeroes_missing_session() {
     }
 }
 use xai_grok_shell::extensions::billing::{BillingConfig, Cent, UsagePeriod};
-use xai_grok_shell::sampling::error::FREE_USAGE_USER_MESSAGE;
 /// The invalid-params server detail survives `attach_prompt_usage`
 /// wrapping `error.data` as `{message, promptUsage}`.
 #[test]
@@ -1095,6 +1094,17 @@ async fn persist_setting_type_mismatch_errors_show_timeline() {
         );
 }
 #[tokio::test]
+async fn persist_setting_type_mismatch_errors_dashboard_preview() {
+    use crate::settings::SettingValue;
+    let error = persist_setting(
+            "dashboard_preview",
+            SettingValue::String("nope".to_owned()),
+        )
+        .await
+        .expect_err("dashboard preview rejects a non-boolean value");
+    assert!(error.contains("persist_setting(dashboard_preview) expected Bool"), "{error}");
+}
+#[tokio::test]
 async fn persist_setting_type_mismatch_errors_page_flip_on_send() {
     use crate::settings::SettingValue;
     let r = persist_setting("page_flip_on_send", SettingValue::String("nope".into()))
@@ -1317,7 +1327,7 @@ fn unregister_best_effort_is_nonblocking_under_lock_contention() {
                 .expect("list")
                 .len(),
             1,
-            "contended unregister must leave the entry for collect_crashed",
+            "contended unregister must leave the entry for the next register to prune",
         );
 }
 /// A real I/O error (uncreatable registry root) is swallowed: the

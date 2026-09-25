@@ -28,7 +28,7 @@
 //!    before any TUI/agent/runtime init). The child reads the source from stdin
 //!    and the theme/width/height from argv, renders source → SVG → PNG, writes
 //!    the PNG atomically to the out-path, and exits 0; any error exits non-zero.
-//! 2. The worker spawns that child with a wall-clock budget ([`RENDER_TIMEOUT`])
+//! 2. The worker spawns that child with a wall-clock budget ([`timeout_for`])
 //!    via [`xai_grok_mermaid::run_with_timeout`], which **kills and reaps** the
 //!    child (real process kill, not a soft signal) on timeout. A child panic
 //!    (abort), non-zero exit, or timeout is contained to the child and surfaces
@@ -94,11 +94,22 @@ const OPEN_MIN_WIDTH_PX: u32 = 2560;
 /// Open-tier height headroom before the crate-wide megapixel/axis caps apply.
 const OPEN_MAX_HEIGHT_PX: u32 = 8192;
 
-/// Wall-clock budget per render. Enforced against the out-of-process child: on
-/// timeout the worker kills and reaps the child (a real process kill) and
-/// surfaces `Failed`, so one pathological diagram neither stalls the worker nor
-/// leaks work.
+/// Wall-clock budget for a terminal-tier render. Enforced against the
+/// out-of-process child: on timeout the worker kills and reaps the child (a
+/// real process kill) and surfaces `Failed`, so one pathological diagram
+/// neither stalls the worker nor leaks work.
 const RENDER_TIMEOUT: Duration = Duration::from_millis(3000);
+/// Open Image rasters at 2× / min-width 2560; a tall flowchart can take ~10s (the 3s terminal budget kills it).
+const OPEN_RENDER_TIMEOUT: Duration = Duration::from_secs(20);
+/// `show_toast` expires at ~3s; mermaid_tick re-shows this while a render is still pending.
+const RENDERING_TOAST: &str = "Rendering diagram\u{2026}";
+
+fn timeout_for(quality: MermaidRenderQuality) -> Duration {
+    match quality {
+        MermaidRenderQuality::Terminal => RENDER_TIMEOUT,
+        MermaidRenderQuality::Open => OPEN_RENDER_TIMEOUT,
+    }
+}
 
 /// Re-sweep the per-session on-disk cache after this many fresh PNG writes, so a
 /// long session that keeps generating diagrams stays bounded between loads
@@ -247,7 +258,8 @@ pub fn spawn_worker() -> (Sender<MermaidJob>, Receiver<MermaidResult>) {
                 // requests for the same diagram render once.
                 let pending = drain_coalesced(first, &job_rx);
                 for (_, job) in pending {
-                    let (outcome, wrote) = render_job(render.as_ref(), &job, RENDER_TIMEOUT);
+                    let (outcome, wrote) =
+                        render_job(render.as_ref(), &job, timeout_for(job.quality));
                     if wrote {
                         writes_since_sweep += 1;
                         if writes_since_sweep >= SWEEP_EVERY_N_WRITES {
@@ -992,7 +1004,12 @@ impl AgentView {
     /// finished on-click renders and run each requesting action. Returns `true`
     /// when a redraw is warranted. A no-op until a click is in flight.
     pub fn mermaid_tick(&mut self) -> bool {
-        self.poll_mermaid_results()
+        let changed = self.poll_mermaid_results();
+        if self.mermaid_needs_tick() && self.toast.is_none() {
+            self.show_toast(RENDERING_TOAST);
+            return true;
+        }
+        changed
     }
 
     /// Lazily create the render runtime (and spawn the worker) on first need.
@@ -1111,7 +1128,7 @@ impl AgentView {
             .as_ref()
             .is_some_and(|rt| rt.has_pending(&key, action))
         {
-            self.show_toast("Rendering diagram\u{2026}");
+            self.show_toast(RENDERING_TOAST);
             return;
         }
 
@@ -1149,7 +1166,7 @@ impl AgentView {
             if let Some(rt) = self.mermaid.as_mut() {
                 rt.pending.push(PendingMermaidAction { key, action });
             }
-            self.show_toast("Rendering diagram\u{2026}");
+            self.show_toast(RENDERING_TOAST);
         } else {
             tracing::warn!(
                 target: MERMAID_TRACING_TARGET,
@@ -1231,6 +1248,17 @@ impl AgentView {
 mod tests {
     use super::*;
     use crate::theme::ThemeKind;
+
+    #[test]
+    fn open_quality_gets_a_longer_timeout_than_terminal() {
+        assert!(
+            timeout_for(MermaidRenderQuality::Open) > timeout_for(MermaidRenderQuality::Terminal)
+        );
+        assert!(
+            timeout_for(MermaidRenderQuality::Open) >= Duration::from_secs(15),
+            "Open Image must outlive a ~10s 30MP raster"
+        );
+    }
 
     fn key(source: &str) -> MermaidCacheKey {
         MermaidCacheKey::derive(
@@ -2170,8 +2198,9 @@ mod tests {
             agent.mermaid_needs_tick(),
             "a miss records a pending action"
         );
-        assert!(
-            toast_of(&agent).contains("Rendering"),
+        assert_eq!(
+            RENDERING_TOAST,
+            toast_of(&agent),
             "a miss shows the transient rendering toast",
         );
 
@@ -2202,6 +2231,30 @@ mod tests {
         assert!(
             out_path.exists(),
             "the on-click render wrote the PNG to the session cache",
+        );
+    }
+
+    #[test]
+    fn mermaid_rendering_toast_is_restored_until_settle() {
+        let mut agent = agent_with_session("toast-hold");
+        let src = "flowchart LR\nA-->B\n".to_string();
+        agent.request_mermaid_render(src, MermaidClickAction::CopyPath);
+        assert_eq!(RENDERING_TOAST, toast_of(&agent));
+
+        agent.toast = None;
+        assert!(
+            agent.mermaid_tick(),
+            "restoring the in-progress toast must request a redraw"
+        );
+        assert_eq!(RENDERING_TOAST, toast_of(&agent));
+
+        pump_until(&mut agent, |a| !a.mermaid_needs_tick());
+        agent.toast = None;
+        assert!(!agent.mermaid_tick());
+        assert!(
+            toast_of(&agent).is_empty(),
+            "must not resurrect Rendering after settle: {}",
+            toast_of(&agent)
         );
     }
 

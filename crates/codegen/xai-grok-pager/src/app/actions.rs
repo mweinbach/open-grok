@@ -202,6 +202,9 @@ pub enum Action {
         text: String,
         /// Pasted images riding along with the prompt.
         images: Vec<crate::prompt_images::PastedImage>,
+        /// Notice raised while the composer was consumed (a placeholder no image backs); the key
+        /// handler has no `AppView`, so it travels with the send and is queued when it dispatches.
+        image_notice: Option<String>,
     },
     /// Enable session voice mode and start recording (the Ctrl+Space
     /// hold-to-talk key-press, on terminals that report key releases).
@@ -528,6 +531,11 @@ pub enum Action {
     /// Toggle the ask_user_question timeout. SHELL-owned; persisted to
     /// `[toolset.ask_user_question].timeout_enabled`. Applies to new sessions.
     SetAskUserQuestionTimeoutEnabled(bool),
+    /// Save `[features].subagent_model_inheritance` as an explicit override. SHELL-owned; agents latch it when built, so it applies on restart.
+    SetSubagentModelInheritance(bool),
+    /// Delete the saved `[features].subagent_model_inheritance` key so the remote setting or the default applies again.
+    /// The reset path uses this instead of writing the compiled default.
+    ClearSubagentModelInheritance,
     /// SHELL-owned `keep_text_selection` (`flash` | `hold`); cache + persist.
     SetKeepTextSelection(crate::appearance::TextSelection),
     /// Set the mouse-wheel scroll speed multiplier (1-100). Pager-owned
@@ -598,6 +606,8 @@ pub enum Action {
     SetTimestamps(bool),
     /// Set timeline sidebar visibility (per-turn tick rail).
     SetTimeline(bool),
+    /// This action saves `[ui].dashboard_preview`.
+    SetDashboardPreview(bool),
     /// Set `[ui].page_flip_on_send` (default ON). Persists via `Effect::PersistSetting`.
     SetPageFlipOnSend(bool),
     /// Set `[ui].confirm_before_rewind` (default ON). Persists via `Effect::PersistSetting`.
@@ -810,7 +820,7 @@ pub enum Action {
     },
     /// Privacy banner `[Opt in]` (ack only after ACP success).
     PrivacyBannerOptIn,
-    /// Privacy banner `[Opt out]` (ack now, then record the decline).
+    /// Privacy banner `[Opt out]` (always writes the decline; ack only after ACP success).
     PrivacyBannerOptOut,
     /// Open the command palette (`/help`). The keybinding path (Ctrl+P) opens it
     /// directly in `handle_agent_action`; this lets a slash command reach the
@@ -1045,6 +1055,19 @@ pub enum Action {
     DoctorFixCancelled(DoctorFixTarget),
     /// Persist the memory modal fullscreen preference to config.toml.
     PersistMemoryFullscreen(bool),
+    /// Turn memory on or off for the active session (`t` in the `/memory` modal).
+    MemoryToggle {
+        enabled: bool,
+    },
+    /// Copy text from the `/memory` modal; the outcome is shown in the modal's status line.
+    MemoryCopy {
+        text: String,
+    },
+    /// Delete one note from the `/memory` modal; the shell verifies the hash before removing.
+    MemoryForget {
+        path: String,
+        expected_content_hash: String,
+    },
     /// Open the Agent Dashboard view (`/dashboard`, `Ctrl+\`, `open-grok dashboard`).
     OpenDashboard,
     /// Close the dashboard, returning to the previous `ActiveView`.
@@ -1268,9 +1291,6 @@ pub enum Action {
     RewindCancelOffer,
     RewindDismiss,
     RewindDismissError,
-    /// Submit an inline edit: conversation-only rewind to that prompt, then
-    /// resubmit the edited text (state lives on `AgentView::inline_edit`).
-    InlineEditSubmit,
     /// Open the `/jump` turn picker.
     JumpShowPicker,
     /// Jump to a turn by its prompt's stable id and close the picker.
@@ -1956,10 +1976,10 @@ pub enum Effect {
         /// right model — mirrors [`Effect::CreateSession::model_id`]. `None`
         /// for the welcome / CLI / fork paths.
         model_id: Option<acp::ModelId>,
-        /// Client-chosen session ID (`--session-id` with `--worktree`) used as
-        /// the worktree/session id and `meta.sessionId` on fresh create.
-        /// Ignored when `load_session_id` is set (resume path owns the id).
+        /// Explicit `--session-id`: names the worktree checkout and is the `meta.sessionId` on create.
         preferred_session_id: Option<String>,
+        /// Pager-minted `meta.sessionId` for a fresh worktree create without an explicit id, so its setup phases route; not the checkout name.
+        minted_session_id: Option<String>,
         /// One-shot `/chat` or sticky `--chat` — stamp `_meta` kind=chat on
         /// fresh create (resume uses `LoadSession.chat_kind` instead).
         chat_kind: bool,
@@ -2199,6 +2219,12 @@ pub enum Effect {
         value: crate::settings::SettingValue,
         rollback_value: crate::settings::SettingValue,
     },
+    /// Write the user `[features]` key of `feature`, or delete it for `saved == None`; completes as
+    /// [`TaskResult::FeatureOverridePersisted`]. A row issues one of these at a time so the disk follows toggle order.
+    PersistFeatureOverride {
+        feature: xai_grok_shell::agent::config::Feature,
+        saved: Option<bool>,
+    },
     /// Send structured prompt blocks to the agent.
     /// Used for skill injection where the prompt consists of
     /// multiple content blocks (metadata + skill body).
@@ -2367,6 +2393,34 @@ pub enum Effect {
     },
     /// Fetch plugins list from the shell (x.ai/plugins/list).
     FetchPluginsList {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Fetch the `/memory` modal contents (x.ai/memory/list).
+    FetchMemoryList {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Turn memory on or off (x.ai/memory/toggle).
+    MemoryToggle {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        enabled: bool,
+    },
+    /// Delete one memory note from the `/memory` modal (x.ai/memory/forget).
+    MemoryForget {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        path: String,
+        expected_content_hash: String,
+    },
+    /// Run `/flush` (x.ai/memory/flush) as a tracked agent command.
+    MemoryFlush {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+    },
+    /// Run `/dream` (x.ai/memory/dream) as a tracked agent command.
+    MemoryDream {
         agent_id: AgentId,
         session_id: acp::SessionId,
     },
@@ -2649,8 +2703,8 @@ pub enum Effect {
     ScheduleClearAuthCopyFeedback {
         generation: u64,
     },
-    /// Register the current session in the active-sessions crash-recovery
-    /// registry (`~/.opengrok/active_sessions.json`).
+    /// Register the current session in the active-session registry
+    /// (`~/.opengrok/active_sessions.json`).
     RegisterActiveSession {
         session_id: acp::SessionId,
         cwd: String,
@@ -2665,12 +2719,8 @@ pub enum Effect {
     SetCodingDataSharing {
         agent_id: AgentId,
         opted_in: bool,
-        /// Pre-toggle value to revert to on failure.
-        rollback_to_opted_in: bool,
-        /// Write generation, echoed back on the `TaskResult`. Writes to this
-        /// endpoint are concurrent, so a result that isn't the newest must
-        /// not touch state: its `rollback_to_opted_in` was captured against
-        /// a world that has since moved on.
+        /// Write generation, echoed back on the `TaskResult`.
+        /// Writes to this endpoint are concurrent, so only the newest result sets the mirror; an older success only updates the pending write's rollback.
         seq: u64,
     },
     /// Rename the current session.
@@ -3196,6 +3246,8 @@ pub enum TaskResult {
     SessionFailed {
         agent_id: AgentId,
         error: String,
+        /// The create RPC hit its bounded timeout, rather than failing early for another reason.
+        timed_out: bool,
     },
     /// Worktree session was created successfully (worktree + ACP session).
     WorktreeSessionCreated {
@@ -3227,6 +3279,10 @@ pub enum TaskResult {
     WorktreeSessionFailed {
         agent_id: AgentId,
         error: String,
+        /// The orphaned worktree still on disk, so the handler can re-append the `open-grok worktree rm` hint; `None` if none was created.
+        orphaned_worktree_root: Option<std::path::PathBuf>,
+        /// The create RPC hit its bounded timeout, rather than failing early for another reason.
+        timed_out: bool,
     },
     /// Session was loaded (resumed) successfully.
     SessionLoaded {
@@ -3544,6 +3600,32 @@ pub enum TaskResult {
         agent_id: AgentId,
         result: Result<xai_hooks_plugins_types::PluginsListResponse, String>,
     },
+    /// Memory listing fetched for the `/memory` modal.
+    MemoryListLoaded {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryListing, String>,
+    },
+    /// Shell answered a memory on/off request.
+    MemoryToggleResult {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryToggleResponse, String>,
+    },
+    /// Shell answered a `/memory` modal delete request.
+    MemoryForgetResult {
+        agent_id: AgentId,
+        path: String,
+        result: Result<xai_grok_shell::extensions::memory::MemoryForgetResponse, String>,
+    },
+    /// `/flush` finished.
+    MemoryFlushComplete {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryFlushResponse, String>,
+    },
+    /// `/dream` finished.
+    MemoryDreamComplete {
+        agent_id: AgentId,
+        result: Result<xai_grok_shell::extensions::memory::MemoryDreamResponse, String>,
+    },
     /// Hooks action completed.
     HooksActionResult {
         agent_id: AgentId,
@@ -3652,7 +3734,6 @@ pub enum TaskResult {
     CodingDataSharingFailed {
         agent_id: AgentId,
         error: String,
-        rollback_to_opted_in: bool,
         seq: u64,
     },
     /// Session rename completed successfully.
@@ -3815,6 +3896,8 @@ pub enum TaskResult {
         result: Result<String, String>,
         /// Correlates minimal responses; fullscreen leaves this unset.
         minimal_request_id: Option<uuid::Uuid>,
+        /// Attachments whose bytes could not be loaded; reported by display number.
+        skipped_image_numbers: Vec<usize>,
     },
     /// `x.ai/recap` request acknowledged (fire-and-forget). The recap itself
     /// arrives separately as a `SessionRecap` notification; this only carries
@@ -3851,8 +3934,11 @@ pub enum TaskResult {
     InterjectFailed {
         agent_id: AgentId,
         error: String,
-        text: String,
-        blocks: Option<Vec<agent_client_protocol::ContentBlock>>,
+        remaining: Vec<(
+            String,
+            String,
+            Option<Vec<agent_client_protocol::ContentBlock>>,
+        )>,
     },
     /// Available commands refreshed from the shell.
     AvailableCommandsRefreshed {
@@ -4036,6 +4122,11 @@ pub enum TaskResult {
     SettingPersistFailedBestEffort {
         key: crate::settings::SettingKey,
         error: String,
+    },
+    /// One [`Effect::PersistFeatureOverride`] write finished; `Ok` carries what it left on disk.
+    FeatureOverridePersisted {
+        feature: xai_grok_shell::agent::config::Feature,
+        result: Result<Option<bool>, String>,
     },
     /// Off-thread clipboard attachment probe finished (see
     /// [`Effect::ProbeClipboardAttachment`]); dispatch attaches the chip.

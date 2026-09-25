@@ -1495,6 +1495,7 @@ fn duplicate_load_unbind_invalidates_old_minimal_btw_response() {
             agent_id: old_owner,
             result: Ok("old answer".into()),
             minimal_request_id: Some(request_id),
+            skipped_image_numbers: Vec::new(),
         }),
         &mut app,
     );

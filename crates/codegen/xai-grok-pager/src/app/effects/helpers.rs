@@ -56,33 +56,68 @@ pub(super) fn encode_feedback_images(
     }
     Ok(encoded)
 }
-/// `acp_send` bounded by [`session_rpc_timeout`]; on expiry, an error naming
-/// `action` instead of an eternal spinner.
+/// Why a bounded session RPC failed; `TimedOut` is observed at the deadline, not inferred later.
+#[derive(Debug)]
+pub(crate) enum SessionRpcError {
+    TimedOut { action: String, timeout: std::time::Duration },
+    Rpc(acp::Error),
+}
+impl SessionRpcError {
+    pub(crate) fn timed_out(&self) -> bool {
+        matches!(self, Self::TimedOut { .. })
+    }
+}
+impl std::fmt::Display for SessionRpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut { action, timeout } => {
+                write!(
+                f,
+                "{action} timed out after {}s. It may still finish in the background; \
+                 retrying right away can run into the same delay.",
+                timeout.as_secs()
+            )
+            }
+            Self::Rpc(e) => write!(f, "{e}"),
+        }
+    }
+}
+impl std::error::Error for SessionRpcError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rpc(e) => Some(e),
+            Self::TimedOut { .. } => None,
+        }
+    }
+}
+/// `acp_send` bounded by [`session_rpc_timeout`], returning a typed [`SessionRpcError`] on expiry.
 pub(super) async fn acp_send_bounded<R, T>(
     request: T,
     tx: &tokio::sync::mpsc::UnboundedSender<R>,
     action: &str,
-) -> Result<T::Response, acp::Error>
+) -> Result<T::Response, SessionRpcError>
 where
     T: xai_acp_lib::AcpRequest,
     R: From<xai_acp_lib::AcpArgs<T>> + std::fmt::Debug,
 {
     let timeout = session_rpc_timeout();
     match tokio::time::timeout(timeout, acp_send(request, tx)).await {
-        Ok(result) => result,
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(SessionRpcError::Rpc(e)),
         Err(_elapsed) => {
-            Err(
-                acp::Error::new(
-                    acp::ErrorCode::InternalError.into(),
-                    format!(
-                "{action} timed out after {}s. It may still finish in the background; \
-                 retrying right away can run into the same delay.",
-                timeout.as_secs()
-            ),
-                ),
-            )
+            Err(SessionRpcError::TimedOut {
+                action: action.to_owned(),
+                timeout,
+            })
         }
     }
+}
+/// Timeout message naming the step a create stalled on.
+pub(crate) fn timed_out_while(step: &str) -> String {
+    format!(
+        "Couldn't start the session: it timed out while {step}. It may still finish in the \
+         background, so give it a moment before trying again."
+    )
 }
 /// Typed progress message for session restore.
 /// Keeps the progress channel from accepting arbitrary `TaskResult` variants.
@@ -187,6 +222,29 @@ pub(super) fn format_acp_error(err: &acp::Error, is_api_key_auth: bool) -> Strin
             &raw,
         )
         .message()
+}
+/// Send an `x.ai/memory/{flush,dream}` request and decode its typed response.
+pub(super) async fn memory_command_request<T: serde::de::DeserializeOwned>(
+    method: &'static str,
+    session_id: &acp::SessionId,
+    tx: &AcpAgentTx,
+) -> Result<T, String> {
+    let body = xai_grok_shell::extensions::memory::MemoryFlushRequest {
+        session_id: session_id.0.to_string(),
+    };
+    let req = acp::ExtRequest::new(
+        method,
+        serde_json::value::to_raw_value(&body)
+            .expect("serialize memory command params")
+            .into(),
+    );
+    match acp_send(req, tx).await {
+        Ok(resp) => {
+            serde_json::from_str::<T>(resp.0.get())
+                .map_err(|_| "Couldn't read the shell's reply.".to_string())
+        }
+        Err(e) => Err(sanitize_user_error(&e.to_string())),
+    }
 }
 /// Format a Duration for user-visible restore progress messages.
 pub(super) fn format_restore_elapsed(d: std::time::Duration) -> String {
@@ -347,6 +405,7 @@ pub(crate) struct SessionFlags {
     /// as `restoreCode` in the `resume_session` ACP payload for worktrees.
     pub restore_code: Option<bool>,
     pub agent_override: Option<serde_json::Value>,
+    pub defer_builtin_agent_profile: bool,
     /// Always-approve for this session (`_meta.yoloMode`).
     pub yolo_mode: bool,
     /// Auto (classifier) permission mode (`_meta.autoMode`). Mutually exclusive
@@ -381,7 +440,7 @@ impl SessionFlags {
     /// needed; it already includes TaskTool). Chat mode never injects a
     /// Build profile (remote owns agent behavior).
     pub(super) fn agent_profile(&self) -> Option<&'static str> {
-        if self.chat_mode {
+        if self.chat_mode || self.defer_builtin_agent_profile {
             return None;
         }
         match (self.plan_mode, self.subagents, self.ask_user) {
@@ -1150,6 +1209,14 @@ pub(crate) async fn persist_setting(
                 .await
                 .map_err(|e| e.to_string())
         }
+        "dashboard_preview" => {
+            let SettingValue::Bool(enabled) = value else {
+                return Err(kind_mismatch("dashboard_preview", "Bool", &value));
+            };
+            xai_grok_shell::util::config::set_dashboard_preview(enabled)
+                .await
+                .map_err(|error| error.to_string())
+        }
         "page_flip_on_send" => {
             let SettingValue::Bool(b) = value else {
                 return Err(kind_mismatch("page_flip_on_send", "Bool", &value));
@@ -1908,7 +1975,7 @@ pub(super) fn unregister_active_session_best_effort_in(
             tracing::debug!(
             session_id = %session_id.0,
             "Skipped active-session unregister under lock contention; \
-             reaped by collect_crashed on next launch"
+             pruned by the next register"
         )
         }
         Err(e) => tracing::warn!(?e, "Failed to unregister active session"),

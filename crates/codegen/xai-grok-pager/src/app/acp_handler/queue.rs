@@ -431,30 +431,25 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
                         prompt_id = %pid,
                         "stashing running-prompt adoption (FIFO handoff race)",
                     );
-                    // A rebroadcast for the SAME running prompt (every queue
-                    // edit/no-op rebroadcasts) must not clobber the stash: the
-                    // first broadcast consumed the drained row from the mirror,
-                    // so this pass re-derives `text: None` and the deferred
-                    // shim would render no user block (and the echo-skip armed
-                    // above already swallowed the shell's echo).
-                    if app
+                    // Same-prompt rebroadcast must not clobber the stash (`text` is already None).
+                    // Still fall through to local flush: promote may have just cleared the server front.
+                    let same_stashed_prompt = app
                         .pending_running_adoptions
                         .get(&aid)
-                        .is_some_and(|p| p.prompt_id == pid)
-                    {
-                        return true;
-                    }
+                        .is_some_and(|p| p.prompt_id == pid);
                     // A newer running prompt supersedes any earlier stash.
-                    if let Some(prev) = app.pending_running_adoptions.insert(
-                        aid,
-                        PendingRunningAdoption {
-                            prompt_id: pid.clone(),
-                            text: running_text,
-                            combined_texts: running_combined,
-                            kind: running_kind,
-                            turn_ended: false,
-                        },
-                    ) && let Some(agent) = app.agents.get_mut(&aid)
+                    if !same_stashed_prompt
+                        && let Some(prev) = app.pending_running_adoptions.insert(
+                            aid,
+                            PendingRunningAdoption {
+                                prompt_id: pid.clone(),
+                                text: running_text,
+                                combined_texts: running_combined,
+                                kind: running_kind,
+                                turn_ended: false,
+                            },
+                        )
+                        && let Some(agent) = app.agents.get_mut(&aid)
                     {
                         agent.discard_pending_adoption_updates(&prev.prompt_id);
                     }
@@ -462,6 +457,16 @@ pub(super) fn handle_queue_changed(notif: &acp::ExtNotification, app: &mut AppVi
             }
         }
         _ => {}
+    }
+    // Retry local flush after server-queue rows clear (wait-start can arrive before promote).
+    if let Some(aid) = agent_id
+        && app
+            .agents
+            .get(&aid)
+            .is_some_and(|agent| !agent.session.loading_replay)
+    {
+        let flush = crate::app::dispatch::flush_held_local_queue_into_wait(app, Some(aid));
+        app.pending_effects.extend(flush);
     }
     true
 }
@@ -486,10 +491,38 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     let session_id = payload.session_id.as_str();
 
     let sid = acp::SessionId::new(session_id.to_string());
-    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+    let Some(matched) = find_session_match(app, &sid) else {
         return false;
     };
+    let id = matched.agent_id();
     let is_active = is_matched_agent_active(app, id);
+    let signal = super::super::turn_completion::TerminalSignal {
+        prompt_id: payload.prompt_id.as_deref(),
+        stop_reason: payload.stop_reason.as_deref(),
+        agent_result: payload.agent_result.as_deref(),
+        cancel_trigger: payload.cancel_trigger(),
+        cancellation_category: payload.cancellation_category(),
+        cancellation_context: payload.cancellation_context(),
+        error_kind: payload.error_kind(),
+    };
+    if let SessionMatch::Child(_) = matched {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return false;
+        };
+        let (finished, label) = {
+            let Some(child) = agent.child_view_for_live_update_mut(session_id) else {
+                return false;
+            };
+            let finished =
+                super::super::turn_completion::finalize_child_view_turn(child, signal, None);
+            let label = finished.then(|| subagent_activity_label(child));
+            (finished, label)
+        };
+        if let Some(label) = label {
+            sync_subagent_activity(agent, session_id, label);
+        }
+        return finished && is_active;
+    }
     let Some(agent) = app.agents.get_mut(&id) else {
         return false;
     };
@@ -497,19 +530,8 @@ pub(super) fn handle_prompt_complete(notif: &acp::ExtNotification, app: &mut App
     // Finalize on the agent, then map the outcome to the return bool in the one
     // shared place both terminal rails use (returns it directly — arming reports
     // a change unconditionally so a background tab still wakes the reconcile tick).
-    let outcome = super::super::turn_completion::finalize_turn_from_terminal(
-        agent,
-        session_id,
-        super::super::turn_completion::TerminalSignal {
-            prompt_id: payload.prompt_id.as_deref(),
-            stop_reason: payload.stop_reason.as_deref(),
-            agent_result: payload.agent_result.as_deref(),
-            cancel_trigger: payload.cancel_trigger(),
-            cancellation_category: payload.cancellation_category(),
-            cancellation_context: payload.cancellation_context(),
-            error_kind: payload.error_kind(),
-        },
-    );
+    let outcome =
+        super::super::turn_completion::finalize_turn_from_terminal(agent, session_id, signal);
     super::super::turn_completion::apply_terminal_outcome(outcome, app, id, is_active)
 }
 

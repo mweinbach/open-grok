@@ -415,6 +415,7 @@ fn minimal_btw_response_after_esc_is_ignored() {
 
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: vec![2],
             agent_id: id,
             result: Ok("late".into()),
             minimal_request_id: Some(request_id),
@@ -423,6 +424,23 @@ fn minimal_btw_response_after_esc_is_ignored() {
     );
 
     assert!(app.agents[&id].btw_state.is_none());
+    assert!(
+        !has_skipped_image_notice(&app, id),
+        "a dismissed side question must not report its images either"
+    );
+}
+
+/// Whether the agent shows the unreadable-image notice on either surface.
+fn has_skipped_image_notice(app: &crate::app::app_view::AppView, id: AgentId) -> bool {
+    let agent = &app.agents[&id];
+    let in_transcript = agent.scrollback.iter_entries().any(|(_, entry)| {
+        matches!(&entry.block, RenderBlock::System(block) if block.text.contains("couldn't be read"))
+    });
+    in_transcript
+        || agent
+            .toast
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("couldn't be read"))
 }
 
 #[test]
@@ -434,6 +452,7 @@ fn minimal_done_dismisses_to_exactly_one_btw_block() {
     let request_id = send_minimal_btw(&mut app, "original question");
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: id,
             result: Ok("original answer".into()),
             minimal_request_id: Some(request_id),
@@ -473,6 +492,7 @@ fn minimal_btw_requests_stay_independent_across_two_agents() {
     // Deliver the background first-agent responses while the second agent is active.
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: vec![2],
             agent_id: first,
             result: Ok("stale first answer".into()),
             minimal_request_id: Some(first_old),
@@ -484,8 +504,13 @@ fn minimal_btw_requests_stay_independent_across_two_agents() {
         Some(crate::views::btw_overlay::BtwOverlayState::Loading { ref question })
             if question == "first new"
     ));
+    assert!(
+        !has_skipped_image_notice(&app, first) && !has_skipped_image_notice(&app, second),
+        "a superseded side question must not report its images"
+    );
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: first,
             result: Ok("current first answer".into()),
             minimal_request_id: Some(first_current),
@@ -508,6 +533,7 @@ fn minimal_btw_requests_stay_independent_across_two_agents() {
     let _ = app.handle_input(&esc());
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: second,
             result: Ok("late second answer".into()),
             minimal_request_id: Some(second_request),
@@ -530,6 +556,7 @@ fn minimal_btw_requests_stay_independent_across_two_agents() {
     let second_request = send_minimal_btw(&mut app, "second reverse");
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: second,
             result: Ok("second reverse answer".into()),
             minimal_request_id: Some(second_request),
@@ -538,6 +565,7 @@ fn minimal_btw_requests_stay_independent_across_two_agents() {
     );
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: first,
             result: Ok("first reverse answer".into()),
             minimal_request_id: Some(first_request),
@@ -572,6 +600,7 @@ fn fullscreen_btw_response_after_dismiss_keeps_existing_behavior() {
 
     dispatch(
         Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: Vec::new(),
             agent_id: id,
             result: Ok("late".into()),
             minimal_request_id: None,
@@ -584,6 +613,68 @@ fn fullscreen_btw_response_after_dismiss_keeps_existing_behavior() {
         Some(crate::views::btw_overlay::BtwOverlayState::Done { ref question, .. })
             if question.is_empty()
     ));
+}
+
+/// Attachments the side question could not load arrive as a visible notice when the answer lands.
+/// (Fork: no `image_notice` cap field — the skipped-images notice stands alone.)
+#[test]
+fn btw_response_toasts_skipped_image_numbers() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    dispatch(Action::SendBtw("side question".into()), &mut app);
+
+    dispatch(
+        Action::TaskComplete(TaskResult::BtwResponse {
+            skipped_image_numbers: vec![2],
+            agent_id: id,
+            result: Ok("answer".into()),
+            minimal_request_id: None,
+        }),
+        &mut app,
+    );
+
+    assert_eq!(
+        app.agents[&id]
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str()),
+        Some("Image #2 couldn't be read — not sent")
+    );
+}
+
+/// A plain `[Image #1]` with no record behind it rides the side question as text; the send goes out
+/// and the toast says the image is not attached, as it does for a queued prompt.
+#[test]
+fn btw_with_unbound_placeholder_sends_and_toasts() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.agents
+        .get_mut(&id)
+        .unwrap()
+        .prompt
+        .set_text("/btw what is [Image #1]");
+
+    let effects = dispatch(
+        Action::SendPrompt("/btw what is [Image #1]".into()),
+        &mut app,
+    );
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::SendBtw { question, .. }]
+                if question == "what is [Image #1]"
+        ),
+        "the side question still goes out as text, got {effects:?}"
+    );
+    assert_eq!(
+        app.agents[&id]
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str()),
+        Some("Image #1 not attached — placeholder sent as text")
+    );
+    assert_eq!(app.agents[&id].prompt.text(), "");
 }
 
 #[test]

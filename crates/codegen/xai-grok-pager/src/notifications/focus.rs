@@ -190,8 +190,6 @@ mod tests {
         assert!(!tracker.should_notify());
     }
 
-    // --- Auto session-recap (recap_due) tests ---
-
     #[test]
     fn recap_not_due_while_focused() {
         let tracker = FocusTracker::new(3, 0);

@@ -177,7 +177,6 @@ struct ForeignScanCoordinatorInner {
 
 impl Drop for ForeignScanCoordinatorInner {
     fn drop(&mut self) {
-        // An already-running spawn_blocking closure remains non-cancellable.
         if let Some(handle) = self.abort_handle.get_mut().take() {
             handle.abort();
         }
@@ -324,12 +323,11 @@ pub(crate) fn is_foreign_picker_source(source: &str) -> bool {
 }
 
 pub(crate) fn badge_for_picker_source(source: &str) -> &'static str {
-    if source == "conversation" {
-        "chat"
-    } else {
-        ForeignPickerSource::from_picker_source(source)
+    match source {
+        "conversation" => "chat",
+        _ => ForeignPickerSource::from_picker_source(source)
             .map(ForeignPickerSource::picker_source)
-            .unwrap_or("")
+            .unwrap_or(""),
     }
 }
 

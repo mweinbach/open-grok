@@ -11,7 +11,7 @@ use crate::appearance::ScrollMode;
 use crate::appearance::TextSelection;
 use crate::appearance::permission_cursor::DefaultSelectedPermission;
 
-use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::agent::config::{Feature, UiConfig};
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -806,6 +806,21 @@ pub fn default_settings() -> Vec<SettingMeta> {
             hidden_in_minimal: true,
         },
         SettingMeta {
+            key: "dashboard_preview",
+            category: SettingCategory::Appearance,
+            owner: SettingOwner::Shared,
+            label: "Dashboard preview",
+            description: "Show the selected session's preview and reply panel in the dashboard. \
+                          Turn off to give the session list more space. Open a session to reply \
+                          or answer permissions when the preview is off.",
+            keywords: &["dashboard", "peek", "preview", "prompt", "reply", "panel"],
+            kind: SettingKind::Bool {
+                default: ui_default.dashboard_preview_enabled(),
+            },
+            restart_required: false,
+            hidden_in_minimal: true,
+        },
+        SettingMeta {
             key: "page_flip_on_send",
             category: SettingCategory::Appearance,
             owner: SettingOwner::Shared,
@@ -1219,6 +1234,41 @@ pub fn default_settings() -> Vec<SettingMeta> {
                 supports_preview: false,
             },
             restart_required: false,
+            hidden_in_minimal: false,
+        },
+        // SHELL-owned `[features].subagent_model_inheritance`, a registry feature row rather than a `[ui]` key
+        // `restart_required` because each agent latches the mode when it is built; the row's value is the next-start resolution
+        // Each `\n` starts a new line in the expanded detail (a Bool row never reaches the single-line sub-pane header)
+        SettingMeta {
+            key: "subagent_model_inheritance",
+            category: SettingCategory::Models,
+            owner: SettingOwner::Shell,
+            label: "Subagent model inheritance",
+            description: "On: Open Grok cannot set models for subagents\n\
+                          Off: Open Grok may choose a different model for a subagent. Takes effect \
+                          after restart.\n\
+                          NOTE: This setting only applies when all models are xAI \
+                          \"model_family\". You likely don't need to configure this setting.",
+            keywords: &[
+                "subagent",
+                "subagents",
+                "subagent model",
+                "same model",
+                "model",
+                "parent",
+                "inherit",
+                "inheritance",
+                "picker",
+                "argument",
+                "task",
+                "spawn",
+                "xai",
+                "features",
+            ],
+            kind: SettingKind::Bool {
+                default: Feature::SubagentModelInheritance.default_enabled(),
+            },
+            restart_required: true,
             hidden_in_minimal: false,
         },
         // Kimi Platform and Kimi Code are separate services with distinct,

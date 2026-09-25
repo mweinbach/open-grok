@@ -319,7 +319,12 @@ fn replay_inherited_updates(
                     .handle_update(update, &meta, &mut child_view.scrollback);
             }
             ReplayedUpdate::Xai(update) => {
+                // Same window as `session/load`: historical xAI events must not start live commands
+                // (family-switch compact) or defer compact outcomes to a turn that never comes.
+                let was_loading = child_view.session.loading_replay;
+                child_view.session.loading_replay = true;
                 crate::app::acp_handler::apply_child_view_session_event(child_view, &update, false);
+                child_view.session.loading_replay = was_loading;
             }
         });
     child_view.scrollback.end_batch();
@@ -734,8 +739,7 @@ pub(crate) fn evict_finished_child_view(
 
 /// Finalize a finished child view: end the turn and append the `TurnCompleted` footer.
 ///
-/// Idempotent on the *trailing* footer: a re-finalized child must not get a second completed line.
-/// An earlier turn's `TurnCompleted` deeper in the transcript must not suppress a later turn's footer.
+/// Idempotent on a trailing turn-terminal marker. An earlier marker must not suppress a later footer.
 pub(crate) fn finalize_finished_child_view(
     child_view: &mut crate::app::agent_view::AgentView,
     elapsed: std::time::Duration,
@@ -745,17 +749,20 @@ pub(crate) fn finalize_finished_child_view(
         .tracker
         .finish_turn(&mut child_view.scrollback);
     child_view.scrollback.finish_all_running();
-    let already_has_trailing_completed_footer = child_view.scrollback.last().is_some_and(|e| {
+    let already_has_trailing_terminal = child_view.scrollback.last().is_some_and(|e| {
         matches!(
             &e.block,
             crate::scrollback::block::RenderBlock::SessionEvent(seb)
                 if matches!(
                     seb.event,
                     crate::scrollback::blocks::SessionEvent::TurnCompleted { .. }
+                        | crate::scrollback::blocks::SessionEvent::TurnCancelled { .. }
+                        | crate::scrollback::blocks::SessionEvent::TurnFailed { .. }
+                        | crate::scrollback::blocks::SessionEvent::TurnBlockedByHook { .. }
                 )
         )
     });
-    if already_has_trailing_completed_footer {
+    if already_has_trailing_terminal {
         return;
     }
     child_view
@@ -787,13 +794,6 @@ fn dedup_persona_role<'a, 'b>(
     match (persona, role) {
         (Some(p), Some(r)) if p.trim().eq_ignore_ascii_case(r.trim()) => (Some(p), None),
         _ => (persona, role),
-    }
-}
-
-pub(crate) fn format_type_label(subagent_type: &str) -> &str {
-    match subagent_type {
-        "general-purpose" => "general",
-        other => other,
     }
 }
 
@@ -837,12 +837,10 @@ pub(crate) fn format_subagent_label(info: &SubagentInfo) -> (String, String) {
         .filter(|s| !s.is_empty())
     {
         r.to_string()
-    } else if info.subagent_type.as_ref() != "general-purpose" {
-        format_type_label(&info.subagent_type).to_string()
     } else if let Some(tag) = tag {
         tag.to_string()
     } else {
-        "general".to_string()
+        "subagent".to_string()
     };
 
     let mut chars = raw_label.chars();
@@ -1395,19 +1393,6 @@ mod legacy_tests {
         );
     }
     #[test]
-    fn type_label_abbreviates_general_purpose() {
-        assert_eq!(format_type_label("general-purpose"), "general");
-    }
-    #[test]
-    fn type_label_passes_through_known_types() {
-        assert_eq!(format_type_label("explore"), "explore");
-        assert_eq!(format_type_label("plan"), "plan");
-    }
-    #[test]
-    fn type_label_passes_through_unknown() {
-        assert_eq!(format_type_label("custom-agent"), "custom-agent");
-    }
-    #[test]
     fn context_badge_resumed() {
         let mut info = make_info();
         info.context_source = Some("resumed".into());
@@ -1483,12 +1468,12 @@ mod legacy_tests {
         assert_eq!(label, "Analyst");
     }
     #[test]
-    fn label_uses_subagent_type_when_meaningful() {
+    fn label_prefers_tag_over_subagent_type() {
         let mut info = make_info();
         info.subagent_type = "explore".into();
         info.description = "[deep-dive] find auth code".into();
         let (label, desc) = format_subagent_label(&info);
-        assert_eq!(label, "Explore");
+        assert_eq!(label, "Deep-dive");
         assert_eq!(desc, "find auth code");
     }
     #[test]
@@ -1501,12 +1486,12 @@ mod legacy_tests {
         assert_eq!(desc, "patch XSS");
     }
     #[test]
-    fn label_final_fallback_general() {
+    fn label_final_fallback_subagent() {
         let mut info = make_info();
         info.subagent_type = "general-purpose".into();
         info.description = "do a thing".into();
         let (label, desc) = format_subagent_label(&info);
-        assert_eq!(label, "General");
+        assert_eq!(label, "Subagent");
         assert_eq!(desc, "do a thing");
     }
     #[test]
@@ -1534,7 +1519,7 @@ mod legacy_tests {
         info.subagent_type = "general-purpose".into();
         info.description = "[] do something".into();
         let (label, desc) = format_subagent_label(&info);
-        assert_eq!(label, "General");
+        assert_eq!(label, "Subagent");
         assert_eq!(desc, "[] do something");
     }
     #[test]
@@ -1543,15 +1528,15 @@ mod legacy_tests {
         info.subagent_type = "general-purpose".into();
         info.description = "[broken description".into();
         let (label, desc) = format_subagent_label(&info);
-        assert_eq!(label, "General");
+        assert_eq!(label, "Subagent");
         assert_eq!(desc, "[broken description");
     }
     #[test]
-    fn label_custom_subagent_type_passes_through_with_capitalization() {
+    fn label_ignores_subagent_type_without_tag() {
         let mut info = make_info();
         info.subagent_type = "custom-agent".into();
         let (label, _) = format_subagent_label(&info);
-        assert_eq!(label, "Custom-agent");
+        assert_eq!(label, "Subagent");
     }
     #[test]
     fn label_preserves_already_capitalized_persona() {

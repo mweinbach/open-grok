@@ -238,8 +238,6 @@ fn open_block_viewer_opens_image_only_blocks_natively() {
     assert!(agent.image_viewer.is_none());
 }
 
-// -- Plugins tab: group-collapse seeding on PluginsListLoaded --------------
-
 fn plugins_list_response() -> xai_hooks_plugins_types::PluginsListResponse {
     use crate::views::extensions_modal::test_plugin_info;
     xai_hooks_plugins_types::PluginsListResponse {

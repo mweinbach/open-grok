@@ -1,19 +1,19 @@
 //! Bridge the shell's `AuthManager` onto the voice crate's bearer provider.
 //!
-//! voice-api accepts both API keys and OAuth2 tokens directly at `api.x.ai`
-//! and attributes per-user billing for OAuth, so the voice channel just reuses
-//! the same bearer the agent uses for chat — no separate env var.
+//! voice-api accepts an xAI API key or an xAI OAuth2 token at `api.x.ai` and attributes per-user billing for OAuth.
+//! The bearer comes from the shell's side-call resolver, the same one the Imagine tools use, so a login issued by a
+//! foreign authority is refused here and no socket opens for it.
 //!
-//! Resolved per request: the agent's refreshing manager in direct-spawn mode,
-//! or a non-refreshing one that adopts the agent's rotated `auth.json` token
-//! under the file lock in leader mode (see [`crate::acp`]).
+//! Resolved per request: the agent's refreshing manager in direct-spawn mode.
+//! In leader mode, a non-refreshing one adopts the agent's rotated `auth.json` token under the file lock (see [`crate::acp`]).
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use xai_grok_tools::types::SharedApiKeyProvider;
-use xai_grok_voice::{SharedVoiceAuth, VoiceAuthProvider};
+use xai_grok_tools::types::api_key_provider::SideCallBearerError;
+use xai_grok_voice::{SharedVoiceAuth, VoiceAuthError, VoiceAuthProvider};
 
 /// Adapts the shell's `ApiKeyProvider` onto [`VoiceAuthProvider`].
 ///
@@ -27,19 +27,30 @@ impl std::fmt::Debug for AuthManagerVoiceAuth {
     }
 }
 
+fn voice_auth_error(error: SideCallBearerError) -> VoiceAuthError {
+    match error {
+        SideCallBearerError::ForeignSession => VoiceAuthError::ForeignSession,
+        SideCallBearerError::Missing => VoiceAuthError::NotSignedIn,
+    }
+}
+
 impl VoiceAuthProvider for AuthManagerVoiceAuth {
-    fn bearer(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
+    fn bearer(&self) -> Pin<Box<dyn Future<Output = Result<String, VoiceAuthError>> + Send + '_>> {
         let provider = self.0.clone();
-        Box::pin(async move { provider.current_api_key_async().await })
+        Box::pin(async move { provider.side_call_bearer().await.map_err(voice_auth_error) })
     }
 }
 
 /// Build the voice bearer provider from the connection's `AuthManager`.
 ///
-/// Works for every auth method: OAuth / grok.com / OIDC session tokens and
-/// `XAI_API_KEY` / per-model BYOK keys.
+/// Serves xAI logins and `XAI_API_KEY` / per-model BYOK keys. A foreign-issuer login resolves to
+/// [`VoiceAuthError::ForeignSession`] instead of a bearer.
 pub fn build_voice_auth(auth_manager: Arc<xai_grok_shell::auth::AuthManager>) -> SharedVoiceAuth {
     Arc::new(AuthManagerVoiceAuth(
         xai_grok_shell::auth::shared_api_key_provider(auth_manager),
     ))
 }
+
+#[cfg(test)]
+#[path = "auth_tests.rs"]
+mod tests;

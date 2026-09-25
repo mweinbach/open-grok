@@ -1,6 +1,7 @@
 use super::{AgentView, PromptInputMode, PromptMode};
 use crate::app::app_view::InputOutcome;
 use crate::views::prompt_widget::StashedPrompt;
+use crossterm::event::KeyEvent;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StashCause {
@@ -13,6 +14,7 @@ pub struct PromptStashEntry {
     pub prompt: StashedPrompt,
     pub input_mode: PromptInputMode,
     pub cause: StashCause,
+    pub undo_armed: bool,
 }
 
 impl PromptStashEntry {
@@ -54,6 +56,7 @@ impl AgentView {
             prompt: self.prompt.stash(),
             input_mode: self.prompt_input_mode,
             cause,
+            undo_armed: true,
         };
         self.prompt.set_text("");
         self.prompt.clear_history();
@@ -137,6 +140,27 @@ impl AgentView {
         self.restore_stash_entry(entry);
         self.note_stash_change_in_minimal("Stashed draft restored.");
         InputOutcome::Changed
+    }
+
+    /// Ctrl+Z as the first key after a stash pops the slot; `None` leaves the key to the widget.
+    pub(super) fn pop_stash_on_undo_key(&mut self, key: &KeyEvent) -> Option<InputOutcome> {
+        // A bracketed paste lands without a key press
+        let composer_untouched = self.prompt.text().is_empty() && self.prompt.images.is_empty();
+        if !crate::input::key::is_undo_key(key)
+            || self.paste_probe_in_flight > 0
+            || !composer_untouched
+        {
+            return None;
+        }
+
+        match self.handle_stash_prompt_key() {
+            InputOutcome::Unchanged => None,
+            outcome => {
+                // The restore pushed a checkpoint; a held Ctrl+Z must stop here
+                self.prompt.clear_history();
+                Some(outcome)
+            }
+        }
     }
 
     fn note_stash_change_in_minimal(&mut self, text: &str) {
@@ -356,20 +380,38 @@ mod tests {
         assert!(agent.prompt_stash.is_some());
     }
 
+    fn undo_key() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)
+    }
+
     #[test]
-    fn undo_cannot_resurrect_a_stashed_draft() {
+    fn undo_right_after_the_stash_pops_it() {
         let mut agent = test_fixtures::make_agent();
         agent.prompt.set_text("a draft worth keeping");
-        agent.stash_prompt_draft(StashCause::Chord);
+        agent.handle_prompt_key_for_test(&chords()[0]);
 
-        let undone = agent.prompt.textarea.undo();
+        agent.handle_prompt_key_for_test(&undo_key());
 
-        assert!(!undone, "the stash left an undo step behind");
+        assert_eq!(agent.prompt.text(), "a draft worth keeping");
+        assert!(agent.prompt_stash.is_none());
+
+        agent.prompt.set_text("");
+        agent.auto_restore_stash_after_send();
         assert_eq!(agent.prompt.text(), "");
-        assert!(
-            agent.prompt_stash.is_some(),
-            "the slot still owns the draft"
-        );
+    }
+
+    #[test]
+    fn key_between_the_stash_and_undo_disarms_the_pop() {
+        let mut agent = test_fixtures::make_agent();
+        agent.prompt.set_text("parked draft");
+        agent.handle_prompt_key_for_test(&chords()[0]);
+        agent.handle_prompt_key_for_test(&KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        agent.handle_prompt_key_for_test(&undo_key());
+        agent.handle_prompt_key_for_test(&undo_key());
+
+        assert_eq!(agent.prompt.text(), "");
+        assert!(agent.prompt_stash.is_some());
     }
 
     #[test]

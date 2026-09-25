@@ -124,10 +124,13 @@ impl QueuedPrompt {
 /// - Type safety (can't misspell command names)
 /// - Variant-specific data (e.g., `/model` would carry target model)
 /// - Proper rendering per command type
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCommand {
     /// `/compact` — compact conversation history.
     Compact,
+    /// Cross-family model switch compact (lossy summary while the `/model` RPC is in flight).
+    /// Idle, so it would otherwise have no turn-status loader; this command owns the spinner.
+    SwitchModelCompact,
     /// Creating a git worktree (from the welcome screen `w` action).
     CreateWorktree,
     /// Resuming a session in a worktree (worktree + code restore).
@@ -138,17 +141,28 @@ pub enum AgentCommand {
     /// Drives the spinner shown on the placeholder agent while the
     /// `x.ai/session/fork` request is in flight.
     ForkSession,
+    /// `/flush`: capture this session's memory now.
+    MemoryFlush,
+    /// `/dream`: consolidate memory now.
+    MemoryDream,
 }
 impl AgentCommand {
     /// Human-readable label for the status line (e.g., "Compacting").
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Compact => "Compacting",
+            Self::SwitchModelCompact => "Switching model",
             Self::CreateWorktree => "Creating worktree",
             Self::RestoreWorktree => "Restoring session in worktree",
             Self::RestoreCode => "Restoring code",
             Self::ForkSession => "Forking session",
+            Self::MemoryFlush => "Flushing memory",
+            Self::MemoryDream => "Consolidating memory",
         }
+    }
+    /// Manual `/compact` or the idle family-switch compact that reuses the same cancel/status path.
+    pub fn is_compact(&self) -> bool {
+        matches!(self, Self::Compact | Self::SwitchModelCompact)
     }
 }
 /// Maximum in-memory stdout per background task (10 MB).
@@ -650,13 +664,22 @@ impl AgentState {
     pub fn is_turn_running(&self) -> bool {
         matches!(self, Self::TurnRunning)
     }
-    /// Manual `/compact` is in flight (stoppable via session/cancel).
+    /// Manual `/compact` or family-switch compact is in flight (stoppable via session/cancel).
     pub fn is_compact_running(&self) -> bool {
         matches!(
             self,
+            Self::CommandRunning { command, .. } if command.is_compact()
+        )
+    }
+    /// Family-switch compact (started from `AutoCompactStarted`, finished from its completed/failed/cancelled follow-up).
+    pub fn is_switch_model_compact(&self) -> bool {
+        matches!(
+            self,
             Self::CommandRunning {
-                command: AgentCommand::Compact,
+                command: AgentCommand::SwitchModelCompact,
                 ..
+            } | Self::CommandCancelling {
+                command: AgentCommand::SwitchModelCompact,
             }
         )
     }
@@ -893,6 +916,28 @@ impl AgentSession {
     pub(crate) fn set_auto_mode_for_test(&mut self, on: bool) {
         self.auto_mode = on;
     }
+    /// The shell's own session directory derivation from the bound session id and this session's cwd.
+    /// `None` until a session id is bound; never touches the filesystem or scans other sessions.
+    pub fn local_session_dir(&self) -> Option<PathBuf> {
+        Some(xai_grok_shell::session::persistence::session_dir(
+            &self.local_session_info()?,
+        ))
+    }
+    /// Create `local_session_dir` with owner-only permissions when it is missing, then return it.
+    /// Not every backend writes to it before the first feedback draft.
+    pub fn ensure_local_session_dir(&self) -> Option<std::io::Result<PathBuf>> {
+        Some(
+            xai_grok_shell::session::persistence::ensure_owner_only_session_dir(
+                &self.local_session_info()?,
+            ),
+        )
+    }
+    fn local_session_info(&self) -> Option<xai_grok_shell::session::info::Info> {
+        Some(xai_grok_shell::session::info::Info {
+            id: self.session_id.clone()?,
+            cwd: self.cwd.to_string_lossy().to_string(),
+        })
+    }
     /// Process an ACP session update. Returns true if scrollback was modified.
     pub fn handle_update(
         &mut self,
@@ -988,16 +1033,12 @@ impl AgentSession {
     pub fn finish_command(&mut self) {
         self.state = AgentState::Idle;
     }
-    /// Mark an in-flight `/compact` as cancelling (waiting for CompactComplete).
+    /// Mark an in-flight compact as cancelling (waiting for CompactComplete / AutoCompactCancelled).
     pub fn cancel_compact_command(&mut self) {
-        if let AgentState::CommandRunning {
-            command: AgentCommand::Compact,
-            ..
-        } = &self.state
+        if let AgentState::CommandRunning { command, .. } = &self.state
+            && command.is_compact()
         {
-            self.state = AgentState::CommandCancelling {
-                command: AgentCommand::Compact,
-            };
+            self.state = AgentState::CommandCancelling { command: *command };
         }
     }
     /// Push a prompt onto the back of the queue. Returns the assigned ID.

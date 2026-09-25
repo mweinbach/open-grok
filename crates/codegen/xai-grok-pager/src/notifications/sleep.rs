@@ -158,7 +158,7 @@ impl Drop for SleepInhibitor {
     }
 }
 
-// -- macOS IOKit FFI ---------------------------------------------------------
+// macOS IOKit FFI
 
 #[cfg(target_os = "macos")]
 use core_foundation::base::TCFType;

@@ -1,7 +1,7 @@
 //! New, exit, cloud, and worktree session dispatchers plus trust and startup actions.
 use super::fork::{dispatch_startup_fork_session, worktree_persist_options};
 use super::load::dispatch_load_session;
-use super::modal::remove_agent_and_cleanup;
+use super::modal::{drop_other_agents_in_minimal, remove_agent_and_cleanup};
 use crate::acp::model_state::{EffortTokenError, ModelState};
 use crate::acp::tracker::AcpUpdateTracker;
 use crate::app::actions::{Action, Effect, SwitchModelError};
@@ -34,7 +34,7 @@ pub(crate) struct DeferredSwitchOutcome {
     pub effort_error: Option<EffortTokenError>,
 }
 /// Resolve the stashed `-m` switch and/or `cli_effort_token` against the session
-/// catalog via [`ModelState::resolve_effort_for_model`] (same gate-first policy
+/// catalog via [`ModelState::resolve_cli_effort_for_model`] (same gate-first policy
 /// as `/effort` and headless).
 pub(crate) fn take_deferred_model_switch(
     stashed: Option<DeferredModelSwitch>,
@@ -49,7 +49,7 @@ pub(crate) fn take_deferred_model_switch(
     {
         let effort_error = match cli_effort_token {
             Some(token) if effort.is_none() => {
-                match models.resolve_effort_for_model(&model_id, token) {
+                match models.resolve_cli_effort_for_model(&model_id, token) {
                     Ok(resolved) => {
                         effort = Some(resolved);
                         None
@@ -80,7 +80,7 @@ pub(crate) fn take_deferred_model_switch(
             effort_error: Some(EffortTokenError::NoActiveModel),
         };
     };
-    match models.resolve_effort_for_model(&current, token) {
+    match models.resolve_cli_effort_for_model(&current, token) {
         Ok(effort) if models.reasoning_effort == Some(effort) => DeferredSwitchOutcome {
             switch: None,
             effort_error: None,
@@ -335,6 +335,18 @@ fn apply_welcome_workspace_on_new_session(app: &mut AppView) -> Result<(), Vec<E
         }
     }
 }
+/// The create's `_meta.sessionId`: honor `preferred`, else mint a v7 UUID. Records it as `pending_session_id` so setup phases route here.
+fn assign_pending_session_id(
+    app: &mut AppView,
+    agent_id: AgentId,
+    preferred: Option<String>,
+) -> String {
+    let session_id = preferred.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    if let Some(agent) = app.agents.get_mut(&agent_id) {
+        agent.pending_session_id = Some(acp::SessionId::new(session_id.clone()));
+    }
+    session_id
+}
 /// Factored out of [`dispatch_new_session`] so the worktree-question
 /// "No" path can call it directly without re-opening the modal.
 pub(in crate::app::dispatch) fn dispatch_new_session_inner(
@@ -441,6 +453,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent.active_pane = ActivePane::Prompt;
     }
     switch_to_agent(app, agent_id, SwitchCause::New);
+    effects.extend(drop_other_agents_in_minimal(app, agent_id));
     if app.screen_mode.is_minimal() {
         app.minimal_state.welcome_pending = true;
     }
@@ -469,6 +482,7 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
             agent.workspace_mode_cli_locked = locked;
         }
         agent.apply_credit_balance(app.credit_balance.clone(), app.auto_topup.clone());
+        agent.session_starting_since = Some(Instant::now());
         agent.mcp_init_progress = Some(McpInitProgress {
             total: 0,
             connected: 0,
@@ -477,19 +491,21 @@ pub(in crate::app::dispatch) fn dispatch_new_session_inner_with_id(
         agent.session.prompt_history_loading = true;
     }
     let preferred_session_id = app.deferred_startup.preferred_session_id.take();
+    let session_id = assign_pending_session_id(app, agent_id, preferred_session_id);
     effects.push(Effect::CreateSession {
         agent_id,
         cwd: effective_cwd,
         permission_mode_override: None,
         model_id,
-        preferred_session_id,
+        preferred_session_id: Some(session_id),
         chat_kind,
     });
     (agent_id, effects)
 }
 /// Exit the current session and return to the welcome screen.
+/// Minimal has no welcome chrome, so this then opens an empty session (same as startup).
 pub(in crate::app::dispatch) fn dispatch_exit_session(app: &mut AppView) -> Vec<Effect> {
-    let effects =
+    let mut effects =
         unregister_session_effect(get_active_agent(app).and_then(|a| a.session.session_id.clone()));
     show_welcome(app);
     app.welcome_prompt_focused = true;
@@ -499,6 +515,9 @@ pub(in crate::app::dispatch) fn dispatch_exit_session(app: &mut AppView) -> Vec<
     app.session_picker_content_results = None;
     app.session_picker_content_loading = false;
     app.exit_session_pending = None;
+    if app.screen_mode.is_minimal() && !app.is_zdr_blocked() {
+        effects.extend(dispatch_new_session(app));
+    }
     effects
 }
 /// Aftermath for `/delete` on the active agent: dashboard overlay returns
@@ -997,6 +1016,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
             .slash_controller
             .registry_mut()
             .set_plugins_visible(!app.appearance.disable_plugins);
+        agent.session_starting_since = Some(Instant::now());
     }
     if let Some(prompt) = prompt
         && let Some(agent) = app.agents.get_mut(&agent_id)
@@ -1004,6 +1024,12 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         agent.session.enqueue_prompt(prompt);
     }
     switch_to_agent(app, agent_id, SwitchCause::New);
+    let minted_session_id = if load_session_id.is_none() {
+        let session_id = assign_pending_session_id(app, agent_id, preferred_session_id.clone());
+        preferred_session_id.is_none().then_some(session_id)
+    } else {
+        None
+    };
     let effects = vec![Effect::CreateWorktreeSession {
         agent_id,
         permission_mode_override: None,
@@ -1012,6 +1038,7 @@ pub(in crate::app::dispatch) fn dispatch_new_worktree_session(
         git_ref,
         model_id,
         preferred_session_id,
+        minted_session_id,
         chat_kind,
     }];
     effects
@@ -1104,7 +1131,7 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 page_flip_entry: None,
             }
         } else {
-            let drain = maybe_drain_queue(agent);
+            let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
             let mut effects = provider_effects;
             effects.extend(drain.effects);
             QueueDrain {
@@ -1227,7 +1254,7 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 page_flip_entry: None,
             }
         } else {
-            let drain = maybe_drain_queue(agent);
+            let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
             let mut effects = provider_effects;
             effects.extend(drain.effects);
             QueueDrain {
@@ -1303,13 +1330,18 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
     vec![]
 }
 /// Surface a session-creation failure on the welcome screen (no toast sink).
+/// Record a session-creation failure as a startup warning; the welcome screen has no toast.
+/// Inserted first: the banner shows one warning, and a failed create outranks a probe warning already there.
 fn push_session_create_failure_warning(app: &mut AppView, msg: &str) {
     if !app.startup_warnings.iter().any(|w| w.message == msg) {
-        app.startup_warnings.push(crate::startup::StartupWarning {
-            severity: crate::startup::WarningSeverity::Warning,
-            message: msg.to_string(),
-            action: None,
-        });
+        app.startup_warnings.insert(
+            0,
+            crate::startup::StartupWarning {
+                severity: crate::startup::WarningSeverity::Warning,
+                message: msg.to_string(),
+                action: None,
+            },
+        );
     }
 }
 /// After an orphan create fails, New/Fork may already have moved overlay
@@ -1339,13 +1371,50 @@ fn restore_dashboard_attach_after_orphan_remove(
 /// Failed plain `CreateSession`: drop orphan placeholders, clear the
 /// starting-session spinner, and surface the error (toast when an agent
 /// remains; startup warning on the welcome screen, which has no toast).
+/// Emits the create-failure event and returns the stalled phase's user-facing copy, if any.
+fn report_session_create_failed(
+    app: &AppView,
+    agent_id: AgentId,
+    timed_out: bool,
+) -> Option<&'static str> {
+    use strum::EnumMessage as _;
+    let (phase, elapsed_ms) = app
+        .agents
+        .get(&agent_id)
+        .map(|a| {
+            (
+                a.session_new_phase,
+                a.session_starting_since
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default();
+    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SessionCreateFailed {
+        outcome: if timed_out {
+            xai_grok_telemetry::startup::StartupOutcome::Timeout
+        } else {
+            xai_grok_telemetry::startup::StartupOutcome::Error
+        },
+        stuck_phase: phase.map(|p| <&'static str>::from(&p).to_owned()),
+        elapsed_ms,
+    });
+    phase.and_then(|p| p.get_message())
+}
+/// Failed plain `CreateSession`: drop orphan placeholders, clear the starting-session spinner, and report the error.
+/// The report is a toast when an agent remains; on the welcome screen, which has no toast, it is a startup warning.
 pub(in crate::app::dispatch) fn handle_session_failed(
     app: &mut AppView,
     agent_id: AgentId,
     error: String,
+    timed_out: bool,
 ) -> Vec<Effect> {
     tracing::error!(agent = ?agent_id, error = %error, "Session creation failed");
-    let msg = format!("Session creation failed: {error}");
+    let stuck_step = report_session_create_failed(app, agent_id, timed_out);
+    let msg = match stuck_step {
+        Some(step) if timed_out => crate::app::effects::timed_out_while(step),
+        Some(_) | None => format!("Session creation failed: {error}"),
+    };
     let is_orphan = app
         .agents
         .get(&agent_id)
@@ -1378,7 +1447,10 @@ pub(in crate::app::dispatch) fn handle_session_failed(
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
         agent.session.prompt_history_loading = false;
+        agent.session_starting_since = None;
         agent.mcp_init_progress = None;
+        agent.session_new_phase = None;
+        agent.pending_session_id = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
         agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
@@ -1398,8 +1470,30 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     app: &mut AppView,
     agent_id: AgentId,
     error: String,
+    orphaned_worktree_root: Option<std::path::PathBuf>,
+    timed_out: bool,
 ) -> Vec<Effect> {
     tracing::error!(agent = ?agent_id, error = %error, "Worktree session creation failed");
+    let is_create = app
+        .agents
+        .get(&agent_id)
+        .is_some_and(|a| a.pending_session_id.is_some());
+    let stuck_step = if is_create {
+        report_session_create_failed(app, agent_id, timed_out)
+    } else {
+        None
+    };
+    let reason = match stuck_step {
+        Some(step) if timed_out => crate::app::effects::timed_out_while(step),
+        Some(_) | None => format!("Cannot create worktree: {error}"),
+    };
+    let msg = match orphaned_worktree_root {
+        Some(root) => format!(
+            "{reason} (worktree {} was created and is still on disk; remove it with `open-grok worktree rm`)",
+            root.display()
+        ),
+        None => reason,
+    };
     let is_orphan = app
         .agents
         .get(&agent_id)
@@ -1420,7 +1514,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
             app.session_picker_content_results = None;
             app.session_picker_content_loading = false;
         }
-        let msg = format!("Cannot create worktree: {error}");
         if !app.startup_warnings.iter().any(|w| w.message == msg) {
             app.startup_warnings.push(crate::startup::StartupWarning {
                 severity: crate::startup::WarningSeverity::Warning,
@@ -1431,12 +1524,16 @@ pub(in crate::app::dispatch) fn handle_worktree_session_failed(
     } else if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
         agent.session.prompt_history_loading = false;
+        agent.session_starting_since = None;
         agent.mcp_init_progress = None;
+        agent.session_new_phase = None;
+        agent.pending_session_id = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
         agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);
         agent.pending_first_prompt = None;
         agent.pending_fork_banner = None;
+        agent.show_toast(&msg);
         agent
             .scrollback
             .push_block(RenderBlock::session_event(SessionEvent::TurnFailed {
@@ -1525,7 +1622,7 @@ pub(in crate::app::dispatch) fn handle_switch_model_complete(
                 vec![]
             }
         };
-        let drain = maybe_drain_queue(agent);
+        let drain = maybe_drain_queue(agent, &mut app.pending_image_notices);
         effects.extend(drain.effects);
         note_peek_page_flip(app, agent_id, drain.page_flip_entry);
         effects

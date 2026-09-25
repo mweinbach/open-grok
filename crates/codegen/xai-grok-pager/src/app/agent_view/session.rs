@@ -40,6 +40,9 @@ impl AgentView {
             self.clear_minimal_btw_lifecycle();
         }
         self.session.session_id = Some(session_id);
+        self.session_starting_since = None;
+        self.session_new_phase = None;
+        self.pending_session_id = None;
     }
     /// Advance the reconnect cursor forward-only. Stores the raw id and its parsed sequence together so later compares need not re-parse the string.
     ///
@@ -134,6 +137,10 @@ impl AgentView {
             failed_wake_marker_for: None,
             running_wake_turn: None,
             finished_wake_prompts: HashSet::new(),
+            ended_child_prompt_ids: HashSet::new(),
+            superseded_child_prompt_ids: HashSet::new(),
+            unidentified_child_turn_closed_ms: None,
+            unidentified_child_turn_closed_prompt: None,
             active_pane: ActivePane::Prompt,
             dock_cursor: 0,
             dock_workflows_expanded: true,
@@ -188,6 +195,8 @@ impl AgentView {
             turn_paused_duration: std::time::Duration::ZERO,
             turn_paused_wall: std::time::Duration::ZERO,
             self_interjection_ids: std::collections::HashSet::new(),
+            interjection_painted_blocks: std::collections::HashMap::new(),
+            interjection_retry_images: std::collections::HashMap::new(),
             last_active_at: Some(Instant::now()),
             current_branch: None,
             is_worktree: false,
@@ -325,11 +334,18 @@ impl AgentView {
             question_scroll_region: None,
             plan_mode_active: false,
             plan_mode_pending: None,
+            available_modes: Vec::new(),
+            session_mode: xai_grok_tools::types::SessionMode::Default,
+            session_mode_pending: None,
             deferred_session_mode: None,
+            deferred_permission_mode: None,
             pending_extensions_fetch: false,
             in_dashboard_overlay: false,
             overlay_can_cycle: false,
             mcp_init_progress: None,
+            session_starting_since: None,
+            session_new_phase: None,
+            pending_session_id: None,
             acp_synced_generation: 0,
             hovered_permission_item: None,
             last_permission_click: None,
@@ -352,8 +368,6 @@ impl AgentView {
             cancel_trigger_hint: None,
             rewind_state: None,
             rewind_points: None,
-            inline_edit: None,
-            pending_inline_resubmit: None,
             jump_state: None,
             timeline_rail: None,
             timeline_hover: None,
@@ -509,6 +523,10 @@ impl AgentView {
         self.late_replay_until = None;
         self.running_wake_turn = None;
         self.finished_wake_prompts.clear();
+        self.ended_child_prompt_ids.clear();
+        self.superseded_child_prompt_ids.clear();
+        self.unidentified_child_turn_closed_ms = None;
+        self.unidentified_child_turn_closed_prompt = None;
         self.pending_cancel_resend = None;
         self.cancel_latency = None;
         self.pending_stop_hooks = None;

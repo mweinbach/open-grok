@@ -137,7 +137,6 @@ impl AgentView {
             || self.casual_commenting_range.is_some()
             || self.cancel_turn_view.is_some()
             || self.rewind_state.is_some()
-            || self.inline_edit.is_some()
             || self.jump_state.is_some()
             || self.prompt.any_dropdown_open();
         if owned_elsewhere {
@@ -660,6 +659,19 @@ impl AgentView {
                 return InputOutcome::Changed;
             }
         }
+        if self.active_modal.is_some() {
+            return match ev {
+                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                    if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
+                        return InputOutcome::Unchanged;
+                    }
+                    self.handle_modal_key_with_registry(key, registry)
+                }
+                Event::Mouse(mouse) => self.handle_modal_mouse_with_registry(mouse, registry),
+                Event::Paste(text) => self.handle_modal_paste(text, registry),
+                _ => InputOutcome::Changed,
+            };
+        }
         if self.btw_state.is_some()
             && let Event::Key(key) = ev
             && key.kind != KeyEventKind::Release
@@ -723,19 +735,6 @@ impl AgentView {
                 }
                 _ => {}
             }
-        }
-        if self.active_modal.is_some() {
-            return match ev {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if registry.lookup(key, When::Always) == Some(ActionId::Quit) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_modal_key_with_registry(key, registry)
-                }
-                Event::Mouse(mouse) => self.handle_modal_mouse_with_registry(mouse, registry),
-                Event::Paste(text) => self.handle_modal_paste(text, registry),
-                _ => InputOutcome::Changed,
-            };
         }
         if self.line_viewer.is_some() && self.focused_card() != Some(BlockingCard::Permission) {
             if let Event::Mouse(mouse) = ev
@@ -1095,24 +1094,6 @@ impl AgentView {
                     self.handle_rewind_key(key)
                 }
                 Event::Mouse(mouse) => self.handle_rewind_mouse(mouse),
-                _ => InputOutcome::Unchanged,
-            };
-        }
-        if self.inline_edit.is_some() {
-            return match ev {
-                Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                    if key!('q', CONTROL).matches(key) {
-                        return InputOutcome::Unchanged;
-                    }
-                    self.handle_inline_edit_key(key)
-                }
-                Event::Mouse(mouse) => self.handle_inline_edit_mouse(mouse),
-                Event::Paste(text) => {
-                    if let Some(ref mut edit) = self.inline_edit {
-                        edit.textarea.insert_str(text);
-                    }
-                    InputOutcome::Changed
-                }
                 _ => InputOutcome::Unchanged,
             };
         }
@@ -1949,6 +1930,20 @@ mod btw_focus_tests {
             "{surface} Esc must restore the complete minimal /btw lifecycle"
         );
     }
+    fn session_info_modal() -> crate::views::modal::ActiveModal {
+        crate::views::modal::ActiveModal::UsageInfo {
+            state: Box::new(crate::views::usage_modal::UsageInfoModalState::new(
+                crate::views::usage_modal::UsageInfoTab::SessionInfo,
+                crate::views::usage_modal::UsageInfoContext {
+                    session_id: Some("s".into()),
+                    usage_visible: true,
+                    chat_kind: false,
+                    billing_redirect_url: None,
+                    subscription_tier: None,
+                },
+            )),
+        }
+    }
     #[test]
     fn focused_panel_scrolls_with_arrows() {
         let mut agent = prompt_focused_agent();
@@ -2125,6 +2120,14 @@ mod btw_focus_tests {
         goal.handle_minimal_input(&key(KeyCode::Esc), &reg);
         assert!(!goal.show_goal_detail, "goal detail handled Esc");
         assert_minimal_btw_active(&goal, "goal detail");
+        let mut session_info = minimal_btw_agent();
+        session_info.active_modal = Some(session_info_modal());
+        session_info.handle_minimal_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            session_info.active_modal.is_none(),
+            "session-info handled Esc"
+        );
+        assert_minimal_btw_active(&session_info, "session-info");
     }
     #[test]
     fn minimal_btw_surface_owner_covers_shared_modal_cascade() {
@@ -2156,6 +2159,46 @@ mod btw_focus_tests {
         agent.handle_input(&key(KeyCode::Esc), &reg);
         assert!(agent.btw_state.is_none());
         assert!(!agent.permission_queue.is_empty());
+    }
+    #[test]
+    fn fullscreen_session_info_owns_esc_over_btw() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.active_modal = Some(session_info_modal());
+        agent.handle_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            agent.active_modal.is_none(),
+            "first Esc closes the painted /session-info modal"
+        );
+        assert!(
+            agent.btw_state.is_some(),
+            "the /btw panel survives under the modal"
+        );
+        agent.handle_input(&key(KeyCode::Esc), &reg);
+        assert!(
+            agent.btw_state.is_none(),
+            "a second Esc dismisses the /btw panel"
+        );
+    }
+    #[test]
+    fn fullscreen_session_info_owns_arrows_over_btw_scroll() {
+        let mut agent = prompt_focused_agent();
+        let reg = ActionRegistry::defaults();
+        agent.btw_state = Some(BtwOverlayState::done("q".into(), long_btw_answer()));
+        agent.btw_focused = true;
+        agent.active_modal = Some(session_info_modal());
+        agent.handle_input(&key(KeyCode::Down), &reg);
+        assert_eq!(
+            done_scroll_offset(&agent),
+            0,
+            "arrows must not scroll /btw while the modal is painted on top"
+        );
+        assert!(
+            agent.active_modal.is_some(),
+            "Down must leave the painted modal open"
+        );
+        assert!(agent.btw_state.is_some());
     }
     #[test]
     fn minimal_does_not_scroll_unpainted_btw_geometry() {
@@ -2638,41 +2681,6 @@ mod voice_stop_click_during_plan_review_tests {
             matches!(outcome, InputOutcome::Action(Action::VoiceToggle)),
             "[stop] click during plan feedback must dispatch VoiceToggle, got {outcome:?}"
         );
-    }
-}
-#[cfg(test)]
-mod rich_textarea_paste_routing_tests {
-    use super::test_fixtures::make_agent;
-    use crate::actions::ActionRegistry;
-    use crate::app::inline_edit::InlineEditState;
-    use crate::scrollback::entry::EntryId;
-    use crossterm::event::Event;
-    use xai_ratatui_textarea::{TextArea, TextAreaState};
-    #[test]
-    fn inline_edit_receives_raw_multiline_paste_without_touching_prompt() {
-        let mut agent = make_agent();
-        agent.prompt.set_text("hidden prompt");
-        let mut textarea = TextArea::new();
-        textarea.set_text("ab");
-        textarea.set_cursor(1);
-        agent.inline_edit = Some(InlineEditState {
-            entry_id: EntryId::new(1),
-            prompt_index: 0,
-            original: "ab".to_owned(),
-            textarea,
-            textarea_state: TextAreaState::default(),
-            last_text_area: None,
-            last_rect: None,
-        });
-        let _ = agent.handle_input(
-            &Event::Paste("中\nline".to_owned()),
-            &ActionRegistry::defaults(),
-        );
-        assert_eq!(
-            agent.inline_edit.as_ref().map(|edit| edit.textarea.text()),
-            Some("a中\nlineb")
-        );
-        assert_eq!(agent.prompt.text(), "hidden prompt");
     }
 }
 /// Pasting while the scrollback pane holds the keyboard (prompt unfocused) must land in
