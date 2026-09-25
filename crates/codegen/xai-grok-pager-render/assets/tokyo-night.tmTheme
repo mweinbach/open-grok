@@ -1034,7 +1034,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 1</string>
 			<key>scope</key>
-			<string>heading.1.markdown entity.name, heading.1.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.1.markdown entity.name, markup.heading.1.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>
@@ -1047,7 +1047,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 2</string>
 			<key>scope</key>
-			<string>heading.2.markdown entity.name, heading.2.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.2.markdown entity.name, markup.heading.2.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>
@@ -1060,7 +1060,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 3</string>
 			<key>scope</key>
-			<string>heading.3.markdown entity.name, heading.3.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.3.markdown entity.name, markup.heading.3.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>
@@ -1073,7 +1073,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 4</string>
 			<key>scope</key>
-			<string>heading.4.markdown entity.name, heading.4.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.4.markdown entity.name, markup.heading.4.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>
@@ -1086,7 +1086,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 5</string>
 			<key>scope</key>
-			<string>heading.5.markdown entity.name, heading.5.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.5.markdown entity.name, markup.heading.5.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>
@@ -1099,7 +1099,7 @@
 			<key>name</key>
 			<string>Markdown - Heading 6</string>
 			<key>scope</key>
-			<string>heading.6.markdown entity.name, heading.6.markdown punctuation.definition.heading.markdown</string>
+			<string>markup.heading.6.markdown entity.name, markup.heading.6.markdown punctuation.definition.heading</string>
 			<key>settings</key>
 			<dict>
 				<key>fontStyle</key>

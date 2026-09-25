@@ -52,15 +52,18 @@ To block specific files (e.g. `.env` or credential paths) on top of a profile, d
 
 **strict** -- The most restrictive profile, for reviewing untrusted code. The agent can only read files within the current working directory and essential system paths. Writes are limited to CWD, `~/.opengrok/`, and temp directories. Child-process network access is blocked on Linux (no-op on macOS).
 
-### Direct global hook write protection
+### Direct global write protection
 
-Under `workspace`, `read-only`, and `strict` (and custom profiles that extend those bases), the Grok state directory remains writable for session/runtime files, but the kernel **write-denies** the Grok-owned direct disk paths used as user-global hook sources (they stay readable):
+Under `workspace`, `read-only`, and `strict` (and custom profiles that extend those bases), the Open Grok state directory remains writable for session/runtime files, but the kernel **write-denies** the Grok-owned direct disk paths used as user-global hook sources (they stay readable), plus its configuration and trust files. Built-in `strict` can read `~/.opengrok` (they stay readable); writes are CWD + `~/.opengrok/sessions` + temp, not the whole tree. Write-deny still applies where the profile grants write:
 
 - `~/.opengrok/hooks/` (hook directory)
 - `~/.opengrok/hooks-paths` (registry file; not loaded as hook JSON — only its absolute targets are)
 - Absolute targets listed in `hooks-paths` (relative lines are ignored; missing targets refuse sandbox start)
+- `~/.opengrok/config.toml`, `~/.opengrok/trusted_folders.toml`, `~/.opengrok/managed_config.toml`, `~/.opengrok/requirements.toml`, `~/.opengrok/sandbox.toml` (settings, folder trust, managed policy, requirements, and sandbox profiles)
 
-On first launch under these profiles, Grok creates a real empty `hooks/` directory and empty `hooks-paths` file when they are missing (never symlinks or wrong types). Claude/Cursor global settings are **not** covered by this write-deny; discovery of those vendors remains separately gated by compatibility settings.
+Because these files are read-only under these profiles, a change that would be saved to them applies to the current session only. Accepting a folder-trust prompt, switching the model with `/model`, and changing the permission mode (`/auto` or Shift+Tab) take effect for the session but are not saved. To save folder trust, run `open-grok --trust` in the directory before starting the sandbox. To change the default model or permission mode, edit `~/.opengrok/config.toml` directly.
+
+On first launch under these profiles, Open Grok creates a real empty `hooks/` directory and empty `hooks-paths` file when they are missing (never symlinks or wrong types). Claude/Cursor global settings are **not** covered by this write-deny; discovery of those vendors remains separately gated by compatibility settings.
 
 A symlinked `$OPENGROK_HOME` or a `hooks-paths` entry with a symlink component is refused at sandbox start (prevents retargeting). Existing parent directories of protected paths are pinned so they cannot be renamed out from under the deny (siblings remain writable). On Linux, nested user namespaces are disabled inside bubblewrap so mount binds cannot be rearranged. Project hooks remain gated by folder trust. The `devbox` profile does not apply this protection (disposable VMs). Profiles that require it refuse to start if the kernel policy cannot be applied (including Linux without verified read-only mounts).
 

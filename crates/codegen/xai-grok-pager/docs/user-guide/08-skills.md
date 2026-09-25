@@ -47,6 +47,8 @@ disabled = ["wip-skill"]              # Skill names to keep listed but inactive
 
 Each entry in `paths` is a `SKILL.md` file or a directory that Grok walks recursively. `ignore` hides a skill completely; `disabled` keeps it in the list but excludes it from the system prompt and from invocation. `paths` and `ignore` take filesystem paths and support `~` expansion; `disabled` takes skill names.
 
+`[paths] extra_skill_dirs` is written by `/import-claude`. It does not inject skills. Put extra directories in `[skills] paths`.
+
 ---
 
 ## Creating a Skill
@@ -220,7 +222,7 @@ See the [Plugins guide](09-plugins.md) for more on installing plugins that provi
 
 2. **Include concrete steps.** Skills work best when they give Grok a clear, ordered procedure to follow.
 
-3. **Reference tools by name.** When a skill relies on specific tools (such as `run_terminal_command` or `search_replace`), name them so the model knows what to use.
+3. **Reference tools by name.** When a skill relies on specific tools (such as `run_terminal_cmd` or `search_replace`), name them so the model knows what to use.
 
 4. **Keep skills focused.** Write one skill per workflow. A "deploy" skill and a "rollback" skill work better than a single "deploy-and-rollback" skill.
 

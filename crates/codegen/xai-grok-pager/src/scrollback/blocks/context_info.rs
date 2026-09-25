@@ -288,15 +288,22 @@ impl ContextInfoBlock {
         let used = snapshot.used;
         let total = snapshot.total;
         let usage_pct = snapshot.usage_pct;
-        let system_tokens = snapshot.system_prompt_tokens;
         let tool_tokens = snapshot.tool_definitions_tokens;
         let tool_count = snapshot.tool_definitions_count;
-        let message_tokens = snapshot.message_tokens;
-        let free_tokens = snapshot.free_tokens;
         let turn_count = snapshot.turn_count;
         let tool_call_count = snapshot.tool_call_count;
         let compaction_count = snapshot.compaction_count;
-        let overhead_tokens = used.saturating_sub(system_tokens + message_tokens);
+
+        let tokens = window_tokens(
+            used,
+            total,
+            snapshot.system_prompt_tokens,
+            snapshot.message_tokens,
+        );
+        let system_tokens = tokens.system;
+        let message_tokens = tokens.messages;
+        let overhead_tokens = tokens.overhead;
+        let free_tokens = tokens.free;
 
         let muted = theme.muted();
         let primary = Style::default()
@@ -374,10 +381,8 @@ impl ContextInfoBlock {
             bar_lines.push(Line::from(spans));
         }
 
-        // Legend rows fill the bar; informational rows sit below it
-        // because their tokens are already counted in its categories:
-        // tool definitions surface in Reasoning/overhead, and the usage
-        // categories overlap Messages.
+        // Tool definitions are already in Reasoning/overhead
+        // Usage categories are already in Messages
         let mut legend_rows = vec![
             LegendRow {
                 glyph: system_glyph,
@@ -465,6 +470,8 @@ impl ContextInfoBlock {
             lines.extend(layout.render(row, bar, total, label_style, muted));
         }
         lines.push(Line::from(""));
+
+        lines.push(Line::from(Span::styled("Already counted above", muted)));
         for row in &info_rows {
             lines.extend(layout.render(row, bar, total, label_style, muted));
         }
@@ -576,6 +583,28 @@ fn fmt_tok_big(n: u64) -> String {
         format!("{:.1}m", n as f64 / 1_000_000.0)
     } else {
         fmt_tok(n)
+    }
+}
+
+/// `system`, `messages`, `overhead`, and `free` sum to `total`.
+struct WindowTokens {
+    system: u64,
+    messages: u64,
+    overhead: u64,
+    free: u64,
+}
+
+/// `system_tokens` and `message_tokens` can exceed `used`.
+/// `used` can exceed `total`.
+fn window_tokens(used: u64, total: u64, system_tokens: u64, message_tokens: u64) -> WindowTokens {
+    let used = used.min(total);
+    let system = system_tokens.min(used);
+    let messages = message_tokens.min(used - system);
+    WindowTokens {
+        system,
+        messages,
+        overhead: used - system - messages,
+        free: xai_token_estimation::free_tokens(total, used),
     }
 }
 
@@ -922,6 +951,51 @@ mod tests {
             }
         }
         (diamonds, tools, free, diamonds + tools + free)
+    }
+
+    #[test]
+    fn window_tokens_caps_used_to_total_and_system_to_used() {
+        let tokens = window_tokens(600_000, 500_000, 1_000, 400_000);
+        assert_eq!(0, tokens.free);
+        assert_eq!(500_000, tokens.system + tokens.messages + tokens.overhead);
+
+        let tokens = window_tokens(100, 1_000, 500, 50);
+        assert_eq!(100, tokens.system);
+        assert_eq!(0, tokens.messages);
+        assert_eq!(0, tokens.overhead);
+        assert_eq!(900, tokens.free);
+    }
+
+    #[test]
+    fn legend_caps_messages_when_estimate_exceeds_used() {
+        let mut snap = snapshot();
+        snap.used = 206_000;
+        snap.total = 500_000;
+        snap.system_prompt_tokens = 1_500;
+        snap.message_tokens = 380_000;
+        snap.usage_pct = 41;
+
+        let block = ContextInfoBlock::new(snap, "grok-build");
+        let theme = test_theme();
+        let lines = block.build_lines(&theme, BarLayout::WIDE);
+
+        let all = all_text(&lines);
+        assert!(
+            all.contains("Messages") && all.contains("205k") && all.contains("(41%)"),
+            "Messages should show capped occupancy, not the 380k estimate:\n{all}"
+        );
+        assert!(
+            !all.contains("Reasoning/overhead"),
+            "overhead is zero when messages eat remaining occupancy:\n{all}"
+        );
+        assert!(
+            all.contains("Free") && all.contains("294k") && all.contains("(59%)"),
+            "Free stays window minus occupancy:\n{all}"
+        );
+        assert!(
+            all.contains("Already counted above"),
+            "info rows must be labeled as overlapping:\n{all}"
+        );
     }
 
     #[test]

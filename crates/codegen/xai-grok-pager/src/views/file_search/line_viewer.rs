@@ -37,8 +37,6 @@ use xai_ratatui_textarea::ElementId;
 /// Stable ids for mermaid affordance rows (above source lines and comments).
 const MERMAID_AFFORDANCE_ID_BASE: u64 = 2_000_000;
 
-// ── Line item ───────────────────────────────────────────────────────────
-
 /// A single source line for the line viewer.
 ///
 /// In normal mode, each item has one `content` line (syntax-highlighted source).
@@ -278,8 +276,6 @@ impl ListItem for SourceLine {
     }
 }
 
-// ── Comment lines ─────────────────────────────────────────────────────
-
 /// An inline review comment displayed between source lines.
 pub struct CommentLine {
     pub comment_id: u64,
@@ -426,8 +422,6 @@ impl ListItem for CommentLine {
     }
 }
 
-// ── Mermaid affordance row ────────────────────────────────────────────
-
 /// Blank reserved row under a Mermaid diagram; buttons are painted by the
 /// draw loop (same pattern as scrollback).
 pub struct MermaidAffordanceLine {
@@ -515,8 +509,6 @@ impl ListItem for MermaidAffordanceLine {
         }
     }
 }
-
-// ── Plan viewer item ──────────────────────────────────────────────────
 
 /// Source line, review comment, or Mermaid affordance row.
 pub enum PlanViewerItem {
@@ -631,14 +623,9 @@ impl ListItem for PlanViewerItem {
     }
 }
 
-// ── Viewer state ────────────────────────────────────────────────────────
-
-/// What kind of content the line viewer is showing.
-///
-/// Replaces string-based type sniffing (`title_override == Some("plan.md")`)
-/// with a typed enum so that plan-specific behavior (commenting, approval,
-/// double-click, shortcuts) can be dispatched via `match` rather than
-/// string comparison.
+/// What kind of content the line viewer is showing. Replaces string-based type sniffing
+/// (`title_override == Some("plan.md")`) with a typed enum. Plan-specific behavior (commenting,
+/// approval, double-click, shortcuts) dispatches via `match` rather than string comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LineViewerKind {
     /// Normal file preview opened from an `@file` reference.
@@ -1179,8 +1166,6 @@ impl LineViewerState {
     }
 }
 
-// ── Syntax highlighting ─────────────────────────────────────────────────
-
 /// Build syntax-highlighted source lines from file content.
 fn build_source_lines(path: &Path, content: &str) -> Vec<SourceLine> {
     let syntect = get_syntect();
@@ -1407,12 +1392,17 @@ fn digit_count(n: usize) -> usize {
     }
 }
 
-// ── Rendering helpers ───────────────────────────────────────────────────
+/// Band for the active commenting / gutter-drag line range: a subtle 15% `accent_plan` tint over the canvas on RGB themes.
+/// Profile palettes (terminal theme, Reset canvas) cannot express a dim yellow tint, so the band is the solid named `accent_plan` with forced Black text — readable on both polarities.
+fn commenting_band(theme: &Theme) -> (Color, Option<Color>) {
+    match crate::render::color::blend_color(theme.bg_base, theme.accent_plan, 0.15) {
+        Some(tint) => (tint, None),
+        None => (theme.accent_plan, Some(Color::Black)),
+    }
+}
 
-/// Build a single review-footer shortcut button styled to match the
-/// shortcut hints in `modal_window::render_modal_shortcuts`:
-/// bold key in the primary text color + dim label, with a
-/// hover-highlighted background.
+/// Build a single review-footer shortcut button styled to match the shortcut hints in `modal_window::render_modal_shortcuts`.
+/// The style is a bold key in the primary text color and a dim label, with a hover-highlighted background.
 fn build_shortcut_button<'a>(
     key: char,
     rest: &str,

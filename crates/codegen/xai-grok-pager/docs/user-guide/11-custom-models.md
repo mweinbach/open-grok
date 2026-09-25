@@ -231,6 +231,28 @@ and omit `context_window`, Grok defaults to 200,000 tokens, so set it
 explicitly to match your provider. Z AI's live `/models` list does not
 include a window size; see [Z AI](#z-ai) for the curated defaults.
 
+### Request Size Limit
+
+`max_request_bytes` is the largest request body your endpoint accepts. Grok evicts older inline images from the conversation to stay under it, so a session with many screenshots keeps working instead of being rejected. When you omit it, Grok picks the default for the `api_backend`: 30 MB for `messages`, and 50 MiB for `chat_completions` and `responses`. Set it only when your host enforces a different cap.
+
+The cap is a property of the endpoint, so it also works on a shared `[model_providers.<id>]` block, where every model pointing at that provider inherits it; a `max_request_bytes` on the model itself overrides the provider's value.
+
+```toml
+[model_providers.messages-gateway]
+base_url = "https://gateway.example/v1"
+api_backend = "messages"
+max_request_bytes = 25000000   # every model on this provider inherits it
+
+[model.claude-sonnet]
+model = "claude-sonnet"
+model_provider = "messages-gateway"   # inherits 25 MB
+
+[model.claude-opus]
+model = "claude-opus"
+model_provider = "messages-gateway"
+max_request_bytes = 20000000   # per-model override
+```
+
 ### Global Default Headers
 
 To apply the same headers to *every* model in the catalog -- built-in, prefetched from `/v1/models`, or custom -- set them once under the global `[models]` section instead of repeating them per model:

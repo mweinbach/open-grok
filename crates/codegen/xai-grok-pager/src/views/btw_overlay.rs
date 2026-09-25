@@ -250,7 +250,6 @@ pub fn render_btw_panel(
     };
     let border_style = Style::default().fg(border_color).bg(bg);
 
-    // ── Clear area and draw rounded border ──
     Clear.render(area, buf);
     buf.set_style(area, Style::default().bg(bg));
     Block::default()
@@ -308,10 +307,8 @@ pub fn render_btw_panel(
         hint_x = (area.x + area.width).saturating_sub(1 + hint_w);
     }
 
-    // ── Title in top border: " /btw <question> " ──
-    // Reserve the hint's columns (everything left of `hint_x`, minus the title's
-    // own two padding spaces) so a long question truncates instead of hiding the
-    // hint.
+    // Reserve the hint's columns so a long question truncates instead of hiding the hint
+    // The title may use everything left of `hint_x`, minus its own two padding spaces
     let question = state.question();
     let title_prefix = "/btw ";
     let max_title = hint_x.saturating_sub(title_x).saturating_sub(2) as usize;
@@ -369,7 +366,6 @@ pub fn render_btw_panel(
         hit.clear();
     }
 
-    // ── Body (between borders) ──
     let body_y = area.y + 1;
     match state {
         BtwOverlayState::Loading { .. } => {

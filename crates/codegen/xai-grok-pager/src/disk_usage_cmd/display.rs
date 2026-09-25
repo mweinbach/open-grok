@@ -44,52 +44,8 @@ pub fn print_report(
         "  {:>SIZE_WIDTH$}  total",
         format_bytes(report.total_bytes)
     )?;
-    if report.skips.unreadable_dirs > 0 {
-        let (noun, pronoun) = if report.skips.unreadable_dirs == 1 {
-            ("directory", "it")
-        } else {
-            ("directories", "them")
-        };
-        writeln!(
-            out,
-            "  {} {noun} could not be read; what is under {pronoun} may be missing from the total. RUST_LOG=debug names {pronoun}.",
-            report.skips.unreadable_dirs,
-        )?;
-    }
-    if report.skips.unstatable_entries > 0 {
-        writeln!(
-            out,
-            "  {} {} could not be read and {} not counted.",
-            report.skips.unstatable_entries,
-            count_noun(report.skips.unstatable_entries, "entry", "entries"),
-            count_verb(report.skips.unstatable_entries)
-        )?;
-    }
-    if report.skips.other_filesystem_dirs > 0 {
-        writeln!(
-            out,
-            "  {} {} on another filesystem and {} not counted, here or in any row.",
-            report.skips.other_filesystem_dirs,
-            count_noun(
-                report.skips.other_filesystem_dirs,
-                "directory is",
-                "directories are"
-            ),
-            count_verb(report.skips.other_filesystem_dirs),
-        )?;
-    }
-    if report.unfollowed_dir_symlinks > 0 {
-        let (noun, pronoun) = if report.unfollowed_dir_symlinks == 1 {
-            ("symlink to a directory is", "its")
-        } else {
-            ("symlinks to directories are", "their")
-        };
-        writeln!(
-            out,
-            "  {} top-level {noun} not followed, so {pronoun} contents are missing from the total.",
-            report.unfollowed_dir_symlinks,
-        )?;
-    }
+    print_redirect_rows(report, out)?;
+    print_skip_notes(report, out)?;
     // The proven statement replaces the general note rather than joining it.
     if report.total_exceeds_volume_used() {
         writeln!(
@@ -195,7 +151,7 @@ pub fn print_report(
         if report.worktrees.iter().any(WorktreeUsage::is_tracked) {
             writeln!(
                 out,
-                "To reclaim space, run `open-grok worktree gc --max-age 7d --dry-run`, then the same command without `--dry-run`. Without `--max-age`, gc expires nothing."
+                "To reclaim space, run `open-grok worktree gc --max-age 7d --dry-run`, then the same command without `--dry-run`. Without `--max-age`, gc expires nothing, and it keeps a worktree whose work it cannot find elsewhere, naming each one."
             )?;
         }
         if !report.worktrees.iter().all(WorktreeUsage::is_tracked) {
@@ -208,12 +164,131 @@ pub fn print_report(
     Ok(())
 }
 
+pub(crate) fn print_redirect_rows(
+    report: &DiskUsageReport,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    if report.redirections_bytes == 0
+        && report.orphaned_redirections.is_empty()
+        && report.unattributed_redirect_dirs.is_empty()
+    {
+        return Ok(());
+    }
+    writeln!(out)?;
+    writeln!(out, "Redirections")?;
+    writeln!(
+        out,
+        "  {:>SIZE_WIDTH$}  Redirections",
+        format_bytes(report.redirections_bytes)
+    )?;
+    let orphaned_bytes = report
+        .orphaned_redirections
+        .iter()
+        .map(|row| row.bytes)
+        .fold(0, u64::saturating_add);
+    if !report.orphaned_redirections.is_empty() {
+        writeln!(
+            out,
+            "  {:>SIZE_WIDTH$}  Orphaned redirections",
+            format_bytes(orphaned_bytes)
+        )?;
+        for row in &report.orphaned_redirections {
+            writeln!(
+                out,
+                "  {:>SIZE_WIDTH$}  {}",
+                format_bytes(row.bytes),
+                row.id
+            )?;
+        }
+    }
+    let unattributed_bytes = report
+        .unattributed_redirect_dirs
+        .iter()
+        .map(|row| row.bytes)
+        .fold(0, u64::saturating_add);
+    if !report.unattributed_redirect_dirs.is_empty() {
+        writeln!(
+            out,
+            "  {:>SIZE_WIDTH$}  Unattributed redirect directories",
+            format_bytes(unattributed_bytes)
+        )?;
+        for row in &report.unattributed_redirect_dirs {
+            writeln!(
+                out,
+                "  {:>SIZE_WIDTH$}  {}",
+                format_bytes(row.bytes),
+                row.path
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub fn print_missing_home(grok_home: &str, out: &mut impl Write) -> std::io::Result<()> {
     writeln!(
         out,
         "Nothing on disk yet at {}.",
         home_prefix_label(grok_home)
     )
+}
+
+pub(crate) fn print_missing_home_report(
+    report: &DiskUsageReport,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
+    print_missing_home(&report.grok_home, out)?;
+    print_redirect_rows(report, out)?;
+    print_skip_notes(report, out)
+}
+
+fn print_skip_notes(report: &DiskUsageReport, out: &mut impl Write) -> std::io::Result<()> {
+    if report.skips.unreadable_dirs > 0 {
+        let (noun, pronoun) = if report.skips.unreadable_dirs == 1 {
+            ("directory", "it")
+        } else {
+            ("directories", "them")
+        };
+        writeln!(
+            out,
+            "  {} {noun} could not be read; what is under {pronoun} may be missing from the total. RUST_LOG=debug names {pronoun}.",
+            report.skips.unreadable_dirs,
+        )?;
+    }
+    if report.skips.unstatable_entries > 0 {
+        writeln!(
+            out,
+            "  {} {} could not be read and {} not counted.",
+            report.skips.unstatable_entries,
+            count_noun(report.skips.unstatable_entries, "entry", "entries"),
+            count_verb(report.skips.unstatable_entries)
+        )?;
+    }
+    if report.skips.other_filesystem_dirs > 0 {
+        writeln!(
+            out,
+            "  {} {} on another filesystem and {} not counted, here or in any row.",
+            report.skips.other_filesystem_dirs,
+            count_noun(
+                report.skips.other_filesystem_dirs,
+                "directory is",
+                "directories are"
+            ),
+            count_verb(report.skips.other_filesystem_dirs),
+        )?;
+    }
+    if report.unfollowed_dir_symlinks > 0 {
+        let (noun, pronoun) = if report.unfollowed_dir_symlinks == 1 {
+            ("symlink to a directory is", "its")
+        } else {
+            ("symlinks to directories are", "their")
+        };
+        writeln!(
+            out,
+            "  {} top-level {noun} not followed, so {pronoun} contents are missing from the total.",
+            report.unfollowed_dir_symlinks,
+        )?;
+    }
+    Ok(())
 }
 
 /// A dash where nothing was measured, which is not zero bytes.

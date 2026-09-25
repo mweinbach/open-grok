@@ -37,7 +37,8 @@ Grok also auto-compacts once the context window hits 85% (tune it with `[session
 
 ### `/context`
 
-Show how the context window is being used: a category breakdown (system prompt, messages, reasoning and overhead, free space) plus informational rows for tool definitions, the skills listing, and MCP server announcements with their estimated token cost.
+Show the context window split into System prompt, Messages, Reasoning/overhead, and Free.
+Rows for Tool definitions, Skills, and MCP servers are already counted in those totals.
 
 ### `/session-info`
 
@@ -168,7 +169,7 @@ Running one while another is active switches modes — for example, `/auto` whil
 
 ### `/multiline`
 
-Toggle multiline input. When it's on, `Enter` inserts a newline and `Shift+Enter` (or `Alt+Enter`) sends the message. Mid-turn, a bare `Enter` on an empty composer still force-sends the top queued follow-up. Alias: `/ml`.
+Toggle multiline input. When it's on, `Enter` inserts a newline and `Shift+Enter` (or `Alt+Enter`) sends the message. Mid-turn, a bare `Enter` on an empty composer still force-sends the top queued follow-up. Alias: `/ml`. With multiline off, the composer footer shows the newline chord once the draft is non-empty.
 
 ### `/history`
 
@@ -219,24 +220,28 @@ Open a preview of the current saved plan. Aliases: `/show-plan`, `/plan-view`.
 
 ## Memory
 
-`/flush`, `/dream`, and `/memory` require memory to be enabled (`--experimental-memory` or `GROK_MEMORY=1`); `/memory` also needs a configured memory backend. `/remember` is always available.
+`/flush` and `/dream` require memory enabled through `GROK_MEMORY=1`, `[memory] enabled = true`, or managed remote settings. `/memory` is available whenever a memory store is configured for the session, including when `[memory] enabled = false` turned memory off, so you can browse saved notes and turn memory on for the session from inside the modal. It is hidden only when no memory store is configured, or when `--no-memory` / `GROK_MEMORY=0` turned memory off for the whole process. `/remember` is always available.
 
 ### `/memory`
 
-Browse, view, and manage saved memories. Pass `on` or `off` to enable or disable memory. Alias: `/mem`.
+Browse, view, and manage saved memories. Alias: `/mem`. Inside the modal, `t`
+turns memory on or off for the session, `x` deletes the selected note, and `s`
+shows content-free queue, lease, retention, and pinned-rollout diagnostics.
+The `t` toggle is session-scoped: it does not edit `config.toml`, and new
+sessions follow the config again. It cannot override `--no-memory` or
+`GROK_MEMORY=0`.
 
 ```
 /memory
-/memory off
 ```
 
 ### `/flush`
 
-Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context.
+Save the current session's knowledge to memory right now, triggering an LLM summary of the most important content. Reach for it before compaction, or any time you want to lock in context. The status line shows "Flushing memory…" while it runs, and a scrollback line reports the outcome (for example "Memory flushed through turn 12").
 
 ### `/dream`
 
-Run memory consolidation — merge session logs into organized topics.
+Run memory consolidation — merge session logs into organized topics. The status line shows "Consolidating memory…" while it runs, and a scrollback line reports what happened: how many observations were merged into how many topics, that there was nothing to consolidate, or that another session is already consolidating.
 
 ### `/remember`
 
@@ -406,6 +411,8 @@ Report an issue or send feedback. A message sends immediately. With none, a pane
 ### `/btw`
 
 Send an aside to the agent without interrupting the current task. In minimal mode (`--minimal`), the answer shows up in a dismissible panel above the prompt: `Esc` dismisses it, a finished answer is saved into native scrollback, and a late reply to an already-dismissed panel is dropped. The side question and its answer aren't part of the main turn.
+
+`/btw` can also appear mid-message: the whole message (minus the token) becomes the side question and nothing goes to the main turn. Only `/btw` works this way; other commands must start the message. For a multi-line side question, use `Alt+Enter` (over SSH) or `Shift+Enter`, a trailing `\`, or `/ml`. Do not rely on `Cmd+Enter`: Apple Terminal inserts a newline locally via CoreGraphics; a delivered `SUPER+Enter` (Kitty) also inserts a newline rather than sending; over SSH Cmd never arrives and the chord sends.
 
 ```
 /btw also check the error handling

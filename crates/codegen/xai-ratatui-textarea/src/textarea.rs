@@ -2755,27 +2755,47 @@ impl TextArea {
         &self.elements
     }
 
-    /// Re-register elements after a [`set_text`] call that placed their
-    /// buffer text back verbatim. Each `(range, kind, display)` tuple
-    /// describes one element whose text already occupies `range` in the
-    /// buffer. No text is inserted — this only recreates the element
-    /// metadata so the textarea renders chips instead of raw text.
+    /// Re-register elements after a [`set_text`] call that placed their buffer text back verbatim. No text is inserted — this
+    /// only recreates the element metadata so the textarea renders chips instead of raw text. Invalid ranges are skipped
+    /// because restored ranges can outlive the buffer.
     pub fn restore_elements(
         &mut self,
         elems: impl IntoIterator<Item = (Range<usize>, ElementKind, Option<Line<'static>>)>,
     ) {
         for (range, kind, display) in elems {
+            if self.get_range(range.clone()).is_none() {
+                continue;
+            }
             self.add_element(range, kind, display);
         }
         self.wrap_cache.replace(None);
     }
 
-    /// Inline an element: remove it from the element list so its buffer text
-    /// becomes plain editable characters. The text content is unchanged.
-    ///
-    /// The cursor is placed at the end of the inlined region.
-    /// This operation is a single undoable step.
-    ///
+    /// Register one element over existing buffer text without editing. `None` when `range` is not a valid slice or
+    /// strictly intersects an existing element (adjacent ranges are accepted). Not undoable, like [`Self::restore_elements`].
+    pub fn get_range(&self, range: Range<usize>) -> Option<&str> {
+        self.text().get(range)
+    }
+
+    pub fn restore_element(
+        &mut self,
+        range: Range<usize>,
+        kind: ElementKind,
+        display: Option<Line<'static>>,
+    ) -> Option<ElementId> {
+        self.get_range(range.clone())?;
+        let intersects = self
+            .elements
+            .iter()
+            .any(|e| e.range.start < range.end && range.start < e.range.end);
+        if intersects {
+            return None;
+        }
+        Some(self.add_element(range, kind, display))
+    }
+
+    /// Inline an element: remove it from the element list so its buffer text becomes plain editable characters. The text
+    /// content is unchanged. The cursor is placed at the end of the inlined region. This operation is a single undoable step.
     /// Returns `true` if the element was found and inlined, `false` otherwise.
     pub fn inline_element(&mut self, id: ElementId) -> bool {
         let Some(idx) = self.elements.iter().position(|e| e.id == id) else {

@@ -452,10 +452,7 @@ pub struct EditBlockConfig {
     /// follows the shell-owned `collapsed_edit_blocks` flag; an explicit
     /// pager.toml value pins the shape regardless of the flag.
     pub line_summary: Option<bool>,
-    /// When true, Edit blocks start in Expanded mode showing the diff; when
-    /// false, they start Collapsed (one-line summary). `None` (default)
-    /// follows the shell-owned `collapsed_edit_blocks` flag; an explicit
-    /// pager.toml value pins the shape regardless of the flag.
+    /// Whether Edit blocks start expanded. Fold shape is [`Self::effective_expanded`].
     pub expanded_by_default: Option<bool>,
     /// Separator between diff hunks.
     /// Options: "…" (ellipsis, default), "───" (line), "⋯" (midline), "" (none).
@@ -484,18 +481,14 @@ impl Default for EditBlockConfig {
 }
 
 impl EditBlockConfig {
-    /// Effective "Edit blocks start expanded" default. The single policy
-    /// point pairing the two owners: an explicit pager.toml value wins;
-    /// unset defers to the shell-owned `collapsed_edit_blocks` flag
-    /// (flag on = collapsed one-liner, off = legacy expanded diff).
+    /// A true flag collapses even when `expanded_by_default` is `Some(true)`.
+    /// Flag off returns `expanded_by_default.unwrap_or(true)`, so an explicit false still collapses.
     pub fn effective_expanded(&self, collapsed_edit_blocks: bool) -> bool {
-        self.expanded_by_default.unwrap_or(!collapsed_edit_blocks)
+        !collapsed_edit_blocks && self.expanded_by_default.unwrap_or(true)
     }
 
-    /// Effective collapsed-header `+N/-M` diffstat toggle. Same pairing as
-    /// [`Self::effective_expanded`]: explicit value wins; unset shows the
-    /// diffstat exactly when the flag collapses Edits (the one-liner view
-    /// is what the summary exists for).
+    /// Effective collapsed-header `+N/-M` diffstat toggle. An explicit `line_summary` wins; unset follows the flag.
+    /// Unset shows the diffstat exactly when the flag collapses Edits (the one-liner view is what the summary exists for).
     pub fn effective_line_summary(&self, collapsed_edit_blocks: bool) -> bool {
         self.line_summary.unwrap_or(collapsed_edit_blocks)
     }
@@ -1155,10 +1148,8 @@ pub struct RawEditBlockConfig {
     /// Commented out (unset), it follows the `[ui] collapsed_edit_blocks`
     /// flag in config.toml; uncomment to pin either way.
     pub line_summary: Option<bool>,
-    /// Start Edit blocks expanded (showing the diff) instead of as a
-    /// collapsed one-line summary. Commented out (unset), it follows the
-    /// `[ui] collapsed_edit_blocks` flag in config.toml (flag on =
-    /// collapsed); uncomment to pin either way.
+    /// Unset follows `[ui] collapsed_edit_blocks`. A true flag collapses even when this is true.
+    /// An explicit false still collapses when the flag is off.
     pub expanded_by_default: Option<bool>,
     /// Separator between diff hunks. Options: "…" (default), "───", "⋯", "" (none).
     pub hunk_separator: Option<String>,
@@ -1962,40 +1953,20 @@ pub fn persist_respect_manual_folds(enabled: bool) -> std::io::Result<()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     let path = crate::util::pager_toml_path();
-    let content = match std::fs::read_to_string(&path) {
+    // Bind read + publish to one follow destination (path + inode).
+    let dest = xai_grok_config::fs_atomic::bind_follow_destination(&path)?;
+    let content = match std::fs::read_to_string(dest.as_path()) {
         Ok(c) => c,
         Err(e) if e.kind() == ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e),
     };
+    let dest = xai_grok_config::fs_atomic::require_same_bound_destination(&path, &dest)?;
     let updated = upsert_respect_manual_folds(&content, enabled)
         .map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
-    if let Some(dir) = path.parent() {
+    if let Some(dir) = dest.as_path().parent() {
         std::fs::create_dir_all(dir)?;
     }
-
-    #[cfg(unix)]
-    let prior_mode: Option<u32> = std::fs::metadata(&path).ok().map(|m| {
-        use std::os::unix::fs::PermissionsExt;
-        m.permissions().mode()
-    });
-
-    let suffix = {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("toml.tmp.{}.{}", std::process::id(), nanos)
-    };
-    let tmp = path.with_extension(suffix);
-    std::fs::write(&tmp, updated)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Some(mode) = prior_mode {
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode));
-        }
-    }
-    std::fs::rename(&tmp, &path)
+    xai_grok_config::fs_atomic::write_atomically_bound(&dest, &updated, None)
 }
 
 fn upsert_respect_manual_folds(content: &str, enabled: bool) -> Result<String, String> {
@@ -2372,19 +2343,17 @@ gutter_bg = true
         }
     }
 
-    /// The single policy point pairing the pager.toml shape keys with the
-    /// shell-owned `collapsed_edit_blocks` flag: unset keys follow the flag
-    /// (on = collapsed one-liner with diffstat, off = legacy expanded diff
-    /// without it); explicit values pin the shape in both directions.
+    /// A true `collapsed_edit_blocks` flag collapses edits even when `expanded_by_default` is `Some(true)`.
+    /// Flag off: `None` and `Some(true)` expand, `Some(false)` collapses. `line_summary` still pins on its own.
     #[test]
-    fn effective_edit_shape_follows_flag_unless_pinned() {
+    fn flag_on_forces_collapse_line_summary_still_pins() {
         let unset = EditBlockConfig::default();
-        assert!(unset.effective_expanded(false), "flag off: expanded");
+        assert!(unset.effective_expanded(false), "flag off + None: expanded");
         assert!(
             !unset.effective_line_summary(false),
             "flag off: no diffstat"
         );
-        assert!(!unset.effective_expanded(true), "flag on: collapsed");
+        assert!(!unset.effective_expanded(true), "flag on + None: collapsed");
         assert!(unset.effective_line_summary(true), "flag on: diffstat");
 
         let pinned = EditBlockConfig {
@@ -2393,8 +2362,12 @@ gutter_bg = true
             ..EditBlockConfig::default()
         };
         assert!(
-            pinned.effective_expanded(true),
-            "explicit expanded beats the flag"
+            !pinned.effective_expanded(true),
+            "flag on collapses even when expanded_by_default is Some(true)"
+        );
+        assert!(
+            pinned.effective_expanded(false),
+            "flag off + Some(true): expanded"
         );
         assert!(
             pinned.effective_line_summary(false),
@@ -2406,8 +2379,12 @@ gutter_bg = true
             ..EditBlockConfig::default()
         };
         assert!(
+            !pinned.effective_expanded(true),
+            "flag on + Some(false): collapsed"
+        );
+        assert!(
             !pinned.effective_expanded(false),
-            "explicit collapse beats the flag"
+            "flag off + Some(false): collapsed"
         );
         assert!(
             !pinned.effective_line_summary(true),

@@ -2,6 +2,13 @@
     use super::*;
     use crate::input::key::key;
 
+    fn at<'a, T>(xs: &'a [T], i: usize) -> &'a T {
+        match xs.get(i) {
+            Some(v) => v,
+            None => panic!("index {i} out of {}", xs.len()),
+        }
+    }
+
     #[test]
     fn feedback_image_owner_cleans_unconsumed_temp_files() {
         let directory = tempfile::tempdir().unwrap();
@@ -753,8 +760,6 @@
         assert!(!pw.can_send()); // trailing backslash
     }
 
-    // ── Paste element tests ──────────────────────────────────────────
-
     #[test]
     fn paste_single_line_inline() {
         let mut pw = PromptWidget::new();
@@ -980,8 +985,6 @@
         pw.textarea.set_cursor(end);
         assert_eq!(pw.paste_element_for_preview(), None);
     }
-
-    // ── Image preview activation (paste-chip parity) ─────────────────
 
     #[test]
     fn image_for_preview_shows_right_after_insert() {
@@ -1337,7 +1340,7 @@
 
     #[test]
     fn repaste_with_bare_cr_expands_chip() {
-        // normalize_cr is an identity on \r\n; bare \r is its non-identity
+        // normalize_line_breaks is an identity on \r\n; bare \r is its non-identity
         // case — the chip stores the \n form, so the repaste comparison
         // must normalize the incoming bytes before comparing.
         let mut pw = PromptWidget::new();
@@ -1429,22 +1432,6 @@
         assert_eq!(&raw[mapped..mapped + 2], "/x");
     }
 
-    // -- PromptStyle prefix_override tests --
-
-    #[test]
-    fn prompt_style_default_has_no_prefix_override() {
-        let style = PromptStyle::default();
-        assert!(style.prefix_override.is_none());
-    }
-
-    #[test]
-    fn prompt_style_overlay_has_no_prefix_override() {
-        let style = PromptStyle::overlay();
-        assert!(style.prefix_override.is_none());
-    }
-
-    // ── Voice interim wrapping ───────────────────────────────────────
-
     #[test]
     fn wrap_voice_interim_wraps_on_word_boundaries() {
         let lines = wrap_voice_interim("the quick brown fox", 10, 5);
@@ -1466,8 +1453,6 @@
         assert!(wrap_voice_interim("hello", 0, 3).is_empty());
         assert!(wrap_voice_interim("hello", 10, 0).is_empty());
     }
-
-    // ── Slash state integration tests ───────────────────────────────
 
     #[test]
     fn refresh_slash_produces_snapshot_for_slash_input() {
@@ -1566,8 +1551,6 @@
             "/loop should be visible once scheduler_create is advertised",
         );
     }
-
-    // ── Slash completion acceptance tests ──────────────────────────
 
     #[test]
     fn accept_completion_inserts_alias_for_alias() {
@@ -1784,8 +1767,6 @@
         );
     }
 
-    // ── Regression tests ────────────────────────────────────────────
-
     #[test]
     fn sync_acp_then_refresh_ordering() {
         // Regression: sync_acp_commands must update registry BEFORE
@@ -1820,8 +1801,8 @@
         let models = crate::acp::model_state::ModelState::default();
 
         let acp_cmds = vec![agent_client_protocol::AvailableCommand::new(
-            "flush".to_string(),
-            "Flush memory".to_string(),
+            "goal".to_string(),
+            "Run a goal".to_string(),
         )];
 
         // Sync three times.
@@ -1829,14 +1810,13 @@
         pw.sync_acp_commands(&acp_cmds, None, &models);
         pw.sync_acp_commands(&acp_cmds, None, &models);
 
-        // Should have exactly all pager-local builtins + 1 ACP ("flush").
-        // We compute the expected count from `builtin_commands()` so the
-        // assertion stays accurate as the builtin set grows.
+        // Should have exactly all pager-local builtins + 1 ACP ("goal").
+        // The expected count comes from `builtin_commands()` so the assertion stays accurate as the builtin set grows
         let expected = crate::slash::commands::builtin_commands().len() + 1;
         let registry = &pw.slash_controller.registry();
         assert_eq!(registry.command_count(), expected);
         assert!(registry.get("quit").is_some());
-        assert!(registry.get("flush").is_some());
+        assert!(registry.get("goal").is_some());
     }
 
     #[test]
@@ -1850,8 +1830,6 @@
         assert!(!snap.active);
         assert!(!snap.open);
     }
-
-    // ── CR normalization tests ────────────────────────────────────
 
     #[test]
     fn paste_bare_cr_becomes_lf() {
@@ -1889,8 +1867,6 @@
         pw.handle_paste("no carriage returns\nhere");
         assert_eq!(pw.textarea.text(), "no carriage returns\nhere");
     }
-
-    // ── Paste chip threshold boundary tests ───────────────────────
 
     #[test]
     fn paste_3_lines_inline_normal_mode() {
@@ -1938,36 +1914,42 @@
         assert!(pw.textarea.elements().is_empty());
     }
 
-    // ── normalize_cr tests ─────────────────────────────────────────
+    // ── normalize_line_breaks tests ─────────────────────────────────────────
 
     #[test]
-    fn normalize_cr_bare_cr() {
-        assert_eq!(normalize_cr("a\rb\rc"), "a\nb\nc");
+    fn normalize_line_breaks_bare_cr() {
+        assert_eq!(normalize_line_breaks("a\rb\rc"), "a\nb\nc");
     }
 
     #[test]
-    fn normalize_cr_crlf_preserved() {
-        assert_eq!(normalize_cr("a\r\nb\r\nc"), "a\r\nb\r\nc");
+    fn normalize_line_breaks_crlf_preserved() {
+        assert_eq!(normalize_line_breaks("a\r\nb\r\nc"), "a\r\nb\r\nc");
     }
 
     #[test]
-    fn normalize_cr_mixed() {
-        assert_eq!(normalize_cr("a\r\nb\rc"), "a\r\nb\nc");
+    fn normalize_line_breaks_mixed() {
+        assert_eq!(normalize_line_breaks("a\r\nb\rc"), "a\r\nb\nc");
     }
 
     #[test]
-    fn normalize_cr_no_cr() {
-        assert_eq!(normalize_cr("no cr\nhere"), "no cr\nhere");
+    fn normalize_line_breaks_no_cr() {
+        assert_eq!(normalize_line_breaks("no cr\nhere"), "no cr\nhere");
     }
 
-    // ── Inline paste (handle_paste without element) ──────────────
+    #[test]
+    fn normalize_line_breaks_unicode_separators() {
+        assert_eq!(normalize_line_breaks("a\u{2028}b\u{2029}c"), "a\nb\nc");
+        assert_eq!(normalize_line_breaks("a\r\nb\u{2029}c"), "a\r\nb\nc");
+        assert_eq!(normalize_line_breaks("a\r\u{2029}b"), "a\n\nb");
+        assert_eq!(normalize_line_breaks("a\u{2028}\r\nb"), "a\n\r\nb");
+    }
 
     #[test]
     fn inline_paste_multiline_no_element() {
         let mut pw = PromptWidget::new();
         let text = "line1\nline2\nline3";
         // Simulate Ctrl+Shift+V: insert_str directly, no element.
-        let normalized = normalize_cr(text);
+        let normalized = normalize_line_breaks(text);
         pw.textarea.insert_str(&normalized);
         assert_eq!(pw.textarea.text(), text);
         assert!(pw.textarea.elements().is_empty());
@@ -1990,8 +1972,6 @@
         assert!(!snap.active, "cleared text should deactivate slash");
         assert!(!snap.open, "cleared text should close dropdown");
     }
-
-    // ── Image chip tests ──────────────────────────────────────────
 
     /// Helper: create a minimal `PastedImage` for testing.
     fn test_image() -> PastedImage {
@@ -2151,10 +2131,9 @@
         pw.textarea.set_cursor(len);
         pw.insert_image(test_image()).unwrap();
 
-        // Delete the first element via textarea (simulates backspace)
-        pw.textarea.set_cursor(0);
-        let first_id = pw.textarea.elements()[0].id;
-        pw.textarea.inline_element(first_id);
+        // Delete the first chip's text via textarea (simulates backspace)
+        let first_range = at(pw.textarea.elements(), 0).range.clone();
+        pw.textarea.replace_range(first_range, "");
         // Now there's one image element left, but images vec still has 2
 
         let drained = pw.drain_images();
@@ -2162,6 +2141,437 @@
         assert_eq!(drained.len(), 1);
         assert_eq!(drained[0].display_number, 2);
         assert!(pw.images.is_empty());
+    }
+
+    /// Inlining a chip leaves its `[Image #N]` text behind; the drain re-chips that text to the record
+    /// that still names it instead of discarding the record.
+    #[test]
+    fn inlined_image_placeholder_is_rechipped_and_drained() {
+        let mut pw = PromptWidget::new();
+        pw.insert_image(test_image()).unwrap();
+        let len = pw.textarea.text().len();
+        pw.textarea.set_cursor(len);
+        pw.insert_image(test_image()).unwrap();
+
+        let first_id = at(pw.textarea.elements(), 0).id;
+        pw.textarea.inline_element(first_id);
+        assert_eq!(pw.textarea.elements().len(), 1);
+
+        pw.rebind_image_placeholders();
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|e| e.kind == KIND_IMAGE)
+                .count(),
+            2,
+            "the inlined placeholder must be a chip again"
+        );
+        assert!(pw.unbound_image_placeholders().is_empty());
+
+        let drained = pw.drain_images();
+        assert_eq!(
+            drained.iter().map(|img| img.display_number).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    /// Ctrl+K kills the chip into the kill buffer as plain text; Ctrl+Y yanks it back as text.
+    /// The yanked placeholder re-binds to the retained record, so the send still carries the image.
+    #[test]
+    fn kill_yank_rebinds_image_chip() {
+        let mut pw = PromptWidget::new();
+        pw.insert_image(test_image()).unwrap();
+        pw.textarea.insert_str("what is this");
+        let identity = at(&pw.images, 0).preview.identity();
+
+        pw.handle_key(&key!(Home).to_key_event());
+        pw.handle_key(&key!('k', CONTROL).to_key_event());
+        assert!(pw.textarea.elements().is_empty(), "kill removes the chip");
+        assert!(pw.images.is_empty(), "killed chip parks its record in the undo stash");
+        assert_eq!(pw.image_undo_stash.len(), 1);
+
+        pw.handle_key(&key!('y', CONTROL).to_key_event());
+        assert_eq!(pw.textarea.text(), "[Image #1] what is this");
+        let chips: Vec<_> = pw
+            .textarea
+            .elements()
+            .iter()
+            .filter(|e| e.kind == KIND_IMAGE)
+            .collect();
+        assert_eq!(chips.len(), 1, "yanked placeholder must render as a chip again");
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(at(&pw.images, 0).element_id, at(&chips, 0).id);
+        assert_eq!(at(&pw.images, 0).preview.identity(), identity);
+        assert!(pw.image_undo_stash.is_empty());
+
+        let drained = pw.drain_images();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(at(&drained, 0).display_number, 1);
+    }
+
+    /// A typed placeholder syncs against the undo stash: the record moves back to `images`.
+    #[test]
+    fn sync_with_placeholder_pulls_record_from_undo_stash() {
+        let mut pw = PromptWidget::new();
+        let mut stashed = test_image();
+        stashed.display_number = 1;
+        pw.push_image_undo_stash_for_test(stashed);
+        pw.textarea.insert_str("look at [Image #1] please");
+
+        pw.sync_images_with_textarea();
+
+        assert!(pw.image_undo_stash.is_empty(), "stash record must bind");
+        assert_eq!(pw.images.len(), 1);
+        let chip = pw
+            .textarea
+            .elements()
+            .iter()
+            .find(|e| e.kind == KIND_IMAGE)
+            .unwrap_or_else(|| panic!("expected a re-chipped image element"));
+        assert_eq!(chip.range, 8..18);
+        assert_eq!(at(&pw.images, 0).element_id, chip.id);
+        assert_eq!(pw.image_counter, 1);
+        assert_eq!(pw.textarea.text(), "look at [Image #1] please");
+    }
+
+    /// `set_images` after `set_text` with a stale chip range (no element restored) binds by text.
+    #[test]
+    fn set_images_rechips_when_stored_range_is_stale() {
+        use crate::app::agent::ChipElement;
+
+        let mut pw = PromptWidget::new();
+        pw.set_text("see [Image #1] now");
+        // Range from an older draft that no longer slices the buffer: `restore_elements` skips it.
+        pw.restore_chip_elements(&[ChipElement {
+            range: 40..50,
+            kind: KIND_IMAGE,
+            display: None,
+        }]);
+        assert!(pw.textarea.elements().is_empty());
+
+        let mut img = test_image();
+        img.display_number = 1;
+        pw.set_images(vec![img]);
+
+        let chip = pw
+            .textarea
+            .elements()
+            .iter()
+            .find(|e| e.kind == KIND_IMAGE)
+            .unwrap_or_else(|| panic!("set_images must re-chip the placeholder"));
+        assert_eq!(chip.range, 4..14);
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(at(&pw.images, 0).element_id, chip.id);
+        assert!(pw.has_live_image());
+    }
+
+    /// `stash()` re-binds before snapshotting, so `chip_elements` and `images` agree for the queue row.
+    #[test]
+    fn stash_rebinds_before_snapshotting_chip_elements() {
+        let mut pw = PromptWidget::new();
+        let mut stashed = test_image();
+        stashed.display_number = 1;
+        pw.push_image_undo_stash_for_test(stashed);
+        // Plain paste path: no sync runs, so the placeholder is orphan text until the stash.
+        pw.textarea.insert_str("[Image #1] describe");
+
+        let stash = pw.stash();
+
+        assert_eq!(stash.images.len(), 1);
+        assert_eq!(at(&stash.images, 0).display_number, 1);
+        assert_eq!(stash.chip_elements.len(), 1);
+        assert_eq!(at(&stash.chip_elements, 0).range, 0..10);
+        assert_eq!(at(&stash.chip_elements, 0).kind, KIND_IMAGE);
+        assert_eq!(stash.text_without_image_chips(), " describe");
+        assert!(stash.image_undo_stash.is_empty());
+    }
+
+    /// A placeholder no record backs stays plain text and is reported as unbound, never chipped.
+    #[test]
+    fn placeholder_without_record_stays_plain_and_is_unbound() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("recall [Image #1] and [Image #3]");
+
+        pw.sync_images_with_textarea();
+
+        assert!(pw.textarea.elements().is_empty());
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.unbound_image_placeholders(), vec![1, 3]);
+        assert_eq!(pw.textarea.text(), "recall [Image #1] and [Image #3]");
+        assert!(pw.drain_images().is_empty());
+    }
+
+    /// Re-chip binds up to `IMAGE_CAP`; a placeholder past the cap stays plain and unbound.
+    #[test]
+    fn rechip_respects_image_cap() {
+        let mut pw = PromptWidget::new();
+        for _ in 0..PromptWidget::IMAGE_CAP {
+            pw.insert_image(test_image()).unwrap();
+        }
+        let extra_number = PromptWidget::IMAGE_CAP + 1;
+        let mut extra = test_image();
+        extra.display_number = extra_number;
+        pw.push_image_undo_stash_for_test(extra);
+        pw.textarea
+            .insert_str(&crate::prompt_images::display_text(extra_number));
+
+        pw.sync_images_with_textarea();
+
+        assert_eq!(pw.images.len(), PromptWidget::IMAGE_CAP);
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|e| e.kind == KIND_IMAGE)
+                .count(),
+            PromptWidget::IMAGE_CAP
+        );
+        assert_eq!(pw.image_undo_stash.len(), 1, "the record past the cap stays stashed");
+        assert_eq!(pw.unbound_image_placeholders(), vec![extra_number]);
+
+        // Kill the line, then undo: the ten chips come back before their records re-bind, so the
+        // extra placeholder must not grab the budget they still need.
+        pw.handle_key(&key!(Home).to_key_event());
+        pw.handle_key(&key!('k', CONTROL).to_key_event());
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.image_undo_stash.len(), PromptWidget::IMAGE_CAP + 1);
+        pw.handle_key(&key!('z', CONTROL).to_key_event());
+        assert_eq!(
+            pw.textarea
+                .elements()
+                .iter()
+                .filter(|e| e.kind == KIND_IMAGE)
+                .count(),
+            PromptWidget::IMAGE_CAP
+        );
+        assert_eq!(pw.images.len(), PromptWidget::IMAGE_CAP);
+        assert_eq!(pw.unbound_image_placeholders(), vec![extra_number]);
+
+        let drained = pw.drain_images();
+        assert_eq!(drained.len(), PromptWidget::IMAGE_CAP);
+        let mut numbers: Vec<usize> = drained.iter().map(|img| img.display_number).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, (1..=PromptWidget::IMAGE_CAP).collect::<Vec<_>>());
+    }
+
+    /// `[Image #N]` inside a paste chip is that chip's content: neither re-chipped nor reported.
+    #[test]
+    fn rechip_skips_placeholder_inside_paste_chip() {
+        let mut pw = PromptWidget::new();
+        let mut stashed = test_image();
+        stashed.display_number = 1;
+        pw.push_image_undo_stash_for_test(stashed);
+        pw.textarea.insert_element(
+            "line one\n[Image #1]\nline three\nline four",
+            KIND_PASTE,
+            None,
+        );
+
+        pw.sync_images_with_textarea();
+
+        assert_eq!(pw.textarea.elements().len(), 1);
+        assert_eq!(at(pw.textarea.elements(), 0).kind, KIND_PASTE);
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.image_undo_stash.len(), 1);
+        assert!(pw.unbound_image_placeholders().is_empty());
+    }
+
+    /// A restored range an element of the same kind already covers is skipped, never doubled.
+    #[test]
+    fn restore_chip_elements_skips_already_covered_range() {
+        use crate::app::agent::ChipElement;
+
+        let mut pw = PromptWidget::new();
+        pw.set_text("[Image #1] and more");
+        pw.restore_chip_elements(&[ChipElement {
+            range: 0..10,
+            kind: KIND_IMAGE,
+            display: None,
+        }]);
+        let first_id = at(pw.textarea.elements(), 0).id;
+
+        pw.restore_chip_elements(&[
+            ChipElement {
+                range: 0..10,
+                kind: KIND_IMAGE,
+                display: None,
+            },
+            ChipElement {
+                range: 11..14,
+                kind: KIND_FILE_REF,
+                display: None,
+            },
+        ]);
+
+        let elements: Vec<_> = pw
+            .textarea
+            .elements()
+            .iter()
+            .map(|e| (e.kind, e.range.clone()))
+            .collect();
+        assert_eq!(elements, vec![(KIND_IMAGE, 0..10), (KIND_FILE_REF, 11..14)]);
+        assert_eq!(at(pw.textarea.elements(), 0).id, first_id);
+    }
+
+    /// External restore sequence (`set_text` → `restore_chip_elements` → `set_images`) into a composer
+    /// whose undo stash holds a stale record with the same number: the restored record binds once,
+    /// no second element appears, and the stash record is not silently dropped.
+    #[test]
+    fn rewind_restore_with_stale_undo_stash_binds_stashed_image_once() {
+        use crate::app::agent::ChipElement;
+
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("stale.png");
+        std::fs::write(&staged, b"stale").unwrap();
+        let mut stale = test_image();
+        stale.staged_temp_path = Some(staged.clone());
+
+        let mut pw = PromptWidget::new();
+        pw.insert_image(stale).unwrap();
+        // Backspace twice: the separator, then the chip; the record parks in the undo stash.
+        pw.handle_key(&key!(Backspace).to_key_event());
+        pw.handle_key(&key!(Backspace).to_key_event());
+        assert!(pw.text().is_empty());
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.image_undo_stash.len(), 1);
+        let stale_identity = at(&pw.image_undo_stash, 0).preview.identity();
+
+        let mut restored = test_image();
+        restored.display_number = 1;
+        restored.encoded_bytes = Some(vec![7u8; 16].into());
+        let restored_identity = restored.preview.identity();
+        pw.set_text("look [Image #1] ");
+        pw.restore_chip_elements(&[ChipElement {
+            range: 5..15,
+            kind: KIND_IMAGE,
+            display: None,
+        }]);
+        pw.set_images(vec![restored]);
+
+        let chips: Vec<_> = pw
+            .textarea
+            .elements()
+            .iter()
+            .filter(|e| e.kind == KIND_IMAGE)
+            .collect();
+        assert_eq!(chips.len(), 1, "exactly one chip element over the placeholder");
+        assert_eq!(at(&chips, 0).range, 5..15);
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(at(&pw.images, 0).element_id, at(&chips, 0).id);
+        assert_eq!(at(&pw.images, 0).preview.identity(), restored_identity);
+        assert_eq!(pw.image_undo_stash.len(), 1, "the stale stash record survives");
+        assert_eq!(at(&pw.image_undo_stash, 0).preview.identity(), stale_identity);
+
+        // A duplicate placeholder names a number a live chip already carries: it stays plain and
+        // must not pull the stale stash record.
+        pw.append_text("[Image #1]");
+        pw.rebind_image_placeholders();
+        assert_eq!(image_chip_count(&pw), 1, "the duplicate placeholder stays plain text");
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(pw.image_undo_stash.len(), 1, "the stale stash record stays stashed");
+
+        // Kill the line and undo: the chip comes back before its record re-binds, and the duplicate
+        // still must not claim a record. The drain sends the restored image exactly once.
+        pw.handle_key(&key!(Home).to_key_event());
+        pw.handle_key(&key!('k', CONTROL).to_key_event());
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.image_undo_stash.len(), 2, "both records wait in the stash");
+        pw.handle_key(&key!('z', CONTROL).to_key_event());
+        assert_eq!(pw.textarea.text(), "look [Image #1] [Image #1]");
+        assert_eq!(image_chip_count(&pw), 1, "the duplicate placeholder stays plain text");
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(at(&pw.images, 0).preview.identity(), restored_identity);
+        // The same-number stale record is no redo target, but it still owns its staged file.
+        assert_eq!(pw.image_undo_stash.len(), 1, "the stale record survives the resync");
+        assert_eq!(at(&pw.image_undo_stash, 0).preview.identity(), stale_identity);
+        assert!(staged.exists(), "a stashed record's staged file must not leak or vanish");
+
+        let drained = pw.drain_images();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(at(&drained, 0).preview.identity(), restored_identity);
+        assert_eq!(pw.image_undo_stash.len(), 1);
+        assert!(staged.exists());
+    }
+
+    fn image_chip_count(pw: &PromptWidget) -> usize {
+        pw.textarea
+            .elements()
+            .iter()
+            .filter(|e| e.kind == KIND_IMAGE)
+            .count()
+    }
+
+    /// Ctrl+C releases the records; undo restores the chip element without one. That chip is
+    /// reported as unbound instead of silently sending as text.
+    #[test]
+    fn undo_after_clear_restores_recordless_chip_which_is_unbound() {
+        let mut pw = PromptWidget::new();
+        pw.insert_image(test_image()).unwrap();
+        pw.handle_key(&key!('c', CONTROL).to_key_event());
+        assert!(pw.text().is_empty());
+        assert!(pw.images.is_empty());
+        assert!(pw.image_undo_stash.is_empty());
+
+        pw.handle_key(&key!('z', CONTROL).to_key_event());
+
+        assert_eq!(pw.textarea.text(), "[Image #1] ");
+        assert_eq!(pw.textarea.elements().len(), 1);
+        assert!(pw.images.is_empty(), "no record can back the restored chip");
+        assert_eq!(pw.unbound_image_placeholders(), vec![1]);
+        assert!(pw.drain_images().is_empty());
+    }
+
+    /// A plain `[Image #1]` next to the bound chip `[Image #1]` is a duplicate of an image that is
+    /// on the wire once, so it is not reported as unbound; a number no record backs still is.
+    #[test]
+    fn duplicate_placeholder_of_attached_chip_is_not_reported_unbound() {
+        let mut pw = PromptWidget::new();
+        pw.insert_image(test_image()).unwrap();
+        pw.append_text("and [Image #1] again");
+        assert_eq!(pw.textarea.text(), "[Image #1] and [Image #1] again");
+        assert_eq!(image_chip_count(&pw), 1);
+
+        assert!(pw.unbound_image_placeholders().is_empty());
+
+        pw.rebind_image_placeholders();
+        assert_eq!(image_chip_count(&pw), 1, "the duplicate stays plain text");
+        assert_eq!(pw.images.len(), 1);
+        assert!(pw.unbound_image_placeholders().is_empty());
+
+        // A number with no record behind it is still reported, once per number.
+        pw.append_text(" [Image #2] [Image #2]");
+        assert_eq!(pw.unbound_image_placeholders(), vec![2]);
+    }
+
+    /// A recalled history line names another send's images. A `[Image #1]` in it must not pick up
+    /// the record the current draft (or its undo stash) still holds under that number.
+    #[test]
+    fn set_text_discarding_images_releases_draft_and_stash_records() {
+        let mut pw = PromptWidget::new();
+        pw.insert_image(test_image()).unwrap();
+        let mut stashed = test_image();
+        stashed.display_number = 2;
+        pw.push_image_undo_stash_for_test(stashed);
+        assert_eq!(pw.textarea.text(), "[Image #1] ");
+        assert_eq!(pw.images.len(), 1);
+        assert_eq!(pw.image_undo_stash_len(), 1);
+
+        pw.set_text_discarding_images("[Image #1] older prompt");
+
+        assert_eq!(pw.textarea.text(), "[Image #1] older prompt");
+        assert_eq!(image_chip_count(&pw), 0, "the recalled placeholder is plain text");
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.image_undo_stash_len(), 0);
+        assert_eq!(pw.image_counter, 0);
+        assert_eq!(pw.unbound_image_placeholders(), vec![1]);
+
+        // The send-time re-bind has no record left to pull; the placeholder stays unbound.
+        pw.rebind_image_placeholders();
+        assert_eq!(image_chip_count(&pw), 0);
+        assert!(pw.images.is_empty());
+        assert_eq!(pw.unbound_image_placeholders(), vec![1]);
+        assert!(pw.drain_images().is_empty());
     }
 
     #[test]
@@ -2206,12 +2616,9 @@
         assert_eq!(pw.image_counter, 2);
         assert_eq!(pw.images.len(), 2);
 
-        // Delete the higher-numbered chip (#2). After deletion live==[#1] but
-        // counter must remain 2 so the next insert lands at #3.
-        let second_id = pw.textarea.elements()[1].id;
-        let second_range_start = pw.textarea.elements()[1].range.start;
-        pw.textarea.set_cursor(second_range_start);
-        pw.textarea.inline_element(second_id);
+        // Delete the higher-numbered chip (#2). After deletion live==[#1] but the counter must remain 2 so the next insert lands at #3.
+        let second_range = at(pw.textarea.elements(), 1).range.clone();
+        pw.textarea.replace_range(second_range, "");
 
         // Force the reconciliation that `handle_key` runs after
         // every text edit.
@@ -2282,11 +2689,11 @@
         pw.insert_image(test_image()).unwrap(); // #2
 
         // Transient delete of `[Image #2]` mid-prompt.
-        let id2 = pw.textarea.elements()[1].id;
-        let r2_start = pw.textarea.elements()[1].range.start;
-        pw.textarea.set_cursor(r2_start);
-        pw.textarea.inline_element(id2);
+        let r2 = at(pw.textarea.elements(), 1).range.clone();
+        pw.textarea.replace_range(r2, "");
         pw.sync_images_with_textarea();
+        let len = pw.textarea.text().len();
+        pw.textarea.set_cursor(len);
 
         pw.insert_image(test_image()).unwrap(); // MUST be #3
 
@@ -2351,12 +2758,9 @@
 
     // ── set_images: identity-based pairing ───────────────────────────
 
-    /// Two restored chips with identical placeholder byte length must
-    /// get distinct `element_id`s after `set_images`. A naive
-    /// `find()`-by-byte-length match would collapse both chips onto
-    /// the same `element_id`, and the next
-    /// `sync_images_with_textarea` would drop one entry as a
-    /// "duplicate element_id" warn.
+    /// Two restored chips with identical placeholder byte length must get distinct `element_id`s after `set_images`.
+    /// A naive `find()`-by-byte-length match would collapse both chips onto the same `element_id`.
+    /// The next `sync_images_with_textarea` would then drop one entry as a "duplicate element_id" warn.
     #[test]
     fn set_images_with_two_same_length_chips_preserves_distinct_element_ids() {
         use crate::app::agent::ChipElement;
@@ -2668,8 +3072,6 @@
             post_eids,
         );
     }
-
-    // ── parse_image_display_number ───────────────────────────────────
 
     #[test]
     fn parse_image_display_number_bracketed_form() {
@@ -3254,10 +3656,9 @@
         pw.insert_image(test_image()).unwrap();
         assert_eq!(pw.images.len(), 2);
 
-        // Delete first element by inlining (simulates backspace removal path).
-        pw.textarea.set_cursor(0);
-        let first_id = pw.textarea.elements()[0].id;
-        pw.textarea.inline_element(first_id);
+        // Delete the first chip's text (simulates backspace removal path).
+        let first_range = at(pw.textarea.elements(), 0).range.clone();
+        pw.textarea.replace_range(first_range, "");
 
         // Drain and build content blocks.
         let images = pw.drain_images();
@@ -3373,8 +3774,6 @@
         assert_eq!(pw.textarea.text(), "[Image #2] ");
         assert_eq!(pw.images[0].display_number, 2);
     }
-
-    // ── File search Right Arrow (drill-down) ────────────────────────────
 
     /// Build a `FuzzyMatchResult` for use in test fixtures.
     fn fuzzy_result(path: &str, is_dir: bool) -> xai_grok_workspace::file_system::FuzzyMatchResult {
@@ -3794,8 +4193,7 @@
 
     // ── Ghost text tests ────────────────────────────────────────────
 
-    /// Chromeless prompt style for rendering tests (no borders, no prefix,
-    /// no vpad — textarea starts at area origin).
+    /// Chromeless prompt style for rendering tests (no borders, no prefix, no vpad; the textarea starts at the area origin).
     fn ghost_test_style() -> PromptStyle {
         PromptStyle {
             focused: true,
@@ -3924,6 +4322,7 @@
                 text: "suffix".into(),
                 token_range: 0..2,
                 full_name: "cmd".into(),
+                highlight: false,
             }),
             ..Default::default()
         });
@@ -4035,7 +4434,7 @@
 
     // --- paint_slash_token_highlight (wrap-aware token painting) ---
 
-    /// Sentinel highlight color — never produced by the textarea's own render.
+    /// Sentinel highlight color, never produced by the textarea's own render.
     const TOKEN_FG: ratatui::style::Color = ratatui::style::Color::Rgb(9, 99, 199);
 
     /// Render `text` into a buffer at `area`, then paint `range` with
@@ -4158,8 +4557,6 @@
         assert!(!pw.has_ghost_text());
     }
 
-    // -- Ghost acceptance through PromptWidget --------------------------------
-
     #[test]
     fn accept_ghost_full_appends_to_textarea() {
         let mut pw = PromptWidget::new();
@@ -4217,8 +4614,7 @@
 
     // -- completion accept / splice application ---------------------------------
 
-    /// Wire-shaped token item: whole-line `insert_text`, `token_text` span
-    /// replacement (what a range-emitting shell sends).
+    /// Wire-shaped token item: `insert_text` carries the whole line, `token_text` carries the span replacement a range-emitting shell sends.
     fn token_completion(
         line: &str,
         token: &str,
@@ -4312,9 +4708,8 @@
 
     // -- apply_completion_fill ---------------------------------------------
 
-    /// The widget-level fill writes the decided LCP over the typed token and
-    /// parks the cursor after it (the decision matrix lives in
-    /// `suggestion_controller`'s `tab_decision` tests).
+    /// The widget-level fill writes the decided LCP over the typed token and parks the cursor after it.
+    /// The decision matrix lives in `suggestion_controller`'s `tab_decision` tests.
     #[test]
     fn apply_completion_fill_writes_and_positions_cursor() {
         let mut pw = PromptWidget::new();
@@ -4357,8 +4752,7 @@
 
     // -- Predicted-next-prompt suggestion through PromptWidget ----------------
 
-    /// Widget with an active gate and a loaded suggestion — the state right
-    /// after a turn ends with `x.ai/suggestPrompt` resolved.
+    /// Widget with an active gate and a loaded suggestion: the state right after a turn ends with `x.ai/suggestPrompt` resolved.
     fn widget_with_prompt_suggestion(text: &str) -> PromptWidget {
         let mut pw = PromptWidget::new();
         pw.prompt_suggestion_active = true;
@@ -4456,6 +4850,7 @@
                 text: "del".into(),
                 token_range: 6..9,
                 full_name: "model".into(),
+                highlight: false,
             }),
             ..Default::default()
         });
@@ -4522,8 +4917,7 @@
 
     // ── Inline title on the top border ──────────────────────────────
 
-    /// Bordered chrome style (the agent-view prompt shape) with an optional
-    /// session title.
+    /// Bordered chrome style (the agent-view prompt shape) with an optional session title.
     fn title_test_style(title: Option<&str>) -> PromptStyle {
         PromptStyle {
             title: title.map(str::to_string),
@@ -4544,12 +4938,11 @@
     fn title_renders_on_top_border_with_corners_intact() {
         let buf = draw_bordered(40, &title_test_style(Some("my session")));
 
-        // ` my session ` is 12 cols, right-aligned ending 2 cells before ╮:
-        // label at x 25..=36, dashes at 37..=38, corner at 39.
-        assert_eq!(buf_text_at(&buf, 25, 37, 0), " my session ");
+        // ` my session ` is 12 cols: label at x 27..=38, corner at 39.
+        assert_eq!(buf_text_at(&buf, 27, 39, 0), " my session ");
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{256d}");
         assert_eq!(buf.cell((39, 0)).unwrap().symbol(), "\u{256e}");
-        assert_eq!(buf_text_at(&buf, 37, 39, 0), "\u{2500}\u{2500}");
+        assert_eq!(buf_text_at(&buf, 25, 27, 0), "\u{2500}\u{2500}");
 
         // Info-line treatment: dimmed secondary text on the prompt bg (same
         // blend as `render_info_line`'s model name), no bold, no inverse.
@@ -4557,7 +4950,7 @@
         let expected_fg =
             crate::render::color::blend_color(theme.bg_base, theme.text_secondary, 0.6)
                 .unwrap_or(theme.gray);
-        let title_cell = buf.cell((26, 0)).unwrap().style();
+        let title_cell = buf.cell((28, 0)).unwrap().style();
         assert_eq!(title_cell.fg, Some(expected_fg));
         assert_eq!(title_cell.bg, Some(theme.bg_base));
         assert!(!title_cell.add_modifier.contains(Modifier::BOLD));
@@ -4586,13 +4979,12 @@
         let long = "a".repeat(60);
         let buf = draw_bordered(40, &title_test_style(Some(&long)));
 
-        // max_w = 40 - 6 = 34: label spans x 3..=36 with a trailing ellipsis.
+        // max_w = 39 - 3 = 36: label spans x 3..=38 with a trailing ellipsis.
         let row = buf_text_at(&buf, 0, 40, 0);
         assert!(row.contains('\u{2026}'), "expected ellipsis in: {row}");
         assert_eq!(buf.cell((0, 0)).unwrap().symbol(), "\u{256d}");
         assert_eq!(buf.cell((39, 0)).unwrap().symbol(), "\u{256e}");
         assert_eq!(buf_text_at(&buf, 1, 3, 0), "\u{2500}\u{2500}");
-        assert_eq!(buf_text_at(&buf, 37, 39, 0), "\u{2500}\u{2500}");
     }
 
     #[test]
@@ -4602,11 +4994,32 @@
         assert_eq!(buf_text_at(&buf, 1, 39, 0), "\u{2500}".repeat(38));
 
         // Too narrow for the min label width (max_w < 6): plain border, no panic.
-        let buf = draw_bordered(11, &title_test_style(Some("my session")));
-        assert_eq!(buf_text_at(&buf, 1, 10, 0), "\u{2500}".repeat(9));
+        let buf = draw_bordered(8, &title_test_style(Some("my session")));
+        assert_eq!(buf_text_at(&buf, 1, 7, 0), "\u{2500}".repeat(6));
     }
 
-    // ── PromptBg::Panel chip remap (inline surfaces) ────────────────
+    #[test]
+    fn title_ends_on_same_column_as_info_line() {
+        // The agent view's 2-cell right pad: both captions end at x 37, one `─` before their corner.
+        let style = PromptStyle {
+            title: Some("my session".to_string()),
+            chrome_pad_right: 2,
+            ..Default::default()
+        };
+        let info = PromptInfo {
+            model_name: "grok-3",
+            ..Default::default()
+        };
+        let mut pw = PromptWidget::new();
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        pw.draw(&mut buf, area, None, &style, Some(&info), None);
+
+        assert_eq!(buf_text_at(&buf, 26, 38, 0), " my session ");
+        assert_eq!(buf_text_at(&buf, 30, 38, 3), " grok-3 ");
+        assert_eq!(buf_text_at(&buf, 38, 40, 0), "\u{2500}\u{256e}");
+        assert_eq!(buf_text_at(&buf, 38, 40, 3), "\u{2500}\u{256f}");
+    }
 
     fn any_cell_with_bg(buf: &Buffer, bg: ratatui::style::Color) -> bool {
         let area = *buf.area();
@@ -4654,4 +5067,107 @@
             any_cell_with_bg(&buf, theme.paste_bg),
             "without the remap the chip keeps its own background"
         );
+    }
+
+    /// The shift-selection chords must reach the textarea through the widget.
+    #[test]
+    fn shift_movement_chords_extend_selection_through_widget() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_cursor(0);
+
+        pw.handle_key(&KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(pw.textarea.selection_range(), Some(0..5), "word extend");
+
+        pw.handle_key(&KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(
+            pw.textarea.selection_range(),
+            Some(0..10),
+            "line-end extend keeps the anchor"
+        );
+
+        pw.handle_key(&KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert_eq!(pw.textarea.selection_range(), Some(0..9), "grapheme shrink");
+    }
+
+    /// A selection-only change must report Edited or the highlight goes stale on screen.
+    #[test]
+    fn selection_only_change_reports_edited() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_cursor(0);
+        pw.handle_key(&KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ));
+        assert_eq!(pw.textarea.selection_range(), Some(0..5));
+
+        // Cursor (head) is at 5; plain Right collapses to 5: same text, same cursor, selection cleared
+        let event = pw.handle_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(event, PromptEvent::Edited);
+        assert_eq!(pw.textarea.selection_range(), None);
+        assert_eq!(pw.textarea.cursor(), 5);
+    }
+
+    /// Esc drops the highlight but is never consumed; the same press still cancels.
+    #[test]
+    fn esc_with_selection_clears_highlight_and_declines() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_selection(0, 5);
+        let event = pw.handle_key(&key!(Esc).to_key_event());
+        assert_eq!(event, PromptEvent::Ignored);
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    /// Modified Esc has no structural consumer: the widget consumes it via the textarea catch-all so the cleared highlight repaints (Edited).
+    #[test]
+    fn modified_esc_with_selection_clears_and_repaints() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_selection(0, 5);
+        let event = pw.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT));
+        assert_eq!(event, PromptEvent::Edited);
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    /// Same contract for Tab: highlight drops and focus switches on one press.
+    #[test]
+    fn tab_with_selection_clears_highlight_and_declines() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_selection(0, 5);
+        let event = pw.handle_key(&key!(Tab).to_key_event());
+        assert_eq!(event, PromptEvent::Ignored);
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    /// Shift/Alt+Enter replaces the selection like typing does.
+    #[test]
+    fn mod_enter_replaces_selection_with_newline() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("alpha beta");
+        pw.textarea.set_selection(0, 5);
+        pw.textarea.set_cursor(5);
+        let event = pw.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(event, PromptEvent::Edited);
+        assert_eq!(pw.textarea.text(), "\n beta");
+        assert_eq!(pw.textarea.selection_range(), None);
+    }
+
+    /// Delivered SUPER+Enter misses is_mod_enter and bare-Enter send; the widget
+    /// inserts a newline instead of depending on textarea's any-Enter fallthrough.
+    #[test]
+    fn delivered_super_enter_inserts_newline() {
+        let mut pw = PromptWidget::new();
+        pw.textarea.insert_str("hello");
+        let event = pw.handle_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        assert_eq!(event, PromptEvent::Edited);
+        assert_eq!(pw.textarea.text(), "hello\n");
     }

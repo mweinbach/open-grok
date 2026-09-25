@@ -111,11 +111,24 @@ mod links {
         /// Total lines passed to `append_lines` (used by the
         /// `set_viewport_height` grow-path test).
         appended_lines: u16,
+        cursor_y: u16,
+        cursor_sets: u16,
+        /// `\r\n` or xenl consume (` \r`) on the last screen row — extra-scroll.
+        extra_scrolls: u16,
     }
 
     impl Write for RecordingBackend {
         fn write(&mut self, b: &[u8]) -> io::Result<usize> {
             self.buf.extend_from_slice(b);
+            // Xenl consume (` \r`) wraps like `\r\n`: off the last screen line it extra-scrolls.
+            let wraps = b == b" \r" || b.windows(2).any(|w| w == b"\r\n");
+            if wraps {
+                if self.cursor_y >= 23 {
+                    self.extra_scrolls = self.extra_scrolls.saturating_add(1);
+                } else {
+                    self.cursor_y = self.cursor_y.saturating_add(1);
+                }
+            }
             Ok(b.len())
         }
         fn flush(&mut self) -> io::Result<()> {
@@ -142,8 +155,16 @@ mod links {
         fn get_cursor_position(&mut self) -> io::Result<Position> {
             Ok(Position::ORIGIN)
         }
-        fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
-            Ok(())
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            let position = position.into();
+            self.cursor_y = position.y;
+            self.cursor_sets = self.cursor_sets.saturating_add(1);
+            write!(
+                self.buf,
+                "\x1b[{};{}H",
+                position.y.saturating_add(1),
+                position.x.saturating_add(1)
+            )
         }
         fn clear(&mut self) -> io::Result<()> {
             Ok(())
@@ -295,6 +316,358 @@ mod links {
         // The viewport top moved up so the whole 10-row region fits on screen.
         let area = t.viewport_area();
         assert_eq!(area.height, 10, "height should be the requested 10");
+        assert!(
+            area.y + area.height <= 24,
+            "viewport must fit on screen, got y={} h={}",
+            area.y,
+            area.height
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_last_full_width_disables_autowrap() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[("abcd".into(), true, false), ("efgh".into(), true, false)])
+            .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        assert!(
+            out.contains("\x1b[?7l"),
+            "last insert row must disable autowrap: {out:?}"
+        );
+        assert!(out.contains("efgh"), "{out:?}");
+        assert_eq!(
+            t.backend().extra_scrolls,
+            0,
+            "last-row hard break must not scroll"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_full_width_before_blank_disables_autowrap() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[
+            ("abcd".into(), true, false),
+            (String::new(), false, false),
+            ("x".into(), false, false),
+        ])
+        .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        assert!(
+            out.contains("\x1b[?7labcd"),
+            "exact-width row before a blank must DECAWM-off or xenl swallows the blank: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_short_row_erases_to_eol() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[("a".into(), false, false), (String::new(), false, false)])
+            .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        assert!(
+            out.contains("a\x1b[K\r\n"),
+            "short row must EL before advancing or LONGTAIL leftovers survive: {out:?}"
+        );
+        let after_a = out.split_once("a\x1b[K\r\n").map(|(_, rest)| rest);
+        assert!(
+            after_a.is_some_and(|rest| rest.contains("\x1b[K\r\n")),
+            "empty row must EL or the previous live row stays intact: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_long_wrap_chain_consumes_xenl_before_next_chunk() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 22, 80, 2));
+        // screen_height-1 = 23. A 24-row wrap chain ends a mid-chunk while xenl is pending.
+        let mut rows: Vec<(String, bool, bool)> =
+            (0..24).map(|i| (format!("W{i:02}"), true, true)).collect();
+        rows.push(("END".into(), false, false));
+        t.insert_before_rows(&rows).unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let between = out
+            .split_once("W21")
+            .and_then(|(_, rest)| rest.split_once("W22").map(|(mid, _)| mid))
+            .expect("W21 then W22");
+        assert!(
+            between.contains(" \r"),
+            "xenl must latch WRAPLINE before the next chunk CUPs: {out:?}"
+        );
+        assert!(
+            !between.contains("\r\n"),
+            "must not hard-break a wrap chain at the chunk boundary: {out:?}"
+        );
+        let xenl_at = between.find(" \r").expect("xenl consume");
+        if let Some(cup_at) = between.find("\x1b[") {
+            assert!(
+                xenl_at < cup_at,
+                "consume xenl before the next chunk CUP: {between:?}"
+            );
+        }
+        let next_pair = out
+            .split_once("W22")
+            .and_then(|(_, rest)| rest.split_once("W23").map(|(mid, _)| mid))
+            .expect("W22 then W23");
+        assert!(
+            !next_pair.contains("\r\n") && !next_pair.contains("\x1b[?7l"),
+            "leftover wrap pair must stay in one chunk: {out:?}"
+        );
+        assert_eq!(
+            t.backend().extra_scrolls,
+            0,
+            "xenl consume must not wrap off the last screen line: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_long_wrap_chain_xenl_consume_does_not_extra_scroll() {
+        // Live region at the bottom: scroll-to-fill pins the last painted row on
+        // last_screen unless consume gets its own slack. Dummy-space wrap from
+        // there extra-scrolls and native-copy-joins the leftover space.
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 22, 80, 2));
+        let mut rows: Vec<(String, bool, bool)> =
+            (0..24).map(|i| (format!("W{i:02}"), true, true)).collect();
+        rows.push(("END".into(), false, false));
+        t.insert_before_rows(&rows).unwrap();
+        assert_eq!(
+            t.backend().extra_scrolls,
+            0,
+            "xenl consume wrapping off last_screen extra-scrolls the viewport"
+        );
+        let area = t.viewport_area();
+        assert!(
+            area.y + area.height <= 24,
+            "viewport must fit on screen, got y={} h={}",
+            area.y,
+            area.height
+        );
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let between = out
+            .split_once("W21")
+            .and_then(|(_, rest)| rest.split_once("W22").map(|(mid, _)| mid))
+            .expect("W21 then W22");
+        assert!(
+            between.contains(" \r") && !between.contains("\r\n"),
+            "wrap+continuation stay joined (WRAPLINE latch, no hard break): {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_wrap_pair_not_split_across_chunks() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 22, 80, 2));
+        let mut rows: Vec<(String, bool, bool)> =
+            (0..22).map(|i| (format!("h{i}"), false, false)).collect();
+        rows.push(("WRAPA".into(), true, true));
+        rows.push(("WRAPB".into(), false, false));
+        rows.extend((0..8).map(|i| (format!("t{i}"), false, false)));
+        t.insert_before_rows(&rows).unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let between = out
+            .split_once("WRAPA")
+            .and_then(|(_, rest)| rest.split_once("WRAPB").map(|(mid, _)| mid))
+            .expect("WRAPA then WRAPB");
+        assert!(
+            !between.contains("\x1b[?7l"),
+            "wrap pair must stay in one chunk so CUP/DECAWM cannot split it: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_xenl_consume_keeps_continuation_sgr() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[
+            ("abcd".into(), true, true),
+            ("\x1b[31mx".into(), false, false),
+        ])
+        .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let after = out.split_once("abcd").map(|(_, rest)| rest).expect("abcd");
+        let xenl_at = after.find(" \r").or_else(|| after.find(' '));
+        let csi_at = after.find("\x1b[31m").expect("continuation SGR");
+        let x_at = after.find('x').expect("continuation glyph");
+        assert!(
+            xenl_at.is_some_and(|i| i < csi_at),
+            "a printable must consume xenl before CSI: {out:?}"
+        );
+        assert!(
+            csi_at < x_at,
+            "continuation SGR must precede its first glyph: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_soft_then_short_keeps_autowrap() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[("abcd".into(), true, true), ("x".into(), false, false)])
+            .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let wrap_to_short = out
+            .split_once("abcd")
+            .map(|(_, rest)| rest)
+            .filter(|rest| rest.contains('x'))
+            .and_then(|rest| rest.split_once('x').map(|(between, _)| between))
+            .expect("abcd then x");
+        assert!(
+            !wrap_to_short.contains("\x1b[?7l"),
+            "DECAWM-off before the short continuation clears xenl: {out:?}"
+        );
+        assert!(out.contains("x\r\n") || out.contains("x"), "{out:?}");
+    }
+
+    #[test]
+    fn insert_before_rows_full_width_continuation_consumes_xenl_before_decawm_off() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[("abcd".into(), true, true), ("efgh".into(), true, false)])
+            .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let after = out.split_once("abcd").map(|(_, rest)| rest).expect("abcd");
+        let xenl_at = after.find(" \r").expect("xenl consume");
+        let decawm_at = after
+            .find("\x1b[?7l")
+            .expect("last full-width row DECAWM-off");
+        let efgh_at = after.find("efgh").expect("continuation");
+        assert!(
+            xenl_at < decawm_at,
+            "dummy printable must consume wrap-pending before CSI ?7l: {out:?}"
+        );
+        assert!(
+            decawm_at < efgh_at,
+            "last exact-width wrap segment still DECAWM-off after consume: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_short_wrap_emits_crlf() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 21, 80, 3));
+        t.insert_before_rows(&[("ab".into(), false, true), ("cd".into(), false, false)])
+            .unwrap();
+        let out = String::from_utf8_lossy(&t.backend().buf);
+        let between = out
+            .split_once("ab")
+            .and_then(|(_, rest)| rest.split_once("cd").map(|(mid, _)| mid))
+            .expect("ab then cd");
+        assert!(
+            between.contains("\r\n"),
+            "a short joiner must hard-break; xenl consume would overwrite: {out:?}"
+        );
+        assert!(
+            !between.contains(" \r"),
+            "xenl consume is only for full-width wraps: {out:?}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_cups_once_per_chunk() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 0, 80, 3));
+        let before = t.backend().cursor_sets;
+        t.insert_before_rows(&[
+            ("abcd".into(), true, true),
+            ("efgh".into(), true, true),
+            ("ijkl".into(), true, false),
+        ])
+        .unwrap();
+        let cups = t.backend().cursor_sets.saturating_sub(before);
+        assert!(
+            cups <= 2,
+            "CUP at chunk start (+ viewport clear), not before each wrap row: {cups}"
+        );
+    }
+
+    #[test]
+    fn insert_before_rows_tall_commit_does_not_extra_scroll() {
+        let mut t = Terminal::with_options(
+            RecordingBackend::default(),
+            TerminalOptions {
+                viewport: Viewport::Inline(2),
+            },
+        )
+        .unwrap();
+        t.set_viewport_area(Rect::new(0, 22, 80, 2));
+        let rows: Vec<(String, bool, bool)> =
+            (0..30).map(|i| (format!("r{i}"), false, false)).collect();
+        t.insert_before_rows(&rows).unwrap();
+        assert_eq!(
+            t.backend().extra_scrolls,
+            0,
+            "a commit taller than the area above the prompt must not \\r\\n the last screen row"
+        );
+        let area = t.viewport_area();
         assert!(
             area.y + area.height <= 24,
             "viewport must fit on screen, got y={} h={}",

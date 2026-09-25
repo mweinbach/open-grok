@@ -23,6 +23,7 @@ mod palette {
     pub const BASE: Color = rgb(3, 3, 4); // #030304  oklch(0.1 0.005 265)
     pub const SURFACE: Color = rgb(4, 5, 7); // #040507  oklch(0.115 0.005 265)
     pub const ELEVATED: Color = rgb(15, 18, 22); // #0F1216  oklch(0.18 0.01 265)
+    pub const CODE_BG: Color = rgb(38, 41, 47); // #26292F  oklch(0.28 0.012 265)
     pub const PANEL: Color = rgb(4, 4, 6); // #040406  oklch(0.11 0.006 265)
 
     // -- text (neutral, no color cast) ----------------------------------------
@@ -139,7 +140,7 @@ impl Theme {
             md_task_checked: TEAL,
             md_task_unchecked: TEXT_DIM,
             md_muted: MUTED,
-            md_code_bg: SURFACE,
+            md_code_bg: CODE_BG,
             md_text: TEXT,
             link_fg: CYAN,
         }

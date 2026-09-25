@@ -341,7 +341,15 @@ A trailing `:*` suffix on a Bash rule is stripped to a plain prefix: `Bash(git c
 
 Commands that cannot be split into simple segments (subshells, command substitution `$(...)`, backticks, background `&`, control flow) prompt as a single unit when Bash restrictions are configured.
 
-Segment-level checks (`deny` and `ask` rules, remembered grants, and the read-only command list) strip environment-variable prefixes such as `RUST_LOG=debug`, and peel a fixed set of process wrappers (`timeout`, `nice`, `ionice`, `chrt`, `stdbuf`, `env`) so that `deny` and `ask` rules match either the wrapped or the inner command. `deny` and `ask` rules are also checked inside inline scripts passed to `bash -c`. Other wrappers, including `sudo`, `xargs`, and `nohup`, are not peeled; write rules that include them explicitly. `allow` rules do not get this treatment: they match the command string as written, so a leading environment assignment or wrapper keeps an `allow` rule from matching and the command prompts instead.
+Each segment is normalized before rules are matched. Leading environment assignments such as `RUST_LOG=debug` are stripped, and a fixed set of wrappers (`timeout`, `nice`, `ionice`, `chrt`, `stdbuf`, `env`) is peeled away, so rules match the inner command: `Bash(npm test *)` approves `RUST_LOG=debug timeout 30 npm test --workers=4`. This applies to `deny`, `ask`, and `allow` rules, remembered grants, and the read-only command list.
+
+A few more matching details:
+
+- Rules also apply inside a literal script passed to `bash -c`. For `allow`, every command inside that script must itself be allowed.
+- Wrappers not on the list (`sudo`, `xargs`, `nohup`, …) are not peeled. Write rules that name them explicitly.
+- When the parser cannot safely peel a form (for example `env -S`), the command prompts instead of matching an `allow` rule.
+- Matching sees parsed literal words joined by single spaces, without shell quotes. Recovered filename variables retain their written spelling; values are never expanded for rule matching.
+- An `allow` rule can cover a quoted filename variable when it is an `ls` or `rg` file operand that follows `--`, carries a literal `/` or `./` prefix, or was assigned a literal path earlier in the same script; `echo`, `head`, and `tail` may appear alongside with literal arguments only, and dynamic options, writes, other programs, and Read/Edit restrictions still prompt. The variable keeps its written spelling, quotes included (`rg -n ERROR "$LOG"`), so match it with `*`. Ask and Auto both honor such a covering `allow` (and an exact remembered grant for the whole script) without the classifier; other scripts with variable arguments go to the classifier in Auto.
 
 ### Dangerous Commands
 

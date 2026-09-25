@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -103,7 +105,20 @@ impl PtyHandle {
         if let Some(ref cwd) = config.cwd {
             cmd.cwd(cwd);
         }
+        #[cfg(unix)]
+        {
+            cmd.env_clear();
+            for (key, value) in std::env::vars_os() {
+                if key.as_bytes().contains(&0) || value.as_bytes().contains(&0) {
+                    continue;
+                }
+                cmd.env(&key, &value);
+            }
+        }
         for (key, value) in &config.env {
+            if key.contains('\0') || value.contains('\0') {
+                continue;
+            }
             cmd.env(key, value);
         }
         // Set TERM for proper terminal detection.

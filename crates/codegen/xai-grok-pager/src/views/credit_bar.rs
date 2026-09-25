@@ -416,8 +416,6 @@ mod tests {
         );
     }
 
-    // ── usage_label / period type ────────────────────────────────────
-
     fn bal_period(pct: f64, period_type: &str) -> CreditBalance {
         CreditBalance {
             period_type: Some(period_type.to_string()),
@@ -487,8 +485,6 @@ mod tests {
             Some(("Weekly limit left: 0%".to_string(), true))
         );
     }
-
-    // ── usage_warning (prompt info row) ──────────────────────────────
 
     #[test]
     fn warning_usage_model_thresholds() {
@@ -646,8 +642,6 @@ mod tests {
             Some(("Usage left: 1%".to_string(), true))
         );
     }
-
-    // ── usage_warning: pay-as-you-go (monthly on-demand) ─────────────
 
     fn pay_as_you_go(usage_pct: f64, cap_cents: i64, used_cents: i64) -> CreditBalance {
         CreditBalance {

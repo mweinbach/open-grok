@@ -266,4 +266,83 @@ mod tests {
             }
         });
     }
+
+    fn markdown_atx_tokens(theme_bytes: &[u8], line: &str) -> Vec<(String, String, (u8, u8, u8))> {
+        let syn = Syntect::new(theme_bytes);
+        let syntax = syn
+            .syntax_set
+            .find_syntax_by_extension("md")
+            .expect("two-face markdown");
+        let mut parse_state = syntect::parsing::ParseState::new(syntax);
+        let ops = parse_state
+            .parse_line(line, &syn.syntax_set)
+            .expect("parse markdown");
+        let highlighter = syntect::highlighting::Highlighter::new(&syn.theme);
+        let mut stack = syntect::parsing::ScopeStack::new();
+        let mut tokens = Vec::new();
+        let mut last = 0usize;
+        for (i, op) in ops {
+            if i > last {
+                let style = highlighter.style_for_stack(stack.as_slice());
+                tokens.push((
+                    line.get(last..i).unwrap_or("").to_owned(),
+                    stack.to_string(),
+                    (style.foreground.r, style.foreground.g, style.foreground.b),
+                ));
+            }
+            stack.apply(&op).expect("scope op");
+            last = i;
+        }
+        if last < line.len() {
+            let style = highlighter.style_for_stack(stack.as_slice());
+            tokens.push((
+                line.get(last..).unwrap_or("").to_owned(),
+                stack.to_string(),
+                (style.foreground.r, style.foreground.g, style.foreground.b),
+            ));
+        }
+        tokens
+    }
+
+    fn atx_token<'a>(
+        tokens: &'a [(String, String, (u8, u8, u8))],
+        name: &str,
+    ) -> &'a (String, String, (u8, u8, u8)) {
+        tokens
+            .iter()
+            .find(|(text, _, _)| text == name)
+            .unwrap_or_else(|| panic!("missing {name:?} token in {tokens:?}"))
+    }
+
+    #[test]
+    fn markdown_atx_h2_emits_markup_heading_scope_and_theme_color() {
+        const LINE: &str = "## Heading\n";
+        let night_h2 = (0x61, 0xbd, 0xf2);
+        let night = markdown_atx_tokens(include_bytes!("../assets/grok-night.tmTheme"), LINE);
+        let (_, scopes, rgb) = atx_token(&night, "Heading");
+        assert!(
+            scopes
+                .split_whitespace()
+                .any(|s| s == "markup.heading.2.markdown"),
+            "two-face must emit markup.heading.2.markdown, got {scopes}"
+        );
+        assert_eq!(*rgb, night_h2);
+        assert_eq!(atx_token(&night, "##").2, night_h2);
+
+        for (bytes, want) in [
+            (
+                include_bytes!("../assets/tokyo-night.tmTheme").as_slice(),
+                night_h2,
+            ),
+            (
+                include_bytes!("../assets/grok-day.tmTheme").as_slice(),
+                (0x2f, 0x64, 0xd2),
+            ),
+        ] {
+            assert_eq!(
+                atx_token(&markdown_atx_tokens(bytes, LINE), "Heading").2,
+                want
+            );
+        }
+    }
 }

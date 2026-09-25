@@ -37,14 +37,12 @@ pub(crate) const SPINNER_DIVISOR: u64 = 4;
 /// `○ ◎ ◉ ◎` cycle runs at roughly half the speed (~1.07s per loop).
 pub(crate) const MONITOR_PULSE_DIVISOR: u64 = 8;
 
-/// Pulse speed for every "waiting on you" diamond — the drain-blocked
-/// status, the pending-user-input status, and the plan-approval status
-/// all share this cadence. `pulse_brightness` returns `sin²(tick*speed)`,
-/// which has period π, so at ~30fps this is ~1.3s per cycle
-/// (`π / (0.08 * 30) ≈ 1.31`).
-///
-/// Always route diamond rendering through [`pending_diamond_color`] so
-/// the three call sites can never silently drift apart.
+/// Rows narrower than this hide the phase timer, which would sit beside the right-aligned turn
+/// timer and read as one confusing pair of numbers. The turn timer stays.
+pub(crate) const PHASE_TIMER_MIN_WIDTH: u16 = 60;
+
+/// Pulse speed for every "waiting on you" diamond. Always route diamond rendering through
+/// [`pending_diamond_color`] so the three call sites can never silently drift apart.
 pub(crate) const USER_WAITING_PULSE_SPEED: f32 = 0.08;
 
 /// Compute the pulsing diamond color for any "waiting on you" cue.
@@ -357,7 +355,6 @@ pub fn render_turn_status(
                 | AgentState::CommandCancelling { .. }
         );
 
-    // ── Compute activity style and label ──
     let (activity_style, label, is_tool) =
         compute_activity(&theme, state, activity, is_bash_turn, goal_verifying);
 
@@ -366,7 +363,7 @@ pub fn render_turn_status(
         return TurnStatusOutput::default();
     }
 
-    // ── Build right-aligned content first (to know how much space is left) ──
+    // Build right-aligned content first (to know how much space is left)
     // Format: `1m20s` or `1m20s ⇣12k` (with tokens).
     let turn_timer_str = match (turn_elapsed, total_tokens) {
         (Some(d), Some(tokens)) if tokens > 0 => {
@@ -414,11 +411,8 @@ pub fn render_turn_status(
 
     let right_width = turn_timer_width + bg_width + cancel_width;
 
-    // ── Build components ──
-    // While a tool is blocked on a permission prompt or `ask_user_question`,
-    // swap the running braille spinner for a pulsing `◆`. Same animation
-    // shape the drain-blocked and plan-approval indicators already use,
-    // so every "your turn" status reads with one consistent visual cue.
+    // While a tool is blocked on a permission prompt or `ask_user_question`, swap the running braille spinner for a pulsing `◆`
+    // The drain-blocked and plan-approval indicators already use this animation, so every "your turn" status reads with one consistent visual cue
     let spinner_str = if is_pending_user_input {
         format!("{} ", crate::glyphs::diamond_filled())
     } else {
@@ -437,8 +431,8 @@ pub fn render_turn_status(
                 if title.starts_with("Ask: ") || title.starts_with("Ask ")
         );
 
-    // Phase timer (gray, same as turn timer) — hidden for ask tools
-    let phase_timer_str = if is_asking {
+    // Phase timer (gray, same as turn timer); hidden for ask tools and on narrow rows
+    let phase_timer_str = if is_asking || area.width < PHASE_TIMER_MIN_WIDTH {
         String::new()
     } else {
         activity_started_at
@@ -477,7 +471,6 @@ pub fn render_turn_status(
         .saturating_sub(min_gap)
         .saturating_sub(right_width);
 
-    // ── Render left side: spinner + label (truncated) + phase_timer + queued_hint ──
     let mut left_spans: Vec<Span<'static>> = Vec::with_capacity(5);
 
     // Spinner color: usually inherits the activity color (green for tools,
@@ -591,11 +584,9 @@ pub fn render_turn_status(
         left_spans.push(hint);
     }
 
-    // Render left side
     let left_line = Line::from(left_spans);
     buf.set_line(area.x, area.y, &left_line, area.width);
 
-    // ── Render right side: turn_timer + bg + cancel ──
     let right_start_x = area.x + area.width.saturating_sub(right_width as u16);
 
     // Helper: build a fully-specified right-side style (fg + bg + clear mods).
@@ -710,9 +701,23 @@ fn compute_activity(
             "Compacting…".to_string(),
             false,
         ),
-        (AgentState::TurnRunning, Some(TurnActivity::Retrying { attempt, .. })) => (
+        (
+            AgentState::TurnRunning,
+            Some(TurnActivity::Retrying {
+                attempt,
+                max_retries,
+                reason,
+                error_type,
+            }),
+        ) => (
             Style::default().fg(theme.warning),
-            format!("Retrying (attempt {attempt})…"),
+            crate::app::error_display::format_retry_activity_label(
+                *attempt,
+                *max_retries,
+                reason,
+                error_type.as_deref(),
+                crate::app::error_display::RetryLabelStyle::Status,
+            ),
             false,
         ),
         (AgentState::TurnRunning, Some(TurnActivity::WritingToolCall(writing))) => (
@@ -1018,6 +1023,38 @@ mod tests {
         // label — the view leaves it as `None` rather than Waiting(Model).
         let (_, label, _) = compute_activity(&theme, &AgentState::TurnRunning, &None, true, false);
         assert_eq!(label, "Running…");
+    }
+
+    #[test]
+    fn family_switch_compact_label_matches_loader() {
+        let theme = Theme::current();
+        let state = AgentState::CommandRunning {
+            command: AgentCommand::SwitchModelCompact,
+            started_at: Instant::now(),
+        };
+        let (_, label, _) = compute_activity(&theme, &state, &None, false, false);
+        assert_eq!(label, "Switching model…");
+        assert!(should_show(&state, false, None, Watchers::default(), false));
+    }
+
+    #[test]
+    fn family_switch_compact_renders_elapsed_timer() {
+        let state = AgentState::CommandRunning {
+            command: AgentCommand::SwitchModelCompact,
+            started_at: Instant::now(),
+        };
+        let mut args = idle_args(Watchers::default());
+        args.state = &state;
+        args.turn_elapsed = Some(Duration::from_secs(12));
+        let text = render_row_text(args, 80);
+        assert!(
+            text.contains("Switching model…"),
+            "status line must keep the family-switch copy, got: {text:?}"
+        );
+        assert!(
+            text.contains("12s"),
+            "family-switch compact must show the elapsed timer like /compact, got: {text:?}"
+        );
     }
 
     #[test]
@@ -1577,6 +1614,33 @@ mod tests {
         assert!(
             text.contains("Waiting on subagent… 5m59s · 1 queued — Enter to send now"),
             "phase timer must sit between the wait label and the queued hint, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_row_drops_phase_timer_keeping_turn_timer() {
+        let activity = Some(TurnActivity::Waiting(WaitingReason::Model));
+        let render = |width: u16| {
+            let mut args = idle_args(Watchers::default());
+            args.state = &AgentState::TurnRunning;
+            args.activity = &activity;
+            args.activity_started_at = Some(Instant::now() - Duration::from_secs(240));
+            args.turn_elapsed = Some(Duration::from_secs(11));
+            render_row_text(args, width)
+        };
+        let wide = render(PHASE_TIMER_MIN_WIDTH);
+        assert!(
+            wide.contains("Waiting for response… 4m0s") && wide.contains("11s"),
+            "a wide row keeps both timers, got: {wide:?}"
+        );
+        let narrow = render(PHASE_TIMER_MIN_WIDTH - 1);
+        assert!(
+            narrow.contains("Waiting for response…") && narrow.contains("11s"),
+            "the narrow row keeps the label and turn timer, got: {narrow:?}"
+        );
+        assert!(
+            !narrow.contains("4m0s"),
+            "the narrow row must drop the phase timer, got: {narrow:?}"
         );
     }
 

@@ -1755,6 +1755,119 @@ fn herdr_over_ssh_pane_does_not_skip_kitty_keyboard() {
     assert_eq!(ctx.multiplexer, MultiplexerKind::Herdr);
     assert_eq!(ctx.kitty_skip_reason(), None);
     assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_iterm2_tmux_3_2a_over_ssh() {
+    // iTerm2 + tmux 3.2a + TERM=screen + SSH: Shift+Enter often collapses; doctor newline-fallback stays off
+    let ctx = TerminalContext {
+        brand: TerminalName::Iterm2,
+        env_brand: TerminalName::Iterm2,
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.2a".to_owned()),
+        is_ssh: true,
+        term_var: Some("screen".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("tmux_old"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_old_tmux_even_locally() {
+    let ctx = TerminalContext {
+        brand: TerminalName::Iterm2,
+        env_brand: TerminalName::Iterm2,
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.2a".to_owned()),
+        ..Default::default()
+    };
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_false_on_local_modern_ghostty() {
+    let ctx = TerminalContext {
+        brand: TerminalName::Ghostty,
+        env_brand: TerminalName::Ghostty,
+        ..Default::default()
+    };
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(!ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_windows_terminal_inside_old_tmux() {
+    // Brand-first kitty_skip_reason reports windows_terminal and would hide tmux_old.
+    let ctx = TerminalContext {
+        brand: TerminalName::WindowsTerminal,
+        env_brand: TerminalName::WindowsTerminal,
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.2a".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("windows_terminal"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_modern_vte_inside_old_tmux() {
+    let ctx = TerminalContext {
+        brand: TerminalName::Vte,
+        vte_version: Some("8200".to_owned()),
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.2a".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("vte"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_modern_vte_inside_screen() {
+    let ctx = TerminalContext {
+        brand: TerminalName::Vte,
+        vte_version: Some("8200".to_owned()),
+        multiplexer: MultiplexerKind::Screen,
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("vte"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_windows_terminal_tmux_extended_keys_off() {
+    let ctx = TerminalContext {
+        brand: TerminalName::WindowsTerminal,
+        env_brand: TerminalName::WindowsTerminal,
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.4".to_owned()),
+        tmux_extended_keys: Some("off".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("windows_terminal"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(ctx.prefer_alt_enter_newline());
+}
+
+#[test]
+fn prefer_alt_enter_newline_false_on_local_windows_terminal_modern_tmux() {
+    let ctx = TerminalContext {
+        brand: TerminalName::WindowsTerminal,
+        env_brand: TerminalName::WindowsTerminal,
+        multiplexer: MultiplexerKind::Tmux,
+        tmux_version: Some("tmux 3.4".to_owned()),
+        tmux_extended_keys: Some("on".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(ctx.kitty_skip_reason(), Some("windows_terminal"));
+    assert!(!ctx.shift_enter_unavailable());
+    assert!(!ctx.prefer_alt_enter_newline());
 }
 
 #[test]

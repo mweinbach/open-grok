@@ -16,6 +16,29 @@ Without memory, each Grok session starts fresh: the model knows nothing about pr
 
 Memory is experimental and disabled by default.
 
+### How memory is organized
+
+Memory has two scopes. Global memory holds facts that apply across all your
+projects; workspace memory holds facts about one repository. Clones and
+worktrees of the same repository share one workspace scope.
+
+Each scope keeps its knowledge as ordinary Markdown files. `topics/` holds
+curated notes, one file per subject, and is what Grok reads at the start of a
+session. New facts captured from a completed turn land as small observations
+that a later consolidation pass (`/dream`) folds into topics. A bounded generated
+index of both scopes is injected into the model's context once per session so
+it can decide which topics to open.
+
+Notes you recorded with earlier versions of Grok Build are carried over
+automatically the first time a workspace is opened after updating: each section
+of the earlier notes becomes a topic, and sections whose name already matches a
+topic are appended to it under a "From earlier sessions" heading. The earlier
+files are left in place unchanged.
+
+Memory product telemetry contains only fixed enums, booleans, counts, and
+durations. It never includes prompts, statements, topic names, keywords,
+paths, model output, or free-form errors.
+
 ---
 
 ## Enabling Memory
@@ -84,30 +107,29 @@ does not default-on via unpublished remote gates.
 
 ### Mid-Session Toggle
 
-Toggle memory on or off during a session without restarting:
+Toggle memory on or off during a session without restarting: open `/memory`
+and press `t`.
 
-```
-/memory on
-/memory off
-```
+The toggle is session-scoped -- it does not persist to `config.toml`, and it works in both directions: a session that started with `[memory] enabled = true` can turn memory off, and a session that started with `[memory] enabled = false` can turn it on. New sessions follow `config.toml` again. Toggling off removes access to memory tools and the memory instructions in the system prompt but keeps existing files on disk. Toggling on re-initializes memory storage, registers the memory tools, restores the memory instructions, and injects the memory index on the next turn. Turning memory on waits for any turn in progress to finish.
 
-The toggle is session-scoped -- it does not persist to `config.toml`. Toggling off removes access to memory tools but keeps existing files on disk. Toggling on re-initializes memory storage and registers the memory tools.
-
-You can also toggle from inside the `/memory` modal by pressing `t`.
+The toggle cannot override the process-wide force-disable (`--no-memory` or `GROK_MEMORY=0`); those hide `/memory` for the whole session.
 
 ### Priority Order
 
 1. `--no-memory` CLI flag (always disables)
 2. `--experimental-memory` CLI flag (enables)
 3. `GROK_MEMORY` env var: `1`/`true` enables, `0`/`false` disables
-4. `[memory]` section in config.toml
-5. Default: disabled
+4. `[memory]` section in config.toml (an explicit `enabled = false` beats a managed remote setting)
+5. Managed remote setting
+6. Default: disabled
 
 ---
 
 ## How Memory Is Stored
 
-Human-editable memory is stored as Markdown files under `~/.opengrok/memory/`:
+When v2 is on (`[memory_v2] enabled`), each scope stores Markdown under `~/.opengrok/memory-v2/`: `topics/` for curated notes and `observations/_inbox/` for new facts. When v2 is off and legacy memory is on, files live under `~/.opengrok/memory/` (`MEMORY.md` plus hashed workspace directories). `[memory] enabled` and `[memory_v2] enabled` both default off.
+
+Human-editable legacy memory is stored as Markdown files under `~/.opengrok/memory/`:
 
 | Location | Scope | Description |
 |----------|-------|-------------|
@@ -270,15 +292,18 @@ The modal uses a split-pane layout: the file list on the left, a read-only conte
 | `↑`/`↓` or `j`/`k` | Move through the file list |
 | `PgUp`/`PgDn` | Jump 10 entries |
 | `/` | Filter the file list |
+| `Enter` | Read the selected note: the preview takes keyboard focus (arrows, `PgUp`/`PgDn`, `Home`/`End` scroll it) |
 | `y` | Copy the selected file's path to the clipboard |
-| `x` | Delete the selected session file (press `x` again to confirm) |
+| `x` | Delete the selected note (press `x` again to confirm) |
 | `t` | Toggle memory on or off |
 | `Ctrl+F` | Toggle fullscreen |
-| `Esc` | Close the modal, or exit filter mode |
+| `Esc` | Close the modal, or leave filter or preview focus |
 
-The preview pane is read-only. Scroll it with the mouse wheel or by dragging its scrollbar. You can delete only session files, not the global or workspace `MEMORY.md`.
+The filter matches note names and note contents; separate words all have to match. When you filter, the preview scrolls to the first match. If nothing matches, the list says so; `Backspace` clears the filter.
 
-When the memory modal's content area is under 80 columns, the modal hides the preview pane and shows the file list only.
+The preview pane is read-only. Scroll it with the mouse wheel, by dragging its scrollbar, or with the keyboard after `Enter`. Drag across the preview text to copy that text to the clipboard; a brief message under the file list confirms every copy. Generated `MEMORY.md` indexes cannot be deleted.
+
+When the memory modal's content area is under 64 columns, the modal shows the file list only and hides the size column; press `Enter` to read the selected note full-width and `Esc` to return to the list.
 
 You can also open `/memory` from the command palette.
 
@@ -292,7 +317,7 @@ When you save a note with `/remember`, Grok confirms in the scrollback:
 Memory saved to ~/.opengrok/memory/MEMORY.md
 ```
 
-Background saves — flush, dream, and session-end — run silently and do not post a scrollback message. Use `/memory` at any time to browse what Grok has stored.
+Background saves — automatic flush, automatic Dream, and session-end — run silently and do not post a scrollback message. `/flush` and `/dream` report their outcome in scrollback when you run them yourself. Use `/memory` at any time to browse what Grok has stored.
 
 ---
 

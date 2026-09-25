@@ -177,6 +177,76 @@ fn set_text_preserves_cursor_clamped_across_grow_and_shrink() {
 }
 
 #[test]
+fn restore_elements_skips_out_of_bounds_ranges() {
+    let mut textarea = ta_with("short");
+    textarea.restore_elements([(0..5, ElementKind(1), None), (0..6, ElementKind(1), None)]);
+
+    let ranges: Vec<_> = textarea
+        .elements()
+        .iter()
+        .map(|element| element.range.clone())
+        .collect();
+    assert_eq!(ranges, vec![0..5]);
+}
+
+#[test]
+fn restore_element_returns_id_over_existing_text() {
+    let mut textarea = ta_with("see [Image #1] now");
+    textarea.clear_history();
+
+    let id = textarea
+        .restore_element(4..14, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("expected a registered element"));
+
+    assert_eq!(textarea.text(), "see [Image #1] now");
+    let elem = textarea
+        .elements()
+        .first()
+        .unwrap_or_else(|| panic!("expected an element"));
+    assert_eq!(
+        (elem.id, elem.range.clone(), elem.kind),
+        (id, 4..14, ElementKind(3))
+    );
+    assert!(
+        !textarea.can_undo(),
+        "restore_element must not record an undo step"
+    );
+}
+
+#[test]
+fn restore_element_rejects_overlapping_range() {
+    let mut textarea = ta_with("[Image #1] tail");
+    textarea
+        .restore_element(0..10, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("first registration must succeed"));
+
+    assert_eq!(textarea.restore_element(5..12, ElementKind(3), None), None);
+    assert_eq!(textarea.restore_element(0..10, ElementKind(1), None), None);
+    assert_eq!(textarea.restore_element(0..100, ElementKind(3), None), None);
+    assert_eq!(textarea.elements().len(), 1);
+}
+
+#[test]
+fn restore_element_accepts_adjacent_range() {
+    let mut textarea = ta_with("[Image #1][Image #2]");
+    textarea
+        .restore_element(0..10, ElementKind(3), None)
+        .unwrap_or_else(|| panic!("first registration must succeed"));
+
+    assert!(
+        textarea
+            .restore_element(10..20, ElementKind(3), None)
+            .is_some()
+    );
+    let ranges: Vec<_> = textarea
+        .elements()
+        .iter()
+        .map(|element| element.range.clone())
+        .collect();
+    assert_eq!(ranges, vec![0..10, 10..20]);
+}
+
+#[test]
 fn set_text_restores_zero_length_element_metadata_through_history() {
     let mut textarea = TextArea::new();
     let id = textarea.insert_element("", ElementKind(7), None);

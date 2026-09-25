@@ -535,15 +535,60 @@ impl<'a> EntryRenderer<'a> {
         (starts, last_content_row)
     }
 
-    /// Rendered-row offset from the entry's top (including any top vpad row) at
-    /// which the search index's `logical_line`-th logical (newline-delimited)
-    /// line begins, at viewport `width`.
+    /// Per painted buffer row: WRAPLINE only when the next `BlockLine` is a mid-word
+    /// soft wrap (`joiner == Some("")`). Word (`" "`) and hard (`"\n"`) joiners stay
+    /// `false` so native copy keeps those separators.
+    ///
+    /// Exact-width hard breaks stay `false`. Last-column occupancy is not a wrap signal.
+    pub fn row_soft_wraps(&self, height: u16) -> Vec<bool> {
+        let mut flags = vec![false; usize::from(height)];
+        if height == 0 || (self.group_header_count > 0 && !self.group_collapse_header) {
+            return flags;
+        }
+        let output = self.entry.cached_output_ref();
+        let vpad_top = u16::from(self.entry.block.has_vpad_for(self.appearance()));
+        let (header_rows, skip_remaining) = if self.group_collapse_header {
+            if self.skip_rows == 0 {
+                (1u16, 0u16)
+            } else {
+                (0u16, self.skip_rows.saturating_sub(1))
+            }
+        } else {
+            (0u16, self.skip_rows)
+        };
+        let vpad_top_visible = skip_remaining < vpad_top;
+        let content_skip = skip_remaining.saturating_sub(vpad_top);
+        let start_y = header_rows.saturating_add(u16::from(vpad_top_visible));
+
+        let mut painted = 0u16;
+        for (i, line) in output.lines.iter().enumerate() {
+            if i < usize::from(content_skip) {
+                continue;
+            }
+            if painted > 0 && line.joiner.as_deref().is_some_and(str::is_empty) {
+                let wrap_y = start_y.saturating_add(painted.saturating_sub(1));
+                let cont_y = start_y.saturating_add(painted);
+                if cont_y < height
+                    && let Some(flag) = flags.get_mut(usize::from(wrap_y))
+                {
+                    *flag = true;
+                }
+            }
+            painted = painted.saturating_add(1);
+            if start_y.saturating_add(painted) >= height {
+                break;
+            }
+        }
+        flags
+    }
+
+    /// The rendered-row offset (from the entry's top, including any top vpad row) where the search index's
+    /// `logical_line`-th line begins at `width`. Past the last logical line, clamps to the final content row.
     ///
     /// EXACT for blocks whose searchable text mirrors their selectable rendered
     /// lines (plain source blocks, markdown/thinking bodies); a best-effort
     /// estimate for field-joined source (Subagent/BgTask/CreditLimit), kept on
-    /// screen by the caller's entry-height clamp. Past the last logical line,
-    /// clamps to the final content row.
+    /// screen by the caller's entry-height clamp.
     pub fn rendered_row_of_logical_line(&self, width: u16, logical_line: usize) -> u16 {
         let (starts, last_content_row) = self.logical_line_start_rows(width);
         starts
@@ -993,6 +1038,51 @@ mod tests {
         // StubBlock: 1 line + 2 vpad = 3
         // Width 80 - chrome(4) = 76 for content
         assert_eq!(renderer.desired_height(80), 3);
+    }
+
+    #[test]
+    fn row_soft_wraps_only_empty_joiners() {
+        let theme = Theme::current();
+        let appearance = AppearanceConfig::default();
+        let assert_joiners = |entry: &ScrollbackEntry, width: u16| {
+            let renderer = EntryRenderer::new(entry, &theme).with_appearance(appearance.clone());
+            let height = renderer.desired_height(width);
+            let wraps = renderer.row_soft_wraps(height);
+            let output = entry.cached_output_ref();
+            let vpad_top = u16::from(entry.block.has_vpad_for(&appearance));
+            let mut painted = 0u16;
+            let mut saw_empty = false;
+            let mut saw_separator = false;
+            for line in &output.lines {
+                if painted > 0 {
+                    let wrap_y = vpad_top.saturating_add(painted.saturating_sub(1));
+                    let expected = line.joiner.as_deref().is_some_and(str::is_empty);
+                    saw_empty |= expected;
+                    saw_separator |= line.joiner.as_deref().is_some_and(|s| !s.is_empty());
+                    assert_eq!(
+                        wraps.get(usize::from(wrap_y)).copied().unwrap_or(false),
+                        expected,
+                        "joiner {:?} at wrap_y {wrap_y}: {wraps:?}",
+                        line.joiner
+                    );
+                }
+                painted = painted.saturating_add(1);
+            }
+            (saw_empty, saw_separator)
+        };
+
+        let words = ScrollbackEntry::new(RenderBlock::user_prompt("hello world foo bar baz"));
+        let (empty, sep) = assert_joiners(&words, 24);
+        assert!(sep, "precondition: word wrap must produce a space joiner");
+        assert!(!empty, "word wrap must not use empty joiners at this width");
+
+        let path = "falcon_missions_nrol97_trajectory_nrol97.mat_unbreakable";
+        let midword = ScrollbackEntry::new(RenderBlock::agent_message(path));
+        let (empty, _) = assert_joiners(&midword, 20);
+        assert!(
+            empty,
+            "unbreakable path must produce empty mid-word joiners"
+        );
     }
 
     #[test]

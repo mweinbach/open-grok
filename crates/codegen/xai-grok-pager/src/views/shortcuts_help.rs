@@ -115,7 +115,8 @@ You can also drag an image file into the prompt.";
 // works where the terminal delivers it; list Ctrl only (hosts often swallow Super).
 const UNDO_LONG_HELP: &str = "\
 Undoes the last change in the prompt editor.\n\
-Covers typing, deletes, line/word kills, and clearing a draft.";
+Covers typing, deletes, line/word kills, and clearing a draft.\n\
+Pressed right after a stash or a double-Esc clear, brings the draft back.";
 
 const REDO_LONG_HELP: &str = "\
 Redoes the last undone change in the prompt editor.\n\

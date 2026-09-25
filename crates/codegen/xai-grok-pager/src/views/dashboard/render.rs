@@ -50,6 +50,9 @@ fn ensure_peek_viewport_lifecycle(
     }
 }
 
+// The thin left bar marking the selected row is `crate::glyphs::selection_bar()`, with a `│` fallback on legacy CP437 consoles
+// It is painted on every content line of a selected row so it spans the row's full visual height
+
 /// Per-row visual height in cells: a title row, a secondary row, and a one-cell breathing gap.
 const ROW_HEIGHT: u16 = 3;
 /// Per-group-header visual height in cells: a label row and a one-cell breathing gap.
@@ -153,82 +156,7 @@ pub fn render_dashboard(
         return None;
     }
 
-    let mut layout = compute_layout(area, false);
-    let fixed = super::layout::chrome_overhead(area);
-    let reply_text_w = layout.dispatch.width.saturating_sub(6);
-
-    match state.selected.clone() {
-        Some(sel) => match super::peek::compute_peek_fields(&sel, agents) {
-            Some(fields) => {
-                let question = fields.question.is_some();
-                let peek_min = if question {
-                    super::layout::PEEK_MIN_BOX_QUESTION
-                } else {
-                    super::layout::PEEK_MIN_BOX_LIVE_TAIL
-                };
-                let content_rows = if question {
-                    1 + fields.options.len().min(9) as u16
-                } else {
-                    let reply_rows = super::peek::reply_row_count(
-                        &state.peek_reply,
-                        reply_text_w,
-                        super::peek::MAX_REPLY_ROWS,
-                    );
-                    let max_content = super::layout::max_peek_content_rows(area);
-
-                    let middle_w = layout.dispatch.width.saturating_sub(4);
-                    let (body_measured, pin_user) =
-                        super::state::scrollback_mut_for_row(&sel, agents)
-                            .map(|sb| {
-                                (
-                                    super::peek_tail::densified_body_line_count(sb, middle_w),
-                                    super::peek_tail::scrollback_has_last_user(sb),
-                                )
-                            })
-                            .unwrap_or((0, false));
-                    super::layout::peek_live_tail_desired_content(
-                        max_content,
-                        reply_rows,
-                        body_measured,
-                        pin_user,
-                    )
-                    .content_rows
-                };
-                let alloc =
-                    super::layout::allocate_peek(area.height, fixed, content_rows, peek_min);
-                if alloc.show_peek {
-                    state.set_peek_reply_target_cwd(peeked_agent_cwd(&sel, agents));
-                    let badge = super::peek::peek_model_and_mode(&sel, agents);
-                    match state.peek.as_mut() {
-                        Some(p) => {
-                            if p.apply_fields(sel, fields) {
-                                state.clear_peek_reply();
-                            }
-                        }
-                        None => state.set_peek(Some(super::peek::PeekPanelState::new(sel, fields))),
-                    }
-                    if let Some(p) = state.peek.as_mut() {
-                        p.model_name = badge.model;
-                        p.auto_approve = badge.yolo;
-                        p.auto = badge.auto;
-                        p.plan_mode = badge.plan;
-                    }
-                    layout = super::layout::compute_layout_with_peek_box(area, alloc.peek_box_h);
-                } else {
-                    state.set_peek_reply_target_cwd(None);
-                    state.set_peek(None);
-                }
-            }
-            None => {
-                state.set_peek_reply_target_cwd(None);
-                state.set_peek(None);
-            }
-        },
-        None => {
-            state.set_peek_reply_target_cwd(None);
-            state.set_peek(None);
-        }
-    }
+    let mut layout = state.layout_with_preview(area, agents);
 
     ensure_peek_viewport_lifecycle(state, agents);
 
@@ -2834,23 +2762,6 @@ fn render_slash_dropdown(
     state.slash_dropdown_items_area = Some(items_area);
 }
 
-/// Working directory of the agent owning the peeked `row`, used to root the reply's `@` file picker.
-/// Top-level rows use their own cwd; subagent rows reply to (and resolve `@paths` against) their parent; roster rows have no local agent (`None`).
-/// `None` too when the agent has since vanished.
-fn peeked_agent_cwd(
-    row: &super::DashboardRowId,
-    agents: &IndexMap<AgentId, AgentView>,
-) -> Option<std::path::PathBuf> {
-    let id = match row {
-        super::DashboardRowId::TopLevel(id) => *id,
-        super::DashboardRowId::Subagent { parent, .. } => *parent,
-        super::DashboardRowId::Roster { .. } | super::DashboardRowId::Workspace { .. } => {
-            return None;
-        }
-    };
-    agents.get(&id).map(|a| a.session.cwd.clone())
-}
-
 /// Render the session-less `@` file-context picker dropdown above the dispatch box.
 /// Twin of [`render_slash_dropdown`] with a `k/n` count hint.
 /// No-op (and clears the hit rect) when the picker is hidden.
@@ -3136,9 +3047,10 @@ fn render_footer(
     let enter = key!(Enter);
 
     let send_open = key!('s', CONTROL);
-
+    // Multiline: bare Enter inserts a newline; Shift+Enter (or Alt+Enter over SSH / when Shift+Enter collapses) sends
+    // This matches the agent prompt keybar
     let send_key = if state.multiline_mode {
-        if crate::terminal::terminal_context().shift_enter_unavailable() {
+        if crate::terminal::terminal_context().prefer_alt_enter_newline() {
             key!(Enter, ALT)
         } else {
             key!(Enter, SHIFT)
@@ -4740,6 +4652,7 @@ mod tests {
         let mut state = DashboardState::new();
         let row = DashboardRow {
             id: DashboardRowId::TopLevel(AgentId(1)),
+            session_id: None,
             label: "abcdefghij ".repeat(10),
             subtitle: None,
             state: RowState::Working,
@@ -5212,6 +5125,7 @@ mod tests {
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
+            session_id: None,
             label: "row label".to_string(),
             subtitle: None,
             state: RowState::Working,
@@ -5275,6 +5189,7 @@ mod tests {
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
+            session_id: None,
             label: "row label".to_string(),
             subtitle: None,
             state: RowState::Idle,
@@ -5378,6 +5293,7 @@ mod tests {
         let id = DashboardRowId::TopLevel(AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
+            session_id: None,
             label: "row label".to_string(),
             subtitle: None,
             state: RowState::Idle,
@@ -5716,6 +5632,7 @@ mod tests {
         use crate::app::agent::AgentId;
         DashboardRow {
             id: DashboardRowId::TopLevel(AgentId(id as usize)),
+            session_id: None,
             label: label.to_string(),
             subtitle: None,
             state,
@@ -6267,6 +6184,7 @@ mod tests {
         state.spinner_tick = 8; // Tick 8 selects dot_spinner_frames()[2], the `⸬` glyph.
         let row = DashboardRow {
             id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+            session_id: None,
             label: "who are you?".to_string(),
             subtitle: None,
             state: RowState::Working,
@@ -6346,6 +6264,7 @@ mod tests {
         let id = DashboardRowId::TopLevel(crate::app::agent::AgentId(7));
         let row = DashboardRow {
             id: id.clone(),
+            session_id: None,
             label: "investigate caching".to_string(),
             subtitle: None,
             state: RowState::Working,
@@ -6408,6 +6327,7 @@ mod tests {
         let theme = Theme::current();
         let make_row = || DashboardRow {
             id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+            session_id: None,
             label: "ask me".to_string(),
             subtitle: None,
             state: RowState::NeedsInput,
@@ -6494,6 +6414,7 @@ mod tests {
         let mut state = DashboardState::new();
         let row = DashboardRow {
             id: DashboardRowId::TopLevel(crate::app::agent::AgentId(1)),
+            session_id: None,
             label: "New session #abc12345".to_string(),
             subtitle: None,
             state: RowState::Idle,
@@ -6647,6 +6568,7 @@ mod tests {
         let mut state = DashboardState::new();
         let parent = DashboardRow {
             id: DashboardRowId::TopLevel(AgentId(1)),
+            session_id: None,
             indent: 0,
             ..header_test_row(1, RowState::Working, "parent")
         };

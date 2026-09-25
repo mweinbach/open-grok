@@ -628,13 +628,9 @@ impl QueuePane {
         (self.entries.len() as u16).clamp(1, MAX_QUEUE_HEIGHT)
     }
 
-    // -- Input handling ------------------------------------------------------
-
-    /// Handle a key event when the queue pane is focused.
-    ///
-    /// Returns `Some(QueueEvent)` for queue-specific actions (delete, edit,
-    /// reorder). Returns `None` if the key wasn't a queue action — the caller
-    /// should then try `handle_navigation_key` for j/k/y etc.
+    /// Handle a key event when the queue pane is focused. Returns `Some(QueueEvent)` for queue-specific
+    /// actions (delete, edit, reorder). Returns `None` if the key wasn't a queue action; the caller
+    /// should then try `handle_navigation_key` for j/k etc.
     pub fn handle_key(
         &self,
         key: &KeyEvent,
@@ -674,7 +670,7 @@ impl QueuePane {
         }
     }
 
-    /// Handle navigation keys (j/k, y to copy, scrolling, etc.).
+    /// Handle navigation keys (j/k, scrolling, etc.).
     ///
     /// Delegates to ListPane. Returns `true` if consumed.
     pub fn handle_navigation_key(&mut self, key: &KeyEvent) -> bool {
@@ -704,9 +700,20 @@ impl QueuePane {
             .map(|e| e.text.as_str())
     }
 
-    /// Select the deleted row's neighbor (so the cursor doesn't jump to the
-    /// top), resolved from the merged `entries` to stay correct across the
-    /// server/local boundary. Call before the next `sync_from_merged` rebuild.
+    pub(crate) fn yank_copy_target(&self) -> Option<(u64, String)> {
+        let entry = self
+            .hovered_row_id
+            .and_then(|id| self.entries.iter().find(|e| e.id == id))
+            .or_else(|| {
+                self.selected_id()
+                    .and_then(|id| self.entries.iter().find(|e| e.id == id))
+            })?;
+        Some((entry.id, entry.copy_text()))
+    }
+
+    /// Select the deleted row's neighbor (so the cursor doesn't jump to the top).
+    /// The neighbor is resolved from the merged `entries` to stay correct across the server/local boundary.
+    /// Call before the next `sync_from_merged` rebuild.
     pub fn select_after_delete(&mut self, deleted_id: u64) {
         let Some(pos) = self.entries.iter().position(|e| e.id == deleted_id) else {
             return;

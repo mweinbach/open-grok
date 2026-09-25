@@ -147,9 +147,93 @@ fn long_identifier_node_labels_survive_intact_in_svg() {
     );
 }
 
-/// A categorical-x-axis xychart with two `line` series must render to a decodable
-/// PNG through the full `[Open Image]` path (source -> SVG -> raster), on both
-/// themes. The categorical x-axis (no `-->`) previously failed to open.
+/// `:::class`, quoted `{id}` labels, and `A & B --> C` must rasterize with those labels intact.
+#[test]
+fn class_annotated_ampersand_flowchart_renders_to_png() {
+    const SOURCE: &str = r#"flowchart TB
+    classDef dark fill:#111,color:#fff,stroke:#000
+    START([Operator starts a run]) --> ASK
+    subgraph P1["1 · Pick a machine"]
+        ASK{machine already claimed?}:::cond
+        ASK -->|yes| KEEP[keep that machine]
+        ASK -->|no| RUSH{job in the<br/>night shift?}:::cond
+        RUSH -->|no| MAIN[MAIN line]
+        RUSH -->|yes| CTX{"running a rush order?<br/>(walk-in → main)"}:::cond
+        CTX -->|no| MAIN
+        CTX -->|yes| SPAREQ{spare line for this<br/>shift exists?}:::cond
+        SPAREQ -->|yes| SPARE[SPARE line]
+        SPAREQ -->|no| SPIN["POST /v1/lines/{id}/spin-up"]:::dark
+        SPIN -->|ok| SPARE
+        SPIN -->|error| MAIN
+    end
+    MAIN & SPARE & KEEP --> MIX
+    subgraph P2["2 · Mix"]
+        MIX["GET /v1/widgets/{name}"]:::dark
+        MIX --> LOCK["PATCH /v1/widgets/{id}/lock"]:::dark
+        LOCK --> ENV["POST /v1/widgets/{id}/env"]:::dark
+    end
+    ENV --> NEED
+    subgraph P3["3 · Pack"]
+        NEED{needs a crate?}:::cond
+        NEED -->|no| FILES
+        NEED -->|"yes, crate ready"| JOIN
+        NEED -->|"yes, none yet"| WHERE{line?}:::cond
+        WHERE -->|main| NEW["POST /v1/crates/open"]:::dark
+        WHERE -->|spare| OLD["GET /v1/crates"]:::dark
+        NEW & OLD --> JOIN["POST /v1/crates/{id}/seal"]:::dark
+    end
+    JOIN --> FILES
+    subgraph P4["4 · Ship"]
+        FILES["POST /v1/parcels"]:::dark --> SEND["POST /v1/shipments"]:::dark
+        SEND --> POLL["GET /v1/shipments/{id}"]:::dark
+        POLL -->|ERROR| LOGS["GET /v1/shipments/{id}/events"]:::dark
+        POLL -->|READY| LIVE[parcel live]
+    end
+    LIVE -.-> NOTE & TAG & HOLD
+    subgraph P6["6 · After"]
+        NOTE["Add a note"]:::dark
+        TAG["Add a tag"]:::dark
+        HOLD["Hold / recall"]:::dark
+        BACK["Release / resume"]:::dark
+    end
+    HOLD -.-> BACK
+    subgraph P7["7 · Idle"]
+        USAGE["Hourly: GET /v1/counts"]:::dark
+        LIST["inventory.json"]
+    end
+"#;
+    let engine = default_engine();
+    let diagram = render_checked(
+        engine.as_ref(),
+        SOURCE,
+        &RenderParams {
+            theme: MermaidTheme::Dark,
+            ..Default::default()
+        },
+        &RenderLimits::default(),
+    )
+    .expect("class/ampersand flowchart must render to PNG");
+    assert!(!diagram.png.is_empty());
+    let img = image::load_from_memory(&diagram.png).expect("output must be a valid PNG");
+    assert_eq!(img.width(), diagram.width_px);
+    assert_eq!(img.height(), diagram.height_px);
+    let svg = mermaid_to_svg::render_mermaid_to_svg(SOURCE, None).expect("svg");
+    assert!(
+        !svg.contains("MAIN &amp; SPARE"),
+        "ampersand group must not render as a node: {svg}"
+    );
+    for needle in [
+        "machine already claimed",
+        "keep that machine",
+        "Hold / recall",
+        "GET /v1/widgets/{name}",
+    ] {
+        assert!(svg.contains(needle), "missing {needle:?} in {svg}");
+    }
+}
+
+/// An xychart with a categorical x-axis and two `line` series must render to a decodable PNG on both themes.
+/// This exercises the full `[Open Image]` path (source to SVG to raster); a categorical x-axis (no `-->`) previously failed to open.
 #[test]
 fn categorical_xychart_with_two_series_renders_to_png() {
     const SOURCE: &str = "xychart-beta\n    \
