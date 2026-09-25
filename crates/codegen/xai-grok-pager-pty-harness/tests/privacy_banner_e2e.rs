@@ -1,10 +1,11 @@
 //! E2E: the coding-data privacy upsell banner — shown on the welcome screen
 //! for an opted-out OAuth user under the `privacy_notice_rollout` flag,
 //! persisting into the agent view, and acked (never re-shown) via both
-//! buttons: `[Opt out]` dismisses on the spot, stamping
-//! `[privacy].privacy_banner_acked` without waiting on the server; `[Opt in]`
-//! opts the user in through the shell's `PUT /privacy/coding-data-retention`
-//! round trip and acks only once that succeeds.
+//! buttons: both write the choice through the shell's
+//! `PUT /privacy/coding-data-retention` round trip and stamp
+//! `[privacy].privacy_banner_acked` only once that succeeds. The banner hides
+//! as soon as the write is pending, so hiding and acknowledging are separate
+//! steps.
 //!
 //! Drives the real pager binary through a PTY against the shared mock
 //! inference server (isolated `$HOME`), with a seeded opted-out OAuth entry
@@ -74,8 +75,8 @@ async fn run_opt_out() -> Result<()> {
 
     click_text(&mut pager, OPT_OUT).context("click Opt out")?;
 
-    // Dismissal is local and immediate — it must not wait on the server, and
-    // must not detour into settings.
+    // The banner hides while the write is pending, and must not detour into
+    // settings; the ack below waits on the reply.
     pager
         .wait_for_text_absent(BANNER_TITLE, Duration::from_secs(10))
         .context("banner dismissed by [Opt out]")?;

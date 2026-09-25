@@ -128,6 +128,12 @@ pub(super) static ALLOWED_STRING_KEYS: &[&str] = &[
     "parent_agent_id",
     "from_mode",
     "tool_use_id",
+    "invocation_id",
+    "tool_id",
+    "tool_version",
+    "source_status",
+    "source_reason",
+    "grep_reason",
     "command_name",
     "command_source",
     "event_type",
@@ -141,6 +147,19 @@ pub(super) static ALLOWED_STRING_KEYS: &[&str] = &[
     "terminal.term_version_source",
     "skip_reason",
     "auto_cadence_reason",
+    "invocation_source",
+    "output_limit",
+    "read_file_role",
+    "read_skill_match",
+    "read_skill_source",
+    "read_selection",
+    "read_limit_kind",
+    "read_lines_applicability",
+    "read_lines_disposition",
+    "read_bytes_applicability",
+    "read_bytes_disposition",
+    "read_tokens_applicability",
+    "read_tokens_disposition",
 ];
 
 /// O(1) lookup view over [`ALLOWED_STRING_KEYS`].
@@ -211,6 +230,7 @@ fn enforce_allowlist(attrs: &mut Vec<KeyValue>) {
 
 fn scrub_attributes(attrs: &mut Vec<KeyValue>) {
     enforce_allowlist(attrs);
+    enforce_enum_values(attrs);
     for kv in attrs.iter_mut() {
         if URL_VALUED_KEYS.contains(&kv.key.as_str()) {
             reduce_url_to_origin(&mut kv.value);
@@ -257,6 +277,95 @@ fn reduce_url_to_origin(value: &mut Value) {
     {
         *s = StringValue::from(origin);
     }
+}
+
+const SOURCE_STATUS: &[&str] = &["unknown", "succeeded", "empty", "failed", "partial"];
+const SOURCE_REASON: &[&str] = &[
+    "not_instrumented",
+    "search.unclassified_exit",
+    "read.not_found",
+    "read.directory",
+    "read.denied",
+    "read.ignored",
+    "read.binary",
+    "read.token_limit",
+    "read.io",
+];
+const INVOCATION_SOURCE: &[&str] = &["model", "user_direct", "system"];
+const OUTPUT_LIMIT: &[&str] = &["unobserved", "not_limited", "limited"];
+const READ_FILE_ROLE: &[&str] = &[
+    "skill_entry",
+    "skill_support",
+    "instruction",
+    "memory",
+    "ordinary",
+    "unknown",
+];
+const READ_SKILL_MATCH: &[&str] = &["registered", "unregistered", "unknown"];
+const READ_SKILL_SOURCE: &[&str] = &["local", "repo", "user", "server", "bundled", "plugin"];
+const READ_SELECTION: &[&str] = &[
+    "full",
+    "model_window",
+    "default_window",
+    "skill_full_read",
+    "unknown",
+];
+const READ_LIMIT_KIND: &[&str] = &["none", "lines", "bytes", "tokens", "multiple", "unknown"];
+const CAP_APPLICABILITY: &[&str] = &["applies", "not_applicable", "unknown"];
+const CAP_DISPOSITION: &[&str] = &[
+    "unobserved",
+    "within_limit",
+    "truncated",
+    "rejected",
+    "exempt",
+];
+const GREP_REASON: &[&str] = &["timeout", "spawn_failure", "early_stop"];
+
+fn enforce_enum_values(attrs: &mut Vec<KeyValue>) {
+    attrs.retain(|kv| match kv.key.as_str() {
+        "source_status" => string_in(&kv.value, SOURCE_STATUS),
+        "source_reason" => string_in(&kv.value, SOURCE_REASON),
+        "grep_reason" => string_in(&kv.value, GREP_REASON),
+        "invocation_source" => string_in(&kv.value, INVOCATION_SOURCE),
+        "output_limit" => string_in(&kv.value, OUTPUT_LIMIT),
+        "read_file_role" => string_in(&kv.value, READ_FILE_ROLE),
+        "read_skill_match" => string_in(&kv.value, READ_SKILL_MATCH),
+        "read_skill_source" => string_in(&kv.value, READ_SKILL_SOURCE),
+        "read_selection" => string_in(&kv.value, READ_SELECTION),
+        "read_limit_kind" => string_in(&kv.value, READ_LIMIT_KIND),
+        "read_lines_applicability" | "read_bytes_applicability" | "read_tokens_applicability" => {
+            string_in(&kv.value, CAP_APPLICABILITY)
+        }
+        "read_lines_disposition" | "read_bytes_disposition" | "read_tokens_disposition" => {
+            string_in(&kv.value, CAP_DISPOSITION)
+        }
+        "tool_version" => string_in(&kv.value, crate::events::ToolContractVersion::ALLOWED),
+        "tool_id" => tool_id_allowed(&kv.value),
+        "invocation_id" => invocation_id_allowed(&kv.value),
+        _ => true,
+    });
+}
+
+fn string_in(value: &Value, allowed: &[&str]) -> bool {
+    string_value(value).is_some_and(|text| allowed.contains(&text))
+}
+
+fn string_value(value: &Value) -> Option<&str> {
+    match value {
+        Value::String(text) => Some(text.as_str()),
+        _ => None,
+    }
+}
+
+fn tool_id_allowed(value: &Value) -> bool {
+    string_value(value).is_some_and(|id| {
+        id == crate::events::CanonicalToolId::OPAQUE
+            || crate::events::CanonicalToolId::from_qualified(id).is_some()
+    })
+}
+
+fn invocation_id_allowed(value: &Value) -> bool {
+    string_value(value).is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 /// Secret-shape then user-path scrub (shared with the external pipeline).
@@ -485,6 +594,12 @@ mod tests {
             "parent_agent_id",
             "from_mode",
             "tool_use_id",
+            "invocation_id",
+            "tool_id",
+            "tool_version",
+            "source_status",
+            "source_reason",
+            "grep_reason",
             "command_name",
             "command_source",
             "event_type",
@@ -497,12 +612,64 @@ mod tests {
             "terminal.term_version_source",
             "skip_reason",
             "auto_cadence_reason",
+            "invocation_source",
+            "output_limit",
+            "read_file_role",
+            "read_skill_match",
+            "read_skill_source",
+            "read_selection",
+            "read_limit_kind",
+            "read_lines_applicability",
+            "read_lines_disposition",
+            "read_bytes_applicability",
+            "read_bytes_disposition",
+            "read_tokens_applicability",
+            "read_tokens_disposition",
         ];
         assert_eq!(
             ALLOWED_STRING_KEYS, expected,
             "ALLOWED_STRING_KEYS changed: adding a key exports a new field — confirm it carries no \
              user content and get telemetry-owner review, then update this pin."
         );
+    }
+
+    #[test]
+    fn tool_execution_enums_drop_paths_and_still_scrub_secrets() {
+        let mut attrs = vec![
+            KeyValue::new("tool_id", "/tmp/secret-project/main.rs"),
+            KeyValue::new("source_reason", "search.unclassified_exit"),
+            KeyValue::new("read_file_role", "/tmp/secret-project/note.txt"),
+            KeyValue::new("read_tokens_disposition", "rejected"),
+            KeyValue::new("source_status", "CANARY_STATUS /tmp/nope"),
+            KeyValue::new("grep_reason", "timeout"),
+            KeyValue::new("invocation_id", "not-a-uuid"),
+            KeyValue::new("tool_version", "current"),
+            KeyValue::new("model_id", "sk-CANARYabcdefghij1234567890"),
+        ];
+        scrub_attributes(&mut attrs);
+        let keys: Vec<&str> = attrs.iter().map(|kv| kv.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "source_reason",
+                "read_tokens_disposition",
+                "grep_reason",
+                "tool_version",
+                "model_id",
+            ]
+        );
+        let model = attrs
+            .iter()
+            .find(|kv| kv.key.as_str() == "model_id")
+            .and_then(|kv| match &kv.value {
+                Value::String(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("model_id must stay a string");
+        assert!(model.contains("[REDACTED_SECRET]"));
+        assert!(!format!("{attrs:?}").contains("secret-project"));
+        assert!(!format!("{attrs:?}").contains("CANARY_STATUS"));
+        assert!(!format!("{attrs:?}").contains("sk-CANARY"));
     }
 
     #[test]

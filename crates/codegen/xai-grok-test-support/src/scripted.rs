@@ -7,6 +7,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -15,6 +16,10 @@ use serde_json::Value;
 
 pub(crate) type BoxWait = Pin<Box<dyn Future<Output = ()> + Send>>;
 pub(crate) type TerminalWait = Box<dyn FnOnce() -> BoxWait + Send>;
+
+/// An SSE comment the hang body flushes so the response head reaches the client, then the stream
+/// produces no chunk; a comment carries no event, so the client's idle timer runs from here.
+const HANG_OPENING_FRAME: &[u8] = b": grok-mock stream open\n\n";
 
 /// One SSE event as data: optional `event:` name plus the `data:` payload.
 #[derive(Debug, Clone)]
@@ -48,6 +53,9 @@ pub enum ScriptedBody {
     Sse(Vec<SseEvent>),
     /// Raw body bytes, served verbatim (byte-controllable malformed SSE etc.).
     Raw(String),
+    /// The head reaches the client, then the body stalls forever with no chunk, so the client's
+    /// inference idle timeout fires.
+    Hang,
 }
 
 /// A scripted reply served by a matched expectation or compatibility FIFO.
@@ -87,6 +95,16 @@ impl ScriptedResponse {
         }
     }
 
+    /// A 200 stream whose head reaches the client, then never yields a chunk, so the client's
+    /// inference idle timeout fires.
+    pub fn hang() -> Self {
+        Self {
+            status: 200,
+            headers: vec![("content-type".to_owned(), "text/event-stream".to_owned())],
+            body: ScriptedBody::Hang,
+        }
+    }
+
     pub(crate) fn is_sse(&self) -> bool {
         matches!(self.body, ScriptedBody::Sse(_))
     }
@@ -121,6 +139,23 @@ impl ScriptedResponse {
                     wait().await;
                 }
                 s.into_response()
+            }
+            ScriptedBody::Hang => {
+                if let Some(wait) = before_terminal {
+                    wait().await;
+                }
+                let body = stream::unfold(false, |flushed| async move {
+                    if flushed {
+                        std::future::pending::<()>().await;
+                        None
+                    } else {
+                        Some((
+                            Ok::<Bytes, std::io::Error>(Bytes::from_static(HANG_OPENING_FRAME)),
+                            true,
+                        ))
+                    }
+                });
+                Response::new(Body::from_stream(body))
             }
             ScriptedBody::Sse(events) => {
                 let last_idx = events.len().checked_sub(1);

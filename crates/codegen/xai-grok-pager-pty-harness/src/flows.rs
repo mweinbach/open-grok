@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 
+use crate::content::MockCanAdministerTeam;
 use crate::{ContentController, PtyHarness};
 
 /// Pump PTY output until every label is absent from the visible screen.
@@ -110,6 +111,25 @@ pub fn seed_fake_oauth_team_member(content: &ContentController, user: &str) {
         user,
         true,
         ",\n    \"team_name\": \"PTY Team\",\n    \"team_role\": \"MEMBER\"",
+    );
+}
+
+/// Like [`seed_fake_oauth_team_member`], with an explicit
+/// `can_administer_team` capability (`Omitted` leaves the key out).
+pub fn seed_fake_oauth_team_member_can_administer(
+    content: &ContentController,
+    user: &str,
+    can_administer: MockCanAdministerTeam,
+) {
+    let capability = match can_administer.wire_value() {
+        Some(value) => format!(",\n    \"can_administer_team\": {value}"),
+        None => String::new(),
+    };
+    seed_fake_oauth_raw(
+        content,
+        user,
+        true,
+        &format!(",\n    \"team_name\": \"PTY Team\",\n    \"team_role\": \"MEMBER\"{capability}"),
     );
 }
 

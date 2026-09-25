@@ -43,6 +43,55 @@ pub fn messages_api_events(text: &str, model: &str, stop_reason: &str) -> Vec<Ev
     ]
 }
 
+/// Messages API turn that streams a `thinking` block before the visible text block, so the sampler
+/// yields a reasoning sibling ahead of the assistant answer.
+pub fn messages_api_script_with_reasoning(
+    reasoning: &str,
+    text: &str,
+    model: &str,
+    stop_reason: &str,
+) -> Vec<SseEvent> {
+    vec![
+        SseEvent::data(
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_test", "type": "message", "role": "assistant",
+                    "content": [], "model": model, "stop_reason": null,
+                    "usage": {
+                        "input_tokens": 10, "output_tokens": 0,
+                        "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0
+                    }
+                }
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}})
+                .to_string(),
+        ),
+        SseEvent::data(
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":reasoning}})
+                .to_string(),
+        ),
+        SseEvent::data(json!({"type":"content_block_stop","index":0}).to_string()),
+        SseEvent::data(
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}})
+                .to_string(),
+        ),
+        SseEvent::data(
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":text}})
+                .to_string(),
+        ),
+        SseEvent::data(json!({"type":"content_block_stop","index":1}).to_string()),
+        SseEvent::data(
+            json!({"type":"message_delta","delta":{"stop_reason":stop_reason},"usage":{"output_tokens":5,"input_tokens":10}})
+                .to_string(),
+        ),
+        SseEvent::data(json!({"type":"message_stop"}).to_string()),
+    ]
+}
+
 /// Generate ChatCompletions SSE events that stream `text` word-by-word
 /// (whitespace-collapsing; use [`chat_completion_events_exact`] when the
 /// receiver must reconstruct `text` byte-for-byte).
@@ -144,6 +193,57 @@ fn chat_completion_script_from_deltas(deltas: &[String], model: &str) -> Vec<Sse
     ));
     events.push(SseEvent::data("[DONE]"));
     events
+}
+
+/// ChatCompletions turn that streams a `reasoning_content` delta before the visible content, so the
+/// sampler routes the reasoning to `SamplingChannel::Reasoning` ahead of the answer text.
+pub fn chat_completion_script_with_reasoning(
+    reasoning: &str,
+    text: &str,
+    model: &str,
+) -> Vec<SseEvent> {
+    vec![
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "reasoning_content": reasoning },
+                    "finish_reason": null
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": text },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+        ),
+        SseEvent::data(
+            json!({
+                "id": "chatcmpl-test",
+                "object": "chat.completion.chunk",
+                "created": 1234567890,
+                "model": model,
+                "choices": [],
+                "usage": { "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12 }
+            })
+            .to_string(),
+        ),
+        SseEvent::data("[DONE]"),
+    ]
 }
 
 /// Generate Responses API SSE events that stream `text` word-by-word

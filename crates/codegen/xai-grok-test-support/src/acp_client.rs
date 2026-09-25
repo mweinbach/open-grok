@@ -277,6 +277,38 @@ impl GrokStdioClient {
             .await
     }
 
+    /// Prompt with `_meta: { "sendNow": true }` — bypasses the prompt queue.
+    pub async fn prompt_send_now(
+        &self,
+        session_id: &acp::SessionId,
+        text: &str,
+    ) -> acp::Result<acp::PromptResponse> {
+        self.conn
+            .prompt(
+                acp::PromptRequest::new(
+                    session_id.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        text.to_string(),
+                    ))],
+                )
+                .meta(serde_json::json!({ "sendNow": true }).as_object().cloned()),
+            )
+            .await
+    }
+
+    /// Send an out-of-spec extension notification (`params` verbatim).
+    pub async fn ext_notification(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> acp::Result<()> {
+        let encoded =
+            serde_json::value::to_raw_value(&params).expect("serialize ext notification params");
+        self.conn
+            .ext_notification(acp::ExtNotification::new(method, Arc::from(encoded)))
+            .await
+    }
+
     pub fn captured_text(&self) -> String {
         self.capture.chunks.lock().unwrap().join("")
     }

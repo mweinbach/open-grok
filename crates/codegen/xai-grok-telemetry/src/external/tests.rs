@@ -202,6 +202,10 @@ fn metric_attr_keys_are_pinned() {
         !schema::METRIC_ALLOWED_ATTR_KEYS.contains(&"prompt.id"),
         "prompt.id is events-only (unbounded cardinality on metrics)"
     );
+    assert!(
+        !schema::METRIC_ALLOWED_ATTR_KEYS.contains(&"invocation_id"),
+        "invocation_id is not a tool.usage label"
+    );
 }
 
 #[test]
@@ -583,21 +587,14 @@ fn turn_error_increments_error_count() {
 
 #[test]
 fn tool_result_hook_rewrote_is_content_free() {
-    use xai_grok_session_events::types::ToolOutcome;
     for (hook_rewrote, want) in [(true, "true"), (false, "false")] {
         let stream = build(gates_off());
-        emit_event_into(
-            &stream,
-            &events::ToolCallCompleted {
-                tool_name: "run_terminal_cmd".into(),
-                outcome: ToolOutcome::Success,
-                hook_rewrote,
-                duration_ms: 5,
-                tool_result_size_bytes: None,
-                file_path: None,
-                parameters: None,
-            },
-        );
+        emit_event_into(&stream, &{
+            let mut event = events::completed_for_test("run_terminal_cmd", "grok");
+            event.hook_rewrote = hook_rewrote;
+            event.duration_ms = 5;
+            event
+        });
         let events = exported_events(&stream);
         assert_eq!(attr(&events[0], "hook_rewrote").as_deref(), Some(want));
     }
@@ -606,22 +603,21 @@ fn tool_result_hook_rewrote_is_content_free() {
 #[test]
 fn tool_result_gates_off_collapses_and_reduces() {
     let stream = build(gates_off());
-    emit_event_into(
-        &stream,
-        &events::ToolCallCompleted {
-            tool_name: "nebula__post_message".into(),
-            outcome: xai_grok_session_events::types::ToolOutcome::Success,
-            hook_rewrote: false,
-            duration_ms: 42,
-            tool_result_size_bytes: None,
-            file_path: Some("/Users/alice/secret-project/main.rs".into()),
-            parameters: Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"})),
-        },
-    );
+    emit_event_into(&stream, &{
+        let mut event = events::completed_for_test("nebula__post_message", "grok");
+        event.duration_ms = 42;
+        event.file_path = Some("/Users/alice/secret-project/main.rs".into());
+        event.parameters = Some(serde_json::json!({"text": "CANARY_TOOL_ARGS"}));
+        event
+    });
     let events = exported_events(&stream);
     let ev = &events[0];
     assert_eq!(ev.0, "grok_code.tool_result");
     assert_eq!(attr(ev, "tool_name").as_deref(), Some("mcp_tool"));
+    assert!(
+        !format!("{:?}", stream.metrics.get_finished_metrics()).contains("invocation_id"),
+        "invocation_id must not be a tool.usage label"
+    );
     assert_eq!(attr(ev, "file_extension").as_deref(), Some("rs"));
     assert_eq!(attr(ev, "file_path"), None, "full path is details-gated");
     assert_eq!(
@@ -646,18 +642,13 @@ fn tool_result_details_gate_exposes_verbatim_scrubbed() {
         .map(|h| h.to_string_lossy().into_owned())
         .unwrap_or_else(|| "/home/testuser".into());
     let path = format!("{home}/proj/main.rs");
-    emit_event_into(
-        &stream,
-        &events::ToolCallCompleted {
-            tool_name: "nebula__post_message".into(),
-            outcome: xai_grok_session_events::types::ToolOutcome::Success,
-            hook_rewrote: false,
-            duration_ms: 42,
-            tool_result_size_bytes: None,
-            file_path: Some(path.clone()),
-            parameters: Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"})),
-        },
-    );
+    emit_event_into(&stream, &{
+        let mut event = events::completed_for_test("nebula__post_message", "grok");
+        event.duration_ms = 42;
+        event.file_path = Some(path.clone());
+        event.parameters = Some(serde_json::json!({"key": "sk-CANARYabcdefghij1234567890"}));
+        event
+    });
     let events = exported_events(&stream);
     let ev = &events[0];
     assert_eq!(
@@ -887,6 +878,7 @@ fn skill_activated_name_gated() {
             skill_name: "internal-deploy-runbook".into(),
             plugin_source: None,
             trigger: events::SkillTrigger::SlashCommand,
+            skill_origin: None,
         },
     );
     let events = exported_events(&stream);
@@ -911,6 +903,7 @@ fn skill_activated_exports_every_trigger() {
                 skill_name: "pdf".into(),
                 plugin_source: None,
                 trigger,
+                skill_origin: None,
             },
         );
         let events = exported_events(&stream);

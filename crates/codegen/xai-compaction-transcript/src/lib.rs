@@ -17,8 +17,9 @@ pub const COMPACTION_DIR: &str = "compaction";
 pub const INDEX_FILE: &str = "INDEX.md";
 const SEGMENT_PREFIX: &str = "segment_";
 
-/// Whole-turn-boundary truncation cap for one segment's verbatim section.
-const SEGMENT_MAX_BYTES: usize = 512 * 1024;
+/// Segment verbatim-section cap, kept at grep's file-size ceiling in
+/// crates/codegen/xai-grok-tools/src/implementations/grok_build/grep/mod.rs.
+const SEGMENT_MAX_BYTES: usize = 5 * 1024 * 1024;
 const TRUNCATION_NOTICE: &str =
     "\n\n[... TRUNCATED at {limit} bytes, {omitted} turns omitted ...]\n";
 /// Per-turn text/arg caps for the `balanced` detail level (chars, like the Python implementation).
@@ -681,8 +682,8 @@ mod tests {
     /// is exceeded, with a notice naming how many turns were omitted.
     #[test]
     fn verbatim_turns_truncate_at_turn_boundary() {
-        // Each turn renders ~200 KB, so the 3rd turn blows the 512 KB budget.
-        let big = "x".repeat(200 * 1024);
+        // Each turn renders ~2 MiB, so the 3rd turn blows the 5 MiB budget.
+        let big = "x".repeat(2 * 1024 * 1024);
         let items = [user(&big), user(&big), user(&big), user(&big)];
         let md = render_segment_md(&items, "s", 0, CompactionDetail::Verbose, "t");
         assert!(md.contains("### Turn 0 (Human)"));
