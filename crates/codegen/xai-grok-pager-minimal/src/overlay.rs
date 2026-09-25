@@ -1292,7 +1292,7 @@ mod tests {
         assert_eq!(visible(3, 12, 40), 3);
         assert_eq!(visible(3, 80, 2), 0);
         assert_eq!(visible(3, 80, 3), 3);
-        assert_eq!(content_target(0, 0, visible(3, 11, 0, 40), 1, 1, 40), 3);
-        assert_eq!(content_target(0, 0, visible(3, 80, 0, 2), 1, 1, 5), 3);
+        assert_eq!(content_target(0, 0, visible(3, 11, 40), 1, 1, 0, 40), 3);
+        assert_eq!(content_target(0, 0, visible(3, 80, 2), 1, 1, 0, 5), 3);
     }
 }

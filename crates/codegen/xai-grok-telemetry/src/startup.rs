@@ -9,6 +9,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
+mod slow_phase;
+mod subphase;
+mod tokens;
+pub(crate) use self::slow_phase::spawn_slow_phase_warnings;
+#[cfg(test)]
+pub(crate) use self::slow_phase::{WarnedPhases, slow_phase_to_warn};
+pub use self::subphase::Subphase;
+#[cfg(test)]
+pub(crate) use self::subphase::SubphaseTimings;
+pub use self::subphase::record_prefetch_wait;
+pub(crate) use self::subphase::{record_subphase, subphases};
+pub use self::tokens::{PendingStartup, PhaseScope, ReadinessBudget, phase_scope};
+
 /// `unified.jsonl` message keys, exported so consumers (the probe, tests)
 /// grep for the same strings this module writes.
 pub const STARTUP_PHASE_MSG: &str = "startup phase";
@@ -16,8 +29,6 @@ pub const CONNECT_FINISHED_MSG: &str = "connect finished";
 pub const STARTUP_COMPLETE_MSG: &str = "startup complete";
 pub const STARTUP_TIMING_MSG: &str = "startup timing";
 pub const STARTUP_SLOW_PHASE_MSG: &str = "startup phase running long";
-
-const SLOW_PHASE_WARN_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::IntoStaticStr)]
 #[strum(serialize_all = "snake_case")]
@@ -106,6 +117,30 @@ impl StartupOutcome {
     }
 }
 
+/// Why the root span closes, so every close site names a reason instead of a bare string.
+#[derive(Clone, Copy)]
+pub(crate) enum RootClose {
+    Reported(StartupOutcome),
+    Superseded,
+    Abandoned,
+    Served,
+    #[cfg(test)]
+    Discarded,
+}
+
+impl RootClose {
+    fn label(self) -> &'static str {
+        match self {
+            RootClose::Reported(outcome) => outcome.label(),
+            RootClose::Superseded => "superseded",
+            RootClose::Abandoned => "abandoned",
+            RootClose::Served => "served",
+            #[cfg(test)]
+            RootClose::Discarded => "discarded",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, strum::IntoStaticStr, serde::Serialize)]
 #[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
@@ -155,8 +190,7 @@ impl PhaseSnapshot {
         self.open.map_or("unknown", |(phase, _)| phase.label())
     }
 
-    /// Not the open step: a step with no await inside closes before a deadline
-    /// observer can run, so the open one is usually its successor.
+    /// The slowest phase so far, including the one still open.
     pub fn longest_step(&self) -> Option<StartupPhase> {
         self.completed
             .iter()
@@ -192,9 +226,17 @@ struct Inner {
     completed: Vec<(StartupPhase, Duration)>,
     current: Option<(StartupPhase, Instant)>,
     current_span: Option<tracing::Span>,
-    root_span: tracing::Span,
+    root_span: Option<tracing::Span>,
     auth_mode: AuthMode,
     owner: Owner,
+}
+
+impl Inner {
+    /// Takes the root and any open-phase span to drop after the lock; `None` once the root has already closed.
+    fn take_spans_to_close(&mut self) -> Option<(tracing::Span, Option<tracing::Span>)> {
+        let root = self.root_span.take()?;
+        Some((root, self.current_span.take()))
+    }
 }
 
 pub struct StartupTimer {
@@ -203,16 +245,19 @@ pub struct StartupTimer {
 }
 
 impl StartupTimer {
-    pub fn new() -> Self {
+    pub(crate) fn new(owner: Owner) -> Self {
         Self {
             started: Instant::now(),
             inner: Mutex::new(Inner {
                 completed: Vec::new(),
                 current: None,
                 current_span: None,
-                root_span: tracing::info_span!("startup", outcome = tracing::field::Empty),
+                root_span: Some(tracing::info_span!(
+                    "startup",
+                    outcome = tracing::field::Empty
+                )),
                 auth_mode: AuthMode::Unknown,
-                owner: Owner::Agent,
+                owner,
             }),
         }
     }
@@ -223,29 +268,49 @@ impl StartupTimer {
 
     /// Closes the open phase; re-entering the open phase is ignored, so two
     /// layers can name the same step and it is measured once.
-    pub fn enter(&self, phase: StartupPhase) {
+    /// Returns whether a prior phase closed, so the caller can stamp the phase boundary.
+    pub fn enter(&self, phase: StartupPhase) -> bool {
         let now = Instant::now();
         let finished_span;
+        let closed_prev;
+        let root_span;
         {
             let mut g = self.lock();
+            let Some(root) = g.root_span.clone() else {
+                return false;
+            };
             if matches!(g.current, Some((open, _)) if open == phase) {
-                return;
+                return false;
             }
+            closed_prev = g.current.is_some();
             if let Some((prev, t0)) = g.current.take() {
                 g.completed.push((prev, now.saturating_duration_since(t0)));
             }
             g.current = Some((phase, now));
-            let span = phase_span(phase, &g.root_span);
-            finished_span = g.current_span.replace(span);
+            finished_span = g.current_span.take();
+            root_span = root;
         }
         drop(finished_span);
-        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let span = phase_span(phase, &root_span);
+        let orphaned = {
+            let mut g = self.lock();
+            if g.root_span.is_some() {
+                g.current_span = Some(span);
+                None
+            } else {
+                g.current = None;
+                Some(span)
+            }
+        };
+        drop(orphaned);
+        let elapsed_ms = duration_ms(self.started.elapsed());
         tracing::info!(phase = %phase.label(), elapsed_ms, "startup phase");
         crate::unified_log::info(
             STARTUP_PHASE_MSG,
             None,
             Some(serde_json::json!({ "phase": phase.label(), "elapsed_ms": elapsed_ms })),
         );
+        closed_prev
     }
 
     fn close_open_phase(&self) {
@@ -263,20 +328,15 @@ impl StartupTimer {
         drop(finished_span);
     }
 
-    fn close_root_span(&self, outcome: &'static str) {
-        let (open_phase, root);
-        {
-            let mut guard = self.lock();
-            open_phase = guard.current_span.take();
-            guard.root_span.record("outcome", outcome);
-            root = std::mem::replace(&mut guard.root_span, tracing::Span::none());
-        }
+    /// Closes the root span exactly once, recording `outcome`, and closes the open phase span with it.
+    /// The record and the drops run after the lock, so subscriber hooks never fire while the guard is held.
+    fn close_root_span(&self, reason: RootClose) {
+        let Some((root, open_phase)) = self.lock().take_spans_to_close() else {
+            return;
+        };
+        root.record("outcome", reason.label());
         drop(open_phase);
         drop(root);
-    }
-
-    fn discard_spans(&self) {
-        self.close_root_span("discarded");
     }
 
     pub fn set_auth_mode(&self, mode: AuthMode) {
@@ -321,11 +381,11 @@ impl StartupTimer {
         let g = self.lock();
         let mut map: BTreeMap<String, u64> = BTreeMap::new();
         for (phase, d) in &g.completed {
-            *map.entry(phase.label().to_string()).or_default() += d.as_millis() as u64;
+            *map.entry(phase.label().to_string()).or_default() += duration_ms(*d);
         }
         if let Some((phase, t0)) = g.current {
             *map.entry(phase.label().to_string()).or_default() +=
-                now.saturating_duration_since(t0).as_millis() as u64;
+                duration_ms(now.saturating_duration_since(t0));
         }
         map
     }
@@ -344,7 +404,7 @@ impl StartupTimer {
         let timings = self.phase_snapshot();
         let stuck_in = (outcome == StartupOutcome::Timeout).then(|| timings.stuck_in().to_string());
         let phases = timings.summary();
-        let elapsed_ms = self.elapsed().as_millis() as u64;
+        let elapsed_ms = duration_ms(self.elapsed());
         crate::unified_log::info(
             CONNECT_FINISHED_MSG,
             None,
@@ -371,75 +431,23 @@ impl StartupTimer {
     }
 }
 
-impl Default for StartupTimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 static CURRENT: Mutex<Option<Arc<StartupTimer>>> = Mutex::new(None);
 static DONE: AtomicBool = AtomicBool::new(false);
 static PROCESS_START: LazyLock<Instant> = LazyLock::new(Instant::now);
-
-/// Call first in `main`; the clock otherwise starts at first use and
-/// totals undercount.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Subphase {
-    SessionLoad,
-    SessionReplay,
-    SessionGitScan,
-    SessionSpawn,
-}
-
-#[derive(Clone, Copy, Default)]
-struct SubphaseTimings {
-    prefetch_wait_ms: Option<u64>,
-    session_load_ms: Option<u64>,
-    session_replay_ms: Option<u64>,
-    session_git_scan_ms: Option<u64>,
-    session_spawn_ms: Option<u64>,
-    time_to_first_frame_ms: Option<u64>,
-}
-
-static SUBPHASES: Mutex<SubphaseTimings> = Mutex::new(SubphaseTimings {
-    prefetch_wait_ms: None,
-    session_load_ms: None,
-    session_replay_ms: None,
-    session_git_scan_ms: None,
-    session_spawn_ms: None,
-    time_to_first_frame_ms: None,
-});
-
-fn subphases() -> std::sync::MutexGuard<'static, SubphaseTimings> {
-    SUBPHASES.lock().unwrap_or_else(|error| error.into_inner())
-}
-
-pub fn record_prefetch_wait(elapsed: Duration) {
-    subphases().prefetch_wait_ms = Some(elapsed.as_millis() as u64);
-}
 
 pub fn record_first_frame() {
     if DONE.load(Ordering::Relaxed) {
         return;
     }
-    let elapsed_ms = process_elapsed().as_millis() as u64;
+    let elapsed_ms = duration_ms(process_elapsed());
     let mut sub = subphases();
     if sub.time_to_first_frame_ms.is_none() {
         sub.time_to_first_frame_ms = Some(elapsed_ms);
     }
 }
 
-pub(crate) fn record_subphase(sp: Subphase, elapsed: Duration) {
-    let ms = elapsed.as_millis() as u64;
-    let mut sub = subphases();
-    match sp {
-        Subphase::SessionLoad => sub.session_load_ms = Some(ms),
-        Subphase::SessionReplay => sub.session_replay_ms = Some(ms),
-        Subphase::SessionGitScan => sub.session_git_scan_ms = Some(ms),
-        Subphase::SessionSpawn => sub.session_spawn_ms = Some(ms),
-    }
-}
-
+/// Call first in `main`; the clock otherwise starts at first use and
+/// totals undercount.
 pub fn mark_process_start() {
     LazyLock::force(&PROCESS_START);
 }
@@ -459,102 +467,43 @@ fn current() -> Option<Arc<StartupTimer>> {
 /// Installs a new attempt, unless startup already ended; after that the
 /// returned timer records locally only.
 pub fn begin(owner: Owner) -> Arc<StartupTimer> {
-    let timer = Arc::new(StartupTimer::new());
-    timer.lock().owner = owner;
+    let timer = Arc::new(StartupTimer::new(owner));
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
-    if !DONE.load(Ordering::Relaxed) {
+    let done = DONE.load(Ordering::Relaxed);
+    let superseded = (!done).then(|| current.take()).flatten();
+    if !done {
         *current = Some(Arc::clone(&timer));
         spawn_slow_phase_warnings();
     }
+    drop(current);
+    if let Some(prev) = superseded {
+        prev.close_root_span(RootClose::Superseded);
+    }
     timer
-}
-
-/// Phases already warned about, per timer.
-#[derive(Default)]
-struct WarnedPhases {
-    timer: usize,
-    phases: Vec<StartupPhase>,
-}
-
-/// A phase left open past the threshold; agent-owned timers idle with a
-/// phase open until their first client, so they are skipped.
-fn slow_phase_to_warn(
-    timer: &Arc<StartupTimer>,
-    threshold: Duration,
-    warned: &mut WarnedPhases,
-) -> Option<(StartupPhase, Duration)> {
-    if timer.owner() == Owner::Agent {
-        return None;
-    }
-    let timer_id = Arc::as_ptr(timer) as usize;
-    if warned.timer != timer_id {
-        *warned = WarnedPhases {
-            timer: timer_id,
-            phases: Vec::new(),
-        };
-    }
-    let (phase, age) = timer.open_phase_age()?;
-    if age < threshold || warned.phases.contains(&phase) {
-        return None;
-    }
-    warned.phases.push(phase);
-    Some((phase, age))
-}
-
-/// Warns once per phase that runs long. A plain thread, because startup
-/// spans runtime construction; exits when startup ends.
-fn spawn_slow_phase_warnings() {
-    static SPAWNED: std::sync::Once = std::sync::Once::new();
-    SPAWNED.call_once(|| {
-        std::thread::Builder::new()
-            .name("startup-slow-phase".into())
-            .spawn(|| {
-                let mut warned = WarnedPhases::default();
-                while !DONE.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_millis(500));
-                    let Some(timer) = current() else { continue };
-                    if let Some((phase, age)) =
-                        slow_phase_to_warn(&timer, SLOW_PHASE_WARN_AFTER, &mut warned)
-                    {
-                        let open_ms = age.as_millis() as u64;
-                        tracing::warn!(
-                            phase = phase.label(),
-                            open_ms,
-                            "startup phase running long"
-                        );
-                        crate::unified_log::warn(
-                            STARTUP_SLOW_PHASE_MSG,
-                            None,
-                            Some(serde_json::json!({
-                                "phase": phase.label(),
-                                "open_ms": open_ms,
-                            })),
-                        );
-                    }
-                }
-            })
-            .ok();
-    });
 }
 
 pub(crate) fn agent_owned() -> Option<Arc<StartupTimer>> {
     current().filter(|p| p.owner() == Owner::Agent)
 }
 
-pub(crate) fn is_active() -> bool {
+pub fn is_active() -> bool {
     !DONE.load(Ordering::Relaxed) && current().is_some()
 }
 
 fn clear() {
     DONE.store(true, Ordering::Relaxed);
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let timer = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(timer) = &timer {
+        timer.close_root_span(RootClose::Abandoned);
+    }
+    drop(timer);
 }
 
 /// Stops recording for a standalone agent at its first client, so idle
 /// waiting is not counted; client-owned runs are unaffected.
 pub fn mark_agent_serving() {
     if let Some(timer) = agent_owned() {
-        timer.discard_spans();
+        timer.close_root_span(RootClose::Served);
         clear();
     }
 }
@@ -562,7 +511,11 @@ pub fn mark_agent_serving() {
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     DONE.store(false, Ordering::Relaxed);
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let timer = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(timer) = &timer {
+        timer.close_root_span(RootClose::Discarded);
+    }
+    drop(timer);
     *subphases() = SubphaseTimings::default();
 }
 
@@ -576,78 +529,12 @@ pub fn enter(phase: StartupPhase) {
         Some(timer) => timer,
         None => begin(Owner::Agent),
     };
-    timer.enter(phase);
-}
-
-/// Scopes a phase to a region of work: entered on creation, closed on drop,
-/// so no failure return can leave the phase open across a retry wait.
-#[must_use = "the phase closes when this guard drops"]
-pub struct PhaseScope(());
-
-impl Drop for PhaseScope {
-    fn drop(&mut self) {
-        if let Some(timer) = current() {
-            timer.close_open_phase();
-        }
-    }
-}
-
-/// Enter `phase` for the lifetime of the returned guard.
-pub fn phase_scope(phase: StartupPhase) -> PhaseScope {
-    enter(phase);
-    PhaseScope(())
+    let _ = timer.enter(phase);
 }
 
 pub fn set_auth_mode(mode: AuthMode) {
     if let Some(timer) = current() {
         timer.set_auth_mode(mode);
-    }
-}
-
-/// The obligation to end startup exactly once; a dropped token ends startup
-/// itself and logs a warning, so forgotten paths are visible.
-#[must_use = "startup must be finished or abandoned"]
-pub struct PendingStartup {
-    ended: bool,
-}
-
-impl PendingStartup {
-    /// One per interactive or headless process; utility commands call
-    /// [`mark_utility_process`] instead.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        PendingStartup { ended: false }
-    }
-
-    /// Records the startup total with `outcome` and ends recording.
-    pub fn finish(mut self, outcome: StartupOutcome) {
-        report_total(outcome);
-        self.ended = true;
-    }
-
-    /// Ends recording without a total, for a run the user cancelled or one
-    /// that never was a startup.
-    pub fn abandon(mut self) {
-        clear();
-        self.ended = true;
-    }
-
-    /// Finishes a token still held in an `Option`; does nothing once taken.
-    pub fn finish_held(token: &mut Option<Self>, outcome: StartupOutcome) {
-        if let Some(pending) = token.take() {
-            pending.finish(outcome);
-        }
-    }
-}
-
-impl Drop for PendingStartup {
-    fn drop(&mut self) {
-        if self.ended {
-            return;
-        }
-        tracing::warn!("startup was never finished; ending recording");
-        crate::unified_log::warn("startup never finished", None, None);
-        clear();
     }
 }
 
@@ -663,75 +550,28 @@ pub(crate) fn report_total(outcome: StartupOutcome) {
         return;
     }
     let timer = CURRENT.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let total_ms = process_elapsed().as_millis() as u64;
+    let total_ms = duration_ms(process_elapsed());
     let (phases, auth_mode) = match timer {
         Some(p) => {
             if outcome == StartupOutcome::Ok {
                 p.close_open_phase();
             }
-            p.close_root_span(outcome.label());
+            p.close_root_span(RootClose::Reported(outcome));
             (p.summary(), p.auth_mode())
         }
         None => (String::new(), AuthMode::Unknown),
     };
     let sub = *subphases();
-    let event = crate::events::StartupCompleted {
-        total_ms,
-        outcome,
-        phases,
-        auth_mode,
-        prefetch_wait_ms: sub.prefetch_wait_ms,
-        session_load_ms: sub.session_load_ms,
-        session_replay_ms: sub.session_replay_ms,
-        session_git_scan_ms: sub.session_git_scan_ms,
-        session_spawn_ms: sub.session_spawn_ms,
-        time_to_first_frame_ms: sub.time_to_first_frame_ms,
-    };
+    let event = sub.startup_completed(total_ms, outcome, phases, auth_mode);
     if let Ok(record) = serde_json::to_value(&event) {
         crate::unified_log::info(STARTUP_COMPLETE_MSG, None, Some(record));
     }
     crate::session_ctx::log_event(event);
 }
 
-/// A deadline for a readiness-path network step. Naming the phase and
-/// bounding the wait are one call, so neither can be forgotten.
-pub struct ReadinessBudget {
-    limit: Duration,
-}
-
-impl ReadinessBudget {
-    pub const fn new(limit: Duration) -> Self {
-        Self { limit }
-    }
-
-    /// Run `fut` under the budget, attributed to `phase` for exactly the
-    /// run's duration. Returns `None` on timeout, after logging, instead of
-    /// blocking readiness.
-    pub async fn run<T>(
-        &self,
-        phase: StartupPhase,
-        fut: impl std::future::Future<Output = T>,
-    ) -> Option<T> {
-        let _scope = phase_scope(phase);
-        match tokio::time::timeout(self.limit, fut).await {
-            Ok(value) => Some(value),
-            Err(_) => {
-                tracing::warn!(
-                    phase = phase.label(),
-                    limit_secs = self.limit.as_secs(),
-                    "readiness step hit its budget"
-                );
-                crate::unified_log::warn(
-                    "readiness step hit its budget",
-                    None,
-                    Some(
-                        serde_json::json!({ "phase": phase.label(), "limit_secs": self.limit.as_secs() }),
-                    ),
-                );
-                None
-            }
-        }
-    }
+/// Whole milliseconds, saturating instead of wrapping on the (never-reached) overflow, matching `subagent_spawn`.
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 pub fn format_duration(d: Duration) -> String {
@@ -929,12 +769,7 @@ mod tests {
 
     #[test]
     fn slow_phase_warning_fires_once_per_open_phase() {
-        // `StartupTimer::new` defaults to the exempt `Owner::Agent`.
-        let client_timer = || {
-            let timer = Arc::new(StartupTimer::new());
-            timer.lock().owner = Owner::Client;
-            timer
-        };
+        let client_timer = || Arc::new(StartupTimer::new(Owner::Client));
         let timer = client_timer();
         let mut warned = WarnedPhases::default();
 
@@ -970,8 +805,7 @@ mod tests {
             "a replacement timer warns afresh for the same phase",
         );
 
-        let agent = Arc::new(StartupTimer::new());
-        agent.lock().owner = Owner::Agent;
+        let agent = Arc::new(StartupTimer::new(Owner::Agent));
         agent.enter(StartupPhase::Bootstrap);
         assert!(
             slow_phase_to_warn(&agent, Duration::ZERO, &mut warned).is_none(),
@@ -981,7 +815,7 @@ mod tests {
 
     #[test]
     fn summary_tracks_completed_and_open_phases() {
-        let p = StartupTimer::new();
+        let p = StartupTimer::new(Owner::Agent);
         p.enter(StartupPhase::ConfigLoad);
         p.enter(StartupPhase::ManagedPolicy);
         p.enter(StartupPhase::ModelCatalog);
@@ -1115,24 +949,27 @@ mod tests {
             reset_for_tests();
             record_subphase(sp, Duration::from_millis(7));
             let sub = *subphases();
-            let routed = match sp {
-                Subphase::SessionLoad => sub.session_load_ms,
-                Subphase::SessionReplay => sub.session_replay_ms,
-                Subphase::SessionGitScan => sub.session_git_scan_ms,
-                Subphase::SessionSpawn => sub.session_spawn_ms,
-            };
-            assert_eq!(routed, Some(7), "{name} routes to its own field");
+            assert_eq!(sub.get(sp), Some(7), "{name} routes to its own slot");
             let set = [
-                sub.session_load_ms,
-                sub.session_replay_ms,
-                sub.session_git_scan_ms,
-                sub.session_spawn_ms,
+                Subphase::SessionLoad,
+                Subphase::SessionReplay,
+                Subphase::SessionGitScan,
+                Subphase::SessionSpawn,
             ]
             .iter()
-            .filter(|value| value.is_some())
+            .filter(|other| sub.get(**other) == Some(7))
             .count();
-            assert_eq!(set, 1, "{name} sets exactly one field");
+            assert_eq!(set, 1, "{name} sets exactly one slot");
         }
+
+        reset_for_tests();
+        record_subphase(Subphase::SessionLoad, Duration::from_millis(7));
+        record_subphase(Subphase::SessionLoad, Duration::from_millis(999));
+        assert_eq!(
+            subphases().get(Subphase::SessionLoad),
+            Some(999),
+            "session subphases keep the latest write"
+        );
 
         reset_for_tests();
         record_first_frame();

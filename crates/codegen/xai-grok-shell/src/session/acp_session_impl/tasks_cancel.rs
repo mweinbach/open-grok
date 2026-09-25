@@ -675,8 +675,21 @@ impl SessionActor {
         if tore_down_task {
             self.cancel_active_sampling_requests();
             if rewound_input.is_none() {
+                // Handoff answers must exist before the repair below writes its halt text.
+                let answers =
+                    if !cancel_subagents && let Some(prompt_id) = cancelled_prompt_id.as_deref() {
+                        let interrupt = if send_now {
+                            xai_tool_types::ForegroundSpawnInterrupt::UserSentMessage
+                        } else {
+                            xai_tool_types::ForegroundSpawnInterrupt::UserStoppedTurn
+                        };
+                        self.hand_off_foreground_subagents(prompt_id, interrupt)
+                            .await
+                    } else {
+                        HashMap::new()
+                    };
                 self.chat_state_handle
-                    .repair_dangling_after_harness_halt("user_cancel");
+                    .repair_dangling_after_harness_halt("user_cancel", answers);
             }
         }
 

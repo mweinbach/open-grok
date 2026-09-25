@@ -194,7 +194,7 @@ impl GrokAuth {
     /// retention. Use this for trace-upload and research-data gates.
     /// Product analytics (`telemetry_enabled`) and user-facing sync
     /// features should use `is_zdr_team()` directly.
-    pub(crate) fn is_data_collection_disabled(&self) -> bool {
+    pub fn is_data_collection_disabled(&self) -> bool {
         self.is_zdr_team() || self.coding_data_retention_opt_out
     }
 

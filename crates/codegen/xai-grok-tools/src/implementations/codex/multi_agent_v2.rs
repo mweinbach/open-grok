@@ -304,7 +304,9 @@ async fn spawn(mut ctx: ToolCallContext, input: SpawnAgentInput) -> Result<ToolO
                     .to_owned(),
                 subagent_type: input
                     .agent_type
+                    .clone()
                     .unwrap_or_else(|| "general-purpose".to_owned()),
+                subagent_type_specified: input.agent_type.is_some(),
                 model: input.model,
                 reasoning_effort: input.reasoning_effort,
                 context: Some(context),
@@ -313,6 +315,7 @@ async fn spawn(mut ctx: ToolCallContext, input: SpawnAgentInput) -> Result<ToolO
                 cwd: None,
                 capability_mode: None,
                 isolation: None,
+                workspace: None,
             },
         )
         .await

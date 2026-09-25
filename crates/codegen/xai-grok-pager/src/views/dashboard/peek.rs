@@ -109,9 +109,8 @@ pub struct PeekPanelState {
     pub auto_approve: bool,
     /// Whether the peeked agent is in Auto (LLM classifier) mode. Shown as an `auto` flag (mutually exclusive with `always-approve`; yolo wins).
     pub auto: bool,
-    /// Whether the peeked agent is in plan mode. Set live by the render-time refresh.
-    /// Shown as a `plan` flag on the bottom border (so the Shift+Tab mode cycle's three states are all visible).
-    pub plan_mode: bool,
+    /// Session-mode flag on the bottom border (`plan`, `ask`). `None` in the default mode.
+    pub mode_label: Option<&'static str>,
 }
 
 impl PeekPanelState {
@@ -135,7 +134,7 @@ impl PeekPanelState {
             model_name: None,
             auto_approve: false,
             auto: false,
-            plan_mode: false,
+            mode_label: None,
         }
     }
 
@@ -330,13 +329,12 @@ pub fn compute_peek_fields(
 }
 
 /// The peeked row's live config-badge state for the peek box's bottom border:
-/// model display name, always-approve (yolo), auto (classifier) mode, and plan mode.
-/// Named fields so the three adjacent bools can't be transposed at a call/return site.
+/// model display name, always-approve (yolo), auto (classifier) mode, and session-mode label.
 pub struct PeekModeBadge {
     pub model: Option<String>,
     pub yolo: bool,
     pub auto: bool,
-    pub plan: bool,
+    pub mode_label: Option<&'static str>,
 }
 
 /// The peeked row's current config-badge state.
@@ -352,19 +350,16 @@ pub fn peek_model_and_mode(
         model: None,
         yolo: false,
         auto: false,
-        plan: false,
+        mode_label: None,
     };
     match row {
         DashboardRowId::TopLevel(id) => match agents.get(id) {
-            Some(agent) => {
-                let plan = agent.plan_mode_pending.unwrap_or(agent.plan_mode_active);
-                PeekModeBadge {
-                    model: agent.session.models.current_model_name(),
-                    yolo: agent.session.yolo_mode,
-                    auto: agent.session.is_auto(),
-                    plan,
-                }
-            }
+            Some(agent) => PeekModeBadge {
+                model: agent.session.models.current_model_name(),
+                yolo: agent.session.yolo_mode,
+                auto: agent.session.is_auto(),
+                mode_label: agent.prompt_row_mode_label(),
+            },
             None => default(),
         },
         DashboardRowId::Subagent {
@@ -382,7 +377,7 @@ pub fn peek_model_and_mode(
                     model,
                     yolo: parent_agent.session.yolo_mode,
                     auto: parent_agent.session.is_auto(),
-                    plan: false,
+                    mode_label: None,
                 }
             }
             None => default(),
@@ -420,9 +415,9 @@ fn paint_peek_config_badge(
     let model_label = panel.model_name.clone().unwrap_or_default();
     let mut flags: Vec<PromptFlag> = Vec::new();
 
-    if panel.plan_mode {
+    if let Some(text) = panel.mode_label {
         flags.push(PromptFlag {
-            text: "plan",
+            text,
             color: Some(theme.accent_plan),
             bold: false,
         });
@@ -1260,7 +1255,7 @@ mod tests {
         let mut planp =
             PeekPanelState::new(DashboardRowId::TopLevel(AgentId(0)), fields("Response"));
         planp.model_name = Some("Grok 4 Fast".to_string());
-        planp.plan_mode = true;
+        planp.mode_label = Some("plan");
         let plan_bottom = badge_row(&planp, 6);
         assert!(
             plan_bottom.contains("plan"),
@@ -1279,7 +1274,7 @@ mod tests {
             "plan suppresses always-approve and auto: {plan_yolo_bottom:?}",
         );
 
-        planp.plan_mode = false;
+        planp.mode_label = None;
         let yolo_bottom = badge_row(&planp, 6);
         assert!(
             yolo_bottom.contains("always-approve") && !yolo_bottom.contains("auto"),

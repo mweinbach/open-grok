@@ -1015,8 +1015,6 @@ mod tests {
 
     // --- archive extraction tests ---
 
-    use super::test_helpers::{bundle_json, make_test_archive};
-
     #[test]
     fn extract_archive_writes_personas_roles_agents_and_skills() {
         let tmp = TempDir::new().unwrap();

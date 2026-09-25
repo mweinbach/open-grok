@@ -286,6 +286,32 @@ impl Theme {
     pub const fn primary(&self) -> Style {
         Style::new().fg(self.text_primary)
     }
+
+    /// Whether this is the bandless terminal-native palette: every band slot is `Reset` so the terminal's own canvas shows through.
+    /// The canonical predicate for "reverse video / decoration fallback instead of a color band" — key every such branch off this, not off individual slots.
+    pub const fn is_bandless(&self) -> bool {
+        matches!(self.bg_visual, Color::Reset)
+    }
+
+    /// Patch over the already-rendered row. Bandless uses reverse video: a bright-black band can sit too close to default fg.
+    pub const fn selection_overlay(&self) -> Style {
+        if self.is_bandless() {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.bg_visual)
+        }
+    }
+
+    /// Hover analog of [`Self::selection_overlay`], keyed off `bg_hover`.
+    /// On the bandless palette hover and selection share reverse video (they shared the same band before); the cursor row stays distinguishable by its marker/bold.
+    /// Dropdowns and chips use this. Inline terminal rows use a row-hover bg instead.
+    pub const fn hover_overlay(&self) -> Style {
+        if self.is_bandless() {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.bg_hover)
+        }
+    }
 }
 
 /// Compute animated brightness for a traveling wave effect.

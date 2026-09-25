@@ -113,6 +113,133 @@ where
     })
 }
 
+const F64_EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+fn parse_lenient_whole_f64(f: f64) -> Result<i64, String> {
+    if !f.is_finite() {
+        return Err("expected finite number".into());
+    }
+    if f == 0.0 {
+        return Ok(0);
+    }
+    if f.fract() != 0.0 {
+        return Err(format!("expected whole number, got {f}"));
+    }
+    if f.abs() > F64_EXACT_INTEGER_LIMIT {
+        return Err(format!(
+            "number {f} exceeds f64 integer precision (whole floats above {F64_EXACT_INTEGER_LIMIT} may be inaccurate)"
+        ));
+    }
+    Ok(f as i64)
+}
+
+/// Parse a JSON number or numeric string into a `u64`.
+pub fn parse_lenient_u64_value(value: &serde_json::Value) -> Result<u64, String> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                return Ok(u);
+            }
+            if let Some(i) = n.as_i64() {
+                if i < 0 {
+                    return Err("expected non-negative number".into());
+                }
+                return u64::try_from(i).map_err(|_| "number out of range for u64".into());
+            }
+            if let Some(f) = n.as_f64() {
+                let i = parse_lenient_whole_f64(f)?;
+                return u64::try_from(i).map_err(|_| "expected non-negative number".to_string());
+            }
+            Err("expected number, got invalid numeric representation".into())
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if let Ok(u) = trimmed.parse::<u64>() {
+                return Ok(u);
+            }
+            let i = parse_lenient_whole_f64(
+                trimmed
+                    .parse()
+                    .map_err(|_| format!("expected number, got string \"{s}\""))?,
+            )?;
+            u64::try_from(i).map_err(|_| "expected non-negative number".to_string())
+        }
+        other => Err(format!("expected number, got {other}")),
+    }
+}
+
+/// Parse a JSON number or numeric string into an `i64`.
+pub fn parse_lenient_i64_value(value: &serde_json::Value) -> Result<i64, String> {
+    match value {
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return Ok(i);
+            }
+            if let Some(u) = n.as_u64() {
+                return i64::try_from(u).map_err(|_| "number out of range for i64".into());
+            }
+            if let Some(f) = n.as_f64() {
+                return parse_lenient_whole_f64(f);
+            }
+            Err("expected number, got invalid numeric representation".into())
+        }
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if let Ok(i) = trimmed.parse::<i64>() {
+                return Ok(i);
+            }
+            parse_lenient_whole_f64(
+                trimmed
+                    .parse()
+                    .map_err(|_| format!("expected number, got string \"{s}\""))?,
+            )
+        }
+        other => Err(format!("expected number, got {other}")),
+    }
+}
+
+pub fn deserialize_lenient_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => parse_lenient_i64_value(&v)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+pub fn deserialize_lenient_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => parse_lenient_u64_value(&v)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
+pub fn deserialize_lenient_required_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    parse_lenient_u64_value(&value).map_err(serde::de::Error::custom)
+}
+
+pub fn deserialize_lenient_required_i64<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    parse_lenient_i64_value(&value).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

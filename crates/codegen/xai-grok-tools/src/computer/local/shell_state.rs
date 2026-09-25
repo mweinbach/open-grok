@@ -448,8 +448,15 @@ impl ShellState {
                 // var=value` does NOT beat allexport) and unset it after the
                 // eval so it can never reach child processes or the state
                 // dump (`export -p`).
+                //
+                // Fork: the same allexport restore also exports the snapshot
+                // carriers (`snap`, `grok_snap_*`). A login shell with large
+                // rc files (e.g. nvm completions) makes those blobs exceed
+                // MAX_ARG_STRLEN, so every subsequent child exec fails with
+                // E2BIG (exit 126). Unexport them right after the restore.
                 "{dump_script} \
                  snap=$(command cat <&3) && builtin shopt -s extglob && builtin eval -- \"$snap\" && \
+                 builtin declare +x snap grok_snap_ENV_VARS_B64 grok_snap_POSIX_OPTS_B64 grok_snap_BASH_OPTS_B64 grok_snap_FUNCTIONS_B64 grok_snap_ALIASES_B64 2>/dev/null && \
                  {{ builtin set +u 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \
                  builtin export PWD=\"$(builtin pwd)\"; \
@@ -469,6 +476,7 @@ impl ShellState {
                  builtin unsetopt aliases 2>/dev/null; \
                  builtin unalias -m '*' 2>/dev/null || true; \
                  builtin eval \"$snap\" && \
+                 builtin typeset +x snap grok_snap_ENV_VARS_B64 grok_snap_ZSH_OPTS_B64 grok_snap_FUNCTIONS_B64 grok_snap_ALIASES_B64 2>/dev/null && \
                  {{ builtin unsetopt nounset 2>/dev/null || true; \
                  builtin setopt nonomatch 2>/dev/null || true; \
                  builtin export GROK_AGENT=1; \

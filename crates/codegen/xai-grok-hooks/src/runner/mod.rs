@@ -20,6 +20,14 @@ pub struct RunContext<'a> {
     pub session_id: &'a str,
     pub workspace_root: &'a str,
     pub process_scope: Option<xai_grok_tools::util::ProcessScope>,
+    /// Loaded by the caller off the dispatch path, so the announced count and the run loop agree and no dispatch reads the file.
+    pub disabled: std::sync::Arc<crate::trust::DisabledHooks>,
+}
+
+impl RunContext<'_> {
+    pub fn disabled(&self) -> &crate::trust::DisabledHooks {
+        &self.disabled
+    }
 }
 
 /// Result of running a single hook (any handler type).

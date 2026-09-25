@@ -283,7 +283,9 @@ name = "testkit_synth_roundtrip"
 required-features = ["test-support"]
 
 # NOTE(1.0.41-replay): upstream adds `tool_call_trace` + `tool_call_trace_off`
-# test targets; re-add when slice-shell-session ports those files.
+# test targets, but those tests exercise the OTLP diagnostic-upload stack
+# (MockOtelServer, otel_layer config) that the fork omits, so their files
+# are not ported and no targets are declared.
 
 [lints]
 workspace = true

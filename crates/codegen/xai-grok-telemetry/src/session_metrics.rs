@@ -106,6 +106,27 @@ pub struct DoomLoopRecovery {
     pub model: String,
 }
 
+/// Emitted whether or not the reminder is enabled so cohorts compare on the same properties. Counts come from `response.usage`, never content.
+#[derive(Serialize)]
+pub struct LongReasoningReminderTurn {
+    pub session_id: String,
+    pub turn_number: u64,
+    pub enabled: bool,
+    /// Reasoning tokens in one call that count as long.
+    pub threshold_tokens: u32,
+    pub delay: u32,
+    pub model_calls: u32,
+    /// Sum of hidden reasoning tokens across the turn's model calls.
+    pub reasoning_tokens: u64,
+    /// Sum of output (completion) tokens across the turn's model calls.
+    pub completion_tokens: u64,
+    pub max_call_reasoning_tokens: u32,
+    /// Model calls whose reasoning exceeded `threshold_tokens`.
+    pub long_calls: u32,
+    pub reminders_fired: u32,
+    pub model: String,
+}
+
 #[derive(Serialize)]
 pub struct TraceUploadAttempted {
     pub session_id: String,
@@ -316,6 +337,48 @@ mod tests {
         })
         .unwrap();
         assert!(no_trigger.get("top_trigger").is_none(), "None is omitted");
+    }
+
+    /// The `grok-shell-long_reasoning_reminder` Mixpanel event's name and property keys are dashboard contracts; pin them.
+    #[test]
+    fn long_reasoning_reminder_event_shape_is_stable() {
+        use crate::events::TelemetryEvent;
+        assert_eq!(
+            super::LongReasoningReminderTurn::NAME,
+            "long_reasoning_reminder"
+        );
+        let event = serde_json::to_value(super::LongReasoningReminderTurn {
+            session_id: "s1".to_string(),
+            turn_number: 7,
+            enabled: true,
+            threshold_tokens: 1000,
+            delay: 1,
+            model_calls: 3,
+            reasoning_tokens: 6500,
+            completion_tokens: 900,
+            max_call_reasoning_tokens: 5000,
+            long_calls: 1,
+            reminders_fired: 1,
+            model: "grok-4.7-build".to_string(),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "session_id": "s1",
+                "turn_number": 7,
+                "enabled": true,
+                "threshold_tokens": 1000,
+                "delay": 1,
+                "model_calls": 3,
+                "reasoning_tokens": 6500,
+                "completion_tokens": 900,
+                "max_call_reasoning_tokens": 5000,
+                "long_calls": 1,
+                "reminders_fired": 1,
+                "model": "grok-4.7-build",
+            }),
+            event
+        );
     }
 
     /// `as_str` values are recorded on the `agent.prompt` span as

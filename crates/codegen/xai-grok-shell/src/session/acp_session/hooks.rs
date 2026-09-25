@@ -201,7 +201,9 @@ impl SessionActor {
         self.hook_registry
             .borrow()
             .as_ref()
-            .is_some_and(|registry| registry.has_enabled_hooks_for_canonical(event))
+            .is_some_and(|registry| {
+                registry.has_enabled_hooks_for_canonical(event, &self.hook_disabled.borrow())
+            })
             || self.client_hooks.borrow().contains_key(&event.canonical())
     }
 

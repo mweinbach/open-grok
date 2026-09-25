@@ -241,8 +241,13 @@ fn fake_standalone_facts_compose_through_shared_view() {
         false,
         RuntimeEvidence::Available(ColorLevel::TrueColor),
     );
-    let report = collect_report_with(snapshot);
+    let mut report = collect_report_with(snapshot);
 
+    // The voice probe reflects real hardware; drop its finding so this
+    // composition test stays hermetic on machines without a mic.
+    report
+        .findings
+        .retain(|finding| finding.id.domain != "voice");
     assert_eq!(report.issue_count(), 1);
     assert!(
         report

@@ -81,6 +81,7 @@ mod tests {
     /// Minimal config builder for tests in this module.
     fn cfg() -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: None,
             base_url: "https://example.test".into(),
             model: "test-model".into(),

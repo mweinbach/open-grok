@@ -136,7 +136,7 @@ async fn prepare(
     let mut deferred = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        actor.prepare_tool_call(call, &mut deferred),
+        actor.prepare_tool_call(call, &mut deferred, None),
     )
     .await
     .expect("prepare_tool_call must not hang")

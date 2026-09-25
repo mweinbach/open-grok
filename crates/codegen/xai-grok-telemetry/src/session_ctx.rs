@@ -280,7 +280,10 @@ pub async fn drain_at_process_exit() {
     drain_pending(SESSION_EXIT_DRAIN).await;
 }
 
-pub async fn drain_pending(timeout: std::time::Duration) {
+/// Wait (up to `timeout`) for in-flight event posts to finish.
+/// Returns whether every registered post finished. A timeout leaves posts in flight.
+/// Meant for commands that exit as soon as their work is done; the agent runs long enough that its events land on their own.
+pub async fn drain_pending(timeout: std::time::Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while PENDING_EVENTS.load(Ordering::Acquire) > 0 {
         if std::time::Instant::now() >= deadline {
@@ -288,10 +291,11 @@ pub async fn drain_pending(timeout: std::time::Duration) {
                 pending = PENDING_EVENTS.load(Ordering::Acquire),
                 "telemetry: gave up draining pending events"
             );
-            return;
+            return false;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    PENDING_EVENTS.load(Ordering::Acquire) == 0
 }
 
 /// Emit an event whose analytics name is `{origin prefix}{event_suffix}`.
@@ -381,6 +385,42 @@ pub async fn emit_event_with_origin_now<T: Serialize + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn file_failure_context_survives_blocking_measurement_on_the_caller() {
+        use crate::events::{
+            McpFileInputCompleted, McpFileInputKind, McpFileInputOutcome, TelemetryEvent,
+        };
+        let context = TelemetryCtx::new(
+            "mcp-overflow-session".to_owned(),
+            Arc::new(tokio::sync::Mutex::new(7)),
+        );
+        with_session_ctx(context, async {
+            assert!(
+                tokio::task::spawn_blocking(clone_current)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let (name, context, _, event) = take_emit_context(
+                EmitterOrigin::Shell,
+                McpFileInputCompleted::NAME,
+                McpFileInputCompleted {
+                    kind: McpFileInputKind::Arguments,
+                    outcome: McpFileInputOutcome::Failed,
+                    source_bytes: 42,
+                    snapshot_bytes: 64,
+                    duration_ms: 1,
+                    model_id: "grok-4.6".to_owned(),
+                },
+            );
+            assert_eq!("grok-shell-mcp_file_input_completed", name);
+            assert_eq!(Some(("mcp-overflow-session".to_owned(), Some(7))), context);
+            assert_eq!(42, event.source_bytes);
+            assert_eq!(64, event.snapshot_bytes);
+        })
+        .await;
+    }
+
     #[test]
     fn only_one_shot_flows_drain_at_session_exit() {
         use crate::process_info::Entrypoint;
@@ -461,7 +501,10 @@ mod tests {
 
         let started = std::time::Instant::now();
         let budget = std::time::Duration::from_secs(5);
-        drain_pending(budget).await;
+        assert!(
+            drain_pending(budget).await,
+            "drain must observe the post finish, not time out"
+        );
         assert!(
             started.elapsed() < budget,
             "drain must observe the post finish, not time out"
