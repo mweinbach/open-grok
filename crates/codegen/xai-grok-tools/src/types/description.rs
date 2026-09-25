@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 
+use crate::implementations::grok_build::task::model_policy::TaskModelSelection;
+
 /// Context for resolving tool description templates.
 ///
 /// - `tools`: canonical name → `Some(model_facing_name)` if enabled, `None` if disabled.
@@ -101,13 +103,22 @@ pub fn resolve_description(template: &str, context: &DescriptionContext) -> Stri
 /// Sorts and deduplicates slugs, then renders with the standard `${{ }}` /
 /// `${% %}` description delimiters. Used when a harness embeds a sorted
 /// model-catalog list in a Task description template.
-pub fn render_with_model_slugs(template: &str, model_slugs: &[String]) -> String {
+/// `hide_model_selection` is set under [`TaskModelSelection::Inherited`].
+pub fn render_with_model_slugs(
+    template: &str,
+    model_slugs: &[String],
+    selection: TaskModelSelection,
+) -> String {
     let mut model_slugs = model_slugs.to_vec();
     model_slugs.sort_unstable();
     model_slugs.dedup();
 
     let env = make_desc_env();
-    env.render_str(template, minijinja::context! { model_slugs => model_slugs })
+    let context = minijinja::context! {
+        model_slugs => model_slugs,
+        hide_model_selection => selection == TaskModelSelection::Inherited,
+    };
+    env.render_str(template, context)
         .expect("Task description template with model_slugs must render")
 }
 
@@ -184,12 +195,16 @@ ${% endif %}";
         let rendered = render_with_model_slugs(
             template,
             &["zeta".to_string(), "alpha".to_string(), "alpha".to_string()],
+            TaskModelSelection::Selectable,
         );
         assert!(rendered.contains("- alpha"));
         assert!(rendered.contains("- zeta"));
         assert!(!rendered.contains("empty"));
         assert!(!rendered.contains("${{"));
-        assert_eq!(render_with_model_slugs(template, &[]).trim(), "empty");
+        assert_eq!(
+            render_with_model_slugs(template, &[], TaskModelSelection::Selectable).trim(),
+            "empty"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@
   "event": {
     "agentId": "agt_1",
     "conversationIds": ["conv_1"],
-    "preview": "done"
+    "preview": "done",
+    "turnId": "turn_7"
   }
 }

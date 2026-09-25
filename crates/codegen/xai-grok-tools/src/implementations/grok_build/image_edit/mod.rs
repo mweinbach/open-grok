@@ -338,6 +338,9 @@ impl xai_tool_runtime::Tool for ImageEditTool {
 
         // Snapshot the per-turn attachment registry so `[Image #N]` tokens
         // resolve to the real attachment (see `resolve_attachment_reference`).
+        // Before the attachments are read: a refused bearer must not cost the
+        // image encoding.
+        client.current_bearer().await?;
         let attached_images = {
             let res = resources.lock().await;
             res.get::<crate::types::resources::AttachedImages>()

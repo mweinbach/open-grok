@@ -407,6 +407,7 @@ fn soak_request(id: String, background: bool) -> SubagentRequest {
         swarm: None,
         owner: SubagentOwner::Task,
         cancel_token: CancellationToken::new(),
+        tool_call_id: None,
     }
 }
 

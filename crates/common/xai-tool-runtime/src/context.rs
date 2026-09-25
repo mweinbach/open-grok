@@ -165,7 +165,9 @@ pub struct WorkspaceViewerContext {
 /// Excludes anything not meant for the workspace (cached tool definitions,
 /// and terminal-provisioning inputs like image/fuse/isolation) so they can
 /// never reach the wire. Every field tolerates a missing/malformed value
-/// (drops to default) to keep valid siblings and mixed-version compatibility.
+/// to keep valid siblings and mixed-version compatibility: all drop to their
+/// default except `tool_approval_policy`, which keeps a malformed value as
+/// `Some(Err(_))` so the consumer can fail closed rather than to the default.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceBindMetadata {
     #[serde(
@@ -203,6 +205,19 @@ pub struct WorkspaceBindMetadata {
         skip_serializing_if = "Option::is_none"
     )]
     pub yolo_mode: Option<bool>,
+    /// The tenant's attended-execution ceiling for the server's host kind, set by the hub
+    /// (never the harness). `None` when omitted or `null` (legacy emitters, or a host kind the
+    /// hub does not stamp); `Some(Ok(_))` when the wire token parses; `Some(Err(raw))` when the
+    /// field is present but unparseable, carrying the raw wire value for the consumer's log.
+    /// The workspace maps omitted → [`ToolApprovalPolicy::GrantsAllowed`] and malformed →
+    /// [`ToolApprovalPolicy::AlwaysPrompt`].
+    #[serde(
+        default,
+        deserialize_with = "tool_approval_policy_ok_or_err",
+        serialize_with = "serialize_tool_approval_policy",
+        skip_serializing_if = "skip_unparsed_tool_approval_policy"
+    )]
+    pub tool_approval_policy: Option<Result<ToolApprovalPolicy, serde_json::Value>>,
     /// Optional/additive: omitted by emitters that don't yet write it.
     #[serde(
         default,
@@ -229,12 +244,29 @@ pub struct WorkspaceBindMetadata {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub rpc_only: bool,
+    /// Real guest session root (`/workspace/<conversation_id>`). When set,
+    /// the workspace virtualizes that tree as `/workspace`.
     #[serde(
         default,
         deserialize_with = "ok_or_default",
         skip_serializing_if = "Option::is_none"
     )]
     pub session_root: Option<String>,
+}
+
+/// How far a bound session may go without the session owner answering a prompt. The hub's
+/// per-host-kind `tool_approval` ceiling (`desktop` / `container` / `sandbox`) reaches the
+/// workspace as one of these; reads never prompt under any value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalPolicy {
+    /// Every mutating call prompts; persisted grants and `yolo_mode` are ignored.
+    AlwaysPrompt,
+    /// Persisted per-folder grants may skip the prompt; `yolo_mode` is still ignored.
+    #[default]
+    GrantsAllowed,
+    /// As `GrantsAllowed`, and the session's `yolo_mode` is honoured (a host with no session owner).
+    UnattendedAllowed,
 }
 
 /// Deserialize a field, falling back to its default on a malformed value
@@ -248,9 +280,46 @@ where
     Ok(serde_json::from_value(value).unwrap_or_default())
 }
 
+/// Present-and-valid → `Some(Ok)`, present-but-unparseable → `Some(Err(raw))`.
+/// Omitted fields never reach this (they take `#[serde(default)]` → `None`); an
+/// explicit `null` is "no ceiling" like every sibling `Option` field, not garbage.
+fn tool_approval_policy_ok_or_err<'de, D>(
+    deserializer: D,
+) -> Result<Option<Result<ToolApprovalPolicy, serde_json::Value>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+    if raw.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_value::<ToolApprovalPolicy>(raw.clone()).map_err(|_| raw),
+    ))
+}
+
+fn serialize_tool_approval_policy<S>(
+    policy: &Option<Result<ToolApprovalPolicy, serde_json::Value>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match policy {
+        Some(Ok(policy)) => serde::Serialize::serialize(policy, serializer),
+        Some(Err(_)) | None => serializer.serialize_none(),
+    }
+}
+
+fn skip_unparsed_tool_approval_policy(
+    policy: &Option<Result<ToolApprovalPolicy, serde_json::Value>>,
+) -> bool {
+    !matches!(policy, Some(Ok(_)))
+}
+
 #[cfg(test)]
 mod bind_metadata_tests {
-    use super::WorkspaceBindMetadata;
+    use super::{ToolApprovalPolicy, WorkspaceBindMetadata};
 
     #[test]
     fn serialize_omits_empty_fields() {
@@ -271,6 +340,7 @@ mod bind_metadata_tests {
                 stream_tool_progress: true,
             }),
             yolo_mode: Some(true),
+            tool_approval_policy: Some(Ok(ToolApprovalPolicy::AlwaysPrompt)),
             manifest_version: Some("v1".to_owned()),
             manifest_hash: Some("abc123".to_owned()),
             system_notifications: Some(true),
@@ -278,12 +348,17 @@ mod bind_metadata_tests {
             session_root: Some("/workspace/conv-abc".to_owned()),
         };
         let value = serde_json::to_value(&md).unwrap();
+        assert_eq!(value["tool_approval_policy"], "always_prompt");
         let back: WorkspaceBindMetadata = serde_json::from_value(value).unwrap();
         assert_eq!(back.preset.as_deref(), Some("explore"));
         assert_eq!(back.capability_mode.as_deref(), Some("read_only"));
         assert_eq!(back.tools.len(), 1);
         assert!(back.viewer_ctx.unwrap().stream_tool_progress);
         assert_eq!(back.yolo_mode, Some(true));
+        assert_eq!(
+            back.tool_approval_policy,
+            Some(Ok(ToolApprovalPolicy::AlwaysPrompt))
+        );
         assert_eq!(back.manifest_version.as_deref(), Some("v1"));
         assert_eq!(back.manifest_hash.as_deref(), Some("abc123"));
         assert_eq!(back.system_notifications, Some(true));
@@ -346,13 +421,55 @@ mod bind_metadata_tests {
             serde_json::from_value(serde_json::json!({"preset": "explore"})).unwrap();
         assert!(md.viewer_ctx.is_none());
     }
+
     #[test]
     fn session_root_is_wire_compatible() {
         let md = WorkspaceBindMetadata::default();
         let value = serde_json::to_value(&md).unwrap();
         assert!(value.get("session_root").is_none());
+
         let md: WorkspaceBindMetadata =
             serde_json::from_value(serde_json::json!({"session_root": "/workspace/c1"})).unwrap();
         assert_eq!(md.session_root.as_deref(), Some("/workspace/c1"));
+    }
+
+    #[test]
+    fn tool_approval_policy_omitted_is_none_malformed_is_err() {
+        for omitted in [
+            serde_json::json!({"preset": "explore"}),
+            serde_json::json!({"tool_approval_policy": null}),
+        ] {
+            let md: WorkspaceBindMetadata = serde_json::from_value(omitted.clone()).unwrap();
+            assert_eq!(None, md.tool_approval_policy, "{omitted}");
+        }
+
+        for raw in [
+            serde_json::json!("unattended"),
+            serde_json::json!(true),
+            serde_json::json!({"kind": "always_prompt"}),
+        ] {
+            let md: WorkspaceBindMetadata =
+                serde_json::from_value(serde_json::json!({"tool_approval_policy": raw})).unwrap();
+            assert_eq!(Some(Err(raw.clone())), md.tool_approval_policy, "{raw}");
+        }
+
+        let parsed: WorkspaceBindMetadata = serde_json::from_value(serde_json::json!({
+            "tool_approval_policy": "grants_allowed",
+        }))
+        .unwrap();
+        assert_eq!(
+            Some(Ok(ToolApprovalPolicy::GrantsAllowed)),
+            parsed.tool_approval_policy
+        );
+    }
+
+    /// A malformed value is never re-emitted: the struct serializes as if the field were omitted.
+    #[test]
+    fn malformed_tool_approval_policy_is_not_reserialized() {
+        let md = WorkspaceBindMetadata {
+            tool_approval_policy: Some(Err(serde_json::json!("unattended"))),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::json!({}), serde_json::to_value(&md).unwrap());
     }
 }

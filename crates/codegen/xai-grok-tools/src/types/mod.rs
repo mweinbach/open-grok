@@ -18,8 +18,12 @@ pub mod resources;
 pub mod schema;
 pub mod session_mode;
 pub mod skill_discovery_tracker;
+pub mod source_summary;
+#[cfg(test)]
+mod source_summary_tests;
 pub mod template_renderer;
 pub mod tool;
+pub mod tool_call_origin;
 pub mod tool_index;
 pub mod tool_io;
 pub mod tool_metadata;

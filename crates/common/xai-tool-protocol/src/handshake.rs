@@ -50,3 +50,25 @@ pub struct HelloAckMsg {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }
+
+/// `auth.refresh` params: the bearer the token-bound tool server now holds,
+/// verified by the hub exactly as the upgrade bearer was.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthRefreshParams {
+    pub access_token: String,
+}
+
+/// The bearer is a credential; `Debug` shows only that one is present.
+impl std::fmt::Debug for AuthRefreshParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthRefreshParams")
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// `auth.refresh` result: the `exp` (unix seconds) the socket is now bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthRefreshResult {
+    pub exp: i64,
+}

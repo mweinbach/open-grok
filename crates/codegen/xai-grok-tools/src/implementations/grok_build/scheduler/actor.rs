@@ -719,6 +719,7 @@ impl SchedulerActor {
             // A child of the actor's token, so shutdown cancels a fire the
             // coordinator still has queued at the concurrent limit.
             cancel_token: self.cancel_token.child_token(),
+            tool_call_id: None,
         };
 
         if events

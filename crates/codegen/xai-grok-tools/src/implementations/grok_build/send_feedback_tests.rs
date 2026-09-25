@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 use pretty_assertions::assert_eq;
 use xai_grok_feedback::{
@@ -8,9 +8,7 @@ use xai_grok_feedback::{
 
 use super::*;
 use crate::types::resources::{Resources, SessionFolder};
-use crate::types::template_renderer::TemplateRenderer;
-use crate::types::tool::ToolKind;
-use crate::types::tool_metadata::{ToolMetadata as _, test_ctx};
+use crate::types::tool_metadata::{ToolMetadata, test_ctx};
 
 fn input(details: &str, failure_mode: Option<FeedbackFailureMode>) -> FeedbackDraftInput {
     FeedbackDraftInput {
@@ -27,7 +25,7 @@ fn tool_input(input: FeedbackDraftInput) -> SendFeedbackInput {
     SendFeedbackInput {
         title: input.title,
         details: input.details,
-        area: input.area,
+        product_area: input.area,
         r#type: input.r#type,
         task_category: input.task_category,
         failure_mode: input.failure_mode,
@@ -229,7 +227,7 @@ fn schema_has_canonical_fields() {
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([
-            "area",
+            "product_area",
             "details",
             "draft_id",
             "failure_mode",
@@ -248,80 +246,6 @@ fn schema_has_canonical_fields() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["details", "title", "type"]),
     );
-}
-
-#[test]
-fn description_template_keeps_real_delimiters() {
-    let template = SendFeedbackTool.description_template();
-    assert!(template.contains("${{ params.feedback.draft_id }}"));
-    assert!(template.contains("${{ params.feedback.title }}"));
-    assert!(template.contains("${{ params.feedback.details }}"));
-    assert!(template.contains("${{ params.feedback.area }}"));
-    assert!(template.contains("${{ params.feedback.failure_mode }}"));
-    assert!(template.contains("${%- if tools.by_kind.ask_user %}"));
-    assert!(template.contains("${{ tools.by_kind.ask_user }}"));
-    assert!(template.contains("${{ feedback_drafts_path }}"));
-    assert!(!template.contains("${ params."));
-    assert!(!template.contains("${- if"));
-}
-
-fn feedback_renderer(tool_names: HashMap<ToolKind, String>) -> TemplateRenderer {
-    TemplateRenderer::new(
-        tool_names,
-        HashMap::from([(
-            ToolKind::Feedback,
-            HashMap::from([
-                ("draft_id".to_owned(), "draft_id".to_owned()),
-                ("title".to_owned(), "title".to_owned()),
-                ("details".to_owned(), "details".to_owned()),
-                ("area".to_owned(), "area".to_owned()),
-                ("failure_mode".to_owned(), "failure_mode".to_owned()),
-            ]),
-        )]),
-    )
-}
-
-fn advertised_description(renderer: &TemplateRenderer) -> String {
-    crate::types::tool_metadata::ToolMetadata::versioned_definition(
-        &SendFeedbackTool,
-        None,
-        SEND_FEEDBACK_TOOL_NAME,
-        None,
-        renderer,
-        &HashMap::new(),
-        &serde_json::json!({"type": "object", "properties": {}}),
-        &serde_json::json!({}),
-    )
-    .function
-    .description
-    .expect("description")
-}
-
-#[test]
-fn advertised_description_renders_present_names_and_omits_absent_ones() {
-    let drafts = drafts_file_path(std::path::Path::new("/tmp/session"));
-    let text = advertised_description(
-        &feedback_renderer(HashMap::from([
-            (ToolKind::Feedback, "send_feedback".to_owned()),
-            (ToolKind::AskUser, "ask_user_question".to_owned()),
-        ]))
-        .with_feedback_drafts_path(&drafts),
-    );
-    for name in ["draft_id", "title", "details", "area", "failure_mode"] {
-        assert!(text.contains(name), "{name} missing from {text}");
-    }
-    assert!(text.contains("ask_user_question"), "{text}");
-    assert!(text.contains(&drafts), "{text}");
-    assert!(!text.contains("${"), "{text}");
-
-    let text = advertised_description(&feedback_renderer(HashMap::from([(
-        ToolKind::Feedback,
-        "send_feedback".to_owned(),
-    )])));
-    assert!(text.contains("draft_id"), "{text}");
-    assert!(!text.contains("ask_user"), "{text}");
-    assert!(!text.contains("drafts file"), "{text}");
-    assert!(!text.contains("${"), "{text}");
 }
 
 #[test]

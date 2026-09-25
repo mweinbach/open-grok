@@ -15,23 +15,16 @@ const SUCCESS_MESSAGE: &str = "Local feedback draft saved.";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SendFeedbackInput {
-    /// Short summary for the draft.
     pub title: String,
-    /// Short labeled bullets in this order: What happened, What the user said, Repro, optional Evidence, then optional verified Cause. Keep each to 1–3 lines; do not use narrative paragraphs.
     pub details: String,
-    /// Optional product area; omit when unclear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub area: Option<String>,
-    /// Feedback classification.
+    pub product_area: Option<String>,
     #[serde(rename = "type")]
     pub r#type: FeedbackType,
-    /// Optional task category; omit when unclear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_category: Option<FeedbackTaskCategory>,
-    /// Optional model-behavior failure mode; omit for a pure product or tool bug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_mode: Option<FeedbackFailureMode>,
-    /// Existing local draft to update. When set, this call does not append a second draft.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_id: Option<String>,
 }
@@ -49,7 +42,7 @@ impl SendFeedbackInput {
         };
         self.title = strip_draft_id(&self.title, id);
         self.details = strip_draft_id(&self.details, id);
-        if let Some(area) = self.area.as_mut() {
+        if let Some(area) = self.product_area.as_mut() {
             *area = strip_draft_id(area, id);
         }
         self
@@ -75,7 +68,7 @@ impl From<SendFeedbackInput> for FeedbackDraftInput {
         Self {
             title: input.title,
             details: input.details,
-            area: input.area,
+            area: input.product_area,
             r#type: input.r#type,
             task_category: input.task_category,
             failure_mode: input.failure_mode,
@@ -121,11 +114,18 @@ fn build_description_template() -> String {
 Save or update user feedback for later review. Feedback is stored as local drafts and is never sent without explicit approval from the `/feedback` Drafts tab in the Open Grok TUI. This tool opens no UI and does not stop the current turn.\n\n\
 # Invocation\n\n\
 When the user types `/feedback` bare into the prompt bar, the form opens with the Write and Drafts tabs. The Write tab is only for the user to hand-write feedback.\n\
-`/feedback <text>` sends the user's report immediately without involving you. Use the ${{ params.feedback.draft_id }} field only when the user explicitly asks you to update an existing feedback draft.\n\
-When ${{ params.feedback.draft_id }} is set, update that existing draft. Do not duplicate drafts. ${{ params.feedback.draft_id }} is only a tool argument. Never write it into ${{ params.feedback.title }}, ${{ params.feedback.details }}, or ${{ params.feedback.area }}.\n\n\
+`/feedback <text>` sends the user's report immediately without involving you. Use ${{ params.feedback.draft_id }} only when the user explicitly asks you to update an existing feedback draft. Do not duplicate drafts. ${{ params.feedback.draft_id }} is only a tool argument. Never write it into ${{ params.feedback.title }}, ${{ params.feedback.details }}, or ${{ params.feedback.product_area }}.\n\n\
 When the user wants to share feedback implicitly, draft it with this tool, whether it is a product or model-behavior issue.\n\n\
 # Usage\n\n\
-Write ${{ params.feedback.details }} as short labeled bullets in this order: What happened, What the user said, Repro, optional Evidence, then optional verified Cause.\n\
+Write ${{ params.feedback.details }} as short lines under these headings. Put a blank line between them.\n\
+\n\
+What happened:\n\
+\n\
+Repro:\n\
+What the user said, the steps, and the evidence. One short line each.\n\
+\n\
+Cause:\n\
+\n\
 Set ${{ params.feedback.failure_mode }} only for model-behavior feedback; omit it for a pure product or tool bug.\n\
 ${%- if tools.by_kind.ask_user %}\n\
 If mapping feedback is incredibly unclear, only then may you use ${{ tools.by_kind.ask_user }} to confirm ambiguity with the user. Use this sparingly.\n\

@@ -26,6 +26,7 @@ pub mod init_or_update_app {
 pub mod kill_task;
 pub mod list_dir;
 pub mod lsp;
+pub mod media_bearer;
 pub mod mission;
 pub mod monitor;
 pub mod read_file;

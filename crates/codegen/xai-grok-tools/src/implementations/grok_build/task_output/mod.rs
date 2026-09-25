@@ -705,9 +705,9 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
             worktree_path,
         } => {
             let mut output = format!(
-                "{output}\n\n<subagent_meta>id={}, type={}, tool_calls={tool_calls}, \
+                "{output}\n\n<subagent_meta>id={}, tool_calls={tool_calls}, \
                  turns={turns}, duration_ms={}</subagent_meta>",
-                snap.subagent_id, snap.subagent_type, snap.duration_ms,
+                snap.subagent_id, snap.duration_ms,
             );
             if let Some(wt) = &worktree_path {
                 output.push_str(&format!("\n<worktree_path>{wt}</worktree_path>"));
@@ -715,7 +715,6 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot, wait_hint: WaitHint) -> Tas
             output.push_str("\n\n");
             output.push_str(&xai_tool_types::format_resume_footer(
                 &snap.subagent_id,
-                &snap.subagent_type,
                 snap.persona.as_deref(),
             ));
             let raw_output_bytes = output.len();
@@ -1089,8 +1088,12 @@ mod tests {
             capped_wait_timeout(Some(5_000), cap),
             Duration::from_millis(5_000)
         );
-        assert_eq!(capped_wait_timeout(Some(36_000_000), cap), cap);
-        assert_eq!(capped_wait_timeout(Some(600_000), cap), cap);
+        assert_eq!(capped_wait_timeout(Some(3_600_000), cap), cap);
+        assert_eq!(capped_wait_timeout(Some(7_200_000), cap), cap);
+        assert_eq!(
+            capped_wait_timeout(Some(600_000), cap),
+            Duration::from_millis(600_000)
+        );
     }
 
     /// A client that shortens the cap at finalize must also shorten the wait —

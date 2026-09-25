@@ -608,6 +608,9 @@ impl GitignoreFilter {
             git_root,
         }
     }
+    pub(crate) fn is_logical_path_ignored(&self, path: &std::path::Path) -> bool {
+        crate::gitignore::is_ignored(&self.gitignore, path, Some(&self.git_root))
+    }
     /// Check whether a path is gitignored.
     ///
     /// For non-existent files (new file creation), canonicalizes the parent

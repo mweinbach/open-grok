@@ -20,6 +20,7 @@ use base64::Engine as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 
 use crate::attribution::{SharedAttributionCallback, ToolConsumer};
+use crate::implementations::grok_build::media_bearer::MediaBearer;
 use crate::types::{ImageGenerationProvider, SharedApiKeyProvider};
 
 use crate::types::output::{MediaGenOutput, ToolOutput};
@@ -66,8 +67,13 @@ pub struct ImageGenClient {
     model: String,
     edit_model: String,
     writer: super::storage::SessionFileWriter,
+    /// Bearer decision for the Grok route: live xAI provider or static key,
+    /// refusing rather than sending a foreign credential to `api.x.ai`.
+    /// The OpenAI route never resolves this; it uses `api_key_provider`.
+    bearer: MediaBearer,
+    /// Live bearer source. The OpenAI route resolves every bearer from this
+    /// (OAuth-only, fail-closed); also feeds the Grok `MediaBearer`.
     api_key_provider: Option<SharedApiKeyProvider>,
-    require_live_bearer: bool,
     /// Optional 401-attribution hook. Hosts wire this so a 401 from the
     /// Imagine API emits an `auth_401_attribution` event with
     /// `consumer == "ImageGen"` for unified auth-failure telemetry.
@@ -123,22 +129,9 @@ impl ImageGenClient {
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        // Grok Imagine bakes the static key as the fallback Authorization;
-        // the live provider overrides per request. OpenAI Images is
-        // ChatGPT-OAuth-only (matching upstream's `uses_codex_backend` gate,
-        // which excludes API-key auth): no static bearer is ever baked, the
-        // identity-anchored live resolver is mandatory, and it fails closed
-        // on logout or account drift.
-        if *provider == ImageGenerationProvider::Grok {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|e| {
-                    xai_tool_runtime::ToolError::invalid_arguments(format!(
-                        "Invalid API key for header: {e}"
-                    ))
-                })?,
-            );
-        }
+        // No static bearer is baked into default headers: every request sets
+        // its Authorization explicitly from the resolved bearer, so a host
+        // cannot leak a token by configuring the client with the wrong one.
 
         extra_headers.into_iter().try_for_each(|(key, value)| {
             let header_name =
@@ -182,6 +175,15 @@ impl ImageGenClient {
             ImageGenerationProvider::Grok => config_api_key_provider.clone().or(api_key_provider),
             ImageGenerationProvider::OpenAi => config_api_key_provider.clone(),
         };
+        // The Grok bearer resolves per request through `MediaBearer` (live
+        // provider or static key, refusing foreign credentials). The OpenAI
+        // route resolves its OAuth bearer directly and never touches this.
+        let bearer = match provider {
+            ImageGenerationProvider::Grok => {
+                MediaBearer::new(api_key_provider.clone(), api_key.clone())
+            }
+            ImageGenerationProvider::OpenAi => MediaBearer::new(None, None),
+        };
 
         Ok(Self {
             http,
@@ -190,8 +192,8 @@ impl ImageGenClient {
             model,
             edit_model,
             writer: super::storage::SessionFileWriter::new(DEFAULT_IMAGE_DIR, extension),
+            bearer,
             api_key_provider,
-            require_live_bearer: *provider == ImageGenerationProvider::OpenAi,
             attribution_callback: None,
             tier_restricted: *provider == ImageGenerationProvider::Grok && *tier_restricted,
             session_header: None,
@@ -227,8 +229,24 @@ impl ImageGenClient {
         self
     }
 
-    pub(crate) async fn current_bearer(&self) -> Option<String> {
-        crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref()).await
+    /// `Err` means the request must not be sent; see [`MediaBearer::resolve`].
+    /// The OpenAI route resolves its ChatGPT-OAuth bearer live instead and
+    /// fails closed on logout or account drift.
+    pub(crate) async fn current_bearer(&self) -> Result<String, xai_tool_runtime::ToolError> {
+        match self.provider {
+            ImageGenerationProvider::Grok => self.bearer.resolve().await,
+            ImageGenerationProvider::OpenAi => {
+                crate::types::api_key_provider::resolve_bearer(self.api_key_provider.as_ref())
+                    .await
+                    .ok_or_else(|| {
+                        xai_tool_runtime::ToolError::new(
+                            xai_tool_runtime::ToolErrorKind::Custom,
+                            "OpenAI image authentication is unavailable; sign in again with `open-grok login --codex`.",
+                        )
+                        .with_details(serde_json::json!({"code": "auth_required", "status": 401}))
+                    })
+            }
+        }
     }
 
     pub(crate) fn record_401_attribution(&self, consumer: ToolConsumer, sent_bearer: Option<&str>) {
@@ -243,12 +261,13 @@ impl ImageGenClient {
         &self,
         url: &str,
         payload: &serde_json::Value,
-        sent_bearer: Option<&str>,
+        sent_bearer: &str,
     ) -> reqwest::RequestBuilder {
-        let mut request = self.http.post(url).json(payload);
-        if let Some(bearer) = sent_bearer {
-            request = request.header(AUTHORIZATION, format!("Bearer {bearer}"));
-        }
+        let mut request = self
+            .http
+            .post(url)
+            .json(payload)
+            .header(AUTHORIZATION, format!("Bearer {sent_bearer}"));
         if let Some(session) = &self.session_header {
             request = request.header(SESSION_ID_HEADER, session.clone());
         }
@@ -347,15 +366,8 @@ impl ImageGenClient {
         // Capture the bearer once so the request and the 401-attribution
         // emit see the same value (even if the provider rotates between
         // the send and the response handling).
-        let sent_bearer = self.current_bearer().await;
-        if self.require_live_bearer && sent_bearer.is_none() {
-            return Err(xai_tool_runtime::ToolError::new(
-                xai_tool_runtime::ToolErrorKind::Custom,
-                "OpenAI image authentication is unavailable; sign in again with `open-grok login --codex`.",
-            )
-            .with_details(serde_json::json!({"code": "auth_required", "status": 401})));
-        }
-        let mut req = self.post_json(&url, &payload, sent_bearer.as_deref());
+        let sent_bearer = self.current_bearer().await?;
+        let mut req = self.post_json(&url, &payload, &sent_bearer);
         if self.provider == ImageGenerationProvider::OpenAi {
             req = req.header(CODEX_IMAGE_TURN_ID_HEADER, turn_id);
         }
@@ -368,7 +380,7 @@ impl ImageGenClient {
 
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            self.record_401_attribution(ToolConsumer::ImageGen, sent_bearer.as_deref());
+            self.record_401_attribution(ToolConsumer::ImageGen, Some(&sent_bearer));
         }
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -436,10 +448,11 @@ pub enum ImageGenConfig {
     Disabled,
     Enabled {
         provider: ImageGenerationProvider,
-        /// Static credential baked as the fallback Authorization header for
-        /// the Grok route. Ignored for OpenAI, which is ChatGPT-OAuth-only
-        /// and resolves every bearer live from `api_key_provider`.
-        api_key: String,
+        /// Static credential for the Grok route's `MediaBearer`.
+        /// `None`: the per-request `ApiKeyProvider` is the only bearer source.
+        /// Ignored for OpenAI, which is ChatGPT-OAuth-only and resolves every
+        /// bearer live from `api_key_provider`.
+        api_key: Option<String>,
         base_url: String,
         extra_headers: indexmap::IndexMap<String, String>,
         /// Provider-specific live bearer source. OpenAI images require the
@@ -723,7 +736,7 @@ mod tests {
             provider: ImageGenerationProvider::OpenAi,
             // Never sent: the OpenAI route is OAuth-only and resolves the
             // bearer live from `api_key_provider`.
-            api_key: "ignored-static-key".into(),
+            api_key: Some("ignored-static-key".into()),
             base_url,
             extra_headers: headers,
             api_key_provider: Some(Arc::new(StaticBearer("codex-token"))),
@@ -742,7 +755,7 @@ mod tests {
             .unwrap()
             .with_session_id("xai-session");
         let codex_request = codex
-            .post_json(url, &serde_json::json!({}), Some("live-codex"))
+            .post_json(url, &serde_json::json!({}), "live-codex")
             .build()
             .unwrap();
         assert!(!codex_request.headers().contains_key(SESSION_ID_HEADER));
@@ -750,7 +763,7 @@ mod tests {
 
         let config = ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "static-example".into(),
+            api_key: Some("static-example".into()),
             base_url: "https://example.test".into(),
             extra_headers: indexmap::IndexMap::new(),
             api_key_provider: None,
@@ -764,7 +777,7 @@ mod tests {
             .unwrap()
             .with_session_id("xai-session");
         let grok_request = grok
-            .post_json(url, &serde_json::json!({}), Some("live-grok"))
+            .post_json(url, &serde_json::json!({}), "live-grok")
             .build()
             .unwrap();
         assert_eq!(grok_request.headers()[SESSION_ID_HEADER], "xai-session");
@@ -978,7 +991,7 @@ mod tests {
     fn per_tool_gates_are_independent() {
         let cfg = ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             api_key_provider: None,
@@ -1000,7 +1013,7 @@ mod tests {
     fn stamp_session_id_header_sets_and_preserves() {
         let mk = |headers: indexmap::IndexMap<String, String>| ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: headers,
             api_key_provider: None,
@@ -1040,7 +1053,7 @@ mod tests {
     fn client_selects_model_from_override() {
         let mk = |model_override: Option<&str>| ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             api_key_provider: None,
@@ -1073,7 +1086,7 @@ mod tests {
     fn client_selects_edit_model_from_override() {
         let mk = |edit_model_override: Option<&str>| ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             api_key_provider: None,
@@ -1128,7 +1141,7 @@ mod tests {
         // before any other resource (e.g. SessionFolder) is required.
         let cfg = ImageGenConfig::Enabled {
             provider: ImageGenerationProvider::Grok,
-            api_key: "k".into(),
+            api_key: Some("k".into()),
             base_url: "https://api.x.ai/v1".into(),
             extra_headers: indexmap::IndexMap::new(),
             api_key_provider: None,
