@@ -11,16 +11,16 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
+use prod_mc_cli_chat_proxy_types::feedback_types::FeedbackSubmission;
 use tokio::sync::oneshot;
 
-pub use super::feedback_drafts::draft_op_error;
 use super::{ExtResult, feedback_drafts, parse_params};
 use crate::agent::MvpAgent;
 use crate::session::persistence::{LocalFeedbackEntry, UserFeedbackEntry};
 use crate::session::{
     ClientFeedbackInput, CommentDeleteRequest, CommentDeleteResponse, CommentRequest,
-    CommentResponse, FeedbackDraftSendRequest, FeedbackRequestDismiss, FeedbackResponse,
-    SessionCommand, SideQuestionError,
+    CommentResponse, FeedbackContext, FeedbackDraftSendRequest, FeedbackOutcome,
+    FeedbackRequestDismiss, FeedbackResponse, SessionCommand, SideQuestionError,
 };
 use crate::upload::gcs::WithAuth as _;
 use xai_file_utils::gcs::upload_bytes;
@@ -33,12 +33,11 @@ pub async fn handle(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
             tracing::info!("handling /btw side question");
             handle_btw(agent, args).await
         }
-        "x.ai/feedback"
-        | "x.ai/feedback/dismiss"
-        | "x.ai/feedback/drafts/list"
-        | "x.ai/feedback/drafts/get"
-        | "x.ai/feedback/drafts/delete"
-        | "x.ai/feedback/drafts/update" => {
+        "x.ai/feedback" | "x.ai/feedback/dismiss" => {
+            tracing::info!("handling user feedback");
+            handle_feedback(agent, args).await
+        }
+        m if m.starts_with(feedback_drafts::DRAFTS_METHOD_PREFIX) => {
             tracing::info!("handling user feedback");
             handle_feedback(agent, args).await
         }
@@ -96,8 +95,8 @@ async fn handle_btw(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     }
 }
 
-/// Reads the request once. A draft body stays raw so `parse_draft_feedback` can reject
-/// legacy fields before typing it; a legacy body is parsed and validated here.
+/// Reads the request once. A draft body reaches `parse_draft_send_request` as
+/// raw JSON. A legacy body is parsed and validated here.
 async fn parse_feedback(
     agent: &MvpAgent,
     args: &acp::ExtRequest,
@@ -112,7 +111,10 @@ async fn parse_feedback(
     let params: serde_json::Value = serde_json::from_str(raw)
         .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
     if params.get("draft_id").is_some() {
-        return parse_draft_feedback(agent, params).await;
+        let request = parse_draft_send_request(params)?;
+        let store = feedback_drafts::feedback_store(agent, &request.session_id)?;
+        let (input, cleanup) = draft_send_input(request, store).await?;
+        return Ok((input, Some(cleanup)));
     }
 
     let mut input = parse_feedback_input(args.params.get())?;
@@ -123,15 +125,16 @@ async fn parse_feedback(
     Ok((input, None))
 }
 
-type DraftCleanup = (
+/// The store and draft id to delete once the proxy has accepted the report.
+pub type DraftCleanup = (
     xai_grok_feedback::FeedbackDraftStore,
     xai_grok_feedback::FeedbackDraftId,
 );
 
-async fn parse_draft_feedback(
-    agent: &MvpAgent,
+/// Parses a draft send request. Form fields outside `edited_body` are rejected.
+pub fn parse_draft_send_request(
     params: serde_json::Value,
-) -> Result<(ClientFeedbackInput, Option<DraftCleanup>), acp::Error> {
+) -> Result<FeedbackDraftSendRequest, acp::Error> {
     let object = params
         .as_object()
         .ok_or_else(|| acp::Error::invalid_params().data("feedback params must be an object"))?;
@@ -155,9 +158,16 @@ async fn parse_draft_feedback(
             )));
         }
     }
-    let request: FeedbackDraftSendRequest = serde_json::from_value(params)
-        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))?;
-    let store = feedback_drafts::feedback_store(agent, &request.session_id)?;
+
+    serde_json::from_value(params)
+        .map_err(|error| acp::Error::invalid_params().data(error.to_string()))
+}
+
+/// Builds the report for a draft send. Fails when `store` no longer holds the draft.
+pub async fn draft_send_input(
+    request: FeedbackDraftSendRequest,
+    store: xai_grok_feedback::FeedbackDraftStore,
+) -> Result<(ClientFeedbackInput, DraftCleanup), acp::Error> {
     let draft_id = request.draft_id;
     let lookup_store = store.clone();
     let lookup_id = draft_id.clone();
@@ -169,6 +179,7 @@ async fn parse_draft_feedback(
     if !is_present {
         return Err(acp::Error::invalid_params().data("feedback draft not found"));
     }
+
     let body = request.edited_body;
     let taxonomy = xai_grok_feedback::FeedbackTaxonomy {
         r#type: Some(body.input.r#type),
@@ -203,16 +214,41 @@ async fn parse_draft_feedback(
             terminal_info: body.terminal_info,
             request_trace_upload_token: request.request_trace_upload_token,
         },
-        Some((store, draft_id)),
+        (store, draft_id),
     ))
+}
+
+/// The report has already been sent. A draft left behind can only produce a duplicate report.
+pub async fn delete_sent_draft(cleanup: Option<DraftCleanup>) -> FeedbackOutcome {
+    let Some((store, draft_id)) = cleanup else {
+        return FeedbackOutcome::Submitted;
+    };
+
+    let deleted = tokio::task::spawn_blocking(move || store.delete(&draft_id))
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    match deleted {
+        Ok(_) => FeedbackOutcome::Submitted,
+        Err(error) => {
+            tracing::warn!(%error, "sent draft not deleted");
+            FeedbackOutcome::SubmittedCleanupFailed
+        }
+    }
 }
 
 fn is_feedback_outcome_unknown(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<reqwest::Error>()
-            .is_some_and(|error| !error.is_builder() && !error.is_connect() && !error.is_status())
+            .is_some_and(request_may_have_arrived)
     })
+}
+
+/// False only when the request never left (bad URL, connection refused) or the proxy answered.
+/// A retry after false cannot send a duplicate.
+pub fn request_may_have_arrived(error: &reqwest::Error) -> bool {
+    !error.is_builder() && !error.is_connect() && !error.is_status()
 }
 
 fn parse_feedback_input(params: &str) -> Result<ClientFeedbackInput, acp::Error> {
@@ -295,24 +331,41 @@ mod feedback_input_tests {
 #[path = "feedback_tests.rs"]
 mod feedback_wire_tests;
 
+/// Shown for every `x.ai/feedback*` request while the feature flag is off
+pub const FEEDBACK_DISABLED_MESSAGE: &str = "Feedback is disabled. To enable, set \
+GROK_FEEDBACK_ENABLED=true or [features] feedback = true in config.toml.";
+
+fn apply_feedback_context(submission: &mut FeedbackSubmission, ctx: Option<FeedbackContext>) {
+    let Some(ctx) = ctx else {
+        submission.reasoning_effort = None;
+        return;
+    };
+    submission.tool_outcomes = ctx.tool_outcomes;
+    submission.session_cwd = Some(ctx.session_cwd);
+    submission.compaction_count = Some(ctx.compaction_count);
+    submission.context_window_usage = Some(ctx.context_window_usage);
+    submission.context_tokens_used = Some(ctx.context_tokens_used);
+    submission.context_window_tokens = Some(ctx.context_window_tokens);
+    submission.reasoning_effort = ctx.reasoning_effort.map(|effort| effort.to_string());
+    if let Some(rated_id) = ctx.model_id {
+        if submission.resolved_model_id.as_ref() != Some(&rated_id)
+            && submission.model_id.as_ref() != Some(&rated_id)
+        {
+            submission.model_id = Some(rated_id);
+            submission.resolved_model_id = None;
+        }
+        submission.model_fingerprint = ctx.model_fingerprint;
+    }
+}
+
 async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult {
     if !agent.cfg.borrow().is_feedback_enabled() {
-        return Err(acp::Error::internal_error().data(
-            "Feedback is disabled. To enable, set GROK_FEEDBACK_ENABLED=true or \
-             [features] feedback = true in config.toml.",
-        ));
+        return Err(acp::Error::internal_error().data(FEEDBACK_DISABLED_MESSAGE));
     }
 
     match args.method.as_ref() {
-        "x.ai/feedback/drafts/list" => {
-            super::feedback_drafts::list_feedback_drafts(agent, args).await
-        }
-        "x.ai/feedback/drafts/get" => super::feedback_drafts::get_feedback_draft(agent, args).await,
-        "x.ai/feedback/drafts/delete" => {
-            super::feedback_drafts::delete_feedback_draft(agent, args).await
-        }
-        "x.ai/feedback/drafts/update" => {
-            super::feedback_drafts::update_feedback_draft(agent, args).await
+        m if m.starts_with(feedback_drafts::DRAFTS_METHOD_PREFIX) => {
+            feedback_drafts::handle(agent, args).await
         }
         "x.ai/feedback" => {
             let (feedback_input, draft_cleanup) = parse_feedback(agent, args).await?;
@@ -339,24 +392,18 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                 let _ = session
                     .cmd_tx
                     .send(SessionCommand::GetCurrentModel { responds_to: tx1 });
-                let model_id = rx1.await.ok();
-
+                let model_id = rx1.await.ok().map(|c| c.id);
                 let model_metadata = session.get_model_metadata().await;
-
                 (model_id, model_metadata)
             } else {
                 let sampling_config = agent.sampling_config.borrow().clone();
                 (Some(sampling_config.model.clone()), Default::default())
             };
 
-            let turn_number = feedback_input.turn_number.or_else(|| {
-                agent
-                    .session_turn_number(&session_id)
-                    .map(|t| t.saturating_sub(1) as i64)
-            });
+            let turn_number = feedback_input.turn_number;
 
             let mut submission = feedback_input.to_submission(
-                model_id.clone(),
+                model_id,
                 model_metadata.resolved_model_id,
                 model_metadata.model_fingerprint,
                 turn_number,
@@ -364,7 +411,7 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             let turn_number = submission.turn_number;
 
             // Enrich with session context for Slack notifications (best-effort).
-            if let Some(ref session_handle) = session_handle {
+            let ctx = if let Some(ref session_handle) = session_handle {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let _ = session_handle
                     .cmd_tx
@@ -372,15 +419,11 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
                         turn_number,
                         responds_to: tx,
                     });
-                if let Ok(ctx) = rx.await {
-                    submission.tool_outcomes = ctx.tool_outcomes;
-                    submission.session_cwd = Some(ctx.session_cwd);
-                    submission.compaction_count = Some(ctx.compaction_count);
-                    submission.context_window_usage = Some(ctx.context_window_usage);
-                    submission.context_tokens_used = Some(ctx.context_tokens_used);
-                    submission.context_window_tokens = Some(ctx.context_window_tokens);
-                }
-            }
+                rx.await.ok()
+            } else {
+                None
+            };
+            apply_feedback_context(&mut submission, ctx);
 
             // Track rating in session signals
             if let (Some(session_handle), Some(rating_value)) =
@@ -478,20 +521,7 @@ async fn handle_feedback(agent: &MvpAgent, args: &acp::ExtRequest) -> ExtResult 
             let response_outcome = match &outcome {
                 crate::session::feedback_manager::SubmitOutcome::Submitted => {
                     tracing::info!("feedback submitted to proxy successfully");
-                    if let Some((store, draft_id)) = draft_cleanup {
-                        let cleanup = tokio::task::spawn_blocking(move || store.delete(&draft_id))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result.map_err(|error| error.to_string()));
-                        if let Err(error) = cleanup {
-                            tracing::warn!(%error, "submitted feedback draft cleanup failed");
-                            Some(crate::session::FeedbackOutcome::SubmittedCleanupFailed)
-                        } else {
-                            Some(crate::session::FeedbackOutcome::Submitted)
-                        }
-                    } else {
-                        Some(crate::session::FeedbackOutcome::Submitted)
-                    }
+                    Some(delete_sent_draft(draft_cleanup).await)
                 }
                 crate::session::feedback_manager::SubmitOutcome::LocalOnly => {
                     tracing::warn!("feedback saved locally only (no proxy client)");

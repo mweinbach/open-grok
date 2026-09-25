@@ -1,4 +1,5 @@
 use super::*;
+use crate::extensions::feedback_drafts::{answer, draft_op_error};
 use crate::session::FeedbackDraftUpdateRequest;
 use xai_grok_feedback::{
     FeedbackDraft, FeedbackDraftStore, FeedbackFailureMode, FeedbackStoreError,
@@ -33,7 +34,7 @@ fn pager_send_body() -> serde_json::Value {
             "type": "bug",
             "task_category": "debug",
             "failure_mode": "hallucinated",
-            "images": [{ "data": "aGk=", "mimeType": "image/png" }],
+            "images": [{ "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "mimeType": "image/png" }],
             "client_version": "1.2.3",
             "terminal_info": {
                 "brand": "Ghostty",
@@ -171,4 +172,88 @@ fn drafts_update_without_type_fails_the_parse_instead_of_half_updating() {
         error.to_string().contains("missing field `type`"),
         "{error}"
     );
+}
+
+/// An `ExtRequest` for `method` whose params hold only `session_id`.
+fn drafts_request(method: &str) -> acp::ExtRequest {
+    let params = serde_json::json!({ "session_id": "sess-1" });
+    acp::ExtRequest::new(
+        method,
+        serde_json::value::to_raw_value(&params)
+            .expect("params serialize")
+            .into(),
+    )
+}
+
+#[tokio::test]
+async fn answer_lists_drafts_and_refuses_an_unknown_method() {
+    let session = tempfile::tempdir().expect("tempdir");
+    let store = FeedbackDraftStore::new(session.path());
+    store
+        .append_predraft("Todo list", "todos are chopped")
+        .expect("predraft appended");
+
+    let listed = answer(
+        &drafts_request("x.ai/feedback/drafts/list"),
+        store.clone(),
+        false,
+    )
+    .await
+    .expect("list answers");
+    let listed: serde_json::Value =
+        serde_json::from_str(listed.0.get()).expect("list response is JSON");
+    assert_eq!(
+        listed
+            .get("drafts")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let unknown = answer(&drafts_request("x.ai/feedback/drafts/rename"), store, false)
+        .await
+        .expect_err("an unknown drafts method is refused");
+    assert_eq!(unknown.code, acp::Error::method_not_found().code);
+}
+
+#[tokio::test]
+async fn draft_send_input_returns_the_draft_text_and_its_id() {
+    let session = tempfile::tempdir().expect("tempdir");
+    let store = FeedbackDraftStore::new(session.path());
+    let predraft = store
+        .append_predraft("Todo list", "todos are chopped")
+        .expect("predraft appended");
+    let mut body = pager_send_body();
+    body.as_object_mut()
+        .expect("send body is an object")
+        .insert("draft_id".to_owned(), predraft.id.to_string().into());
+
+    let (input, (_, draft_id)) = draft_send_input(
+        parse_draft_send_request(body).expect("send body parses"),
+        store,
+    )
+    .await
+    .expect("a present draft resolves");
+
+    assert!(
+        input
+            .feedback_text
+            .is_some_and(|text| text.contains("edited title"))
+    );
+    assert_eq!(draft_id, predraft.id);
+}
+
+#[tokio::test]
+async fn draft_send_input_refuses_a_draft_the_store_does_not_have() {
+    let session = tempfile::tempdir().expect("tempdir");
+    let store = FeedbackDraftStore::new(session.path());
+
+    let error = draft_send_input(
+        parse_draft_send_request(pager_send_body()).expect("send body parses"),
+        store,
+    )
+    .await
+    .expect_err("a draft the store lacks is refused");
+
+    assert_eq!(error.code, acp::Error::invalid_params().code);
 }

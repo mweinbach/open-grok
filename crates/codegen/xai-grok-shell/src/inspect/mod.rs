@@ -1262,6 +1262,7 @@ fn enforced_label(p: &EnforcedPolicy) -> String {
         "alwaysApprove" => "Permissions mode: always-approve",
         "telemetry" => "Telemetry",
         "feedback" => "Feedback",
+        "nonManagedHooks" => "Hooks outside managed policy",
         other => other,
     };
     let state = if p.enabled { "enabled" } else { "disabled" };
@@ -1898,6 +1899,13 @@ mod tests {
             "Permissions mode: always-approve disabled"
         );
         assert!(!enforced_label(&p).contains("yolo"));
+
+        let p = EnforcedPolicy {
+            setting: "nonManagedHooks".into(),
+            enabled: false,
+            source: "requirements.toml".into(),
+        };
+        assert_eq!(enforced_label(&p), "Hooks outside managed policy disabled");
     }
 
     /// Model-override warnings flow from an effective config through `Config`
@@ -2069,19 +2077,19 @@ mod tests {
         );
         login.plugin_name = Some("acme".into());
         let deploy = skill_fixture("deploy", "/tmp/deploy/SKILL.md", SkillScope::Local);
-        // Gated builtins like /flush stay untagged — inspect must not invent
-        // /local:flush while the live catalog may still advertise /flush.
-        let flush = skill_fixture("flush", "/tmp/flush/SKILL.md", SkillScope::Local);
+        // Gated builtins like /goal stay untagged — inspect must not invent
+        // /local:goal while the live catalog may still advertise /goal.
+        let goal = skill_fixture("goal", "/tmp/goal/SKILL.md", SkillScope::Local);
         let commit_local = skill_fixture("commit", "/tmp/l/commit/SKILL.md", SkillScope::Local);
         let commit_user = skill_fixture("commit", "/tmp/u/commit/SKILL.md", SkillScope::User);
-        let all = [login, deploy, flush, commit_local, commit_user];
-        let [login, deploy, flush, commit_local, commit_user] = &all;
+        let all = [login, deploy, goal, commit_local, commit_user];
+        let [login, deploy, goal, commit_local, commit_user] = &all;
 
         let entry = collision_entry(login, &all);
         assert_eq!(entry.collides_with.as_deref(), Some("login"));
         assert_eq!(entry.invocable_as.as_deref(), Some("acme:login"));
 
-        for skill in [deploy, flush] {
+        for skill in [deploy, goal] {
             let entry = collision_entry(skill, &all);
             assert_eq!(entry.collides_with, None, "{}", skill.name);
             assert_eq!(entry.invocable_as, None, "{}", skill.name);

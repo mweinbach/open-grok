@@ -491,6 +491,11 @@ pub enum AutoCompactCancelReason {
     UserCancelled,
 }
 
+/// User-visible auto-compact start banner for a cross-`model_family` switch.
+/// The pager also matches this `AutoCompactStarted.reason` to show the idle
+/// `Switching model…` loader (family-switch compact runs with no turn in flight).
+pub const MODEL_FAMILY_SWITCH_COMPACT_BANNER: &str = "Switching model. Compacting…";
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case", tag = "sessionUpdate")]
 pub enum SessionUpdate {
@@ -1284,6 +1289,10 @@ fn memory_files_default_true() -> bool {
 pub enum MemoryDisabledReason {
     /// Turned off with `/memory off`; `/memory on` re-enables it.
     SessionToggle,
+    /// `[memory] enabled = false` in the effective TOML; `/memory on` enables it for this session only.
+    ConfigOptOut,
+    /// `--no-memory` or `GROK_MEMORY=0` turned memory off for the whole process; it cannot be enabled until a new session.
+    ProcessDisabled,
     /// The session's pinned rollout controls disable memory; it cannot be enabled until a new session.
     RolloutRestricted,
     /// No memory storage is configured for this session.
@@ -1306,6 +1315,9 @@ pub struct MemoryFileInfo {
     /// A store-generated index (the v2 scope `MEMORY.md`) rather than a note.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub generated: bool,
+    /// Human-readable label when the filename is not one (v2 inbox observations carry a `topic_hint`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -2115,6 +2127,7 @@ mod tests {
                     size_bytes: 1024,
                     modified_epoch_secs: Some(1_700_000_000),
                     generated: false,
+                    title: None,
                 },
                 MemoryFileInfo {
                     path: "/project/.opengrok/memory/MEMORY.md".into(),
@@ -2122,6 +2135,7 @@ mod tests {
                     size_bytes: 512,
                     modified_epoch_secs: None,
                     generated: false,
+                    title: None,
                 },
             ],
             enabled: true,

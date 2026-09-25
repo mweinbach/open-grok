@@ -22,7 +22,7 @@ pub(crate) fn current_hook_infos(
     let Some(registry) = registry else {
         return Vec::new();
     };
-    let disabled = xai_grok_hooks::trust::DisabledHooks::load();
+    let disabled = crate::util::hooks::disabled_hooks_snapshot();
     let registered = crate::config::registered_hook_paths();
     hook_specs_to_infos(&registry.all_hooks(), &disabled, &registered)
 }
@@ -103,7 +103,7 @@ fn hook_spec_to_info_with(
         url: url_display,
         timeout_ms: spec.timeout_ms,
         source_dir,
-        disabled: xai_grok_hooks::trust::hook_disabled_for_display_with(spec, disabled),
+        disabled: disabled.blocks(spec),
         pinned: spec.is_managed_policy(),
         removable,
     }
@@ -344,7 +344,7 @@ mod tests {
     /// the DTO; then the resolved value, else `None`. Same for `command` and `url`.
     #[test]
     fn hook_spec_to_info_raw_display_wins_so_secrets_never_reach_dto() {
-        let no_disabled = xai_grok_hooks::trust::DisabledHooks::from_names([]);
+        let no_disabled = xai_grok_hooks::trust::DisabledHooks::new([], false);
         let no_dirs = HashSet::new();
         let command = |raw, resolved| {
             hook_specs_to_infos(
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn hook_specs_to_infos_pins_removable_at_source_level() {
-        let no_disabled = xai_grok_hooks::trust::DisabledHooks::from_names([]);
+        let no_disabled = xai_grok_hooks::trust::DisabledHooks::new([], false);
         let registered: HashSet<String> = [
             "/reg/policy".to_string(),
             "/reg/req".to_string(),
@@ -433,6 +433,25 @@ mod tests {
         );
         assert!(infos[4].removable);
         assert!(!infos[5].removable, "unregistered dirs are never removable");
+    }
+
+    /// The `[disabled]` badge under `allow_managed_hooks_only` comes from the dispatch skip rule, not `enabled`/disabled-hooks alone.
+    #[test]
+    fn hook_specs_to_infos_marks_non_managed_hooks_disabled_under_managed_only() {
+        let lockdown = xai_grok_hooks::trust::DisabledHooks::new([], true);
+        let user = make_spec(Some("u"), None, None, None);
+        let mut req = make_spec(Some("r"), None, None, None);
+        req.layer = xai_grok_hooks::config::HookProvenance::Requirements;
+
+        let infos = hook_specs_to_infos(&[&user, &req], &lockdown, &HashSet::new());
+        let [user_info, req_info] = infos.as_slice() else {
+            panic!("expected 2 hook infos: {infos:?}");
+        };
+        assert!(
+            user_info.disabled,
+            "enabled file hook shows disabled under the pin"
+        );
+        assert!(!req_info.disabled, "managed-policy hook stays enabled");
     }
 
     #[test]
@@ -663,7 +682,7 @@ mod tests {
         let hook_spec_to_info = |spec: &xai_grok_hooks::config::HookSpec| {
             hook_spec_to_info_with(
                 spec,
-                &xai_grok_hooks::trust::DisabledHooks::from_names([]),
+                &xai_grok_hooks::trust::DisabledHooks::new([], false),
                 &HashSet::new(),
                 &HashSet::new(),
             )

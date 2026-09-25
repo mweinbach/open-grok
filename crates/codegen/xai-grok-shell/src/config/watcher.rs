@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use notify::RecursiveMode;
+use notify::{RecursiveMode, Watcher};
 use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer_opt};
 use tokio::sync::mpsc;
 
@@ -131,6 +131,7 @@ pub struct ConfigFileWatcher {
     /// that is no longer needed, bounding inotify-watch accumulation
     /// as sessions churn across directories.
     watched_cwds: HashSet<PathBuf>,
+    _dest_watch: Option<FollowDestWatch>,
 }
 
 impl ConfigFileWatcher {
@@ -168,52 +169,35 @@ impl ConfigFileWatcher {
         // canonicalized in `parent_is_dir`.
         let user_home_buf: Option<PathBuf> =
             dirs::home_dir().map(|h| dunce::canonicalize(&h).unwrap_or(h));
+        // Follow dest may live outside `$GROK_HOME`. Classify against the live
+        // dest (not a startup snapshot) so A→B retargets still match B writes.
+        let dest_watch = FollowDestWatch::start(&grok_home_buf, tx.clone());
 
+        let dest_watch_for_events = dest_watch.clone();
         let mut debouncer = new_filtered_debouncer(debounce, move |res: DebounceEventResult| {
             let Ok(events) = res else { return };
 
+            let mut saw_slot = false;
             let mut batch_events: Vec<ConfigChangeEvent> = Vec::new();
+            let live_dest = resolve_global_config_dest(&grok_home_buf);
             for event in events {
-                let path = &event.path;
-                let name = path.file_name().and_then(|n| n.to_str());
-                let parent = path.parent();
-
-                let change = match name {
-                    Some("auth.json") if parent == Some(grok_home_buf.as_path()) => {
-                        Some(ConfigChangeEvent::AuthChanged)
-                    }
-                    Some("config.toml") if parent == Some(grok_home_buf.as_path()) => {
-                        Some(ConfigChangeEvent::GlobalConfigChanged)
-                    }
-                    Some("models_cache.json") if parent == Some(grok_home_buf.as_path()) => {
-                        Some(ConfigChangeEvent::ModelsCacheChanged)
-                    }
-                    Some("config.toml") => {
-                        Some(ConfigChangeEvent::ProjectConfigChanged { path: path.clone() })
-                    }
-                    // `~/.claude.json` routes through
-                    // the dedicated home-level variant so the
-                    // reloader can broadcast. Project-level
-                    // `<cwd>/.claude.json` (and any `.mcp.json`)
-                    // continues to be a per-cwd reload.
-                    Some(".claude.json")
-                        if user_home_buf
-                            .as_deref()
-                            .is_some_and(|h| parent_is_dir(parent, h)) =>
-                    {
-                        Some(ConfigChangeEvent::HomeClaudeJsonChanged)
-                    }
-                    Some(".mcp.json") | Some(".claude.json") => {
-                        Some(ConfigChangeEvent::McpConfigChanged { path: path.clone() })
-                    }
-                    _ => None,
-                };
-
-                if let Some(evt) = change
-                    && !batch_events.contains(&evt)
+                if event.path.file_name().and_then(|n| n.to_str()) == Some("config.toml")
+                    && event.path.parent() == Some(grok_home_buf.as_path())
+                {
+                    saw_slot = true;
+                }
+                if let Some(evt) = classify_watched_path(
+                    &event.path,
+                    &grok_home_buf,
+                    live_dest.as_deref(),
+                    user_home_buf.as_deref(),
+                ) && !batch_events.contains(&evt)
                 {
                     batch_events.push(evt);
                 }
+            }
+            if saw_slot && let Some(dest_watch) = &dest_watch_for_events {
+                dest_watch.refresh();
             }
             for evt in batch_events {
                 let _ = tx.send(evt);
@@ -233,6 +217,10 @@ impl ConfigFileWatcher {
                 )
             })
             .ok()?;
+
+        if let Some(dest_watch) = &dest_watch {
+            dest_watch.refresh();
+        }
 
         for p in extra_paths {
             if let Some(parent) = p.parent() {
@@ -274,6 +262,7 @@ impl ConfigFileWatcher {
             Self {
                 debouncer,
                 watched_cwds,
+                _dest_watch: dest_watch,
             },
             rx,
         ))
@@ -325,6 +314,124 @@ impl ConfigFileWatcher {
             return;
         }
         unwatch_cwd_dirs(&mut self.debouncer, cwd);
+    }
+}
+
+/// Snapshot the follow dest of `$GROK_HOME/config.toml`. Canonicalize for notify path match.
+fn resolve_global_config_dest(grok_home: &Path) -> Option<PathBuf> {
+    let slot = grok_home.join("config.toml");
+    xai_grok_config::fs_atomic::resolve_atomic_destination(&slot)
+        .ok()
+        .map(|p| dunce::canonicalize(&p).unwrap_or(p))
+}
+
+/// External dest-parent watch that retargets when the slot is rewritten A→B.
+struct FollowDestWatch {
+    inner: std::sync::Arc<std::sync::Mutex<FollowDestWatchInner>>,
+}
+
+struct FollowDestWatchInner {
+    watcher: AccessFilteredWatcher,
+    grok_home: PathBuf,
+    dest_parent: Option<PathBuf>,
+}
+
+impl Clone for FollowDestWatch {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl FollowDestWatch {
+    fn start(grok_home: &Path, tx: mpsc::UnboundedSender<ConfigChangeEvent>) -> Option<Self> {
+        let grok_home_buf = grok_home.to_path_buf();
+        let watcher = AccessFilteredWatcher::new(
+            move |res: notify::Result<notify::Event>| {
+                let Ok(event) = res else { return };
+                let dest = resolve_global_config_dest(&grok_home_buf);
+                for path in &event.paths {
+                    if classify_watched_path(path, &grok_home_buf, dest.as_deref(), None)
+                        == Some(ConfigChangeEvent::GlobalConfigChanged)
+                    {
+                        let _ = tx.send(ConfigChangeEvent::GlobalConfigChanged);
+                        break;
+                    }
+                }
+            },
+            notify::Config::default(),
+        )
+        .map_err(|e| tracing::warn!(error = %e, "failed to create config dest watcher"))
+        .ok()?;
+        Some(Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(FollowDestWatchInner {
+                watcher,
+                grok_home: grok_home.to_path_buf(),
+                dest_parent: None,
+            })),
+        })
+    }
+
+    fn refresh(&self) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let dest = resolve_global_config_dest(&inner.grok_home);
+        let parent = dest
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !paths_equal(p, &inner.grok_home))
+            .map(Path::to_path_buf);
+        if parent == inner.dest_parent {
+            return;
+        }
+        if let Some(old) = inner.dest_parent.take() {
+            let _ = inner.watcher.unwatch(&old);
+        }
+        if let Some(ref parent) = parent
+            && let Err(e) = inner.watcher.watch(parent, RecursiveMode::NonRecursive)
+        {
+            log_watch_error(&e, "failed to watch global config.toml referent parent");
+            return;
+        }
+        inner.dest_parent = parent;
+    }
+}
+
+fn classify_watched_path(
+    path: &Path,
+    grok_home: &Path,
+    global_config_dest: Option<&Path>,
+    user_home: Option<&Path>,
+) -> Option<ConfigChangeEvent> {
+    if global_config_dest.is_some_and(|d| paths_equal(path, d)) {
+        return Some(ConfigChangeEvent::GlobalConfigChanged);
+    }
+    let name = path.file_name().and_then(|n| n.to_str());
+    let parent = path.parent();
+    match name {
+        Some("auth.json") if parent == Some(grok_home) => Some(ConfigChangeEvent::AuthChanged),
+        Some("config.toml") if parent == Some(grok_home) => {
+            Some(ConfigChangeEvent::GlobalConfigChanged)
+        }
+        Some("models_cache.json") if parent == Some(grok_home) => {
+            Some(ConfigChangeEvent::ModelsCacheChanged)
+        }
+        Some("config.toml") => Some(ConfigChangeEvent::ProjectConfigChanged {
+            path: path.to_path_buf(),
+        }),
+        // `~/.claude.json` routes through the dedicated home-level
+        // variant so the reloader can broadcast. Project-level
+        // `<cwd>/.claude.json` (and any `.mcp.json`) continues to be a
+        // per-cwd reload.
+        Some(".claude.json") if user_home.is_some_and(|h| parent_is_dir(parent, h)) => {
+            Some(ConfigChangeEvent::HomeClaudeJsonChanged)
+        }
+        Some(".mcp.json") | Some(".claude.json") => Some(ConfigChangeEvent::McpConfigChanged {
+            path: path.to_path_buf(),
+        }),
+        _ => None,
     }
 }
 
@@ -419,7 +526,7 @@ fn discovery_change_for_path(path: &Path) -> Option<DiscoveryChange> {
     {
         return Some(DiscoveryChange::Workflows);
     }
-    if file_name.is_some_and(|name| name == "skills" || name == "commands" || name == "SKILL.md")
+    if file_name.is_some_and(|name| SKILL_DISCOVERY_BASENAMES.contains(&name))
         || path
             .ancestors()
             .any(|ancestor| ancestor.file_name().is_some_and(|name| name == "skills"))
@@ -435,6 +542,9 @@ fn discovery_change_for_path(path: &Path) -> Option<DiscoveryChange> {
 
 /// Known vendor config root basenames; kept in sync with `collect_skill_config_dirs`.
 const VENDOR_CONFIG_ROOT_NAMES: &[&str] = &[".opengrok", ".agents", ".claude", ".cursor"];
+
+/// `bundled` is the synced bundle root in grok home, so its appearance means skills changed.
+const SKILL_DISCOVERY_BASENAMES: &[&str] = &["skills", "commands", "SKILL.md", "bundled"];
 
 /// Vendor roots (by name or `grok_home`) must use scoped watches — they can
 /// contain large non-skill trees (`worktrees/`, etc.).
@@ -800,6 +910,39 @@ mod tests {
 
     fn wait_ms(ms: u64) {
         std::thread::sleep(Duration::from_millis(ms));
+    }
+
+    fn wait_for_notify(rx: &mut mpsc::UnboundedReceiver<()>, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match rx.try_recv() {
+                Ok(()) => return true,
+                Err(mpsc::error::TryRecvError::Disconnected) => return false,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn arm_parent_watch(probe: &Path, rx: &mut mpsc::UnboundedReceiver<()>) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut n = 0u8;
+        loop {
+            n = n.wrapping_add(1);
+            fs::write(probe, [n]).unwrap();
+            if wait_for_notify(rx, Duration::from_millis(200)) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("parent watch never became live: {}", probe.display());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        while rx.try_recv().is_ok() {}
     }
 
     #[test]
@@ -1352,10 +1495,10 @@ mod tests {
             refresh_dirs: vec![(workflows.clone(), RecursiveMode::NonRecursive)],
             refreshed_dirs: HashSet::new(),
         };
+        arm_parent_watch(&root.join(".watch-arm"), &mut rx);
         fs::create_dir(&workflows).unwrap();
-        wait_ms(150);
         assert!(
-            rx.try_recv().is_ok(),
+            wait_for_notify(&mut rx, Duration::from_secs(2)),
             "parent watch sees first directory creation"
         );
         assert!(watcher.refresh_new_discovery_dirs());
@@ -1417,33 +1560,36 @@ mod tests {
             refresh_dirs: vendor_skill_refresh_dirs(&vendor).to_vec(),
             refreshed_dirs: HashSet::new(),
         };
+        arm_parent_watch(&vendor.join("bundled"), &mut rx);
 
         fs::create_dir_all(skills.join("alpha")).unwrap();
-        wait_ms(150);
-        assert!(rx.try_recv().is_ok(), "must see skills/ creation");
+        assert!(
+            wait_for_notify(&mut rx, Duration::from_secs(2)),
+            "must see skills/ creation"
+        );
         assert!(watcher.refresh_new_discovery_dirs());
         assert!(watcher.refreshed_dirs.contains(&skills));
         while rx.try_recv().is_ok() {}
 
         fs::write(skills.join("alpha").join("SKILL.md"), "# alpha").unwrap();
-        wait_ms(250);
         assert!(
-            rx.try_recv().is_ok(),
+            wait_for_notify(&mut rx, Duration::from_secs(2)),
             "SKILL.md under newly created skills/ must fire"
         );
         while rx.try_recv().is_ok() {}
 
         fs::create_dir(&commands).unwrap();
-        wait_ms(150);
-        assert!(rx.try_recv().is_ok(), "must see commands/ creation");
+        assert!(
+            wait_for_notify(&mut rx, Duration::from_secs(2)),
+            "must see commands/ creation"
+        );
         assert!(watcher.refresh_new_discovery_dirs());
         assert!(watcher.refreshed_dirs.contains(&commands));
         while rx.try_recv().is_ok() {}
 
         fs::write(commands.join("foo.md"), "# foo").unwrap();
-        wait_ms(250);
         assert!(
-            rx.try_recv().is_ok(),
+            wait_for_notify(&mut rx, Duration::from_secs(2)),
             "command md under newly created commands/ must fire"
         );
     }
@@ -1860,5 +2006,95 @@ mod tests {
         assert!(!watcher.watched_cwds.contains(p));
         watcher.unwatch_path(p);
         assert!(!watcher.watched_cwds.contains(p));
+    }
+
+    /// An external `config.toml` referent must classify as global, not project.
+    #[test]
+    fn classify_external_config_toml_referent_as_global() {
+        let grok_home = Path::new("/home/u/.opengrok");
+        let dest = Path::new("/home/u/dotfiles/config.toml");
+        assert_eq!(
+            classify_watched_path(dest, grok_home, Some(dest), None),
+            Some(ConfigChangeEvent::GlobalConfigChanged)
+        );
+        assert_eq!(
+            classify_watched_path(dest, grok_home, None, None),
+            Some(ConfigChangeEvent::ProjectConfigChanged {
+                path: dest.to_path_buf()
+            })
+        );
+        let slot = grok_home.join("config.toml");
+        assert_eq!(
+            classify_watched_path(&slot, grok_home, Some(dest), None),
+            Some(ConfigChangeEvent::GlobalConfigChanged)
+        );
+    }
+
+    /// Writes to an external referent must be observed as GlobalConfigChanged.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn watcher_emits_global_change_for_external_config_toml_referent() {
+        let grok = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let dest = repo.path().join("config.toml");
+        fs::write(&dest, "a = 1").unwrap();
+        std::os::unix::fs::symlink(&dest, grok.path().join("config.toml")).unwrap();
+
+        let (_w, mut rx) =
+            ConfigFileWatcher::start(grok.path(), &[], None, Some(Duration::from_millis(50)))
+                .expect("watcher should start");
+        wait_ms(150);
+        while rx.try_recv().is_ok() {}
+
+        fs::write(&dest, "a = 2").unwrap();
+        wait_ms(300);
+        let mut found = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt == ConfigChangeEvent::GlobalConfigChanged {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "write to the external config.toml referent must emit GlobalConfigChanged"
+        );
+    }
+
+    /// Retarget A→B, then edit B: the watcher must follow the live dest.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn watcher_emits_global_change_after_referent_retarget() {
+        let grok = TempDir::new().unwrap();
+        let repo = TempDir::new().unwrap();
+        let a = repo.path().join("a.toml");
+        let b = repo.path().join("b.toml");
+        fs::write(&a, "a = 1").unwrap();
+        fs::write(&b, "b = 1").unwrap();
+        let slot = grok.path().join("config.toml");
+        std::os::unix::fs::symlink(&a, &slot).unwrap();
+
+        let (_w, mut rx) =
+            ConfigFileWatcher::start(grok.path(), &[], None, Some(Duration::from_millis(50)))
+                .expect("watcher should start");
+        wait_ms(150);
+        while rx.try_recv().is_ok() {}
+
+        std::fs::remove_file(&slot).unwrap();
+        std::os::unix::fs::symlink(&b, &slot).unwrap();
+        wait_ms(300);
+        while rx.try_recv().is_ok() {}
+
+        fs::write(&b, "b = 2").unwrap();
+        wait_ms(300);
+        let mut found = false;
+        while let Ok(evt) = rx.try_recv() {
+            if evt == ConfigChangeEvent::GlobalConfigChanged {
+                found = true;
+            }
+        }
+        assert!(
+            found,
+            "write to the retargeted config.toml referent must emit GlobalConfigChanged"
+        );
     }
 }

@@ -2,12 +2,15 @@ use super::mcp::user_config_path;
 use super::persist::{
     atomic_write_string, lock_config_writes, read_to_string_or_empty, update_config,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::UNIX_EPOCH;
 use toml::Value as TomlValue;
 use toml::map::Map as TomlMap;
+use xai_grok_config::fs_atomic::BoundDest;
+use xai_grok_config_types::Feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocalFeatureFlagSpec {
@@ -205,7 +208,7 @@ pub async fn set_local_feature_flag(key: &'static str, value: bool) -> Result<()
     if local_feature_flag_default(key).is_none() {
         anyhow::bail!("unsupported local feature flag `{key}`");
     }
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let path = user_config_path();
     let contents = read_to_string_or_empty(&path)?;
     let mut root = if contents.trim().is_empty() {
@@ -350,6 +353,75 @@ pub async fn set_page_flip_on_send(value: bool) -> Result<()> {
 
 pub async fn set_confirm_before_rewind(value: bool) -> Result<()> {
     update_config(|cfg| cfg.ui.confirm_before_rewind = Some(value)).await
+}
+
+pub async fn set_dashboard_preview(value: bool) -> Result<()> {
+    rewrite_user_config_locked("dashboard preview", move |path| {
+        write_dashboard_preview(
+            path,
+            value,
+            crate::util::config::persist::atomic_write_follow_bound,
+        )
+    })
+    .await
+}
+
+pub(super) fn write_dashboard_preview(
+    path: &Path,
+    value: bool,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+) -> Result<()> {
+    rewrite_user_config_table(path, "dashboard preview", write, |root| {
+        let ui = root
+            .entry("ui".to_owned())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .with_context(|| format!("{} [ui] must be a table", path.display()))?;
+        ui.insert("dashboard_preview".to_owned(), toml::Value::Boolean(value));
+        Ok(())
+    })
+}
+
+/// Run a raw-table rewrite of the user `config.toml` under the config write guard.
+/// For keys `update_config` cannot express (a deletion, or a table `save_config_locked` does not merge).
+async fn rewrite_user_config_locked(
+    what: &'static str,
+    rewrite: impl FnOnce(&Path) -> Result<()> + Send + 'static,
+) -> Result<()> {
+    let guard = crate::util::config::persist::lock_config_writes()
+        .await
+        .map_err(|error| anyhow::anyhow!("lock config.toml to save {what}: {error}"))?;
+    guard
+        .run_blocking(move || rewrite(&crate::util::config::mcp::user_config_path()))
+        .await
+        .map_err(|error| anyhow::anyhow!("{what} persistence task failed: {error}"))?
+}
+
+/// Read `path`, hand its root table to `edit`, and publish the result with `write`; `what` names the setting in every error.
+fn rewrite_user_config_table(
+    path: &Path,
+    what: &str,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+    edit: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
+    let (destination, content) = crate::util::config::persist::read_follow_bound(path)
+        .map_err(|error| anyhow::anyhow!("read {} to save {what}: {error}", path.display()))?;
+    let mut document =
+        crate::util::config::persist::parse_existing_config_toml(&content).map_err(|error| {
+            anyhow::anyhow!(
+                "parse {} to save {what}: {}",
+                path.display(),
+                xai_grok_config::toml_error_detail(&content, &error)
+            )
+        })?;
+    let root = document
+        .as_table_mut()
+        .with_context(|| format!("{} must contain a TOML table", path.display()))?;
+    edit(root)?;
+    let content = toml::to_string_pretty(&document)
+        .map_err(|error| anyhow::anyhow!("serialize {} for {what}: {error}", path.display()))?;
+    write(path, &destination, &content)
+        .map_err(|error| anyhow::anyhow!("write {} to save {what}: {error}", path.display()))
 }
 
 /// Persist `[ui].combine_queued_prompts` via `update_config`.
@@ -514,6 +586,50 @@ pub async fn set_privacy_banner_acked(acked_at_rfc3339: String) -> Result<()> {
         cfg.privacy.privacy_banner_acked = Some(acked_at_rfc3339);
     })
     .await
+}
+
+/// Persist or remove a registry `[features]` key in the user `config.toml`.
+/// `None` deletes the key so the remote and default tiers apply again.
+pub async fn set_feature_override(feature: Feature, value: Option<bool>) -> Result<()> {
+    rewrite_user_config_locked(feature.path(), move |path| {
+        write_feature_override(
+            path,
+            feature,
+            value,
+            crate::util::config::persist::atomic_write_follow_bound,
+        )
+    })
+    .await
+}
+
+pub(super) fn write_feature_override(
+    path: &Path,
+    feature: Feature,
+    value: Option<bool>,
+    write: impl FnOnce(&Path, &BoundDest, &str) -> std::io::Result<()>,
+) -> Result<()> {
+    rewrite_user_config_table(path, feature.path(), write, |root| {
+        match value {
+            Some(flag) => {
+                let features = root
+                    .entry("features".to_owned())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+                    .as_table_mut()
+                    .with_context(|| format!("{} [features] must be a table", path.display()))?;
+                features.insert(feature.key().to_owned(), toml::Value::Boolean(flag));
+            }
+            None => {
+                let table = root.get_mut("features").and_then(toml::Value::as_table_mut);
+                if let Some(features) = table {
+                    features.remove(feature.key());
+                    if features.is_empty() {
+                        root.remove("features");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Persist `[ui].fork_secondary_model` via `update_config`.
@@ -796,7 +912,7 @@ pub async fn upsert_custom_model(
     Option<String>,
 )> {
     let (record, warning) = crate::custom_models::normalize_custom_model(record)?;
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let path = user_config_path();
     let model = super::persist::persist_custom_model_upsert_at(&path, &record)?;
     Ok((record, model, warning))
@@ -814,7 +930,7 @@ pub async fn upsert_custom_models(
     Vec<(String, crate::agent::config::ConfigModelOverride)>,
     Vec<String>,
 )> {
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     let path = user_config_path();
     let mut accepted = Vec::new();
     let mut warnings = Vec::new();
@@ -846,7 +962,7 @@ pub async fn upsert_custom_models(
 pub async fn delete_custom_model(key: &str) -> Result<bool> {
     let key = key.trim();
     crate::custom_models::validate_model_key(key)?;
-    let _guard = lock_config_writes().await;
+    let _guard = lock_config_writes().await?;
     super::persist::persist_custom_model_delete_at(&user_config_path(), key)
 }
 

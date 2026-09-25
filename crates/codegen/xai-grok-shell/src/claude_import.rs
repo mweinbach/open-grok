@@ -1198,6 +1198,18 @@ fn apply_hooks_to_dir(hooks_dir: &Path, items: &[ImportableItem]) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xai_grok_hooks::discovery::HookSourceConfig;
+
+    fn source_path_strs(sources: &[HookSourceConfig]) -> Vec<String> {
+        sources
+            .iter()
+            .map(|s| match s {
+                HookSourceConfig::SettingsFile(p) | HookSourceConfig::Directory(p) => {
+                    p.to_string_lossy().into_owned()
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn format_rule_bash_with_pattern() {
@@ -1597,22 +1609,18 @@ mod tests {
         refresh_marker_cache(true);
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
-        let project_strs: Vec<String> = paths
-            .project
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
+        let project_strs = source_path_strs(&paths.project);
         assert!(
             !project_strs.iter().any(|s| s.contains(".claude")),
             "project sources should not include .claude/ when marker set; got {:?}",
             project_strs
         );
-        let global_strs: Vec<String> = paths
-            .global
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let global_strs = source_path_strs(&paths.global);
         assert!(
             !global_strs.iter().any(|s| s.contains("/.claude/")),
             "global sources should not include ~/.claude/ when marker set; got {:?}",
@@ -1647,12 +1655,12 @@ mod tests {
         refresh_marker_cache(false);
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
-        let project_strs: Vec<String> = paths
-            .project
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
+        let project_strs = source_path_strs(&paths.project);
         assert!(
             project_strs.iter().any(|s| s.contains(".claude")),
             "project sources should include .claude/ when marker unset; got {:?}",
@@ -1667,12 +1675,12 @@ mod tests {
         refresh_marker_cache(false);
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
-        let global_strs: Vec<String> = paths
-            .global
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
+        let global_strs = source_path_strs(&paths.global);
         assert!(
             global_strs
                 .iter()
@@ -1680,11 +1688,7 @@ mod tests {
             "global sources should include ~/.cursor/hooks.json; got {:?}",
             global_strs
         );
-        let project_strs: Vec<String> = paths
-            .project
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let project_strs = source_path_strs(&paths.project);
         assert!(
             project_strs
                 .iter()
@@ -1702,22 +1706,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut compat = xai_grok_tools::types::compat::CompatConfig::default();
         compat.cursor.hooks = false;
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
-        let global_strs: Vec<String> = paths
-            .global
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
+        let global_strs = source_path_strs(&paths.global);
         assert!(
             !global_strs.iter().any(|s| s.contains(".cursor")),
             "global sources should not include .cursor/ when disabled; got {:?}",
             global_strs
         );
-        let project_strs: Vec<String> = paths
-            .project
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let project_strs = source_path_strs(&paths.project);
         assert!(
             !project_strs.iter().any(|s| s.contains(".cursor")),
             "project sources should not include .cursor/ when disabled; got {:?}",
@@ -1734,22 +1734,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut compat = xai_grok_tools::types::compat::CompatConfig::default();
         compat.claude.hooks = false;
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
-        let global_strs: Vec<String> = paths
-            .global
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
+        let global_strs = source_path_strs(&paths.global);
         assert!(
             !global_strs.iter().any(|s| s.contains("/.claude/")),
             "global sources should not include ~/.claude/ when compat disabled; got {:?}",
             global_strs
         );
-        let project_strs: Vec<String> = paths
-            .project
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
+        let project_strs = source_path_strs(&paths.project);
         assert!(
             !project_strs.iter().any(|s| s.contains(".claude")),
             "project sources should not include .claude/ when compat disabled; got {:?}",
@@ -1767,7 +1763,11 @@ mod tests {
         refresh_marker_cache(false);
         let dir = tempfile::tempdir().unwrap();
         let compat = xai_grok_tools::types::compat::CompatConfig::default();
-        let paths = crate::util::hooks::discover_hook_source_paths(Some(dir.path()), &compat);
+        let paths = xai_grok_hooks::discovery::discover_hook_source_paths(
+            Some(dir.path()),
+            &compat,
+            is_claude_import_marked(),
+        );
         assert!(
             !paths.project.is_empty(),
             "project source paths should be non-empty for a git_root"

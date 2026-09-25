@@ -391,6 +391,42 @@ impl SubagentSpawnContext {
             .resolve()
             .value
     }
+    pub(crate) fn resolve_long_reasoning_reminder(
+        &self,
+    ) -> crate::session::long_reasoning_reminder::LongReasoningReminder {
+        let local = self
+            .agent_config
+            .as_ref()
+            .map(|c| &c.long_reasoning_reminder);
+        crate::session::long_reasoning_reminder::LongReasoningReminder::resolve(
+            local.unwrap_or(&crate::util::config::LongReasoningReminderSettings::default()),
+            self.remote_settings
+                .as_ref()
+                .and_then(|s| s.long_reasoning_reminder.as_ref()),
+        )
+    }
+    /// Upstream `feature(Feature::SubagentModelInheritance)` in fork idiom:
+    /// the parent's tiers resolve against the subagent's own remote settings
+    /// snapshot. Precedence: env > config `[features]` > remote > default
+    /// (false). The [`Resolved`] (not just the bit) flows into the child
+    /// spawn so the child's task-tool presentation latches the same value.
+    pub(crate) fn resolve_subagent_model_inheritance(
+        &self,
+    ) -> crate::agent::config::Resolved<bool> {
+        crate::agent::config::BoolFlag::env("GROK_SUBAGENT_MODEL_INHERITANCE")
+            .config(
+                self.agent_config
+                    .as_ref()
+                    .and_then(|c| c.features.subagent_model_inheritance),
+            )
+            .feature_flag(
+                self.remote_settings
+                    .as_ref()
+                    .and_then(|r| r.subagent_model_inheritance_enabled),
+            )
+            .default(false)
+            .resolve()
+    }
     pub(crate) fn resolve_compaction_tool_choice(
         &self,
     ) -> crate::util::config::CompactionToolChoice {
@@ -955,6 +991,7 @@ async fn read_parent_sampling_config(
                 query_params: cfg.query_params.clone(),
                 env_http_headers: cfg.env_http_headers.clone(),
                 context_window: cfg.context_window.get(),
+                max_request_bytes: cfg.max_request_bytes,
                 client_version: creds.client_version,
                 reasoning_effort: cfg.reasoning_effort,
                 service_tier: None,
@@ -2206,14 +2243,6 @@ fn filter_pool_by_inheritance(
             Some(pool)
         }
     }
-}
-/// Whether a subagent may declare its own agent-owned `mcpServers`.
-///
-/// Plugin agents cannot: untrusted packages must not spawn MCP processes or
-/// open network MCP endpoints. Parent-pool inheritance is independent and
-/// always available subject to [`McpInheritance`].
-fn agent_owned_mcp_servers_allowed(is_plugin_agent: bool) -> bool {
-    !is_plugin_agent
 }
 /// Resolve a subagent type name to its `AgentDefinition`, with the parent
 /// session's CLI tool/permission overrides already applied (so the spawn path
@@ -3672,7 +3701,8 @@ fn completed_finish_from_inspection(inspection: &SubagentInspection) -> Option<S
 /// `SubagentFinished` per id, unioning two id-keyed sources (so a crash orphan
 /// in both heals once) — `unfinished` replayed spawns whose finish a rewind
 /// dropped (or a forked-in subagent with no meta), and on-disk `running` metas.
-/// Skipping ids still active or pending: a `running` meta → `cancelled` (unless
+/// Skipping ids still live under `parent_session_id` (a fork source's live
+/// children are not): a `running` meta → `cancelled` (unless
 /// the coordinator still holds its terminal result, then re-emit that); a terminal
 /// meta that survived a rewound finish re-emits its real outcome; a no-meta
 /// replayed spawn → `cancelled`. Runs after replay so the finish orders after the spawn.
@@ -3684,6 +3714,7 @@ pub(crate) async fn reconcile_orphaned_subagents_with_backend(
     gateway: &GatewaySender,
     parent_cmd_tx: Option<&mpsc::UnboundedSender<SessionCommand>>,
 ) {
+    let backend = backend.scoped_to_session(parent_session_id);
     let subagents_dir = session_dir.join("subagents");
     let mut candidates: std::collections::BTreeMap<String, Option<String>> =
         std::collections::BTreeMap::new();
@@ -3827,5 +3858,7 @@ mod refresh_reasoning_effort_tests {
         );
     }
 }
+#[cfg(feature = "test-support")]
+pub(crate) mod isolated_spawn_e2e;
 #[cfg(test)]
 mod tests;
