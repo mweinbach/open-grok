@@ -6,6 +6,8 @@
 //! avoids transitive dependencies on shell-specific types
 //! (`xai-grok-tools`, etc.).
 
+use std::num::NonZeroU64;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use xai_grok_sampling_types::{
@@ -99,6 +101,9 @@ pub struct SamplerConfig {
     /// it; it is informational metadata used by the session for compaction
     /// decisions.
     pub context_window: u64,
+    /// Provider request-body cap, already defaulted from `api_backend` by model resolution; `None` budgets to 50 MiB.
+    #[serde(default)]
+    pub max_request_bytes: Option<NonZeroU64>,
     pub force_http1: bool,
     pub max_retries: Option<u32>,
     pub stream_tool_calls: bool,
@@ -231,6 +236,7 @@ impl Default for SamplerConfig {
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: 0,
+            max_request_bytes: None,
             force_http1: false,
             max_retries: None,
             stream_tool_calls: false,

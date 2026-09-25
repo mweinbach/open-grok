@@ -108,6 +108,9 @@ pub struct UiConfig {
     /// `None` = off (client default; opt-in). Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub show_timeline: Option<bool>,
+    /// The dashboard preview includes the selected session's reply panel. Unset means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_preview: Option<bool>,
     /// Snap a just-sent prompt to the viewport top. `None` = on (default).
     /// Written by the pager's settings modal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -364,6 +367,7 @@ impl Default for UiConfig {
             default_selected_permission: None,
             show_timestamps: None,
             show_timeline: None,
+            dashboard_preview: None,
             page_flip_on_send: None,
             confirm_before_rewind: None,
             auto_dark_theme: None,
@@ -406,6 +410,10 @@ impl Default for UiConfig {
 }
 
 impl UiConfig {
+    pub fn dashboard_preview_enabled(&self) -> bool {
+        self.dashboard_preview.unwrap_or(true)
+    }
+
     /// The single source of truth for the timeline-sidebar default (opt-in).
     /// Flip this one line to change the default everywhere.
     ///

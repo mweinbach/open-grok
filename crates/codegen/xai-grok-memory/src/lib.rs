@@ -41,6 +41,7 @@ pub mod text_utils;
 pub mod v2;
 mod v2_access;
 pub mod v2_capture;
+pub mod v2_carryover;
 mod v2_clock;
 pub mod v2_consolidation;
 mod v2_maintenance;
@@ -61,6 +62,10 @@ pub use v2_capture::{
     ClaimRequest, CommitResult, MAX_ALIASES, MAX_BODY_BYTES, MAX_KEYWORDS, MAX_OBSERVATIONS,
     MAX_STATEMENT_BYTES, MAX_TERM_BYTES, MAX_TOPIC_BYTES, ObservationDraft, ObservationType,
     V2CaptureError, V2CaptureStore,
+};
+pub use v2_carryover::{
+    V2CarryoverError, V2CarryoverOutcome, V2CarryoverReport, carry_over_legacy_memory,
+    default_legacy_memory_root, legacy_memory_file,
 };
 pub use v2_clock::{SharedV2Clock, SystemV2Clock, V2Clock, system_v2_clock};
 pub use v2_consolidation::{

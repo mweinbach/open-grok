@@ -420,7 +420,7 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                         (
                             ImageGenConfig::Enabled {
                                 provider: xai_grok_tools::types::ImageGenerationProvider::Grok,
-                                api_key: token.clone(),
+                                api_key: Some(token.clone()),
                                 base_url: url.clone(),
                                 extra_headers: headers.clone(),
                                 api_key_provider: None,
@@ -431,11 +431,12 @@ impl SessionContextFactory for WorkspaceSessionContextFactory {
                                 tier_restricted: false,
                             },
                             VideoGenConfig::Enabled {
-                                api_key: token.clone(),
+                                api_key: Some(token.clone()),
                                 base_url: url.clone(),
                                 extra_headers: headers.clone(),
                                 zdr_video_output_s3: None,
                                 tier_restricted: false,
+                                zdr_restricted: false,
                             },
                             WebSearchConfig::Enabled {
                                 api_key: token,

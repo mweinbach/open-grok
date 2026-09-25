@@ -1,6 +1,6 @@
 //! Handle to communicate with ChatStateActor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use tokio::sync::{mpsc, oneshot};
 use xai_grok_sampling_types::{
@@ -363,11 +363,16 @@ impl ChatStateHandle {
         let _ = self.cmd_tx.send(ChatStateCommand::FlushHarnessTraceTurn);
     }
 
-    /// Repair dangling tool calls after a harness-initiated halt.
-    pub fn repair_dangling_after_harness_halt(&self, class: &'static str) {
+    /// Repair dangling tool calls after a harness-initiated halt. `answers` are
+    /// written only for ids still dangling; the rest are dropped.
+    pub fn repair_dangling_after_harness_halt(
+        &self,
+        class: &'static str,
+        answers: HashMap<String, String>,
+    ) {
         let _ = self
             .cmd_tx
-            .send(ChatStateCommand::RepairDanglingAfterHarnessHalt { class });
+            .send(ChatStateCommand::RepairDanglingAfterHarnessHalt { class, answers });
     }
 
     pub fn pop_stranded_continue_reminder(&self) {

@@ -1,5 +1,6 @@
 //! Tests for ChatStateActor.
 
+use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
@@ -31,6 +32,7 @@ fn test_config_with_window(context_window: u64) -> SamplingConfig {
         context_window: NonZeroU64::new(context_window)
             .expect("test context_window must be non-zero"),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     }
@@ -1243,6 +1245,7 @@ async fn update_sampling_config_is_queryable() {
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(200_000).unwrap(),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     };
@@ -1632,6 +1635,7 @@ async fn build_request_uses_sampling_config() {
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(128_000).unwrap(),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     };
@@ -2875,7 +2879,8 @@ async fn turn_capture_survives_integrity_repair_prefix_shrink() {
     // conversation to len 5 while the un-rebased offset stays at 7 (offset 7 >
     // len 5). Without the fix the later take_turn_messages slice is out of range,
     // panics the actor, and the query comes back as None.
-    h.handle.repair_dangling_after_harness_halt("test-halt");
+    h.handle
+        .repair_dangling_after_harness_halt("test-halt", HashMap::new());
 
     // Second turn item lands after the rebase — it must still be captured.
     h.handle
@@ -2911,7 +2916,8 @@ async fn integrity_repair_does_not_flag_compaction() {
 
     // An in-place integrity repair goes through `snapshot_turn_slice` like
     // compaction does, but it is NOT compaction — the flag must stay unset.
-    h.handle.repair_dangling_after_harness_halt("test-halt");
+    h.handle
+        .repair_dangling_after_harness_halt("test-halt", HashMap::new());
 
     let capture = h
         .handle
@@ -3784,6 +3790,7 @@ async fn sampling_config_survives_compaction_replacement() {
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     };
@@ -3871,6 +3878,7 @@ async fn model_metadata_lost_after_compaction_then_recovered_on_next_turn() {
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     };
@@ -3963,6 +3971,7 @@ async fn context_window_downgrade_triggers_auto_compact() {
         env_http_headers: Default::default(),
         context_window: NonZeroU64::new(500_000).unwrap(),
         reasoning_effort: None,
+        max_request_bytes: None,
         service_tier: None,
         stream_tool_calls: None,
     };
@@ -5490,7 +5499,7 @@ async fn cancel_integrity_repair_drops_stranded_continue_reminder() {
 
     harness
         .handle
-        .repair_dangling_after_harness_halt("test-cancel");
+        .repair_dangling_after_harness_halt("test-cancel", HashMap::new());
     let conv = harness.handle.get_conversation().await;
     assert!(
         !matches!(

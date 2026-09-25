@@ -25,6 +25,7 @@
 
 pub mod actor;
 pub mod commands;
+pub mod compaction_image_context;
 pub mod compaction_mode;
 pub mod compaction_transcript;
 pub mod compaction_utils;
@@ -40,7 +41,7 @@ pub mod usage;
 pub use actor::state::{
     estimate_conversation_tokens, estimate_item_tokens, estimate_messages_tokens,
     estimate_system_message_tokens, estimate_tool_definition_tokens,
-    estimate_tool_definitions_tokens,
+    estimate_tool_definitions_tokens, estimate_tool_specs_tokens,
 };
 pub use actor::{ChatStateActor, prune_conversation};
 pub use commands::{ModelMetadata, StrictAppendAck, StrictAppendError};

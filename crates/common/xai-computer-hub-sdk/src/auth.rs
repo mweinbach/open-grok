@@ -193,6 +193,10 @@ pub struct AuthIdentity {
 
 /// Credential provider called on every connect/reconnect.
 pub trait AuthProvider: Send + Sync + std::fmt::Debug {
+    /// The credential to present now. Must return promptly, or at least in
+    /// bounded time: the SDK also calls it from the blocking pool once per
+    /// connected phase and then periodically, and cannot cancel a call in
+    /// flight.
     fn current(&self) -> AuthCredential;
 
     /// Stable pool-dedup key, decoupled from the per-connect credential.

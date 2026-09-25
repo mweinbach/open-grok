@@ -4960,6 +4960,17 @@ pub fn repair_dangling_tool_calls(
     conversation: &mut Vec<ConversationItem>,
     reason: DanglingToolCallReason,
 ) -> usize {
+    repair_dangling_tool_calls_with(conversation, |_, name| {
+        synthetic_dangling_result_text(name, reason)
+    })
+}
+
+/// `resolve(tool_call_id, tool_name)` is only asked for tool calls that still
+/// have no result; answered calls keep their existing result.
+pub fn repair_dangling_tool_calls_with(
+    conversation: &mut Vec<ConversationItem>,
+    mut resolve: impl FnMut(&str, &str) -> String,
+) -> usize {
     // Phase 1: forward scan to find every assistant with unanswered tool calls.
     // We record (insert_position, synthetic_items) for each repair site.
     let mut repairs: Vec<(usize, Vec<ConversationItem>)> = Vec::new();
@@ -5000,7 +5011,7 @@ pub fn repair_dangling_tool_calls(
                 .iter()
                 .filter(|(_, _, _, call_id)| !answered.contains(call_id))
                 .map(|(id, name, is_custom, call_id)| {
-                    let text = synthetic_dangling_result_text(name, reason);
+                    let text = resolve(id.as_ref(), name);
                     if *is_custom {
                         ConversationItem::custom_tool_output(
                             CustomToolOutputItem::text(call_id, text).with_name(name),
@@ -5068,7 +5079,7 @@ pub fn has_dangling_tool_calls(conversation: &[ConversationItem]) -> bool {
     false
 }
 
-fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
+pub fn synthetic_dangling_result_text(name: &str, reason: DanglingToolCallReason) -> String {
     // Exhaustive match — no `_ =>` guard — so adding a new variant is a
     // compile-time error at every call site that renders these messages.
     match reason {

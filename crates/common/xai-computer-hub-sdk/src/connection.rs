@@ -24,7 +24,11 @@
 //! 3. Re-runs the `hello` handshake.
 //! 4. The ToolServer replays `serve{session_id, tools}` per active
 //!    session via the on_reconnect callback. The server auto-registers
-//!    sessions from `serve` so no separate wire call is needed.
+//!    sessions from `serve` so no separate wire call is needed. A harness
+//!    replays `session_open` and then every `session_bind_server` it last
+//!    succeeded with, so the hub forwards a fresh `session.bind` — stamped
+//!    with its current policy — to each tool server the session was bound
+//!    to (a hub roll drops both sockets and re-stamps nothing by itself).
 //! 5. Drains any outbound frames that buffered during step 1-4.
 use crate::auth::{AuthCredential, AuthProvider, PrincipalKey};
 use crate::demux::Demux;
@@ -47,11 +51,12 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use url::Url;
 use xai_tool_protocol::{
-    ConnectionId, ConnectionKind, JsonRpcId, JsonRpcRequest, JsonRpcResponse, JsonRpcVersion,
-    Method, PingFrame, PongFrame, ResponseOutcome, SessionId,
+    AuthRefreshParams, AuthRefreshResult, ConnectionId, ConnectionKind, JsonRpcError, JsonRpcId,
+    JsonRpcRequest, JsonRpcResponse, JsonRpcVersion, Method, PingFrame, PongFrame, ResponseOutcome,
+    ServerId, SessionBindServerParams, SessionId,
 };
 /// Outbound mpsc bound. Picked to match the server's per-actor outbound
 /// buffer so a single-process roundtrip never dead-blocks on sender
@@ -103,6 +108,33 @@ const INITIAL_CONNECT_MAX_ATTEMPTS: u32 = 3;
 const DEFAULT_WS_PING_INTERVAL: Duration = Duration::from_secs(30);
 const SERVE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const SERVE_MAX_ATTEMPTS: u32 = 3;
+/// How often a token-bound tool server asks its provider for a fresher bearer
+/// to present in band ([`AuthRefreshDriver`]) unless
+/// [`ConnectionTuning::auth_refresh_poll`] says otherwise.
+pub(crate) const AUTH_REFRESH_POLL: Duration = Duration::from_secs(30);
+/// Bound on one `auth.refresh` round-trip; the hub answers or refuses well
+/// within this, so a later reply is a stuck socket.
+const AUTH_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Unaccepted `auth.refresh` answers in a row on one phase at which the
+/// driver logs once at `warn!`: a refusal that persists means the hub will
+/// still close the socket at the bearer's `exp`.
+const AUTH_REFRESH_WARN_AFTER: u32 = 3;
+/// The hub's `error.data.reason` for a bearer whose `exp` is not later than
+/// the one it already holds.
+const AUTH_REFRESH_NOT_LATER: &str = "not_later";
+/// The `data.reason` values the hub sends with a refused `auth.refresh`.
+const AUTH_REFRESH_KNOWN_REASONS: &[&str] = &[
+    "not_token_bound",
+    "unconfigured",
+    "disabled",
+    "in_flight",
+    "too_soon",
+    "unreadable",
+    AUTH_REFRESH_NOT_LATER,
+    "unverified",
+    "identity_changed",
+    "unavailable",
+];
 const CLOCK_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const CLOCK_JUMP_ACCUM_MIN_MS: u64 = 100;
 const CLOCK_JUMP_REPORT_MIN_MS: u64 = 2_000;
@@ -384,6 +416,10 @@ pub struct ConnectionTuning {
     pub reconnect_attempt_reset_after: Option<Duration>,
     pub reconnect_after_terminal_close_codes: Vec<u16>,
     pub initial_connect_attempt_timeout: Option<Duration>,
+    /// Override for how often a token-bound tool server asks its provider
+    /// for a fresher bearer to present in band (`auth.refresh`). `None` (or
+    /// zero) ⇒ 30 s.
+    pub auth_refresh_poll: Option<Duration>,
 }
 /// Pool dedup key. Two connections are pooled together iff their
 /// `(url, principal)` match.
@@ -553,6 +589,8 @@ struct HubConnectionInner {
     /// Incremented at the start of each reconnect episode so jitter
     /// re-phases across outages of the same connection.
     reconnect_after_terminal_close_codes: Vec<u16>,
+    /// Cadence of the in-band bearer refresh ([`run_auth_refresh`]).
+    auth_refresh_poll: Duration,
     outage_seq: AtomicU32,
     /// Outbound frames waiting to be written. Filled by `send_*`
     /// helpers; drained by the writer half of the actor.
@@ -562,6 +600,11 @@ struct HubConnectionInner {
     /// Refcounted bound-session set. Used by the reconnect path to
     /// re-issue `register_session` for every still-live session.
     bound_sessions: Arc<RefCountedSet<SessionId>>,
+    /// The last `session_bind_server` that succeeded per session and tool
+    /// server, replayed after `session_open` on reconnect. Kept here rather
+    /// than on the harness because the connection owns the replay and the
+    /// harness only learns of a reconnect after it.
+    last_binds: dashmap::DashMap<SessionId, Vec<SessionBindServerParams>>,
     /// Cached server-issued `connection_id`. Updated on every (re)connect.
     connection_id: Arc<Mutex<Option<ConnectionId>>>,
     /// Optional capabilities the server advertised in the most recent
@@ -620,7 +663,7 @@ impl HubConnection {
             resolve_initial_connect_attempt_timeout(config.tuning.initial_connect_attempt_timeout);
         let initial_jitter_seed = new_reconnect_jitter_seed();
         let mut attempt: u32 = 0;
-        let (sink, stream, ack) = loop {
+        let (sink, stream, ack, presented) = loop {
             attempt += 1;
             let cred = config.credential.current();
             let attempt_result = match tokio::time::timeout(budget, async {
@@ -651,7 +694,7 @@ impl HubConnection {
                 ))),
             };
             match attempt_result {
-                Ok(parts) => break parts,
+                Ok((sink, stream, ack)) => break (sink, stream, ack, cred),
                 Err(err) => {
                     if attempt >= INITIAL_CONNECT_MAX_ATTEMPTS || !initial_connect_retryable(&err) {
                         return Err(err);
@@ -701,10 +744,16 @@ impl HubConnection {
                 codes.dedup();
                 codes
             },
+            auth_refresh_poll: config
+                .tuning
+                .auth_refresh_poll
+                .filter(|poll| !poll.is_zero())
+                .unwrap_or(AUTH_REFRESH_POLL),
             outage_seq: AtomicU32::new(0),
             outbound_tx,
             demux: demux.clone(),
             bound_sessions: bound_sessions.clone(),
+            last_binds: dashmap::DashMap::new(),
             connection_id,
             hello_capabilities: parking_lot::RwLock::new(ack.capabilities),
             next_request_id: std::sync::atomic::AtomicU64::new(1),
@@ -738,6 +787,7 @@ impl HubConnection {
         tokio::spawn(run_reader_actor(
             reader_inner,
             stream,
+            presented,
             stop_rx,
             reconnect_rx,
             writer_ctl_tx,
@@ -779,11 +829,7 @@ impl HubConnection {
     ///   `capabilities` field are indistinguishable from an empty list, so
     ///   support is unknown and callers should probe per call.
     pub fn supports(&self, capability: &str) -> Option<bool> {
-        let caps = self.inner.hello_capabilities.read();
-        if caps.is_empty() {
-            return None;
-        }
-        Some(caps.iter().any(|c| c == capability))
+        self.inner.supports(capability)
     }
     /// Demux (used by the server-side run loop to register session
     /// inboxes). Cheap to clone (Arc bump).
@@ -823,7 +869,37 @@ impl HubConnection {
     /// the last borrower drops. Returns the post-decrement count
     /// (`Some(0)` = last borrower; `None` = key was absent).
     pub fn untrack_session(&self, session_id: &SessionId) -> Option<u64> {
-        self.inner.bound_sessions.decrement(session_id)
+        let count = self.inner.bound_sessions.decrement(session_id);
+        if count == Some(0) {
+            self.inner.last_binds.remove(session_id);
+        }
+        count
+    }
+    /// Remember a `session_bind_server` that the hub accepted, so a reconnect
+    /// replays it (one entry per tool server; a rebind of the same server
+    /// replaces its entry).
+    pub(crate) fn record_session_bind(
+        &self,
+        session_id: &SessionId,
+        params: SessionBindServerParams,
+    ) {
+        let mut binds = self.inner.last_binds.entry(session_id.clone()).or_default();
+        binds.retain(|b| b.server_id != params.server_id);
+        binds.push(params);
+    }
+    /// Drop the replay entry for `server_id` after a `session_unbind_server`
+    /// the hub accepted; `None` drops every server of the session (close).
+    pub(crate) fn forget_session_bind(&self, session_id: &SessionId, server_id: Option<&ServerId>) {
+        let Some(server_id) = server_id else {
+            self.inner.last_binds.remove(session_id);
+            return;
+        };
+        if let Some(mut binds) = self.inner.last_binds.get_mut(session_id) {
+            binds.retain(|b| &b.server_id != server_id);
+        }
+        self.inner
+            .last_binds
+            .remove_if(session_id, |_, binds| binds.is_empty());
     }
     /// Send a JSON-RPC request and await the response.
     ///
@@ -874,52 +950,16 @@ impl HubConnection {
     where
         P: serde::Serialize,
     {
-        let text =
-            serde_json::to_string(request).map_err(|e| DeadlineCallError::Other(e.into()))?;
-        let (tx, rx) = oneshot::channel();
         self.inner
-            .demux
-            .register_response_waiter(request_id.clone(), tx);
-        let _guard = WaiterGuard {
-            demux: &self.inner.demux,
-            request_id: &request_id,
-        };
-        self.send_outbound(text)
+            .call_request_with_deadline(request_id, request, timeout)
             .await
-            .map_err(DeadlineCallError::Other)?;
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(result)) => result.map_err(DeadlineCallError::Other),
-            Ok(Err(recv_err)) => Err(DeadlineCallError::Other(recv_err.into())),
-            Err(_elapsed) => Err(DeadlineCallError::TimedOut(timeout)),
-        }
     }
     /// Send a fully-formed JSON text frame onto the outbound channel.
     /// Used by the server-side handler when replying to a
     /// `tool_call_request` (the response flows out without going
     /// through a waiter).
     pub async fn send_outbound(&self, text: String) -> Result<(), ClientError> {
-        match self.inner.outbound_tx.try_send(text) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(text)) => {
-                match tokio::time::timeout(
-                    Duration::from_millis(250),
-                    self.inner.outbound_tx.send(text),
-                )
-                .await
-                {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) => Err(ClientError::NetworkError(
-                        "outbound channel closed".to_owned(),
-                    )),
-                    Err(_) => Err(ClientError::BackpressureError(
-                        "outbound mpsc full beyond bounded wait".to_owned(),
-                    )),
-                }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::NetworkError(
-                "outbound channel closed".to_owned(),
-            )),
-        }
+        self.inner.send_outbound(text).await
     }
     /// Non-blocking enqueue for synchronous drop paths that cannot
     /// `.await` (e.g. `RemoteCallStream::Drop` cancel-on-drop). A full
@@ -944,11 +984,7 @@ impl HubConnection {
     /// produce). Callers in non-fallible contexts should propagate
     /// the error rather than panic.
     pub fn try_alloc_request_id(&self) -> Result<xai_tool_protocol::RequestId, ClientError> {
-        let value = self
-            .inner
-            .next_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        xai_tool_protocol::RequestId::new(format!("c{value}")).map_err(ClientError::from)
+        self.inner.try_alloc_request_id()
     }
     /// Number of sessions currently bound to this connection.
     /// Stable observable for monitoring and tests; not on the hot path.
@@ -1076,7 +1112,7 @@ async fn open_socket(
     }
     let _ = alpha_test_key;
     xai_tracing::http_client::attach_trace_to_http_request(headers);
-    let (ws, _resp) = connect_async(request)
+    let (ws, _resp) = Box::pin(connect_async(request))
         .await
         .map_err(ClientError::from_handshake_error)?;
     Ok(ws)
@@ -1491,6 +1527,177 @@ async fn run_writer<S>(
         }
     }
 }
+/// In-band bearer refresh for a token-bound tool server. The hub closes such
+/// a socket at its bearer's `exp`; presenting the provider's fresher bearer
+/// over the live socket moves that deadline instead. One driver per
+/// connected phase, aborted with it.
+struct AuthRefreshDriver {
+    /// The bearer the hub currently holds for this socket: the one the
+    /// upgrade presented, then each refresh the hub accepted.
+    acknowledged: String,
+    /// Answers since the last acknowledgement that left `acknowledged` as it
+    /// was; the one that reaches [`AUTH_REFRESH_WARN_AFTER`] is logged at
+    /// `warn!`, the rest at `debug!`.
+    unaccepted_in_a_row: u32,
+}
+impl AuthRefreshDriver {
+    /// `None` unless a tool server presented a bearer to a hub that
+    /// advertised `auth.refresh`; a hub that predates the capability, or one
+    /// that does not offer it to this socket, closes at `exp` as before.
+    fn for_phase(
+        kind: ConnectionKind,
+        presented: &AuthCredential,
+        supports_refresh: Option<bool>,
+    ) -> Option<Self> {
+        if kind != ConnectionKind::ToolServer || supports_refresh != Some(true) {
+            return None;
+        }
+        match presented {
+            AuthCredential::Bearer { token } => Some(Self {
+                acknowledged: token.clone(),
+                unaccepted_in_a_row: 0,
+            }),
+            AuthCredential::Headers { .. } => None,
+        }
+    }
+    /// The bearer to present now, if `current` is one the hub has not seen.
+    fn pending(&self, current: AuthCredential) -> Option<String> {
+        match current {
+            AuthCredential::Bearer { token } if token != self.acknowledged => Some(token),
+            AuthCredential::Bearer { .. } | AuthCredential::Headers { .. } => None,
+        }
+    }
+    /// Fold the hub's answer to presenting `token` into what the hub now
+    /// holds. A `not_later` refusal means the hub already holds a bearer at
+    /// least this fresh (an accept whose reply was lost), so it counts as an
+    /// acknowledgement: re-presenting it would be refused for its whole life.
+    fn settle(&mut self, token: String, answer: Result<i64, AuthRefreshError>) {
+        match answer {
+            Ok(exp) => {
+                debug!(exp, "hub accepted the refreshed bearer in band");
+                self.acknowledge(token);
+            }
+            Err(err) => {
+                crate::metrics::auth_refresh_refused(err.reason());
+                if err.is_not_later() {
+                    debug!("hub already holds this bearer or a later one");
+                    self.acknowledge(token);
+                } else {
+                    self.unaccepted_in_a_row += 1;
+                    if self.unaccepted_in_a_row == AUTH_REFRESH_WARN_AFTER {
+                        warn!(
+                            %err,
+                            in_a_row = self.unaccepted_in_a_row,
+                            "auth.refresh keeps being refused; the hub will close this socket at the bearer's exp"
+                        );
+                    } else {
+                        debug!(%err, "auth.refresh not accepted; retrying next tick");
+                    }
+                }
+            }
+        }
+    }
+    fn acknowledge(&mut self, token: String) {
+        self.acknowledged = token;
+        self.unaccepted_in_a_row = 0;
+    }
+}
+/// Why one `auth.refresh` did not move the hub's deadline.
+#[derive(Debug, thiserror::Error)]
+enum AuthRefreshError {
+    /// The hub answered a refusal; `reason` is its `error.data.reason`.
+    #[error("refused ({reason}): {message}")]
+    Refused { reason: String, message: String },
+    /// No usable answer: transport, timeout, or an unreadable reply.
+    #[error(transparent)]
+    Failed(#[from] ClientError),
+}
+impl AuthRefreshError {
+    fn from_jsonrpc_error(err: JsonRpcError) -> Self {
+        match err
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str)
+        {
+            Some(reason) => Self::Refused {
+                reason: reason.to_owned(),
+                message: err.message,
+            },
+            None => Self::Failed(ClientError::from_jsonrpc_error(err)),
+        }
+    }
+    fn is_not_later(&self) -> bool {
+        matches!(self, Self::Refused { reason, .. } if reason == AUTH_REFRESH_NOT_LATER)
+    }
+    /// Metric label: the hub's reason when it is one this SDK knows, `other`
+    /// for any other string (the label set stays bounded whatever the hub
+    /// sends), or `failed` when there was no answer.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Refused { reason, .. } => AUTH_REFRESH_KNOWN_REASONS
+                .iter()
+                .copied()
+                .find(|known| *known == reason)
+                .unwrap_or("other"),
+            Self::Failed(_) => "failed",
+        }
+    }
+}
+/// Once at phase start and then every `poll`, read the provider's current
+/// credential off the runtime's workers (`current()` may refresh over HTTP)
+/// and present a bearer the hub has not acknowledged. One request at a time;
+/// a refused or timed-out refresh is retried on the next tick with whatever
+/// is current then.
+async fn run_auth_refresh(
+    inner: Arc<HubConnectionInner>,
+    mut driver: AuthRefreshDriver,
+    poll: Duration,
+) {
+    let mut tick = tokio::time::interval(poll);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let provider = Arc::clone(&inner.credential);
+        let current = match tokio::task::spawn_blocking(move || provider.current()).await {
+            Ok(current) => current,
+            Err(err) => {
+                warn!(%err, "credential provider did not return; retrying next tick");
+                continue;
+            }
+        };
+        let Some(token) = driver.pending(current) else {
+            continue;
+        };
+        let answer = inner.auth_refresh(&token).await;
+        driver.settle(token, answer);
+    }
+}
+/// Aborts the task on drop so a driver stops with the phase it was spawned
+/// for. Two things outlive the abort: a `current()` already running on the
+/// blocking pool finishes there and its result is dropped, and a frame
+/// already handed to the outbound queue may still be written on the next
+/// phase's socket, where the hub refuses it `not_later` or answers a waiter
+/// that no longer exists.
+struct PhaseTask(tokio::task::JoinHandle<()>);
+impl Drop for PhaseTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+fn spawn_auth_refresh(
+    inner: &Arc<HubConnectionInner>,
+    presented: &AuthCredential,
+) -> Option<PhaseTask> {
+    let supports = inner.supports(Method::AuthRefresh.as_wire_str());
+    AuthRefreshDriver::for_phase(inner.kind, presented, supports).map(|driver| {
+        PhaseTask(tokio::spawn(run_auth_refresh(
+            Arc::clone(inner),
+            driver,
+            inner.auth_refresh_poll,
+        )))
+    })
+}
 /// Invoke the optional disconnect callback (best-effort, sync).
 fn fire_on_disconnect(inner: &HubConnectionInner) {
     if let Some(cb) = &inner.on_disconnect {
@@ -1509,6 +1716,7 @@ fn fire_on_terminal_close(inner: &HubConnectionInner, code: u16) {
 async fn run_reader_actor(
     inner: Arc<HubConnectionInner>,
     mut stream: SplitStream<WsStream>,
+    mut presented: AuthCredential,
     mut stop_rx: mpsc::Receiver<()>,
     mut reconnect_rx: mpsc::Receiver<()>,
     writer_ctl_tx: mpsc::Sender<WriterControl<SplitSink<WsStream, Message>>>,
@@ -1521,7 +1729,8 @@ async fn run_reader_actor(
     let mut attempt: u32 = 0;
     let mut connected_at = Instant::now();
     'actor: loop {
-        match run_reader_phase(
+        let auth_refresh = spawn_auth_refresh(&inner, &presented);
+        let exit = run_reader_phase(
             inner.as_ref(),
             &mut stream,
             &mut stop_rx,
@@ -1529,8 +1738,9 @@ async fn run_reader_actor(
             liveness_deadline,
             &priority_tx,
         )
-        .await
-        {
+        .await;
+        drop(auth_refresh);
+        match exit {
             ConnectedExit::Stop => break,
             ConnectedExit::TerminalClose(code)
                 if inner
@@ -1650,7 +1860,8 @@ async fn run_reader_actor(
                         }),
                     };
                     match outcome {
-                        Ok((new_sink, new_stream)) => {
+                        Ok((new_sink, new_stream, fresh_cred)) => {
+                            presented = fresh_cred;
                             let elapsed = reconnect_start.elapsed().as_secs_f64();
                             crate::metrics::reconnect_succeeded();
                             crate::metrics::reconnect_duration_observe(elapsed);
@@ -1821,6 +2032,61 @@ where
         }
     }
 }
+/// Send one replay request on the fresh socket and wait for *its* reply
+/// (best-effort, bounded; the reconnect must not hang on the hub's reply).
+///
+/// The reader phase is not running yet, so every other frame that arrives
+/// first is handled here the way it would handle it: data frames go to the
+/// demux (a `tools_changed` the hub emits while serving a replayed bind
+/// must reach the session inbox), an app ping is answered on the sink, an
+/// app/WS pong counts as liveness. Discarding "the next frame" as the ack
+/// lost whichever of those the hub wrote first.
+async fn replay_request<P: serde::Serialize>(
+    inner: &HubConnectionInner,
+    sink: &mut SplitSink<WsStream, Message>,
+    stream: &mut SplitStream<WsStream>,
+    request: &xai_tool_protocol::JsonRpcRequest<P>,
+) {
+    let Ok(text) = serde_json::to_string(request) else {
+        return;
+    };
+    let Ok(request_id) = serde_json::to_value(&request.id) else {
+        return;
+    };
+    let _ = SinkExt::send(sink, Message::Text(text.into())).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let Ok(next) = tokio::time::timeout_at(deadline, StreamExt::next(stream)).await else {
+            return;
+        };
+        match next {
+            Some(Ok(Message::Text(text))) => {
+                if is_reply_to(text.as_ref(), &request_id) {
+                    return;
+                }
+                match classify_inbound_text(inner, text.as_ref()) {
+                    InboundText::AppPing { pong: Some(pong) } => {
+                        let _ = SinkExt::send(sink, Message::Text(pong.into())).await;
+                    }
+                    InboundText::AppPong => inner.health.record_inbound(),
+                    InboundText::AppPing { pong: None }
+                    | InboundText::Data
+                    | InboundText::Unparseable => {}
+                }
+            }
+            Some(Ok(Message::Pong(_))) => inner.health.record_inbound(),
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
+        }
+    }
+}
+/// Whether `text` is the JSON-RPC response to the request with `id`.
+fn is_reply_to(text: &str, id: &Value) -> bool {
+    serde_json::from_str::<Value>(text).is_ok_and(|frame| {
+        frame.get("id") == Some(id)
+            && (frame.get("result").is_some() || frame.get("error").is_some())
+    })
+}
 /// Reconnect once and replay every session binding + tool registration.
 async fn reconnect_and_replay(
     inner: &HubConnectionInner,
@@ -1828,7 +2094,14 @@ async fn reconnect_and_replay(
     attempt: u32,
     outage: &OutageInfo,
     backoff_total: Duration,
-) -> Result<(SplitSink<WsStream, Message>, SplitStream<WsStream>), ClientError> {
+) -> Result<
+    (
+        SplitSink<WsStream, Message>,
+        SplitStream<WsStream>,
+        AuthCredential,
+    ),
+    ClientError,
+> {
     let fresh_cred = inner.credential.current();
     let ws = open_socket(
         url,
@@ -1849,9 +2122,10 @@ async fn reconnect_and_replay(
     )
     .await?;
     let sessions = inner.bound_sessions.snapshot_keys();
+    let mut binds_replayed = 0usize;
     if inner.kind == ConnectionKind::Harness {
         for sid in &sessions {
-            let req = xai_tool_protocol::JsonRpcRequest {
+            let open = xai_tool_protocol::JsonRpcRequest {
                 jsonrpc: xai_tool_protocol::JsonRpcVersion,
                 id: xai_tool_protocol::JsonRpcId::new_uuid_v7(),
                 session_id: Some(sid.clone()),
@@ -1861,10 +2135,22 @@ async fn reconnect_and_replay(
                     last_seq: None,
                 },
             };
-            if let Ok(text) = serde_json::to_string(&req) {
-                let _ = SinkExt::send(&mut sink, Message::Text(text.into())).await;
-                let _ = tokio::time::timeout(Duration::from_secs(5), StreamExt::next(&mut stream))
-                    .await;
+            replay_request(inner, &mut sink, &mut stream, &open).await;
+            let binds = inner
+                .last_binds
+                .get(sid)
+                .map(|binds| binds.clone())
+                .unwrap_or_default();
+            for params in binds {
+                let bind = xai_tool_protocol::JsonRpcRequest {
+                    jsonrpc: xai_tool_protocol::JsonRpcVersion,
+                    id: xai_tool_protocol::JsonRpcId::new_uuid_v7(),
+                    session_id: Some(sid.clone()),
+                    method: Method::SessionBindServer.as_wire_str().to_owned(),
+                    params,
+                };
+                replay_request(inner, &mut sink, &mut stream, &bind).await;
+                binds_replayed += 1;
             }
         }
     }
@@ -1873,6 +2159,7 @@ async fn reconnect_and_replay(
     info!(
         attempt,
         sessions_replayed,
+        binds_replayed,
         cause = outage.cause.label(),
         close_code = ?outage.cause.close_code(),
         error_detail = ?outage.cause.detail(),
@@ -1901,9 +2188,93 @@ async fn reconnect_and_replay(
             attempt,
         });
     }
-    Ok((sink, stream))
+    Ok((sink, stream, fresh_cred))
 }
 impl HubConnectionInner {
+    fn try_alloc_request_id(&self) -> Result<xai_tool_protocol::RequestId, ClientError> {
+        let value = self
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        xai_tool_protocol::RequestId::new(format!("c{value}")).map_err(ClientError::from)
+    }
+    async fn call_request_with_deadline<P>(
+        &self,
+        request_id: xai_tool_protocol::RequestId,
+        request: &JsonRpcRequest<P>,
+        timeout: Duration,
+    ) -> Result<JsonRpcResponse, DeadlineCallError>
+    where
+        P: serde::Serialize,
+    {
+        let text =
+            serde_json::to_string(request).map_err(|e| DeadlineCallError::Other(e.into()))?;
+        let (tx, rx) = oneshot::channel();
+        self.demux.register_response_waiter(request_id.clone(), tx);
+        let _guard = WaiterGuard {
+            demux: &self.demux,
+            request_id: &request_id,
+        };
+        self.send_outbound(text)
+            .await
+            .map_err(DeadlineCallError::Other)?;
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(result)) => result.map_err(DeadlineCallError::Other),
+            Ok(Err(recv_err)) => Err(DeadlineCallError::Other(recv_err.into())),
+            Err(_elapsed) => Err(DeadlineCallError::TimedOut(timeout)),
+        }
+    }
+    async fn send_outbound(&self, text: String) -> Result<(), ClientError> {
+        match self.outbound_tx.try_send(text) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(text)) => {
+                match tokio::time::timeout(Duration::from_millis(250), self.outbound_tx.send(text))
+                    .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) => Err(ClientError::NetworkError(
+                        "outbound channel closed".to_owned(),
+                    )),
+                    Err(_) => Err(ClientError::BackpressureError(
+                        "outbound mpsc full beyond bounded wait".to_owned(),
+                    )),
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ClientError::NetworkError(
+                "outbound channel closed".to_owned(),
+            )),
+        }
+    }
+    /// Whether the hub advertised `capability` in `hello_ack`; `None` when
+    /// the ack advertised nothing, which a hub predating capabilities also
+    /// does, so support is unknown.
+    fn supports(&self, capability: &str) -> Option<bool> {
+        let caps = self.hello_capabilities.read();
+        (!caps.is_empty()).then(|| caps.iter().any(|c| c == capability))
+    }
+    /// Present `access_token` to the hub as this socket's new bearer; `Ok`
+    /// carries the `exp` the hub now holds.
+    async fn auth_refresh(&self, access_token: &str) -> Result<i64, AuthRefreshError> {
+        let request_id = self.try_alloc_request_id()?;
+        let request = JsonRpcRequest {
+            jsonrpc: JsonRpcVersion,
+            id: JsonRpcId::from_request_id(&request_id),
+            session_id: None,
+            method: Method::AuthRefresh.as_wire_str().to_owned(),
+            params: AuthRefreshParams {
+                access_token: access_token.to_owned(),
+            },
+        };
+        let response = self
+            .call_request_with_deadline(request_id, &request, AUTH_REFRESH_TIMEOUT)
+            .await
+            .map_err(ClientError::from)?;
+        match response.outcome {
+            ResponseOutcome::Result(value) => serde_json::from_value::<AuthRefreshResult>(value)
+                .map(|result| result.exp)
+                .map_err(|e| ClientError::Serde(e.to_string()).into()),
+            ResponseOutcome::Error(err) => Err(AuthRefreshError::from_jsonrpc_error(err)),
+        }
+    }
     fn begin_reconnect_outage(&self) {
         self.outage_seq.fetch_add(1, Ordering::Relaxed);
     }

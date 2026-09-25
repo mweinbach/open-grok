@@ -433,6 +433,7 @@ pub struct WorkspaceHandle {
 }
 /// Client-fs resolution base: request paths resolve against `base`,
 /// `canonical` is the matching canonicalization-containment boundary.
+#[derive(Debug)]
 pub(crate) struct ClientFsBase {
     pub(crate) base: PathBuf,
     pub(crate) canonical: PathBuf,
@@ -674,6 +675,7 @@ impl WorkspaceHandle {
             skills_config: config.skills_config,
             plugin_discovery_config: config.plugin_discovery_config,
             hub_handle: tokio::sync::Mutex::new(None),
+            queue_stats_sampler: parking_lot::Mutex::new(None),
             hub_tools_snapshot: arc_swap::ArcSwap::new(Arc::new(vec![])),
             hub_config: config.hub_config,
             auth_provider: config.auth_provider,
@@ -1830,22 +1832,31 @@ impl WorkspaceHandle {
         &self,
         session_id: Option<&str>,
     ) -> WorkspaceResult<ClientFsBase> {
+        let session = session_id.and_then(|id| self.session(id));
+        self.client_fs_base_for_session(session_id, session.as_ref())
+            .await
+    }
+    /// [`Self::client_fs_base`] for a session the caller already holds.
+    /// The cwd comes from that `Arc`, not from a map lookup after the await, so a session evicted mid-call cannot silently rebase the op onto the root.
+    pub(crate) async fn client_fs_base_for_session(
+        &self,
+        session_id: Option<&str>,
+        session: Option<&Arc<WorkspaceSession>>,
+    ) -> WorkspaceResult<ClientFsBase> {
         let root = self.root_cwd()?;
         let canonical_root = self.canonical_root().await?;
-        let suffix = session_id
-            .and_then(|id| self.session(id))
-            .and_then(|session| {
-                let cwd = session.cwd();
-                cwd.strip_prefix(&root)
-                    .or_else(|_| cwd.strip_prefix(&canonical_root))
-                    .ok()
-                    .filter(|s| {
-                        !s.as_os_str().is_empty()
-                            && s.components()
-                                .all(|c| matches!(c, std::path::Component::Normal(_)))
-                    })
-                    .map(std::path::Path::to_path_buf)
-            });
+        let suffix = session.and_then(|session| {
+            let cwd = session.cwd();
+            cwd.strip_prefix(&root)
+                .or_else(|_| cwd.strip_prefix(&canonical_root))
+                .ok()
+                .filter(|s| {
+                    !s.as_os_str().is_empty()
+                        && s.components()
+                            .all(|c| matches!(c, std::path::Component::Normal(_)))
+                })
+                .map(std::path::Path::to_path_buf)
+        });
         let root_base = || ClientFsBase {
             base: root.clone(),
             canonical: canonical_root.clone(),
@@ -2474,9 +2485,6 @@ impl WorkspaceHandle {
     ) -> Option<Arc<xai_codebase_graph::IndexManagerHandle>> {
         self.shared.codebase_indexes.lock().get_covering(path)
     }
-    pub fn ensure_codebase_indexes(&self, roots: &[std::path::PathBuf]) {
-        self.shared.codebase_indexes.lock().ensure_all(roots);
-    }
     fn spawn_codebase_index_event_forwarder(&self) -> tokio::task::JoinHandle<()> {
         let shared = self.shared.clone();
         let root_cwd = self.shared.root_cwd.clone();
@@ -3100,6 +3108,7 @@ impl WorkspaceHandle {
         session.shutdown_terminal_backend();
         session.shutdown_browser_service();
         session.cancel_hunk_tracker();
+        session.staged_uploads().abandon_all();
         self.shared.tool_defs_last_emit.remove(session_id);
         Ok(())
     }
@@ -3858,14 +3867,6 @@ impl WorkspaceHandle {
             }));
         }
         handle.set_codebase_index_forwarder_task(self.spawn_codebase_index_event_forwarder());
-        {
-            let ws = self.clone();
-            tokio::spawn(async move {
-                if let Ok(roots) = crate::workspace_ops::materialized_git_roots(&ws).await {
-                    ws.ensure_codebase_indexes(&roots);
-                }
-            });
-        }
         if let Some(task) = self.spawn_tool_definitions_event_forwarder() {
             handle.set_tool_defs_forwarder_task(task);
         }
@@ -3874,6 +3875,9 @@ impl WorkspaceHandle {
     }
     /// Shutdown the server connection, if active.
     pub async fn shutdown_hub(&self) {
+        if let Some(sampler) = self.shared.queue_stats_sampler.lock().take() {
+            sampler.abort();
+        }
         let handle = self.shared.hub_handle.lock().await.take();
         if let Some(h) = handle {
             h.shutdown().await;
@@ -4259,10 +4263,6 @@ pub async fn connect_local_workspace(
         );
     }
     upload_queue.cleanup_orphans(xai_file_utils::queue::DEFAULT_MAX_AGE);
-    crate::upload::spawn_queue_stats_sampler(
-        upload_queue.clone(),
-        std::time::Duration::from_secs(15),
-    );
     if crate::session::tool_config::tool_state_enabled() {
         let home = workspace_home.clone();
         tokio::spawn(async move {
@@ -4285,7 +4285,8 @@ pub async fn connect_local_workspace(
         identity,
     )
     .map_err(|e| WorkspaceError::HubError(format!("failed to create workspace: {e}")))?;
-    let connect_result = ws_handle.connect_hub().await;
+    let _maintenance = crate::file_system::client_fs::spawn_staged_upload_maintenance(&ws_handle);
+    let connect_result = Box::pin(ws_handle.connect_hub()).await;
     observe_startup_stage(
         STARTUP_STAGE_TIME_TO_READY,
         if connect_result.is_ok() {
@@ -4296,6 +4297,13 @@ pub async fn connect_local_workspace(
         time_to_ready_started.elapsed().as_secs_f64(),
     );
     connect_result?;
+    if let Some(upload_queue) = &ws_handle.shared.upload_queue {
+        *ws_handle.shared.queue_stats_sampler.lock() =
+            Some(crate::upload::spawn_queue_stats_sampler(
+                upload_queue.clone(),
+                std::time::Duration::from_secs(15),
+            ));
+    }
     Ok(ws_handle)
 }
 /// Resolve `$GROK_WORKSPACE_HOME` — the workspace-owned on-disk state root.

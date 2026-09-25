@@ -117,8 +117,22 @@ pub mod test_seam {
 
     /// Dark keys on this thread for `f` only.
     pub fn with_dark<R>(f: impl FnOnce() -> R) -> R {
+        with_local_keys(Vec::new(), f)
+    }
+
+    /// Runs `f` with `keys` as the trusted set on this thread only (a keyed unit test that must not race the process override).
+    pub fn with_keys<R>(keys: &[(&str, &[u8])], f: impl FnOnce() -> R) -> R {
+        with_local_keys(
+            keys.iter()
+                .map(|(id, key)| ((*id).to_owned(), key.to_vec()))
+                .collect(),
+            f,
+        )
+    }
+
+    fn with_local_keys<R>(keys: OwnedKeys, f: impl FnOnce() -> R) -> R {
         LOCAL_OVERRIDE.with(|cell| {
-            let prev = cell.replace(Some(Some(Vec::new())));
+            let prev = cell.replace(Some(Some(keys)));
             struct Restore(Option<KeyOverride>);
             impl Drop for Restore {
                 fn drop(&mut self) {
@@ -430,6 +444,50 @@ pub fn check_on_disk_matches(
     Ok(())
 }
 
+/// True when `content` is exactly the `requirements.toml` the server signed for this home, which makes hooks parsed from it admin-authored policy.
+/// Callers pass the bytes they go on to parse, so classification and parse never see two different files.
+/// False in a dark build (no key verifies), without an authentic readable sidecar, or when the signed requirements are absent or differ; refusing a tampered cache is the fail-closed gate's job.
+/// Identity, expiry and the remote kill-switch are not consulted: they decide whether the gate refuses a session, and none changes who authored the bytes.
+pub fn signed_requirements_attest(home: &std::path::Path, content: &str) -> bool {
+    with_embedded_keys(|keys| signed_requirements_attest_with_keys(home, keys, content))
+}
+
+/// Key-injected core of [`signed_requirements_attest`] so tests can supply throwaway keys.
+fn signed_requirements_attest_with_keys(
+    home: &std::path::Path,
+    trusted_keys: &[(&str, &[u8])],
+    content: &str,
+) -> bool {
+    // A missing sidecar is the common unmanaged case and stays silent; every other miss demotes enforced hooks to user-owned, so say so
+    let sidecar = match read_sidecar(home) {
+        SidecarRead::Present(sidecar) => sidecar,
+        SidecarRead::Absent => return false,
+        SidecarRead::Unreadable => {
+            tracing::info!(path = %sidecar_path(home).display(), "requirements.toml hooks stay user-owned: signature sidecar unreadable");
+            return false;
+        }
+    };
+    let payload = match verify_signed_payload(
+        &sidecar.signed_payload,
+        &sidecar.signature,
+        trusted_keys,
+    ) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::info!(path = %sidecar_path(home).display(), error = %e, "requirements.toml hooks stay user-owned: signature sidecar does not verify");
+            return false;
+        }
+    };
+    let Some(signed) = payload.requirements.as_deref().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if signed != content {
+        tracing::info!(path = %home.join(crate::loader::REQUIREMENTS_FILENAME).display(), "requirements.toml differs from the signed copy; its hooks stay user-owned");
+        return false;
+    }
+    true
+}
+
 pub(crate) fn sidecar_path(home: &std::path::Path) -> std::path::PathBuf {
     home.join(SIGNATURE_SIDECAR_FILE)
 }
@@ -731,7 +789,7 @@ fn signed_cache_compromised_with_keys(
     }
 }
 
-// Tests in a sibling file (they dwarf the module) but a child module, for private access.
+// Tests in a sibling file (they dwarf the module) but a child module, for private access; its envelope helpers serve the loader tests too.
 #[cfg(test)]
 #[path = "signed_policy/tests.rs"]
-mod tests;
+pub(crate) mod tests;

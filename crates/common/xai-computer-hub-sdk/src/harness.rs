@@ -56,17 +56,12 @@ use xai_tool_types::ToolDescription;
 use crate::auth::{AuthCredential, AuthProvider};
 use crate::connection::{HubConnection, ReconnectCallback, ReconnectEvent};
 use crate::connection_borrow::ConnectionBorrow;
+use crate::demux::HookHandlerSlot;
 use crate::error::ClientError;
 use crate::pool::HubConnectionPool;
 
 /// Host-supplied source of the current W3C `traceparent`.
 pub type TraceContextProvider = Arc<dyn Fn() -> Option<String> + Send + Sync>;
-
-/// Host-registered sink for inbound reverse-direction hook requests
-/// (server → harness); invoked by the inbox loop with the decoded
-/// [`HookFrame`](xai_tool_protocol::HookFrame), answered via
-/// [`ToolHarness::send_hook_reply`].
-type HookRequestHandler = Arc<dyn Fn(xai_tool_protocol::HookFrame) + Send + Sync>;
 
 /// Well-known [`HookEvent::Custom`](xai_tool_protocol::HookEvent::Custom) kind
 /// for a server → harness permission request. Sibling of
@@ -660,8 +655,7 @@ struct ToolHarnessInner {
     last_bind_report: arc_swap::ArcSwapOption<SessionBindReport>,
     discovery_handle: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Weak handle to the demux session-inbox sender this harness registered.
-    /// Identity-guarded unregister uses this without holding a strong sender
-    /// that would keep the inbox alive after a peer rebind replaces it.
+    /// Identity-guarded unregister uses this without keeping the channel open.
     session_inbox_tx:
         parking_lot::Mutex<Option<tokio::sync::mpsc::WeakSender<crate::demux::InboundFrame>>>,
     /// Deferred server bind (prompt-before-bind): set when this local-only harness
@@ -673,7 +667,7 @@ struct ToolHarnessInner {
     /// its own `Arc` so the inbox loop can clone this slot — not the whole
     /// `inner` — a long-lived `inner` clone would pin the harness forever and
     /// prevent both the wrapper Drop gate and `ToolHarnessInner::Drop`.
-    hook_request_handler: Arc<parking_lot::Mutex<Option<HookRequestHandler>>>,
+    hook_request_handler: HookHandlerSlot,
 }
 
 impl ToolHarnessInner {
@@ -804,20 +798,20 @@ async fn list_remote_tools(
     }
 }
 
-/// Untrack; if last borrower, identity-unregister our inbox only.
+/// Identity-unregister this harness's inbox unconditionally: peers may share
+/// the session binding, and a non-last harness must not leave a closed inbox
+/// behind. Untracks the session afterwards.
 fn release_session_binding(
     connection: &HubConnection,
     session: &SessionId,
     inbox_tx: Option<&tokio::sync::mpsc::WeakSender<crate::demux::InboundFrame>>,
 ) {
-    if connection.untrack_session(session) != Some(0) {
-        return;
-    }
     if let Some(weak) = inbox_tx {
         let _ = connection
             .demux()
             .unregister_session_inbox_if_weak(session, weak);
     }
+    let _ = connection.untrack_session(session);
 }
 
 impl Drop for ToolHarnessInner {
@@ -1127,6 +1121,7 @@ impl ToolHarness {
                     self.inner
                         .last_bind_report
                         .store(Some(Arc::new(SessionBindReport::from(&bind_result))));
+                    connection.record_session_bind(&self.inner.session, req.params);
                     Ok(bind_result)
                 }
                 ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1227,6 +1222,7 @@ impl ToolHarness {
                 // Clear cached remote tools — the server's tools are no
                 // longer available after unbind.
                 self.inner.remote_tools.store(Arc::new(Vec::new()));
+                connection.forget_session_bind(&self.inner.session, Some(&req.params.server_id));
                 Ok(())
             }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
@@ -1250,7 +1246,10 @@ impl ToolHarness {
         };
         let resp = connection.call_request(request_id, &req).await?;
         match resp.outcome {
-            ResponseOutcome::Result(_) => Ok(()),
+            ResponseOutcome::Result(_) => {
+                connection.forget_session_bind(&self.inner.session, None);
+                Ok(())
+            }
             ResponseOutcome::Error(err) => Err(ClientError::from_jsonrpc_error(err)),
         }
     }
@@ -1682,16 +1681,27 @@ impl ToolHarness {
         }
 
         let (inbox_tx, mut inbox_rx) = mpsc::channel::<crate::demux::InboundFrame>(64);
-        // Weak only — a strong clone would keep the channel open after a peer
-        // rebind replaces the demux entry and would block the prior discovery
-        // task from seeing EOF. Keep a stack-local weak for undo: concurrent
-        // finish_teardown may take the mutex slot without demux-unregistering
-        // (non-last untrack), so undo must not rely on that take.
+        // Weak only: the demux entry holds the sole strong sender, so
+        // identity-guarded unregister on teardown closes the channel and the
+        // inbox loop sees EOF. The stack-local copy backs the undo below.
         let inbox_weak = inbox_tx.downgrade();
-        connection
-            .demux()
-            .register_session_inbox(self.inner.session.clone(), inbox_tx);
-        *self.inner.session_inbox_tx.lock() = Some(inbox_weak.clone());
+        // A repeat subscribe replaces this harness's own inbox; peers on the
+        // same session keep theirs.
+        let previous = self
+            .inner
+            .session_inbox_tx
+            .lock()
+            .replace(inbox_weak.clone());
+        if let Some(previous) = previous {
+            let _ = connection
+                .demux()
+                .unregister_session_inbox_if_weak(&self.inner.session, &previous);
+        }
+        connection.demux().register_session_inbox(
+            self.inner.session.clone(),
+            inbox_tx,
+            Some(self.inner.hook_request_handler.clone()),
+        );
 
         // Teardown may have won between the check and register — undo.
         if self.inner.borrow.as_ref().is_some_and(|b| b.is_torn_down()) {
@@ -1823,8 +1833,8 @@ impl ToolHarness {
     ///
     /// Shared with both Drop paths via an at-most-once CAS inside
     /// `finish_teardown`. Aborts tool discovery, cancels the borrow token,
-    /// untracks the session, and identity-unregisters this harness's demux
-    /// inbox when last borrower. Idempotent across clones.
+    /// identity-unregisters this harness's demux inbox, and untracks the
+    /// session. Idempotent across clones.
     ///
     /// **In-flight `call(...)` futures are NOT cancelled** by
     /// `shutdown`. The harness owns no run-loop — the underlying
@@ -1858,35 +1868,109 @@ fn build_session_event_frame(event: &SessionEvent) -> ToolNotificationFrame {
     }
 }
 
-/// Classify an inbound `Request` frame as a reverse-direction permission-request
-/// hook, returning the decoded [`HookFrame`](xai_tool_protocol::HookFrame) or `None`.
-fn parse_permission_request_hook(value: &Value) -> Option<xai_tool_protocol::HookFrame> {
-    let method = value.get("method").and_then(Value::as_str)?;
-    if method != Method::Hook.as_wire_str() {
-        return None;
+/// Why an inbound `Request` frame is not handed to the permission-request handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookRequestSkip {
+    /// Not a `hook` request.
+    NotHook { method: String },
+    /// A `hook` request whose params do not decode as a
+    /// [`HookFrame`](xai_tool_protocol::HookFrame); the sender may be awaiting
+    /// a reply the harness cannot correlate.
+    Malformed,
+    /// A fire-and-forget hook (no `hook_id`); nothing awaits an answer.
+    NoReplyLeg { event: String },
+    /// A request/response hook of a kind this harness never answers; the
+    /// sender waits on its own backstop.
+    UnansweredKind { event: String },
+}
+
+fn hook_event_label(event: &xai_tool_protocol::HookEvent) -> String {
+    match event {
+        xai_tool_protocol::HookEvent::Custom { kind, .. } => kind.clone(),
+        other => format!("{other:?}"),
     }
-    let hook =
-        <xai_tool_protocol::HookFrame as serde::Deserialize>::deserialize(value.get("params")?)
-            .ok()?;
-    // Only request/response hooks (those with a reply leg) qualify.
-    hook.hook_id.as_ref()?;
+}
+
+/// The tool call a permission-request hook is gating.
+///
+/// `custom_request` frames leave `call_id` unset; the id lives in the
+/// `Custom` payload's `tool_call_id`. Fall back to `call_id` for hooks that
+/// carry it on the frame.
+fn permission_request_tool_call_id(hook: &xai_tool_protocol::HookFrame) -> Option<&str> {
     match &hook.event {
-        xai_tool_protocol::HookEvent::Custom { kind, .. } if kind == PERMISSION_REQUEST_KIND => {
-            Some(hook)
+        xai_tool_protocol::HookEvent::Custom { payload, .. } => {
+            payload.get("tool_call_id").and_then(Value::as_str)
         }
         _ => None,
+    }
+    .or_else(|| hook.call_id.as_ref().map(|id| id.as_str()))
+}
+
+/// Classify an inbound `Request` frame as a reverse-direction permission-request
+/// hook, returning the decoded [`HookFrame`](xai_tool_protocol::HookFrame) or
+/// the reason it is skipped.
+fn classify_inbound_hook_request(
+    value: &Value,
+) -> Result<xai_tool_protocol::HookFrame, HookRequestSkip> {
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method != Method::Hook.as_wire_str() {
+        return Err(HookRequestSkip::NotHook {
+            method: method.to_owned(),
+        });
+    }
+    let hook = value
+        .get("params")
+        .and_then(|params| {
+            <xai_tool_protocol::HookFrame as serde::Deserialize>::deserialize(params).ok()
+        })
+        .ok_or(HookRequestSkip::Malformed)?;
+    // Only request/response hooks (those with a reply leg) qualify.
+    if hook.hook_id.is_none() {
+        return Err(HookRequestSkip::NoReplyLeg {
+            event: hook_event_label(&hook.event),
+        });
+    }
+    match &hook.event {
+        xai_tool_protocol::HookEvent::Custom { kind, .. } if kind == PERMISSION_REQUEST_KIND => {
+            Ok(hook)
+        }
+        event => Err(HookRequestSkip::UnansweredKind {
+            event: hook_event_label(event),
+        }),
     }
 }
 
 /// Dispatch one inbound `Request`: hand a permission-request hook to `handler`;
 /// drop anything else (and permission requests with no handler registered).
-fn dispatch_inbound_hook_request(
-    value: &Value,
-    handler: &parking_lot::Mutex<Option<HookRequestHandler>>,
-) {
-    let Some(hook) = parse_permission_request_hook(value) else {
-        tracing::debug!("inbound request frame is not a permission-request hook; dropping");
-        return;
+///
+/// Drops that leave a tool server awaiting a reply — a malformed or
+/// unexpected request/response hook, or a permission request with no handler
+/// registered — log at `warn` so a stalled tool call is diagnosable in prod.
+fn dispatch_inbound_hook_request(value: &Value, handler: &HookHandlerSlot) {
+    let hook = match classify_inbound_hook_request(value) {
+        Ok(hook) => hook,
+        Err(HookRequestSkip::NotHook { method }) => {
+            tracing::debug!(method, "inbound request frame is not a hook; dropping");
+            return;
+        }
+        Err(HookRequestSkip::NoReplyLeg { event }) => {
+            tracing::debug!(event, "inbound hook has no reply leg; dropping");
+            return;
+        }
+        Err(HookRequestSkip::Malformed) => {
+            tracing::warn!("inbound hook request params do not decode as a HookFrame; dropping");
+            return;
+        }
+        Err(HookRequestSkip::UnansweredKind { event }) => {
+            tracing::warn!(
+                event,
+                "inbound request/response hook is not a permission request; dropping — the sender waits on its backstop"
+            );
+            return;
+        }
     };
     // Clone out of the lock so the handler never runs while it is held.
     let handler = handler.lock().clone();
@@ -1902,7 +1986,12 @@ fn dispatch_inbound_hook_request(
             }
         }
         None => {
-            tracing::debug!("inbound hook request received but no handler is registered; dropping")
+            tracing::warn!(
+                session_id = %hook.session_id,
+                hook_id = hook.hook_id.as_deref().unwrap_or_default(),
+                tool_call_id = permission_request_tool_call_id(&hook).unwrap_or_default(),
+                "permission request received but no handler is registered; dropping — the tool server waits on its backstop"
+            );
         }
     }
 }
@@ -2980,14 +3069,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_permission_request_hook_matches_request_response_hook() {
+    fn classify_inbound_hook_request_matches_permission_request() {
         let hook = xai_tool_protocol::HookFrame::custom_request(
             SessionId::new("s1").expect("valid"),
             "hook-7".to_owned(),
             PERMISSION_REQUEST_KIND.to_owned(),
             serde_json::json!({ "tool_call_id": "call-1" }),
         );
-        let parsed = parse_permission_request_hook(&inbound_hook_request_frame(&hook))
+        let parsed = classify_inbound_hook_request(&inbound_hook_request_frame(&hook))
             .expect("permission request matches");
         assert_eq!(parsed.hook_id.as_deref(), Some("hook-7"));
         match parsed.event {
@@ -3000,29 +3089,75 @@ mod tests {
     }
 
     #[test]
-    fn parse_permission_request_hook_rejects_other_custom_kind() {
+    fn permission_request_tool_call_id_reads_payload_then_call_id() {
+        let session = SessionId::new("s1").expect("valid");
+        let from_payload = xai_tool_protocol::HookFrame::custom_request(
+            session.clone(),
+            "hook-7".to_owned(),
+            PERMISSION_REQUEST_KIND.to_owned(),
+            serde_json::json!({ "tool_call_id": "call-1" }),
+        );
+        assert!(from_payload.call_id.is_none());
+        assert_eq!(
+            Some("call-1"),
+            permission_request_tool_call_id(&from_payload)
+        );
+
+        let mut from_call_id = xai_tool_protocol::HookFrame::custom_request(
+            session.clone(),
+            "hook-8".to_owned(),
+            PERMISSION_REQUEST_KIND.to_owned(),
+            serde_json::json!({}),
+        );
+        from_call_id.call_id = Some(ToolCallId::new("call-2").expect("valid"));
+        assert_eq!(
+            Some("call-2"),
+            permission_request_tool_call_id(&from_call_id)
+        );
+
+        let neither = xai_tool_protocol::HookFrame::custom_request(
+            session,
+            "hook-9".to_owned(),
+            PERMISSION_REQUEST_KIND.to_owned(),
+            serde_json::json!({ "tool_call_id": 7 }),
+        );
+        assert_eq!(None, permission_request_tool_call_id(&neither));
+    }
+
+    #[test]
+    fn classify_inbound_hook_request_flags_other_custom_kind_as_unanswered() {
         let hook = xai_tool_protocol::HookFrame::custom_request(
             SessionId::new("s1").expect("valid"),
             "hook-7".to_owned(),
             xai_tool_protocol::turn_hook::TURN_HOOK_KIND.to_owned(),
             serde_json::json!({}),
         );
-        assert!(parse_permission_request_hook(&inbound_hook_request_frame(&hook)).is_none());
+        assert_eq!(
+            classify_inbound_hook_request(&inbound_hook_request_frame(&hook)),
+            Err(HookRequestSkip::UnansweredKind {
+                event: xai_tool_protocol::turn_hook::TURN_HOOK_KIND.to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn parse_permission_request_hook_rejects_missing_hook_id() {
+    fn classify_inbound_hook_request_skips_missing_hook_id_as_no_reply_leg() {
         let hook = xai_tool_protocol::HookFrame::custom(
             SessionId::new("s1").expect("valid"),
             PERMISSION_REQUEST_KIND.to_owned(),
             serde_json::json!({}),
         );
         assert!(hook.hook_id.is_none());
-        assert!(parse_permission_request_hook(&inbound_hook_request_frame(&hook)).is_none());
+        assert_eq!(
+            classify_inbound_hook_request(&inbound_hook_request_frame(&hook)),
+            Err(HookRequestSkip::NoReplyLeg {
+                event: PERMISSION_REQUEST_KIND.to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn parse_permission_request_hook_rejects_non_custom_event() {
+    fn classify_inbound_hook_request_flags_non_custom_event_as_unanswered() {
         let hook = xai_tool_protocol::HookFrame {
             session_id: SessionId::new("s1").expect("valid"),
             tool_id: None,
@@ -3031,11 +3166,16 @@ mod tests {
             event: xai_tool_protocol::HookEvent::Pause,
             trace_context: None,
         };
-        assert!(parse_permission_request_hook(&inbound_hook_request_frame(&hook)).is_none());
+        assert_eq!(
+            classify_inbound_hook_request(&inbound_hook_request_frame(&hook)),
+            Err(HookRequestSkip::UnansweredKind {
+                event: "Pause".to_owned(),
+            })
+        );
     }
 
     #[test]
-    fn parse_permission_request_hook_rejects_non_hook_method() {
+    fn classify_inbound_hook_request_skips_non_hook_method() {
         let hook = xai_tool_protocol::HookFrame::custom_request(
             SessionId::new("s1").expect("valid"),
             "hook-7".to_owned(),
@@ -3044,7 +3184,26 @@ mod tests {
         );
         let mut frame = inbound_hook_request_frame(&hook);
         frame["method"] = serde_json::json!("tool_call_request");
-        assert!(parse_permission_request_hook(&frame).is_none());
+        assert_eq!(
+            classify_inbound_hook_request(&frame),
+            Err(HookRequestSkip::NotHook {
+                method: "tool_call_request".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn classify_inbound_hook_request_flags_undecodable_params_as_malformed() {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "h1",
+            "method": Method::Hook.as_wire_str(),
+            "params": { "hook_id": "hook-7" },
+        });
+        assert_eq!(
+            classify_inbound_hook_request(&frame),
+            Err(HookRequestSkip::Malformed)
+        );
     }
 
     #[tokio::test]
@@ -3089,10 +3248,10 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
-        let slot: parking_lot::Mutex<Option<HookRequestHandler>> =
-            parking_lot::Mutex::new(Some(Arc::new(move |_hook| {
+        let slot: HookHandlerSlot =
+            Arc::new(parking_lot::Mutex::new(Some(Arc::new(move |_hook| {
                 counter.fetch_add(1, Ordering::SeqCst);
-            })));
+            }))));
         let perm = xai_tool_protocol::HookFrame::custom_request(
             SessionId::new("s1").expect("valid"),
             "hook-7".to_owned(),
@@ -3355,18 +3514,18 @@ mod tests {
             .take()
             .expect("discovery handle installed");
 
-        // Extra session track so Drop is not last → does not unregister inbox.
-        // Discovery keeps waiting on a live rx with only a dead Weak.
-        conn.track_session(session.clone());
+        // Keep the receiver open independently of demux teardown to exercise
+        // the weak-upgrade failure branch rather than the EOF branch.
+        let inbox_tx = harness
+            .inner
+            .session_inbox_tx
+            .lock()
+            .as_ref()
+            .and_then(tokio::sync::mpsc::WeakSender::upgrade)
+            .expect("session inbox sender");
         drop(harness);
-        assert_eq!(
-            conn.bound_session_count(),
-            1,
-            "peer track keeps the session binding (and demux inbox) alive"
-        );
+        assert_eq!(conn.bound_session_count(), 0);
 
-        // Force the upgrade-failure branch (not EOF): deliver a notification
-        // while no strong ToolHarnessInner remains.
         let frame = json!({
             "jsonrpc": "2.0",
             "session_id": session.as_str(),
@@ -3377,19 +3536,15 @@ mod tests {
                 "removed": [],
             }
         });
-        let outcome = conn.demux().route(frame);
-        assert!(
-            matches!(outcome, crate::demux::RouteOutcome::Session),
-            "notification must reach the still-registered session inbox, got {outcome:?}"
-        );
+        inbox_tx
+            .try_send(crate::demux::InboundFrame::Notification(frame))
+            .expect("notification reaches discovery inbox");
 
         let join = tokio::time::timeout(Duration::from_secs(5), handle).await;
         assert!(
             join.is_ok(),
             "discovery task must exit via weak.upgrade() == None on a post-drop notification"
         );
-
-        let _ = conn.untrack_session(&session);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3482,11 +3637,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_session_rebind_replaces_prior_inbox() {
+    async fn same_session_peer_subscribe_keeps_both_inboxes() {
         let addr = spawn_discovery_mock_hub().await;
         let url = Url::parse(&format!("ws://{addr}/v1/tools")).expect("valid url");
         let pool = HubConnectionPool::new();
-        let session = SessionId::new("rebind-session").expect("valid");
+        let session = SessionId::new("peer-session").expect("valid");
         let cred = AuthCredential::bearer("ignored");
 
         let first = ToolHarnessBuilder::default()
@@ -3516,28 +3671,33 @@ mod tests {
         second.start_tool_discovery().await;
         assert!(second.discovery_task_started_for_tests());
 
-        // register_session_inbox replaces the prior sender → first rx EOFs.
-        let join = tokio::time::timeout(Duration::from_secs(5), first_handle).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            join.is_ok(),
-            "first discovery task must exit when second harness rebinds the inbox"
+            !first_handle.is_finished(),
+            "first discovery task must survive the peer subscription"
         );
 
-        // Last-borrower gate: dropping first must not unregister second's inbox.
         let conn = second.connection().expect("connected").clone();
         let second_session = second.session().clone();
-        drop(first);
-        let frame = json!({
-            "jsonrpc": "2.0",
-            "session_id": second_session.as_str(),
-            "method": "tools_changed",
-            "params": {
+        let frame = || {
+            json!({
+                "jsonrpc": "2.0",
                 "session_id": second_session.as_str(),
-                "added": [],
-                "removed": [],
-            }
-        });
-        let outcome = conn.demux().route(frame);
+                "method": "tools_changed",
+                "params": {
+                    "session_id": second_session.as_str(),
+                    "added": [],
+                    "removed": [],
+                }
+            })
+        };
+        assert_eq!(
+            conn.demux().route(frame()),
+            crate::demux::RouteOutcome::Session
+        );
+
+        drop(first);
+        let outcome = conn.demux().route(frame());
         assert!(
             matches!(outcome, crate::demux::RouteOutcome::Session),
             "second's demux inbox must remain after first drop, got {outcome:?}"
@@ -3559,6 +3719,94 @@ mod tests {
             "session fully released after last harness drop",
         )
         .await;
+    }
+
+    /// A repeat `subscribe_notifications` on one harness replaces its own
+    /// inbox: the earlier channel closes so its loop exits, and the session
+    /// keeps exactly one inbox for this harness.
+    #[tokio::test]
+    async fn resubscribe_replaces_own_inbox_and_closes_the_previous_channel() {
+        let (harness, _pool, conn) = build_connected_harness("resubscribe").await;
+        let session = harness.session().clone();
+        let mut first_rx = harness
+            .subscribe_notifications()
+            .await
+            .expect("first subscribe");
+        let _second_rx = harness
+            .subscribe_notifications()
+            .await
+            .expect("second subscribe");
+
+        assert_eq!(conn.demux().session_inbox_count(&session), 1);
+        let first_eof = tokio::time::timeout(Duration::from_secs(2), first_rx.recv()).await;
+        assert!(
+            matches!(first_eof, Ok(None)),
+            "first subscription must EOF once replaced, got {first_eof:?}"
+        );
+    }
+
+    /// Two harnesses share one pooled connection and one session. The
+    /// harness that installed the hook handler must still receive a reverse
+    /// permission hook when the other harness subscribed later.
+    #[tokio::test]
+    async fn permission_hook_reaches_owner_handler_after_peer_subscribes_same_session() {
+        let addr = spawn_discovery_mock_hub().await;
+        let url = Url::parse(&format!("ws://{addr}/v1/tools")).expect("valid url");
+        let pool = HubConnectionPool::new();
+        let session = SessionId::new("shared-session").expect("valid");
+        let cred = AuthCredential::bearer("ignored");
+
+        let owner = ToolHarnessBuilder::default()
+            .pool(pool.clone())
+            .url(url.clone())
+            .auth(cred.clone())
+            .session(session.clone())
+            .build()
+            .await
+            .expect("owner harness");
+        let (tx, mut rx) = mpsc::channel::<xai_tool_protocol::HookFrame>(1);
+        owner.set_hook_request_handler(move |hook| {
+            let _ = tx.try_send(hook);
+        });
+        owner.start_tool_discovery().await;
+
+        let consumer = ToolHarnessBuilder::default()
+            .pool(pool)
+            .url(url)
+            .auth(cred)
+            .session(session.clone())
+            .build()
+            .await
+            .expect("consumer harness");
+        consumer.start_tool_discovery().await;
+
+        let hook = xai_tool_protocol::HookFrame::custom_request(
+            session.clone(),
+            "hook-1".to_owned(),
+            PERMISSION_REQUEST_KIND.to_owned(),
+            json!({ "tool_call_id": "call-1" }),
+        );
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "h1",
+            "session_id": session.as_str(),
+            "method": Method::Hook.as_wire_str(),
+            "params": serde_json::to_value(&hook).expect("serialize hook"),
+        });
+        let conn = owner.connection().expect("connected").clone();
+        assert_eq!(
+            conn.demux().route(frame),
+            crate::demux::RouteOutcome::Session
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect(
+                "owner handler must receive the permission hook while a peer shares the session",
+            )
+            .expect("handler channel open");
+        assert_eq!(received.hook_id.as_deref(), Some("hook-1"));
+        drop(consumer);
     }
 
     #[tokio::test]

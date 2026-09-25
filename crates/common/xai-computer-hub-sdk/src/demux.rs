@@ -25,6 +25,8 @@
 //! the entire connection actor and starve every other session sharing
 //! the socket.
 
+use std::sync::Arc;
+
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::oneshot;
@@ -35,6 +37,9 @@ use xai_tool_protocol::{
 };
 
 use crate::error::ClientError;
+
+pub(crate) type HookRequestHandler = Arc<dyn Fn(xai_tool_protocol::HookFrame) + Send + Sync>;
+pub(crate) type HookHandlerSlot = Arc<parking_lot::Mutex<Option<HookRequestHandler>>>;
 
 /// Frame routed to a session inbox.
 #[derive(Debug, Clone)]
@@ -86,11 +91,27 @@ pub enum RouteOutcome {
     ProgressDropped,
 }
 
+#[derive(Clone)]
+struct SessionInbox {
+    tx: tokio::sync::mpsc::Sender<InboundFrame>,
+    /// `None` for tool servers (they answer every Request themselves).
+    hook_handler: Option<HookHandlerSlot>,
+}
+
+impl std::fmt::Debug for SessionInbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionInbox")
+            .field("tx", &self.tx)
+            .field("has_hook_handler_slot", &self.hook_handler.is_some())
+            .finish()
+    }
+}
+
 /// Demux state. Cheap to construct; uses [`DashMap`] internally so
 /// concurrent registers and routes never block each other.
 #[derive(Debug)]
 pub struct Demux {
-    sessions: DashMap<SessionId, tokio::sync::mpsc::Sender<InboundFrame>>,
+    sessions: DashMap<SessionId, Vec<SessionInbox>>,
     waiters: DashMap<RequestId, oneshot::Sender<Result<JsonRpcResponse, ClientError>>>,
     /// Session index for `tool.call` response waiters only. Lets the SDK
     /// in-flight short-circuit fail every parked call for a session on a
@@ -141,44 +162,63 @@ impl Demux {
         self.notifications.subscribe()
     }
 
-    /// Bind `session_id` to `inbox`; replaces any existing binding.
-    /// Returns the previous sender if one existed; the caller may
-    /// drop or drain it as appropriate.
+    /// Append `inbox` to the bindings for `session_id`.
     pub fn register_session_inbox(
         &self,
         session_id: SessionId,
         inbox: tokio::sync::mpsc::Sender<InboundFrame>,
-    ) -> Option<tokio::sync::mpsc::Sender<InboundFrame>> {
-        self.sessions.insert(session_id, inbox)
+        hook_handler: Option<HookHandlerSlot>,
+    ) {
+        self.sessions
+            .entry(session_id)
+            .or_default()
+            .push(SessionInbox {
+                tx: inbox,
+                hook_handler,
+            });
     }
 
-    /// Remove the inbox bound to `session_id`. The returned sender (if
-    /// present) is dropped by the caller, signalling EOF to its
-    /// receiver task.
+    #[cfg(test)]
+    pub(crate) fn session_inbox_count(&self, session_id: &SessionId) -> usize {
+        self.sessions
+            .get(session_id)
+            .map_or(0, |inboxes| inboxes.len())
+    }
+
+    /// Remove every inbox bound to `session_id`.
     pub fn unregister_session_inbox(
         &self,
         session_id: &SessionId,
-    ) -> Option<tokio::sync::mpsc::Sender<InboundFrame>> {
-        self.sessions.remove(session_id).map(|(_, sender)| sender)
+    ) -> Vec<tokio::sync::mpsc::Sender<InboundFrame>> {
+        self.sessions
+            .remove(session_id)
+            .map(|(_, inboxes)| inboxes.into_iter().map(|inbox| inbox.tx).collect())
+            .unwrap_or_default()
     }
 
-    /// Remove the inbox only if it is still the same channel as `expected`.
-    ///
-    /// Prevents a late untrack→unregister from clobbering a peer harness that
-    /// rebound the same session in between (identity, not key-only).
+    /// Remove only the inbox whose sender is the same channel as `expected`,
+    /// so a late teardown never removes a peer harness's binding on the same
+    /// session. Drops the session key once its last inbox is gone.
     pub fn unregister_session_inbox_if(
         &self,
         session_id: &SessionId,
         expected: &tokio::sync::mpsc::Sender<InboundFrame>,
     ) -> Option<tokio::sync::mpsc::Sender<InboundFrame>> {
+        let removed = {
+            let mut inboxes = self.sessions.get_mut(session_id)?;
+            let position = inboxes
+                .iter()
+                .position(|inbox| inbox.tx.same_channel(expected))?;
+            inboxes.remove(position).tx
+        };
         self.sessions
-            .remove_if(session_id, |_, sender| sender.same_channel(expected))
-            .map(|(_, sender)| sender)
+            .remove_if(session_id, |_, inboxes| inboxes.is_empty());
+        Some(removed)
     }
 
     /// Like [`Self::unregister_session_inbox_if`], but compares via a
     /// [`tokio::sync::mpsc::WeakSender`] so callers need not hold a strong
-    /// sender (which would pin the channel open after demux replacement).
+    /// sender that would pin the channel open.
     pub fn unregister_session_inbox_if_weak(
         &self,
         session_id: &SessionId,
@@ -418,28 +458,100 @@ impl Demux {
         let Ok(session_id) = SessionId::new(sid_str) else {
             return RouteOutcome::Unrouted;
         };
-        let Some(sender) = self.sessions.get(&session_id) else {
+        let Some(session_inboxes) = self.sessions.get(&session_id) else {
             return RouteOutcome::UnknownSession;
         };
-        let inbox = sender.value().clone();
-        drop(sender);
-        let kind = if frame.get("id").is_some() {
-            InboundFrame::Request(frame)
+        let inboxes = session_inboxes.value().clone();
+        drop(session_inboxes);
+
+        if frame.get("id").is_some() {
+            self.route_session_request(&session_id, frame, &inboxes)
         } else {
-            InboundFrame::Notification(frame)
+            self.route_session_notification(&session_id, frame, &inboxes)
+        }
+    }
+
+    fn route_session_notification(
+        &self,
+        session_id: &SessionId,
+        frame: Value,
+        inboxes: &[SessionInbox],
+    ) -> RouteOutcome {
+        let Some((last, rest)) = inboxes.split_last() else {
+            return RouteOutcome::UnknownSession;
         };
-        match inbox.try_send(kind) {
-            Ok(()) => RouteOutcome::Session,
+        let mut delivered = false;
+        let mut full = false;
+        let mut deliver = |inbox: &SessionInbox, value: Value| match inbox
+            .tx
+            .try_send(InboundFrame::Notification(value))
+        {
+            Ok(()) => delivered = true,
             Err(tokio::sync::mpsc::error::TrySendError::Full(frame)) => {
-                self.reject_inbox_full(&session_id, frame);
-                RouteOutcome::InboxFull
+                self.reject_inbox_full(session_id, frame);
+                full = true;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                 warn!(%session_id, "session inbox dropped; binding stale");
-                self.sessions.remove(&session_id);
-                RouteOutcome::SessionDropped
+                self.unregister_session_inbox_if(session_id, &inbox.tx);
+            }
+        };
+        for inbox in rest {
+            deliver(inbox, frame.clone());
+        }
+        deliver(last, frame);
+
+        if delivered {
+            RouteOutcome::Session
+        } else if full {
+            RouteOutcome::InboxFull
+        } else {
+            RouteOutcome::SessionDropped
+        }
+    }
+
+    fn route_session_request(
+        &self,
+        session_id: &SessionId,
+        frame: Value,
+        inboxes: &[SessionInbox],
+    ) -> RouteOutcome {
+        // Newest inbox with a live hook handler first, so an owner harness
+        // answers ahead of a consumer that subscribed later. Handler-less
+        // inboxes stay reachable as fallback so a genuinely unanswered hook
+        // still surfaces the harness-side "no handler registered" warn.
+        let has_handler: Vec<bool> = inboxes
+            .iter()
+            .map(|inbox| {
+                inbox
+                    .hook_handler
+                    .as_ref()
+                    .is_some_and(|slot| slot.lock().is_some())
+            })
+            .collect();
+        let newest_first = (0..inboxes.len()).rev();
+        let candidates = newest_first
+            .clone()
+            .filter(|&i| has_handler[i])
+            .chain(newest_first.filter(|&i| !has_handler[i]));
+
+        let mut frame = InboundFrame::Request(frame);
+        for index in candidates {
+            let inbox = &inboxes[index];
+            match inbox.tx.try_send(frame) {
+                Ok(()) => return RouteOutcome::Session,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    self.reject_inbox_full(session_id, returned);
+                    return RouteOutcome::InboxFull;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(returned)) => {
+                    warn!(%session_id, "session inbox dropped; binding stale");
+                    self.unregister_session_inbox_if(session_id, &inbox.tx);
+                    frame = returned;
+                }
             }
         }
+        RouteOutcome::SessionDropped
     }
 
     /// Handle a full session inbox without blocking the reader.
@@ -587,7 +699,7 @@ mod tests {
         let demux = Demux::new();
         let session = SessionId::new("s1").expect("valid");
         let (tx, mut rx) = mpsc::channel(4);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let frame = json!({
             "jsonrpc": "2.0",
             "id": "x",
@@ -610,7 +722,7 @@ mod tests {
         let demux = Demux::new();
         let session = SessionId::new("s1").expect("valid");
         let (tx, mut rx) = mpsc::channel(4);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let hook = xai_tool_protocol::HookFrame::custom_request(
             session.clone(),
             "hook-7".to_owned(),
@@ -636,7 +748,7 @@ mod tests {
         let demux = Demux::new();
         let session = SessionId::new("s1").expect("valid");
         let (tx, mut rx) = mpsc::channel(4);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let frame = json!({
             "jsonrpc": "2.0",
             "session_id": "s1",
@@ -676,7 +788,7 @@ mod tests {
         let demux = Demux::new();
         let session = SessionId::new("backed_up").expect("valid");
         let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let frame = || {
             json!({
                 "jsonrpc": "2.0",
@@ -698,16 +810,19 @@ mod tests {
         let session = SessionId::new("id-guard").expect("valid");
         let (old_tx, _old_rx) = mpsc::channel(1);
         let (new_tx, _new_rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), old_tx.clone());
-        demux.register_session_inbox(session.clone(), new_tx.clone());
-        // Stale teardown with old sender must not remove the peer's inbox.
+        demux.register_session_inbox(session.clone(), old_tx.clone(), None);
+        demux.register_session_inbox(session.clone(), new_tx.clone(), None);
+
         assert!(
             demux
                 .unregister_session_inbox_if(&session, &old_tx)
-                .is_none()
+                .is_some()
         );
-        assert!(demux.sessions.get(&session).is_some());
-        // Matching sender removes.
+        let inboxes = demux.sessions.get(&session).expect("new inbox remains");
+        assert_eq!(inboxes.len(), 1);
+        assert!(inboxes[0].tx.same_channel(&new_tx));
+        drop(inboxes);
+
         assert!(
             demux
                 .unregister_session_inbox_if(&session, &new_tx)
@@ -717,11 +832,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_full_request_without_outbound_does_not_panic() {
+        // A bare demux (no outbound, e.g. unit context) must still report
+        // InboxFull cleanly when it cannot synthesize a rejection.
+        let demux = Demux::new();
+        let session = SessionId::new("no_out").expect("valid");
+        let (tx, _rx) = mpsc::channel(1);
+        demux.register_session_inbox(session.clone(), tx, None);
+        let frame = || {
+            json!({
+                "jsonrpc": "2.0",
+                "id": "x",
+                "session_id": "no_out",
+                "method": "tool_call_request",
+                "params": {},
+            })
+        };
+        assert_eq!(demux.route(frame()), RouteOutcome::Session);
+        assert_eq!(demux.route(frame()), RouteOutcome::InboxFull);
+    }
+
+    #[tokio::test]
+    async fn notification_fans_out_to_every_session_inbox() {
+        let demux = Demux::new();
+        let session = SessionId::new("fanout").expect("valid");
+        let (first_tx, mut first_rx) = mpsc::channel(1);
+        let (second_tx, mut second_rx) = mpsc::channel(1);
+        demux.register_session_inbox(session.clone(), first_tx, None);
+        demux.register_session_inbox(session, second_tx, None);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "session_id": "fanout",
+            "method": "tool.notification",
+            "params": {},
+        });
+
+        assert_eq!(demux.route(frame.clone()), RouteOutcome::Session);
+        assert!(matches!(
+            first_rx.recv().await,
+            Some(InboundFrame::Notification(value)) if value == frame
+        ));
+        assert!(matches!(
+            second_rx.recv().await,
+            Some(InboundFrame::Notification(value)) if value == frame
+        ));
+    }
+
+    #[tokio::test]
+    async fn request_prefers_newest_inbox_with_hook_handler() {
+        let demux = Demux::new();
+        let session = SessionId::new("handler-priority").expect("valid");
+        let (a_tx, mut a_rx) = mpsc::channel(1);
+        let (b_tx, mut b_rx) = mpsc::channel(1);
+        let (c_tx, mut c_rx) = mpsc::channel(1);
+        let handler: HookRequestHandler = Arc::new(|_| {});
+        let a_slot = Arc::new(parking_lot::Mutex::new(Some(handler.clone())));
+        let b_slot = Arc::new(parking_lot::Mutex::new(None));
+        demux.register_session_inbox(session.clone(), a_tx, Some(a_slot));
+        demux.register_session_inbox(session.clone(), b_tx, Some(b_slot.clone()));
+        demux.register_session_inbox(session, c_tx, None);
+        let request = || {
+            json!({
+                "jsonrpc": "2.0",
+                "id": "hook",
+                "session_id": "handler-priority",
+                "method": "hook",
+                "params": {},
+            })
+        };
+
+        assert_eq!(demux.route(request()), RouteOutcome::Session);
+        assert!(matches!(a_rx.try_recv(), Ok(InboundFrame::Request(_))));
+        assert!(b_rx.try_recv().is_err());
+        assert!(c_rx.try_recv().is_err());
+
+        *b_slot.lock() = Some(handler);
+        assert_eq!(demux.route(request()), RouteOutcome::Session);
+        assert!(a_rx.try_recv().is_err());
+        assert!(matches!(b_rx.try_recv(), Ok(InboundFrame::Request(_))));
+        assert!(c_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn request_falls_back_to_newest_inbox_when_no_handler() {
+        let demux = Demux::new();
+        let session = SessionId::new("request-fallback").expect("valid");
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        demux.register_session_inbox(session.clone(), old_tx, None);
+        demux.register_session_inbox(session, new_tx, None);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "request",
+            "session_id": "request-fallback",
+            "method": "hook",
+            "params": {},
+        });
+
+        assert_eq!(demux.route(frame), RouteOutcome::Session);
+        assert!(old_rx.try_recv().is_err());
+        assert!(matches!(new_rx.try_recv(), Ok(InboundFrame::Request(_))));
+    }
+
+    #[tokio::test]
+    async fn closed_inbox_is_pruned_and_request_falls_through() {
+        let demux = Demux::new();
+        let session = SessionId::new("closed-fallthrough").expect("valid");
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let (new_tx, new_rx) = mpsc::channel(1);
+        let handler: HookRequestHandler = Arc::new(|_| {});
+        let slot = Arc::new(parking_lot::Mutex::new(Some(handler)));
+        demux.register_session_inbox(session.clone(), old_tx.clone(), None);
+        demux.register_session_inbox(session.clone(), new_tx, Some(slot));
+        drop(new_rx);
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": "request",
+            "session_id": "closed-fallthrough",
+            "method": "hook",
+            "params": {},
+        });
+
+        assert_eq!(demux.route(frame), RouteOutcome::Session);
+        assert!(matches!(old_rx.try_recv(), Ok(InboundFrame::Request(_))));
+        let inboxes = demux.sessions.get(&session).expect("old inbox remains");
+        assert_eq!(inboxes.len(), 1);
+        assert!(inboxes[0].tx.same_channel(&old_tx));
+    }
+
+    #[tokio::test]
     async fn dropped_receiver_returns_session_dropped() {
         let demux = Demux::new();
         let session = SessionId::new("gone").expect("valid");
         let (tx, rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         drop(rx);
         let frame = json!({
             "jsonrpc": "2.0",
@@ -743,7 +987,7 @@ mod tests {
         let demux = Demux::with_outbound(out_tx);
         let session = SessionId::new("busy").expect("valid");
         let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let frame = |id: &str| {
             json!({
                 "jsonrpc": "2.0",
@@ -780,7 +1024,7 @@ mod tests {
         let demux = Demux::with_outbound(out_tx);
         let session = SessionId::new("bad_id").expect("valid");
         let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let frame = |id: Value| {
             json!({
                 "jsonrpc": "2.0",
@@ -815,7 +1059,7 @@ mod tests {
         let demux = Demux::with_outbound(out_tx);
         let session = SessionId::new("notif_busy").expect("valid");
         let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
+        demux.register_session_inbox(session.clone(), tx, None);
         let notif = || {
             json!({
                 "jsonrpc": "2.0",
@@ -831,27 +1075,6 @@ mod tests {
             out_rx.try_recv().is_err(),
             "notifications must not synthesize an outbound response"
         );
-    }
-
-    #[tokio::test]
-    async fn inbox_full_request_without_outbound_does_not_panic() {
-        // A bare demux (no outbound, e.g. unit context) must still report
-        // InboxFull cleanly when it cannot synthesize a rejection.
-        let demux = Demux::new();
-        let session = SessionId::new("no_out").expect("valid");
-        let (tx, _rx) = mpsc::channel(1);
-        demux.register_session_inbox(session.clone(), tx);
-        let frame = || {
-            json!({
-                "jsonrpc": "2.0",
-                "id": "x",
-                "session_id": "no_out",
-                "method": "tool_call_request",
-                "params": {},
-            })
-        };
-        assert_eq!(demux.route(frame()), RouteOutcome::Session);
-        assert_eq!(demux.route(frame()), RouteOutcome::InboxFull);
     }
 
     #[tokio::test]

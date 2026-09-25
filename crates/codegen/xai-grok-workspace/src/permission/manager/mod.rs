@@ -16,6 +16,7 @@ use crate::permission::auto_mode::{
 use crate::permission::bash_command_splitting::{
     is_setup_command, try_parse_shell, try_parse_word_only_commands_sequence, unwrap_wrappers,
 };
+use crate::permission::bash_permission_script::PermissionScript;
 use crate::permission::exec_risk::{
     AmbientScanPlan, SAFE_GIT_SUBCOMMANDS, ambient_exec_risk_from_plan,
     ambient_scan_plan_from_segments, git_words_are_read_only_query,
@@ -41,6 +42,7 @@ use xai_grok_tools::implementations::grok_build::web_fetch::{
 use xai_grok_tools::types::resources::resolve_model_path;
 
 mod bash_grants;
+mod bash_policy_allow;
 pub mod reasons;
 mod request_classification;
 
@@ -48,7 +50,10 @@ pub use bash_grants::{always_allow_row_is_effective, always_allow_scope_persists
 use bash_grants::{
     bash_glob_covers_script, bash_grant_segments, persist_bash_always_allow, whole_script_grant,
 };
-
+pub use bash_policy_allow::broad_allow_floor_requires_prompt;
+use bash_policy_allow::{
+    broad_allow_deferred, configured_filename_allow, requires_recovered_classification,
+};
 pub use request_classification::{AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT};
 use request_classification::{
     AUTO_DENY_GUIDANCE, ClassificationOutcome, ClassificationSource, DenialCounters,
@@ -610,7 +615,7 @@ pub(crate) enum SegmentEvaluation {
 
 /// One request's parsed Bash authorization facts.
 #[derive(Debug)]
-struct BashEvaluation {
+pub(crate) struct BashEvaluation {
     segments: SegmentEvaluation,
     exact_grant: bool,
     all_segments_granted: bool,
@@ -618,11 +623,15 @@ struct BashEvaluation {
     /// single source for grant/sandbox floor disposition and classifier
     /// evidence. `ExecOrAmbientGit` may be added later by the ambient git scan.
     assessment: BashSecurityAssessment,
-    /// Raw segment word lists for ambient cwd tracking (git present, flags clean).
+    /// An unsafe write target came from a redirect (`> f`), which allow-rule word matching cannot see; no configured allow rule may vouch for it.
+    /// `true` (fail closed) unless the script decomposed or was recovered as an eligible reader script.
     redirect_write: bool,
+    /// Raw segment word lists for ambient cwd tracking (git present, flags clean).
     ambient_segments: Option<Vec<Vec<String>>>,
     creation_paths: Vec<String>,
     has_cwd_change: bool,
+    /// Strict decomposition failed but every command is a reviewed reader with understood filename positions.
+    recovered_eligible: bool,
 }
 
 fn unparseable_exec_risk(cmd: &str) -> bool {
@@ -676,6 +685,7 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
             ambient_segments: None,
             creation_paths: Vec::new(),
             has_cwd_change: false,
+            recovered_eligible: false,
         };
     };
     let writes = command_write_paths_split(tree.root_node(), cmd);
@@ -702,8 +712,26 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
         assessment.insert(finding);
     }
     let Some(segments) = segments else {
-        // WHY: undecomposable dynamic `bash -c "$X"`/`eval` is still opaque shell.
-        assessment.insert(Finding::UnparseableShell);
+        let recovery = PermissionScript::analyze(&tree, cmd);
+        if recovery.has_unresolved() {
+            assessment.insert(Finding::UnresolvedArgument);
+        }
+        let projections = recovery.projections();
+        for words in &projections {
+            let words = unwrap_wrappers(words);
+            if is_dangerous_command_words(words) {
+                assessment.insert(Finding::DangerousCommand);
+            }
+            if rg_has_pre_flag(words) {
+                assessment.insert(Finding::SpecialExecSurface);
+            }
+            if segment_exec_facts(words).exec_risk {
+                assessment.insert(Finding::ExecOrAmbientGit);
+            }
+        }
+        if !recovery.is_eligible() {
+            assessment.insert(Finding::UnparseableShell);
+        }
         if tree_has_opaque_shell(tree.root_node(), cmd) {
             assessment.insert(Finding::OpaqueShell);
         }
@@ -711,14 +739,21 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
             assessment.insert(Finding::ExecOrAmbientGit);
         }
         return BashEvaluation {
-            segments: raw_deny_rejection(cmd, state).unwrap_or(SegmentEvaluation::Unparseable),
+            segments: raw_deny_rejection(cmd, state)
+                .or_else(|| {
+                    projections.iter().find_map(|words| {
+                        raw_deny_rejection(&unwrap_wrappers(words).join(" "), state)
+                    })
+                })
+                .unwrap_or(SegmentEvaluation::Unparseable),
             exact_grant,
             all_segments_granted: false,
             assessment,
-            redirect_write: true,
+            redirect_write: redirect_write || !recovery.is_eligible(),
             ambient_segments: None,
             creation_paths: Vec::new(),
             has_cwd_change: false,
+            recovered_eligible: recovery.is_eligible(),
         };
     };
     // Upgrade the raw-string compare with the dequoted single-command form now
@@ -773,6 +808,7 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
                 ambient_segments: None,
                 creation_paths: Vec::new(),
                 has_cwd_change: false,
+                recovered_eligible: false,
             };
         }
 
@@ -863,7 +899,26 @@ fn evaluate_bash(cmd: &str, state: &PermissionState, honor_safe_lists: bool) -> 
         ambient_segments,
         creation_paths: writes.creation_paths,
         has_cwd_change,
+        recovered_eligible: false,
     }
+}
+
+/// [`evaluate_bash`] plus the ambient git scan, run on the caller's thread: a `git` segment whose
+/// checkout carries executable config (`core.fsmonitor`, hooks) is `ExecOrAmbientGit`.
+pub(crate) fn evaluate_bash_with_ambient(
+    cmd: &str,
+    state: &PermissionState,
+    cwd: &std::path::Path,
+) -> BashEvaluation {
+    let mut evaluation = evaluate_bash(cmd, state, true);
+    if let Some(raw) = evaluation.ambient_segments.take()
+        && ambient_exec_risk_from_plan(&ambient_scan_plan_from_segments(&raw, cwd))
+    {
+        evaluation
+            .assessment
+            .insert(ClassifierSecurityFinding::ExecOrAmbientGit);
+    }
+    evaluation
 }
 
 #[cfg(test)]
@@ -1253,15 +1308,6 @@ fn persisted_bash_auto_allows(
 /// [`BashSecurityAssessment`] — no re-derivation of per-effect fields.
 fn bash_request_floor_requires_prompt(evaluation: Option<&BashEvaluation>) -> bool {
     evaluation.is_some_and(|e| !e.exact_grant && e.assessment.constrains_broad_grant())
-}
-
-fn narrow_allow_clears_write_floor(
-    evaluation: Option<&BashEvaluation>,
-    policy: Option<&CompiledPolicy>,
-    access: &AccessKind,
-) -> bool {
-    evaluation.is_some_and(|e| e.assessment.is_file_write_only() && !e.redirect_write)
-        && policy.is_some_and(|p| p.narrow_allow_authorizes(access))
 }
 
 /// A request has no static-analysis findings at all — the only case where a
@@ -1914,6 +1960,8 @@ fn spawn_permission_manager_with_pin(
                         }
                         _ => None,
                     };
+                    let recovered_classification =
+                        auto_mode && requires_recovered_classification(bash_evaluation.as_ref());
                     let protected_edit = match (&access, path_context.as_ref()) {
                         (AccessKind::Edit(path), Some(context)) => {
                             let resolved = resolve_model_path(
@@ -2020,6 +2068,7 @@ fn spawn_permission_manager_with_pin(
                             !(auto_mode && web_fetch_allowlist_is_default),
                             yolo_pin,
                         )
+                        && (!recovered_classification || !matches!(decision, Decision::Allow))
                     {
                         tracing::debug!(
                             tool = %tool_name,
@@ -2042,11 +2091,15 @@ fn spawn_permission_manager_with_pin(
                     // unless a grant-floor finding constrains them — rationale
                     // and boundaries on `narrow_allow_authorizes`. That walk
                     // re-parses the script, so it runs only when findings exist.
+                    let covering_filename_allow =
+                        configured_filename_allow(bash_evaluation.as_ref());
                     if auto_mode
+                        && (covering_filename_allow || !recovered_classification)
                         && !pre_classifier_forced_prompt
                         && protected_edit.is_none()
                         && matches!(policy_decision, Some(Decision::Allow))
-                        && (bash_assessment_is_clear(bash_evaluation.as_ref())
+                        && (covering_filename_allow
+                            || bash_assessment_is_clear(bash_evaluation.as_ref())
                             || (!bash_request_floor_requires_prompt(bash_evaluation.as_ref())
                                 && compiled_policy
                                     .as_ref()
@@ -2333,6 +2386,7 @@ fn spawn_permission_manager_with_pin(
                     }
 
                     if matches!(&access, AccessKind::Bash(_))
+                        && !recovered_classification
                         && sandbox_may_auto_allow_bash(
                             bash_evaluation.as_ref(),
                             xai_grok_sandbox::should_auto_allow_bash(),
@@ -2373,13 +2427,13 @@ fn spawn_permission_manager_with_pin(
                             if protected_edit.is_some()
                                 || auto_forced_prompt
                                 || hook_forced_prompt
-                                || (bash_request_floor_requires_prompt(
-                                    bash_evaluation.as_ref(),
-                                ) && !narrow_allow_clears_write_floor(
+                                || recovered_classification
+                                || broad_allow_deferred(
                                     bash_evaluation.as_ref(),
                                     compiled_policy.as_ref(),
                                     &access,
-                                )) =>
+                                    prompt_policy != PromptPolicy::Deny,
+                                ) =>
                         {
                             // Auto forced a prompt (classifier timeout/unavailable/
                             // denial-limit on a findings-bearing command): a broad
@@ -2573,8 +2627,8 @@ fn spawn_permission_manager_with_pin(
                                 if *reason == reasons::STATIC_ALLOWLIST
                                     || *reason == reasons::PERSISTED_GRANT
                         );
-                    if auto_forced_prompt
-                        && auto_prompt_blocks_allow(&access)
+                    if (recovered_classification
+                        || (auto_forced_prompt && auto_prompt_blocks_allow(&access)))
                         && matches!(pre_decision, Some((Decision::Allow, _)))
                         && !webfetch_static_fallback
                     {
@@ -2612,6 +2666,7 @@ fn spawn_permission_manager_with_pin(
                     // reached the classifier reports the classifier outcome); the
                     // bash floors are the fallback triggers.
                     if prompt_policy == crate::permission::types::PromptPolicy::Allow
+                        && !recovered_classification
                         && !hook_forced_prompt
                         && !shell_forced_prompt
                         && yolo_pin.is_none()
@@ -3047,6 +3102,9 @@ fn spawn_permission_manager_with_pin(
 mod tests {
     use super::*;
     use crate::permission::bash_command_splitting::primary_command_from_script;
+
+    #[path = "bash_filename_arguments_tests.rs"]
+    mod bash_filename_arguments_tests;
 
     // ── Managed-policy pin: yolo clamp + persisted bash clamp ──
 
@@ -8967,9 +9025,8 @@ mod tests {
         }
     }
 
-    /// Opaque shell is detected on the undecomposable path (dynamic `-c`/`eval`)
-    /// and surfaces both the `opaque_shell` and `unparseable_shell` findings;
-    /// non-opaque undecomposable commands surface only `unparseable_shell`.
+    /// Opaque shell is detected on the undecomposable path (dynamic `-c`/`eval`) and surfaces both `opaque_shell` and `unparseable_shell`.
+    /// Non-opaque undecomposable commands surface `unparseable_shell` (plus `unresolved_argument` when the structure was recovered).
     #[test]
     fn opaque_shell_floor_covers_undecomposable_inline_c_and_eval() {
         use ClassifierSecurityFinding::{OpaqueShell, UnparseableShell};

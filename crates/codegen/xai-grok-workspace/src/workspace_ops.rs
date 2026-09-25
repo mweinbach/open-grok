@@ -22,13 +22,16 @@ use crate::file_system::ContentSearchRequest;
 use crate::handle::WorkspaceHandle;
 use crate::worktree::{ApplyWorktreeRequest, CreateWorktreeRequest, RemoveWorktreeRequest};
 use async_trait::async_trait;
+use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use xai_computer_hub_sdk::ToolHarness;
 use xai_grok_tools::types::output::ToolRunResult;
+use xai_grok_tools::types::resources::SessionFolder;
 use xai_grok_workspace_client::{WorkspaceClient, is_transport_fatal};
 pub use xai_grok_workspace_types::rpc::agents_md::DiscoverAgentsMdReq;
 pub use xai_grok_workspace_types::rpc::code_nav::{
@@ -38,8 +41,9 @@ pub use xai_grok_workspace_types::rpc::code_nav::{
 pub use xai_grok_workspace_types::rpc::export_github::ExportGithubReq;
 pub use xai_grok_workspace_types::rpc::fs::{
     ClientFsListNode, ClientFsListReq, ClientFsListRes, ClientFsReadFileReq, ClientFsReadFileRes,
-    ClientFsStatReq, ClientFsStatRes, GetFileEntry, GetFileResult, GetFilesReq, GetFilesRes,
-    PutFileEntry, PutFileResult, PutFilesReq, PutFilesRes,
+    ClientFsStatReq, ClientFsStatRes, ClientFsWriteFileReq, ClientFsWriteFileRes, GetFileEntry,
+    GetFileResult, GetFilesReq, GetFilesRes, PutFileEntry, PutFileResult, PutFilesReq, PutFilesRes,
+    StoreSessionImageReq, StoreSessionImageRes,
 };
 pub use xai_grok_workspace_types::rpc::git::{
     BinaryFileInfoData, CheckoutCommitResponse, CommitWithPatchData, DetectVcsKindReq,
@@ -1065,6 +1069,85 @@ impl WorkspaceOp for HookRegistryReq {
     }
 }
 #[async_trait]
+impl WorkspaceOp for StoreSessionImageReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        let session_id = session_id.ok_or_else(|| {
+            WorkspaceError::HubError("store_session_image requires a bound session".to_owned())
+        })?;
+        let session = ws
+            .session(session_id)
+            .ok_or_else(|| WorkspaceError::SessionNotFound(session_id.to_owned()))?;
+        if !matches!(self.extension.as_str(), "jpg" | "png" | "webp" | "gif") {
+            return Err(WorkspaceError::HubError(
+                "store_session_image extension must be jpg, png, webp, or gif".to_owned(),
+            ));
+        }
+        let folder = session
+            .toolset()
+            .resources
+            .lock()
+            .await
+            .require::<SessionFolder>()
+            .map_err(|e| WorkspaceError::HubError(format!("store_session_image: {e}")))?
+            .0
+            .clone();
+        if self.content_base64.len()
+            > xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BASE64_BYTES
+        {
+            return Err(WorkspaceError::HubError(format!(
+                "session image exceeds {} byte limit",
+                xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES
+            )));
+        }
+        let content_base64 = self.content_base64.clone();
+        let extension = self.extension.clone();
+        tokio::task::spawn_blocking(move || {
+            let content = base64::engine::general_purpose::STANDARD
+                .decode(content_base64)
+                .map_err(|e| {
+                    WorkspaceError::HubError(format!("invalid session image base64: {e}"))
+                })?;
+            if content.len() > xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES {
+                return Err(WorkspaceError::HubError(format!(
+                    "session image exceeds {} byte limit",
+                    xai_grok_workspace_types::rpc::fs::MAX_SESSION_IMAGE_BYTES
+                )));
+            }
+            let folder = dunce::canonicalize(&folder).map_err(|e| {
+                WorkspaceError::HubError(format!(
+                    "resolve session image folder {}: {e}",
+                    folder.display()
+                ))
+            })?;
+            let path = folder.join(format!("{}.{extension}", uuid::Uuid::new_v4()));
+            let file_path = path
+                .to_str()
+                .ok_or_else(|| {
+                    WorkspaceError::HubError("session image path is not UTF-8".to_owned())
+                })?
+                .to_owned();
+            let mut temp = tempfile::NamedTempFile::new_in(&folder).map_err(|e| {
+                WorkspaceError::HubError(format!("create session image temporary file: {e}"))
+            })?;
+            temp.write_all(&content)
+                .map_err(|e| WorkspaceError::HubError(format!("write session image: {e}")))?;
+            temp.as_file()
+                .sync_all()
+                .map_err(|e| WorkspaceError::HubError(format!("sync session image: {e}")))?;
+            temp.persist_noclobber(&path).map_err(|e| {
+                WorkspaceError::HubError(format!("persist session image {}: {e}", path.display()))
+            })?;
+            Ok(StoreSessionImageRes { file_path })
+        })
+        .await
+        .map_err(|e| WorkspaceError::JoinError(e.to_string()))?
+    }
+}
+#[async_trait]
 impl WorkspaceOp for PutFilesReq {
     async fn execute(
         &self,
@@ -1112,6 +1195,16 @@ impl WorkspaceOp for ClientFsReadFileReq {
         session_id: Option<&str>,
     ) -> WorkspaceResult<Self::Response> {
         crate::file_system::client_fs::read_file(ws, session_id, self).await
+    }
+}
+#[async_trait]
+impl WorkspaceOp for ClientFsWriteFileReq {
+    async fn execute(
+        &self,
+        ws: &WorkspaceHandle,
+        session_id: Option<&str>,
+    ) -> WorkspaceResult<Self::Response> {
+        crate::file_system::client_fs::write_file(ws, session_id, self).await
     }
 }
 /// Resolve the index root for a code-nav op. Prefers the explicit per-session
@@ -1719,6 +1812,19 @@ impl WorkspaceOps {
         call_id: &str,
         session_id: Option<&str>,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        let mut ctx = xai_tool_runtime::ToolCallContext::default();
+        ctx.call_id = xai_tool_protocol::ToolCallId::new(call_id.to_owned()).unwrap_or(ctx.call_id);
+        self.call_tool_with_context(name, args, session_id, ctx)
+            .await
+    }
+    /// Local dispatch keeps the caller's context. The proxy hop cannot carry a slot, so it is not serialized.
+    pub async fn call_tool_with_context(
+        &self,
+        name: &str,
+        args: Value,
+        session_id: Option<&str>,
+        ctx: xai_tool_runtime::ToolCallContext,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
         match self {
             Self::Local { handle } => {
                 let session_id = session_id.ok_or_else(|| {
@@ -1736,7 +1842,7 @@ impl WorkspaceOps {
                         ),
                     )
                 })?;
-                session.toolset().call(name, args, call_id, None).await
+                session.toolset().call_with_context(name, args, ctx).await
             }
             Self::Proxy { client } => {
                 if !client.is_connected() {
@@ -1751,10 +1857,8 @@ impl WorkspaceOps {
                         format!("invalid tool name: {e}"),
                     )
                 })?;
-                let mut ctx = xai_tool_runtime::ToolCallContext::default();
-                ctx.call_id =
-                    xai_tool_protocol::ToolCallId::new(call_id.to_owned()).unwrap_or(ctx.call_id);
-                let mut stream = client.harness().call(tool_id, args, ctx).await;
+                let proxy_ctx = xai_tool_runtime::ToolCallContext::new(ctx.call_id.clone());
+                let mut stream = client.harness().call(tool_id, args, proxy_ctx).await;
                 let typed = crate::hub_channel::consume_stream_terminal(&mut stream)
                     .await
                     .inspect_err(|e| {
@@ -2337,8 +2441,7 @@ mod tests {
             "HookSpecWire serde shape drifted from upstream HookSpec"
         );
     }
-    /// The worktree-fork request projects onto / rebuilds from its wire mirror;
-    /// the two `#[serde(skip)]` runtime fields never ride the wire.
+    /// The worktree-fork request projects onto / rebuilds from its wire mirror; `#[serde(skip)]` runtime fields are never serialized.
     #[test]
     fn create_worktree_from_worktree_request_wire_round_trip() {
         let req = crate::worktree::CreateWorktreeFromWorktreeRequest {
@@ -2351,6 +2454,8 @@ mod tests {
             grove_worktree: None,
             cancellation_token: None,
             resolved_dest_path: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -2360,6 +2465,7 @@ mod tests {
         assert_eq!(back.source_worktree_path, "/src");
         assert!(back.cancellation_token.is_none());
         assert!(back.resolved_dest_path.is_none());
+        assert!(back.resolved_source_git_root.is_none());
     }
 
     #[test]
@@ -2375,6 +2481,8 @@ mod tests {
                 grove_worktree,
                 cancellation_token: None,
                 resolved_dest_path: None,
+                resolved_source_git_root: None,
+                grove_gate_source: None,
             };
             let operation = CreateWorktreeFromWorktreeSyncReq {
                 inner: request.into_wire(),

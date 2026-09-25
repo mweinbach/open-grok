@@ -446,13 +446,12 @@ impl McpServerConfig {
                     })
                     .unwrap_or_default();
 
-                // Add bearer token from environment variable if specified
                 if let Some(env_var) = bearer_token_env_var {
                     match std::env::var(env_var) {
                         Ok(token) => {
                             http_headers.push(acp::HttpHeader::new(
                                 "Authorization",
-                                format!("Bearer {}", token),
+                                format!("Bearer {token}"),
                             ));
                         }
                         Err(_) => {

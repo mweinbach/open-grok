@@ -91,6 +91,12 @@ pub struct CreateWorktreeRequest {
     /// When absent, an automatic `YYYY-MM-DD-<uuid>` label is generated.
     #[serde(default)]
     pub label: Option<String>,
+    /// Gate source from `gate_grove_worktree_layers` (`request` / `env` / `local` / `enable_all` / `remote` / `remote_kill` / `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
+    /// Pinned by prepare so streaming `Created.source_git_root` matches `Creating`.
+    #[serde(default, skip)]
+    pub resolved_source_git_root: Option<String>,
 }
 impl WorkspaceRpc for CreateWorktreeRequest {
     const METHOD: &'static str = "workspace.create_worktree";
@@ -194,6 +200,9 @@ pub struct CreateWorktreeFromWorktreeResponse {
 pub struct CreateWorktreeFromWorktreeRequestWire {
     #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
     pub grove_worktree: Option<bool>,
+    /// Gate source from `gate_grove_worktree_layers` (`request` / `env` / `local` / `enable_all` / `remote` / `remote_kill` / `default`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
     pub source_worktree_path: String,
     pub new_session_id: String,
     #[serde(default = "default_copy_mode")]
@@ -416,6 +425,7 @@ mod tests {
                 worktree_type: None,
                 label: None,
                 grove_worktree: None,
+                grove_gate_source: None,
             },
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -438,6 +448,8 @@ mod tests {
             worktree_type: None,
             label: None,
             grove_worktree: None,
+            grove_gate_source: None,
+            resolved_source_git_root: None,
         });
         let json = serde_json::to_value(&req).unwrap();
         assert_eq!(json["sessionId"], "s1");

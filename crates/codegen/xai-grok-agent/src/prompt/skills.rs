@@ -345,7 +345,7 @@ fn expand_tilde(raw: &str) -> PathBuf {
 /// Each entry is either a direct SKILL.md file or a directory to walk recursively.
 /// `~` is expanded. Scope is `Repo` if the resolved path falls inside `git_root`,
 /// otherwise `User`.
-fn collect_config_skills(config_paths: &[String], git_root: Option<&Path>) -> Vec<SkillInfo> {
+pub fn collect_config_skills(config_paths: &[String], git_root: Option<&Path>) -> Vec<SkillInfo> {
     let mut skill_files: Vec<(PathBuf, SkillScope)> = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1568,6 +1568,7 @@ mod tests {
             disable_model_invocation: false,
             has_user_specified_description: false,
             paths: None,
+            origin: None,
             enabled: true,
             body: None,
         }

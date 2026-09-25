@@ -241,7 +241,7 @@ pub struct HookInfo {
     pub timeout_ms: u64,
     /// Source directory of the hook definition file.
     pub source_dir: String,
-    /// Whether this hook is disabled via ~/.opengrok/disabled-hooks.
+    /// Whether dispatch skips this hook: `enabled = false`, listed in ~/.opengrok/disabled-hooks, or kept off by `allow_managed_hooks_only`.
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]

@@ -110,14 +110,6 @@ impl CodebaseIndexManager {
             .map(|(_, handle)| handle)
     }
 
-    /// Ensure an index exists for every materialized mount.
-    pub fn ensure_all(&mut self, roots: &[PathBuf]) -> Vec<Arc<IndexManagerHandle>> {
-        roots
-            .iter()
-            .map(|root| self.get_or_create(root.clone()).0)
-            .collect()
-    }
-
     /// Returns the number of currently-live indexes (test helper).
     #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {

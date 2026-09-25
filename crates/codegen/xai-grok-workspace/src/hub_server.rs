@@ -177,7 +177,8 @@ impl crate::worktree::WorktreeNotificationSender for NoOpNotifier {
 /// disables the ops with a graceful `HubError` that the remote caller
 /// maps to a fallback. Read per call — flipping the variable needs no
 /// process restart and tests can toggle it under a lock.
-fn client_fs_queries_enabled() -> bool {
+/// Also gates the staged-upload maintenance (orphan sweep and GC ticker) started with the workspace.
+pub(crate) fn client_fs_queries_enabled() -> bool {
     !matches!(
         std::env::var("WORKSPACE_CLIENT_FS_QUERIES").as_deref(),
         Ok("0") | Ok("false")
@@ -661,6 +662,9 @@ impl WorkspaceRpcHandler {
             <GetFilesReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<GetFilesReq>(params, &self.workspace, bound_session).await
             }
+            <StoreSessionImageReq as WorkspaceRpc>::METHOD => {
+                dispatch_op::<StoreSessionImageReq>(params, &self.workspace, bound_session).await
+            }
             <FsListReq as WorkspaceRpc>::METHOD => {
                 dispatch_op::<FsListReq>(params, &self.workspace, None).await
             }
@@ -687,6 +691,10 @@ impl WorkspaceRpcHandler {
             <ClientFsReadFileReq as WorkspaceRpc>::METHOD => {
                 ensure_client_fs_queries_enabled()?;
                 dispatch_op::<ClientFsReadFileReq>(params, &self.workspace, bound_session).await
+            }
+            <ClientFsWriteFileReq as WorkspaceRpc>::METHOD => {
+                ensure_client_fs_queries_enabled()?;
+                dispatch_op::<ClientFsWriteFileReq>(params, &self.workspace, bound_session).await
             }
             <DiscoverSkillsReq as WorkspaceRpc>::METHOD => {
                 let cwd = self.workspace.root_cwd()?;
@@ -1260,6 +1268,7 @@ impl ToolServerHandler for WorkspaceRpcHandler {
             let mut sessions = self.workspace.shared.sessions.write();
             let removed = sessions.remove(sid);
             if let Some(session) = &removed {
+                session.staged_uploads().abandon_all();
                 session.abort_system_notify_producers();
                 session.shutdown_terminal_backend();
                 session.shutdown_browser_service();

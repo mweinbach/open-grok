@@ -59,6 +59,20 @@ pub struct DoomLoopRecoverySettings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_tokens: Option<u32>,
 }
+/// Shared shape of the `[long_reasoning_reminder]` TOML table and the remote `long_reasoning_reminder` object; unset fields fall through per field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LongReasoningReminderSettings {
+    /// Mid-turn reminder to reason briefly after a long hidden-reasoning call; default off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Reasoning tokens in one model call that count as a long step; absent uses the client default (1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u32>,
+    /// Model calls to wait after the long step before the reminder is injected; absent uses the client default (1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delay: Option<u32>,
+}
 /// Per-kind age policy for auto-GC: seconds or never.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeKindMaxAge {
@@ -860,6 +874,12 @@ pub struct RemoteSettings {
     /// is set in config.toml. Absent → default (**disabled** — ships dark).
     #[serde(default)]
     pub subagent_worktree_snapshot_enabled: Option<bool>,
+    /// Remote fallback for `[features] subagent_model_inheritance`; absent or null means off.
+    #[serde(default)]
+    pub subagent_model_inheritance_enabled: Option<bool>,
+    /// Remote `long_reasoning_reminder` object; see [`LongReasoningReminderSettings`].
+    #[serde(default, deserialize_with = "deserialize_tolerant")]
+    pub long_reasoning_reminder: Option<LongReasoningReminderSettings>,
     /// `image_gen` / `/imagine`. `None` → env / `[features]` / default on.
     #[serde(default)]
     pub image_gen_enabled: Option<bool>,
@@ -989,9 +1009,7 @@ pub struct RemoteSettings {
     /// file into one row (expand for the diffs). `None` defers to local
     /// config / env / default (`false`); `Some(false)` is a remote kill
     /// switch. Resolved via `resolve_collapsed_edit_blocks` (requirements >
-    /// env > user > managed > remote > default false). Explicit pager.toml
-    /// `[scrollback.blocks.edit]` shape keys override the flag's fold shape
-    /// client-side; merging always follows the flag.
+    /// env > user > managed > remote > default false).
     #[serde(default)]
     pub collapsed_edit_blocks: Option<bool>,
     /// Display-refresh probe + auto-cadence. See [`DisplayRefreshSettings`].
@@ -1126,6 +1144,8 @@ pub struct RemoteSettings {
     pub active_agent_messages_enabled: Option<bool>,
     #[serde(default)]
     pub subagent_rate_limit_max_attempts: Option<u32>,
+    // Kept for the fork's VCS-status system prompt (upstream removed this with
+    // its repo-status prefix; the fork keeps `resolve_repo_status_in_system_prompt`).
     #[serde(default)]
     pub repo_status_in_system_prompt: Option<bool>,
     #[serde(default)]

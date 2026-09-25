@@ -4,6 +4,7 @@
 //! supporting direct upload (via service account), proxy upload (via cli-chat-proxy),
 //! and S3-compatible backends.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,7 +13,9 @@ use anyhow::Context;
 use crate::UploadMethod;
 use xai_grok_auth::{AuthCredentialProvider, StaticAuthCredentialProvider};
 
-use crate::storage_client::{Auth401AttributionCallback, StaticGrokAuth, StorageClient};
+use crate::storage_client::{
+    Auth401AttributionCallback, ExistsResult, StaticGrokAuth, StorageClient, UploadResponse,
+};
 
 /// Threshold for switching to multipart upload (50 MB).
 ///
@@ -176,6 +179,56 @@ pub async fn upload_bytes<C: StorageConfig>(
                 endpoint_url.as_deref(),
             )
             .await
+        }
+    }
+}
+
+/// The proxy is the only backend with an existence probe; `None` for Direct and S3.
+fn proxy_storage_client<C: StorageConfig>(config: &C) -> Option<StorageClient> {
+    match config.upload_method() {
+        UploadMethod::Proxy {
+            proxy_base_url,
+            user_token,
+            deployment_key,
+            alpha_test_key: _,
+        } => Some(build_proxy_client_with_fallback(
+            proxy_base_url,
+            user_token,
+            deployment_key.clone(),
+            config.proxy_credentials(),
+            config.proxy_attribution(),
+            config.proxy_http_client(),
+        )),
+        UploadMethod::Direct { .. } | UploadMethod::S3 { .. } => None,
+    }
+}
+
+/// Existing paths among `paths` in one round trip (keep it under 100 paths: the proxy sub-batches
+/// at 100 and reports a failed sub-batch as missing). Direct and S3 answer `ProbeFailed` so a
+/// caller can never read the absence of a probe as "absent". No retries.
+pub async fn batch_check_exists<C: StorageConfig, S: AsRef<str>>(
+    config: &C,
+    paths: &[S],
+) -> ExistsResult<HashSet<String>> {
+    match proxy_storage_client(config) {
+        Some(client) => client.batch_check_exists(paths).await,
+        None => {
+            tracing::debug!("batch existence probe is only available through the proxy");
+            ExistsResult::ProbeFailed
+        }
+    }
+}
+
+/// Single-object existence probe with the same dispatch rules as [`batch_check_exists`].
+pub async fn check_exists<C: StorageConfig>(
+    config: &C,
+    object_path: &str,
+) -> ExistsResult<UploadResponse> {
+    match proxy_storage_client(config) {
+        Some(client) => client.check_exists(object_path).await,
+        None => {
+            tracing::debug!("existence probe is only available through the proxy");
+            ExistsResult::ProbeFailed
         }
     }
 }

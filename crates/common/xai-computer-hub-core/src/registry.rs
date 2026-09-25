@@ -221,6 +221,10 @@ pub trait ToolRegistry: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Bind-time policy keys on the stamped [`ServerRecord::host_kind`]; the
+/// type lives in the protocol crate because `servers.list` carries it.
+pub use xai_tool_protocol::HostKind;
+
 /// Server identity captured at `register_server` time.
 #[derive(Debug, Clone)]
 pub struct ServerRecord {
@@ -233,6 +237,9 @@ pub struct ServerRecord {
     /// Monotonic registration stamp ([`next_registration_seq`]) — the
     /// stale-vs-revived discriminator for newest-wins (`registered_at` is display-only).
     pub registration_seq: u64,
+    /// Resolved from the credential's minter at upgrade; `None` for a minter
+    /// the hub does not know. Stamped right after registration.
+    pub host_kind: Option<HostKind>,
 }
 
 /// Process-global hybrid logical clock: per-process strictly-increasing (no ties,

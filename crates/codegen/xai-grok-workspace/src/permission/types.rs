@@ -396,10 +396,15 @@ impl From<&xai_grok_tools::types::ToolInput> for AccessKind {
                 name: mcp.tool_name.to_string(),
                 input: mcp.tool_input.clone(),
             },
-            ToolInput::UseTool(u) => AccessKind::MCPTool {
-                name: u.tool_name.clone(),
-                input: u.tool_input.clone(),
-            },
+            ToolInput::UseTool(xai_grok_tools::implementations::UseToolInput::Inline(u)) => {
+                AccessKind::MCPTool {
+                    name: u.tool_name.clone(),
+                    input: u.tool_input.clone(),
+                }
+            }
+            ToolInput::UseTool(u) => {
+                AccessKind::Read(u.source_path().map(|p| p.to_string_lossy().into_owned()))
+            }
             ToolInput::WebFetch(wf) => AccessKind::WebFetch(wf.url.clone()),
             // Local draft I/O only. AccessKind::Tool (upstream: every call
             // prompts) is not in this tree yet; do not remap Task/ApplyPatch.
@@ -814,10 +819,12 @@ mod tests {
     fn use_tool_maps_to_mcp_tool_access() {
         use xai_grok_tools::implementations::use_tool::UseToolInput;
         use xai_grok_tools::types::ToolInput;
-        let input = ToolInput::UseTool(UseToolInput {
-            tool_name: "linear__save_issue".into(),
-            tool_input: serde_json::json!({ "title" : "test" }),
-        });
+        let input = ToolInput::UseTool(UseToolInput::Inline(
+            xai_grok_tools::implementations::use_tool::InlineMcpInvocation {
+                tool_name: "linear__save_issue".into(),
+                tool_input: serde_json::json!({ "title" : "test" }),
+            },
+        ));
         let access = AccessKind::from(&input);
         assert!(
             matches!(
@@ -975,12 +982,14 @@ mod tests {
                 prompt: "edit config.toml".into(),
                 description: "spawn".into(),
                 subagent_type: "general-purpose".into(),
+                subagent_type_specified: false,
                 run_in_background: false,
                 capability_mode: None,
                 isolation: None,
                 resume_from: None,
                 cwd: None,
                 model: None,
+                workspace: None,
                 task_id: None,
                 context: None,
                 reasoning_effort: None,

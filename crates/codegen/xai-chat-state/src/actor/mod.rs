@@ -312,8 +312,8 @@ impl ChatStateActor {
             ChatStateCommand::FlushHarnessTraceTurn => {
                 self.state.seal_harness_trace_turn();
             }
-            ChatStateCommand::RepairDanglingAfterHarnessHalt { class } => {
-                self.repair_dangling_after_harness_halt(class);
+            ChatStateCommand::RepairDanglingAfterHarnessHalt { class, answers } => {
+                self.repair_dangling_after_harness_halt(class, answers);
             }
             ChatStateCommand::PopStrandedContinueReminder => {
                 self.pop_stranded_continue_reminder();

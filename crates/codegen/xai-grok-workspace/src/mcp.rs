@@ -20,12 +20,21 @@ use xai_tool_types::ToolDescription;
 
 /// Adapts [`McpClient`] to the [`McpTransport`] trait for [`McpBridge`].
 pub(crate) struct McpClientTransportAdapter {
-    client: Arc<McpClient>,
+    /// `None` once closed: the hub's handlers keep the adapter alive after a stop, and must not keep the client.
+    client: arc_swap::ArcSwapOption<McpClient>,
 }
 
 impl McpClientTransportAdapter {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client: arc_swap::ArcSwapOption::new(Some(client)),
+        }
+    }
+
+    fn client(&self) -> Result<Arc<McpClient>, xai_computer_hub_mcp_adapter::McpError> {
+        self.client.load_full().ok_or_else(|| {
+            xai_computer_hub_mcp_adapter::McpError::Transport("MCP transport closed".into())
+        })
     }
 }
 
@@ -33,7 +42,7 @@ impl McpClientTransportAdapter {
 impl McpTransport for McpClientTransportAdapter {
     async fn initialize(&self) -> Result<McpServerInfo, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -53,7 +62,7 @@ impl McpTransport for McpClientTransportAdapter {
         &self,
     ) -> Result<Vec<McpToolDefinition>, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -89,7 +98,7 @@ impl McpTransport for McpClientTransportAdapter {
         arguments: Value,
     ) -> Result<McpCallResult, xai_computer_hub_mcp_adapter::McpError> {
         let service = self
-            .client
+            .client()?
             .ensure_initialized()
             .await
             .map_err(|e| xai_computer_hub_mcp_adapter::McpError::Transport(e.to_string()))?;
@@ -132,7 +141,9 @@ impl McpTransport for McpClientTransportAdapter {
     }
 
     async fn close(&self) -> Result<(), xai_computer_hub_mcp_adapter::McpError> {
-        // No-op: cleanup happens when McpClient is dropped.
+        // Letting go of the client is what ends a stdio child, once no in-flight call still holds its
+        // service; a call routed in afterwards fails here.
+        self.client.store(None);
         Ok(())
     }
 }
@@ -209,6 +220,28 @@ pub(crate) fn server_name_from_mcp_error(e: &xai_grok_mcp::servers::McpError) ->
     e.server_name().unwrap_or("unknown")
 }
 
+/// Compose a host-owned built-in `entry` into `servers`: same-named entries are dropped so none
+/// can take its first-party posture, and it goes first so any server cap keeps it.
+pub fn compose_built_in(
+    servers: Vec<agent_client_protocol::McpServer>,
+    entry: agent_client_protocol::McpServer,
+) -> Vec<agent_client_protocol::McpServer> {
+    let name = xai_grok_mcp::servers::mcp_server_name(&entry);
+    let (same_name, mut composed): (Vec<_>, Vec<_>) = servers
+        .into_iter()
+        .partition(|server| xai_grok_mcp::servers::mcp_server_name(server) == name);
+    let impersonating = same_name.iter().filter(|server| **server != entry).count();
+    if impersonating > 0 {
+        tracing::warn!(
+            dropped = impersonating,
+            server = name,
+            "dropping MCP servers that use a reserved built-in server name"
+        );
+    }
+    composed.insert(0, entry);
+    composed
+}
+
 /// Bridge config factory for MCP bridge connections.
 pub(crate) fn make_bridge_config(
     session_id: xai_tool_protocol::SessionId,
@@ -257,6 +290,47 @@ mod tests {
         async fn close(&self) -> Result<(), McpError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn compose_built_in_reserves_the_name_and_leads_the_list() {
+        let composed = compose_built_in(
+            vec![
+                stdio("other", "/other"),
+                stdio("built_in", "/impersonator"),
+                stdio("built_in", "/impersonator-2"),
+            ],
+            stdio("built_in", "/host"),
+        );
+        assert_eq!(
+            composed,
+            vec![stdio("built_in", "/host"), stdio("other", "/other")]
+        );
+    }
+
+    /// A host re-feeding its own composed list (hot reload) must not warn about itself.
+    #[test]
+    fn compose_built_in_warns_only_for_a_differing_same_named_entry() {
+        let host = stdio("built_in", "/host");
+        let ((), re_fed) = crate::capturing_warn_logs(|| {
+            let composed =
+                compose_built_in(vec![host.clone(), stdio("other", "/other")], host.clone());
+            assert_eq!(2, composed.len());
+        });
+        assert!(!re_fed.contains("reserved"), "own entry re-fed: {re_fed}");
+        let ((), impersonated) = crate::capturing_warn_logs(|| {
+            compose_built_in(vec![stdio("built_in", "/impersonator")], host.clone());
+        });
+        assert!(
+            impersonated.contains("reserved") && impersonated.contains("dropped=1"),
+            "impersonator: {impersonated}"
+        );
+    }
+
+    fn stdio(name: &str, command: &str) -> agent_client_protocol::McpServer {
+        agent_client_protocol::McpServer::Stdio(agent_client_protocol::McpServerStdio::new(
+            name, command,
+        ))
     }
 
     #[tokio::test]

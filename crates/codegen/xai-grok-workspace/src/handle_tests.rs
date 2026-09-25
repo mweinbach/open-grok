@@ -6067,3 +6067,32 @@ async fn build_session_routed_handlers_preserves_renamed_active_message_kind() {
         Some(ToolKind::ActiveAgentMessage.as_key())
     );
 }
+/// A status probe reads a server's settled outcome without waiting on the session's MCP lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_server_outcome_reports_settled_starts_and_never_waits() {
+    use crate::session::McpServerOutcome;
+    let handle = make_handle();
+    let session = handle.session("main").expect("main session");
+    assert_eq!(session.mcp_server_outcome("computer_use"), None);
+    session
+        .settle_mcp_server_for_test("computer_use", McpServerOutcome::Failed)
+        .await;
+    assert_eq!(
+        session.mcp_server_outcome("computer_use"),
+        Some(McpServerOutcome::Failed)
+    );
+    session
+        .settle_mcp_server_for_test("computer_use", McpServerOutcome::Connected)
+        .await;
+    assert_eq!(
+        session.mcp_server_outcome("computer_use"),
+        Some(McpServerOutcome::Connected)
+    );
+    let held = session.mcp_state.lock().await;
+    assert_eq!(
+        session.mcp_server_outcome("computer_use"),
+        None,
+        "a start holding the lock reads as unsettled rather than blocking the probe"
+    );
+    drop(held);
+}

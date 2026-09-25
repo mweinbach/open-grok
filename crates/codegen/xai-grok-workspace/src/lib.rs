@@ -63,7 +63,7 @@ pub use path_virtualization::{
     VISIBLE_ROOT,
 };
 pub use permission::*;
-pub use session::{WorkspaceSession, WorkspaceShared};
+pub use session::{McpServerOutcome, WorkspaceSession, WorkspaceShared};
 pub use session::{file_state, git, jj};
 pub use upload::environment::{WorkspaceEnvironment, WorkspaceIdentity};
 pub use workspace_ops::{WorkspaceOp, WorkspaceOps};
@@ -158,6 +158,55 @@ impl LockedTestEnv {
         self._env.push(TestEnvGuard::set(key, val));
         self
     }
+}
+/// Test sink that accumulates `tracing` output into a shared buffer.
+#[cfg(test)]
+#[derive(Clone)]
+struct VecWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+#[cfg(test)]
+impl std::io::Write for VecWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+/// Serializes capture tests: `rebuild_interest_cache` is process-global, so
+/// two concurrent captures can drop each other's warns.
+#[cfg(test)]
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Run `f` while capturing WARN-level logs on this thread. `f` must be pure:
+/// it runs once un-captured first to register its warn callsites.
+#[cfg(test)]
+pub(crate) fn capturing_warn_logs<T>(f: impl Fn() -> T) -> (T, String) {
+    let _guard = CAPTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    {
+        static GLOBAL_SINK: std::sync::Once = std::sync::Once::new();
+        GLOBAL_SINK.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_max_level(tracing::Level::WARN)
+                    .with_writer(std::io::sink)
+                    .finish(),
+            );
+        });
+    }
+    f();
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer_buf = buf.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || VecWriter(writer_buf.clone()))
+        .finish();
+    let value = tracing::subscriber::with_default(subscriber, || {
+        tracing::callsite::rebuild_interest_cache();
+        f()
+    });
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    (value, logs)
 }
 #[cfg(test)]
 mod init_metrics_tests {

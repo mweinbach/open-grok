@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use git2::{DiffOptions, Oid, Repository};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as TokioMutex;
@@ -26,7 +26,12 @@ use crate::session::git::{
     find_main_repo_root_from_path, git_cli,
 };
 
+mod create_root;
 mod identity;
+
+pub use create_root::{
+    git_or_grove_is_jj_async, git_or_grove_root, git_or_grove_root_async, grove_visible_git_root,
+};
 pub use identity::{WorktreeIdentity, worktree_identity_for_cwd, worktree_identity_in};
 
 // Canonical in xai-grok-workspace-types; re-exported for existing paths.
@@ -38,6 +43,17 @@ pub use xai_grok_workspace_types::rpc::worktree::{
 };
 
 const WORKTREE_LOG: &str = "xai_worktree";
+
+/// Blocking worktree IO off the async runtime (spawn_blocking passthrough).
+pub(crate) async fn blocking_copy_on_write<F, T>(
+    work: F,
+) -> std::result::Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await
+}
 
 /// True when `path` is on a grove FUSE mount. Fast btrfs CoW cannot snapshot
 /// FUSE; callers must fall back to a plain git checkout ([`WorktreeType::Git`]).
@@ -236,9 +252,45 @@ mod grove_fuse_tests {
             WorktreeType::Git
         );
     }
+
+    #[test]
+    fn grove_fuse_forkable_preserve_keeps_linked_not_git() {
+        let src = Path::new("/tmp/src");
+        assert_eq!(
+            resolve_grove_fuse_creation_type_for(
+                WorktreeType::Linked,
+                true,
+                &WorkingTreeMode::PreserveWorkingTree,
+                src,
+                "s",
+            ),
+            WorktreeType::Linked
+        );
+        assert_eq!(
+            resolve_grove_fuse_creation_type_for(
+                WorktreeType::Standalone,
+                true,
+                &WorkingTreeMode::PreserveWorkingTree,
+                src,
+                "s",
+            ),
+            WorktreeType::Standalone
+        );
+        assert_eq!(
+            resolve_grove_fuse_creation_type_for(
+                WorktreeType::Git,
+                true,
+                &WorkingTreeMode::PreserveWorkingTree,
+                src,
+                "s",
+            ),
+            WorktreeType::Git,
+            "GitCheckout still never enters the Grove arm"
+        );
+    }
 }
 
-fn enabled_grove_opts() -> xai_fast_worktree::NfsWorktreeOpts {
+pub(crate) fn enabled_grove_opts() -> xai_fast_worktree::NfsWorktreeOpts {
     xai_fast_worktree::NfsWorktreeOpts {
         enabled: true,
         ..xai_fast_worktree::NfsWorktreeOpts::default()
@@ -246,8 +298,7 @@ fn enabled_grove_opts() -> xai_fast_worktree::NfsWorktreeOpts {
 }
 
 /// Keep GitCheckout for ordinary grove FUSE sources.
-/// Linked local-codebase views (confirmed by `source_is_linked_local_view`) stay Linked so CreateWorktree runs.
-/// Preserve on a confirmed linked view must not become Git (clean checkout); later layers decline it.
+/// Linked local-codebase views and forkable Grove parents stay Linked/Standalone so CreateWorktree runs.
 fn resolve_grove_fuse_creation_type(
     source: &Path,
     requested: WorktreeType,
@@ -258,24 +309,30 @@ fn resolve_grove_fuse_creation_type(
     if !is_grove_fuse_mount(source) {
         return requested;
     }
-    let linked = grove_enabled
-        && xai_fast_worktree::source_is_linked_local_view(&enabled_grove_opts(), source);
-    resolve_grove_fuse_creation_type_for(requested, linked, working_tree, source, session_id)
+    let keep_requested = grove_enabled
+        && xai_fast_worktree::source_keeps_grove_create(&enabled_grove_opts(), source);
+    resolve_grove_fuse_creation_type_for(
+        requested,
+        keep_requested,
+        working_tree,
+        source,
+        session_id,
+    )
 }
 
 fn resolve_grove_fuse_creation_type_for(
     requested: WorktreeType,
-    linked_confirmed: bool,
+    keep_requested: bool,
     _working_tree: &WorkingTreeMode,
     source: &Path,
     session_id: &str,
 ) -> WorktreeType {
-    if linked_confirmed {
+    if keep_requested {
         tracing::info!(
             target: WORKTREE_LOG,
             session_id,
             source = %source.display(),
-            "grove linked local-codebase view: using CreateWorktree"
+            "grove source: using CreateWorktree"
         );
         return requested;
     }
@@ -919,6 +976,19 @@ pub fn worktree_base_dir_for_source(source_path: &Path) -> Result<std::path::Pat
     }
 }
 
+/// Dest is already pinned; do not use launch cwd as `source_git_root` on a Grove parent.
+/// `resolved_source_git_root` is `serde(skip)`, so a wire pin still falls back to discover.
+pub(crate) fn source_git_root_for_pinned_dest(
+    source: &Path,
+    grove_enabled: bool,
+    pinned: Option<String>,
+) -> Option<String> {
+    if pinned.is_some() {
+        return pinned;
+    }
+    git_or_grove_root(source, grove_enabled).map(|p| p.to_string_lossy().into_owned())
+}
+
 fn resolve_worktree_path(req: &CreateWorktreeRequest, git_root: &Path) -> String {
     if let Some(ref path) = req.worktree_path {
         return path.clone();
@@ -980,7 +1050,7 @@ fn worktree_record_for_cwd(cwd: &str) -> Option<(WorktreeDb, WorktreeRecord)> {
 /// The recorded source repo of the grok-managed worktree containing `cwd`, if any.
 ///
 /// Thin wrapper over [`worktree_record_for_cwd`] that drops the DB handle;
-/// returns `None` (without DB I/O) for paths outside `~/.grok/worktrees/`.
+/// returns `None` (without DB I/O) for paths outside `~/.opengrok/worktrees/`.
 pub(crate) fn source_repo_for_cwd(cwd: &str) -> Option<std::path::PathBuf> {
     worktree_record_for_cwd(cwd).map(|(_db, rec)| rec.source_repo)
 }
@@ -1015,20 +1085,20 @@ pub fn touch_worktree_for_cwd(cwd: &str) {
 
 pub async fn prepare_worktree_creation(req: &CreateWorktreeRequest) -> PrepareWorktreeResult {
     let source_path = Path::new(&req.source_path);
-    let git_root = match find_main_repo_root_from_path(source_path) {
-        Ok(root) => root,
+    let grove_requested = req.grove_worktree.unwrap_or(false);
+    let layout = match create_root::resolve_create_source_layout(source_path, grove_requested).await
+    {
+        Ok(layout) => layout,
         Err(e) => {
             return PrepareWorktreeResult {
-                response: Err(anyhow::anyhow!("Invalid source path: {}", e)),
+                response: Err(anyhow::anyhow!("Invalid source path: {e}")),
                 spawn_task: false,
             };
         }
     };
 
-    let worktree_path = resolve_worktree_path(req, &git_root);
-    let source_git_root = find_git_root_from_path(source_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+    let worktree_path = resolve_worktree_path(req, &layout.git_root);
+    let source_git_root = layout.source_git_root.clone();
 
     if is_worktree_in_progress(&req.session_id).await {
         return PrepareWorktreeResult {
@@ -1058,9 +1128,10 @@ pub async fn prepare_worktree_creation(req: &CreateWorktreeRequest) -> PrepareWo
     }
 
     // Verify source is a valid git repository/worktree
-    if git_cli(source_path, &["rev-parse", "--git-dir"])
-        .await
-        .is_err()
+    if !layout.skipped_libgit2
+        && git_cli(source_path, &["rev-parse", "--git-dir"])
+            .await
+            .is_err()
     {
         return PrepareWorktreeResult {
             response: Err(anyhow::anyhow!("Not a git repository or worktree")),
@@ -1135,24 +1206,38 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
     let start = std::time::Instant::now();
     let source_path = Path::new(&req.source_path);
     let session_id = req.session_id.clone();
-    let git_root = match find_main_repo_root_from_path(source_path) {
-        Ok(root) => root,
-        Err(e) => {
-            tracing::warn!(
-                target: WORKTREE_LOG,
-                session_id = %session_id,
-                source = %req.source_path,
-                error = %e,
-                "CREATE_ERROR: invalid source path"
-            );
-            return WorktreeStatus::Error {
-                session_id,
-                message: format!("Invalid source path: {}", e),
-            };
+    let grove_enabled = req.grove_worktree.unwrap_or(false);
+    let (worktree_path_str, source_git_root) = if let Some(pinned) = &req.worktree_path {
+        let source_buf = source_path.to_path_buf();
+        let resolved = req.resolved_source_git_root.clone();
+        let source_git_root = blocking_copy_on_write(move || {
+            source_git_root_for_pinned_dest(&source_buf, grove_enabled, resolved)
+        })
+        .await
+        .ok()
+        .flatten();
+        (pinned.clone(), source_git_root)
+    } else {
+        match create_root::resolve_create_source_layout(source_path, grove_enabled).await {
+            Ok(layout) => (
+                resolve_worktree_path(req, &layout.git_root),
+                layout.source_git_root,
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    target: WORKTREE_LOG,
+                    session_id = %session_id,
+                    source = %req.source_path,
+                    error = %e,
+                    "CREATE_ERROR: invalid source path"
+                );
+                return WorktreeStatus::Error {
+                    session_id,
+                    message: format!("Invalid source path: {e}"),
+                };
+            }
         }
     };
-
-    let worktree_path_str = resolve_worktree_path(req, &git_root);
 
     tracing::info!(
         target: WORKTREE_LOG,
@@ -1184,17 +1269,31 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
     let source_path = req.source_path.clone();
     let dest_path = worktree_path_str.clone();
     let git_ref = req.git_ref.clone();
-    let grove_enabled = req.grove_worktree.unwrap_or(false);
     // Determine worktree type, preserving the .git.is_dir() guard for Standalone mode.
     // A linked worktree has a `.git` *file* pointing to the main repo; a real repo has a `.git` *directory*.
+    // Status RPC must not run on the async runtime.
     let requested_type = req.worktree_type.unwrap_or(WorktreeType::Linked);
-    let requested_type = resolve_grove_fuse_creation_type(
-        Path::new(&req.source_path),
-        requested_type,
-        grove_enabled,
-        &working_tree_mode,
-        session_id.as_str(),
-    );
+    let source_for_rewrite = req.source_path.clone();
+    let sid_for_rewrite = session_id.clone();
+    let requested_type = match blocking_copy_on_write(move || {
+        resolve_grove_fuse_creation_type(
+            Path::new(&source_for_rewrite),
+            requested_type,
+            grove_enabled,
+            &working_tree_mode,
+            sid_for_rewrite.as_str(),
+        )
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return WorktreeStatus::Error {
+                session_id,
+                message: format!("Worktree creation failed: {e}"),
+            };
+        }
+    };
     let git_dir_is_directory = std::path::Path::new(&req.source_path).join(".git").is_dir();
     let creation_mode = if requested_type == WorktreeType::Standalone {
         if git_dir_is_directory {
@@ -1357,11 +1456,6 @@ pub async fn create_worktree_streaming<N: WorktreeNotificationSender>(
         elapsed_ms,
         "CREATE_OK: worktree created successfully"
     );
-
-    // source_path was shadowed as a String for the spawn_blocking closure above.
-    let source_git_root = find_git_root_from_path(Path::new(&req.source_path))
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
 
     WorktreeStatus::Created {
         session_id: req.session_id.clone(),
@@ -1635,6 +1729,10 @@ pub struct CreateWorktreeFromWorktreeRequest {
     pub label: Option<String>,
     #[serde(default, alias = "nfsWorktree", alias = "nfs_worktree")]
     pub grove_worktree: Option<bool>,
+    /// Where the grove gate decision came from ("request", "flag", ...).
+    /// Provenance for telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grove_gate_source: Option<String>,
     /// When tripped, the file copy is aborted mid-flight and the partial worktree is cleaned up.
     #[serde(skip)]
     pub cancellation_token: Option<tokio_util::sync::CancellationToken>,
@@ -1642,10 +1740,13 @@ pub struct CreateWorktreeFromWorktreeRequest {
     /// async creation reuses the same directory returned to the client.
     #[serde(skip)]
     pub resolved_dest_path: Option<String>,
+    /// `Creating.source_git_root` pinned with dest so streaming does not use launch cwd.
+    #[serde(skip)]
+    pub resolved_source_git_root: Option<String>,
 }
 
 impl CreateWorktreeFromWorktreeRequest {
-    /// Project onto the lean wire request, dropping the two `#[serde(skip)]`
+    /// Project onto the lean wire request, dropping `#[serde(skip)]`
     /// runtime-only fields (which never ride the wire anyway). Consumes `self`
     /// so the owned string fields move instead of cloning.
     pub fn into_wire(self) -> CreateWorktreeFromWorktreeRequestWire {
@@ -1657,6 +1758,7 @@ impl CreateWorktreeFromWorktreeRequest {
             worktree_type: self.worktree_type,
             label: self.label,
             grove_worktree: self.grove_worktree,
+            grove_gate_source: self.grove_gate_source,
         }
     }
 }
@@ -1671,28 +1773,39 @@ impl From<CreateWorktreeFromWorktreeRequestWire> for CreateWorktreeFromWorktreeR
             worktree_type: w.worktree_type,
             label: w.label,
             grove_worktree: w.grove_worktree,
+            grove_gate_source: w.grove_gate_source,
             // Runtime-only fields, never on the wire.
             cancellation_token: None,
             resolved_dest_path: None,
+            resolved_source_git_root: None,
         }
     }
 }
 
 /// Resolve the target worktree path for a fork operation.
 ///
-/// When the source path is already inside `~/.grok/worktrees/<repo>/`, the
-/// repo name is derived from the directory structure rather than calling
-/// `find_main_repo_root_from_path` (which would return the standalone
-/// worktree root itself, causing nested paths).
+/// When the source path is already inside `~/.opengrok/worktrees/<repo>/`, the
+/// repo name is derived from the directory structure rather than `git_root`
+/// (which would be the standalone worktree itself, causing nested paths).
 fn resolve_fork_worktree_path(
     source_worktree_path: &Path,
-    _new_session_id: &str,
+    git_root: &Path,
     label: Option<&str>,
-) -> Result<String> {
-    let base = worktree_base_dir_for_source(source_worktree_path)?;
+) -> String {
+    let grok_home = grok_home();
+    let worktrees_dir = grok_home.join("worktrees");
+    let base = if let Ok(suffix) = source_worktree_path.strip_prefix(&worktrees_dir) {
+        if let Some(component) = suffix.components().next() {
+            worktrees_dir.join(component)
+        } else {
+            worktrees_dir.join("repo")
+        }
+    } else {
+        worktree_base_dir(git_root)
+    };
     let dir_name = derive_worktree_label(label);
     let dir_name = resolve_label_collision(&base, &dir_name);
-    Ok(base.join(dir_name).to_string_lossy().into_owned())
+    base.join(dir_name).to_string_lossy().into_owned()
 }
 
 /// Prepare for creating a worktree from another worktree (fork flow).
@@ -1701,11 +1814,26 @@ pub async fn prepare_worktree_from_worktree(
     req: &CreateWorktreeFromWorktreeRequest,
 ) -> PrepareWorktreeResult {
     let source_path = Path::new(&req.source_worktree_path);
+    let grove_requested = req.grove_worktree.unwrap_or(false);
+    let layout = match create_root::resolve_create_source_layout(source_path, grove_requested).await
+    {
+        Ok(layout) => layout,
+        Err(e) => {
+            return PrepareWorktreeResult {
+                response: Err(anyhow::anyhow!(
+                    "Source path is not a valid git repository or worktree: {}: {e}",
+                    req.source_worktree_path
+                )),
+                spawn_task: false,
+            };
+        }
+    };
 
     // Verify the source path is a valid git worktree
-    if git_cli(source_path, &["rev-parse", "--git-dir"])
-        .await
-        .is_err()
+    if !layout.skipped_libgit2
+        && git_cli(source_path, &["rev-parse", "--git-dir"])
+            .await
+            .is_err()
     {
         return PrepareWorktreeResult {
             response: Err(anyhow::anyhow!(
@@ -1717,19 +1845,8 @@ pub async fn prepare_worktree_from_worktree(
     }
 
     let worktree_path =
-        match resolve_fork_worktree_path(source_path, &req.new_session_id, req.label.as_deref()) {
-            Ok(path) => path,
-            Err(e) => {
-                return PrepareWorktreeResult {
-                    response: Err(anyhow::anyhow!("Failed to resolve worktree path: {}", e)),
-                    spawn_task: false,
-                };
-            }
-        };
-
-    let git_root_str = find_git_root_from_path(source_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
+        resolve_fork_worktree_path(source_path, &layout.git_root, req.label.as_deref());
+    let git_root_str = layout.source_git_root;
 
     // Check if creation is already in progress
     if is_worktree_in_progress(&req.new_session_id).await {
@@ -1839,17 +1956,30 @@ pub async fn create_worktree_from_worktree_streaming<N: WorktreeNotificationSend
         "FORK_START: creating worktree from existing worktree"
     );
 
-    let git_root = find_git_root_from_path(source_path).ok();
-
-    let worktree_path_str = if let Some(resolved) = pinned_dest_path {
-        resolved
+    let grove_enabled = req.grove_worktree.unwrap_or(false);
+    let (worktree_path_str, source_git_root) = if let Some(resolved) = pinned_dest_path {
+        let source_buf = source_path.to_path_buf();
+        let pin = req.resolved_source_git_root.clone();
+        let source_git_root = blocking_copy_on_write(move || {
+            source_git_root_for_pinned_dest(&source_buf, grove_enabled, pin)
+        })
+        .await
+        .ok()
+        .flatten();
+        (resolved, source_git_root)
     } else {
-        match resolve_fork_worktree_path(source_path, &req.new_session_id, req.label.as_deref()) {
-            Ok(path) => path,
+        match create_root::resolve_create_source_layout(source_path, grove_enabled).await {
+            Ok(layout) => (
+                resolve_fork_worktree_path(source_path, &layout.git_root, req.label.as_deref()),
+                layout.source_git_root,
+            ),
             Err(e) => {
                 return WorktreeStatus::Error {
                     session_id,
-                    message: format!("Failed to resolve worktree path: {}", e),
+                    message: format!(
+                        "Source path is not a valid git repository or worktree: {}: {e}",
+                        req.source_worktree_path
+                    ),
                 };
             }
         }
@@ -1928,7 +2058,6 @@ pub async fn create_worktree_from_worktree_streaming<N: WorktreeNotificationSend
         );
         let session_id_for_builder = session_id.clone();
         let btrfs_delegate = btrfs_delegate_from_env();
-        let grove_enabled = req.grove_worktree.unwrap_or(false);
         let label_for_meta = label_from_path(&worktree_path_str);
         let label_metadata = build_label_metadata(&label_for_meta, false);
         tokio::task::spawn_blocking(move || {
@@ -2085,7 +2214,7 @@ pub async fn create_worktree_from_worktree_streaming<N: WorktreeNotificationSend
         session_id: req.new_session_id.clone(),
         worktree_path: absolute_path,
         commit: report.commit,
-        source_git_root: git_root.map(|p| p.to_string_lossy().to_string()),
+        source_git_root,
         copied_changes: Some(copied_changes),
     }
 }
@@ -2096,12 +2225,16 @@ pub async fn create_worktree_from_worktree_sync(
     req: &CreateWorktreeFromWorktreeRequest,
 ) -> Result<CreateWorktreeFromWorktreeResponse> {
     let source_path = Path::new(&req.source_worktree_path);
-    let source_git_root = find_git_root_from_path(source_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-
+    let grove_enabled = req.grove_worktree.unwrap_or(false);
+    let layout = match create_root::resolve_create_source_layout(source_path, grove_enabled).await {
+        Ok(layout) => layout,
+        Err(e) => {
+            return Err(e);
+        }
+    };
+    let source_git_root = layout.source_git_root.clone();
     let worktree_path_str =
-        resolve_fork_worktree_path(source_path, &req.new_session_id, req.label.as_deref())?;
+        resolve_fork_worktree_path(source_path, &layout.git_root, req.label.as_deref());
 
     // Check if worktree already exists
     if tokio::fs::metadata(&worktree_path_str).await.is_ok() {
@@ -2164,7 +2297,6 @@ pub async fn create_worktree_from_worktree_sync(
     );
     let session_id_for_builder = req.new_session_id.clone();
     let btrfs_delegate = btrfs_delegate_from_env();
-    let grove_enabled = req.grove_worktree.unwrap_or(false);
     let label_for_meta = label_from_path(&worktree_path_str);
     let label_metadata = build_label_metadata(&label_for_meta, false);
     let report = tokio::task::spawn_blocking(move || {
@@ -2469,10 +2601,18 @@ pub async fn create_jj_workspace(
     req: &CreateWorktreeFromWorktreeRequest,
 ) -> Result<CreateWorktreeFromWorktreeResponse> {
     let source_path = Path::new(&req.source_worktree_path);
-    let source_git_root = find_git_root_from_path(source_path)
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    let dest = resolve_fork_worktree_path(source_path, &req.new_session_id, req.label.as_deref())?;
+    let grove = req.grove_worktree.unwrap_or(false);
+    let source_buf = source_path.to_path_buf();
+    let (source_git_root, dest_slug) = blocking_copy_on_write(move || {
+        let (slug, nearest) = create_root::jj_slug_and_source_git_root(&source_buf, grove);
+        (
+            nearest.map(|p| p.to_string_lossy().into_owned()),
+            slug.unwrap_or(source_buf),
+        )
+    })
+    .await
+    .context("jj dest slug join failed")?;
+    let dest = resolve_fork_worktree_path(source_path, &dest_slug, req.label.as_deref());
 
     if tokio::fs::metadata(&dest).await.is_ok() {
         let commit = jj_commit_id(Path::new(&dest)).await;
@@ -3317,6 +3457,8 @@ mod tests {
             worktree_type: None,
             label: None,
             grove_worktree: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
 
         let result = prepare_worktree_creation(&req).await;
@@ -3374,6 +3516,8 @@ mod tests {
             worktree_type: None,
             label: None,
             grove_worktree: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
 
         let notifier = MarkerProbeNotifier {
@@ -3419,6 +3563,8 @@ mod tests {
             grove_worktree: None,
             cancellation_token: None,
             resolved_dest_path: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
 
         let result = prepare_worktree_from_worktree(&req).await;
@@ -3482,6 +3628,8 @@ mod tests {
             worktree_type: None,
             label: None,
             grove_worktree: None,
+            resolved_source_git_root: None,
+            grove_gate_source: None,
         };
         let notifier = TerminalStatusCounter {
             terminal: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),

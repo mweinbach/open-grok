@@ -13,7 +13,7 @@ fn empty_policy_slots_are_not_unsigned_policy() {
     }
 }
 
-fn test_keypair() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
+pub(crate) fn test_keypair() -> (ring::signature::Ed25519KeyPair, Vec<u8>) {
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
     let kp = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
@@ -25,7 +25,10 @@ fn keyset<'a>(id: &'a str, pubkey: &'a [u8]) -> Vec<(&'a str, &'a [u8])> {
     vec![(id, pubkey)]
 }
 
-fn sign(kp: &ring::signature::Ed25519KeyPair, payload: &SignedPayload) -> SignatureEnvelope {
+pub(crate) fn sign(
+    kp: &ring::signature::Ed25519KeyPair,
+    payload: &SignedPayload,
+) -> SignatureEnvelope {
     let signed_payload = serde_json::to_string(payload).unwrap();
     let sig = kp.sign(signed_payload.as_bytes());
     SignatureEnvelope {
@@ -35,7 +38,7 @@ fn sign(kp: &ring::signature::Ed25519KeyPair, payload: &SignedPayload) -> Signat
     }
 }
 
-fn payload() -> SignedPayload {
+pub(crate) fn payload() -> SignedPayload {
     SignedPayload {
         typ: MANAGED_POLICY_TYP.into(),
         version: 1,
@@ -939,6 +942,83 @@ fn signed_cache_compromised_expired_reads_compromised() {
     );
 }
 
+/// The hooks classification predicate: only an authentic envelope whose signed requirements equal the caller's bytes attests.
+#[test]
+fn signed_requirements_attest_requires_authentic_equal_requirements() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (kp, pubkey) = test_keypair();
+    let keys = keyset("v1", &pubkey);
+    let p = payload(); // fail_closed = false: attestation is about authorship, not the gate's opt-in
+    let signed = p.requirements.clone().unwrap();
+
+    // No sidecar: the bytes could be the user's own
+    assert!(!signed_requirements_attest_with_keys(home, &keys, &signed));
+
+    // Authentic and equal attests, expiry and identity notwithstanding
+    write_sidecar(home, &sign(&kp, &p)).unwrap();
+    assert!(signed_requirements_attest_with_keys(home, &keys, &signed));
+    let expired_foreign = SignedPayload {
+        expires_at: 1,
+        team_id: Some("team-other".into()),
+        ..payload()
+    };
+    write_sidecar(home, &sign(&kp, &expired_foreign)).unwrap();
+    assert!(
+        signed_requirements_attest_with_keys(home, &keys, &signed),
+        "authorship does not lapse with expiry or a foreign binding; the gate and refetch own those"
+    );
+
+    // A forged signature is not authorship evidence
+    let mut bad = sign(&kp, &p);
+    bad.signature = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
+    write_sidecar(home, &bad).unwrap();
+    assert!(!signed_requirements_attest_with_keys(home, &keys, &signed));
+
+    // Edited bytes read user-owned; the other slot's state is irrelevant to these bytes
+    write_sidecar(home, &sign(&kp, &p)).unwrap();
+    assert!(!signed_requirements_attest_with_keys(
+        home,
+        &keys,
+        "[features]\nweb_fetch = true\n"
+    ));
+    assert!(!signed_requirements_attest_with_keys(home, &keys, ""));
+
+    // A signed-absent or signed-empty requirements slot attests nothing
+    for requirements in [None, Some(String::new())] {
+        let none = SignedPayload {
+            requirements,
+            ..payload()
+        };
+        write_sidecar(home, &sign(&kp, &none)).unwrap();
+        assert!(!signed_requirements_attest_with_keys(home, &keys, ""));
+        assert!(!signed_requirements_attest_with_keys(home, &keys, &signed));
+    }
+}
+
+/// An unreadable sidecar attests nothing, so the layer loads as the user's own; the gate treats the same read as a blip, not tamper, and admits the session.
+#[cfg(unix)]
+#[test]
+fn signed_requirements_attest_is_false_when_sidecar_unreadable() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (kp, pubkey) = test_keypair();
+    let keys = keyset("v1", &pubkey);
+    let p = payload();
+    let signed = p.requirements.as_deref().unwrap();
+    write_sidecar(home, &sign(&kp, &p)).unwrap();
+    assert!(signed_requirements_attest_with_keys(home, &keys, signed));
+    let path = sidecar_path(home);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_to_string(&path).is_ok() {
+        eprintln!("skipping: permissions not enforced (running as root?)");
+        return;
+    }
+    assert!(matches!(read_sidecar(home), SidecarRead::Unreadable));
+    assert!(!signed_requirements_attest_with_keys(home, &keys, signed));
+}
+
 /// Rewriting the untrusted outer `sidecar.key_id` can't redirect verification —
 /// only the SIGNED payload's `key_id` selects the verifying key.
 #[test]
@@ -1097,5 +1177,25 @@ fn remote_kill_switch_with_keys_disarms_and_rearms() {
 
         apply_remote_managed_config_signature_verification(None, true);
         assert!(verification_active());
+    });
+}
+
+/// The kill-switch stops the gate from refusing sessions; it does not change who authored the cache, so attestation only follows the embedded keys.
+#[test]
+fn signed_requirements_attest_ignores_remote_kill_switch() {
+    with_remote_disarm_lock(|| {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let (kp, pubkey) = test_keypair();
+        let p = payload();
+        write_sidecar(home, &sign(&kp, &p)).unwrap();
+        let signed = p.requirements.as_deref().unwrap();
+        test_seam::with_keys(&keyset("v1", &pubkey), || {
+            apply_remote_managed_config_signature_verification(Some(false), true);
+            assert!(!verification_active());
+            assert!(signed_requirements_attest(home, signed));
+            apply_remote_managed_config_signature_verification(None, true);
+            assert!(signed_requirements_attest(home, signed));
+        });
     });
 }

@@ -579,7 +579,7 @@ pub enum GoalPauseReasonTelemetry {
 
 /// Outcome of a single tool call. More granular than a boolean -- distinguishes
 /// between tools that executed vs tools that were never run.
-#[derive(Debug, Clone, Copy, Serialize, strum::IntoStaticStr)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::IntoStaticStr)]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ToolOutcome {
@@ -631,6 +631,8 @@ pub enum TurnOutcomeLabel {
     Completed,
     Cancelled,
     Error,
+    /// Written at session load for a `turn_started` the previous process never closed.
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

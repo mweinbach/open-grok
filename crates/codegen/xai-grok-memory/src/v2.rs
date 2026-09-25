@@ -25,6 +25,17 @@ const MAX_SOURCE_BYTES: u64 = 64 * 1024;
 /// cannot persist more content than v2 will inspect while building a manifest.
 pub const MAX_MANUAL_OBSERVATION_BYTES: usize = MAX_SOURCE_BYTES as usize;
 const MAX_HASH_VERIFIED_MANIFEST_FILES: usize = 4_096;
+/// Committed observation files not yet archived by Dream. The `REPLACE` join must
+/// keep this exact text so the expression index on `consolidation_archives` applies.
+pub(crate) const COMMITTED_UNARCHIVED_FILES_SQL: &str = "SELECT f.path, f.content_hash
+     FROM capture_observation_files f
+     JOIN capture_outcomes o USING(job_id)
+     LEFT JOIN consolidation_archives a
+       ON REPLACE(a.source_path, char(92), '/')
+        = REPLACE(f.path, char(92), '/')
+     WHERE a.source_path IS NULL
+     ORDER BY f.path
+     LIMIT ?1";
 
 pub type Result<T> = std::result::Result<T, V2StorageError>;
 
@@ -722,17 +733,7 @@ pub(crate) fn excluded_manifest_paths_with_journal_mode(
     }
 
     let mut statement = connection
-        .prepare(
-            "SELECT f.path, f.content_hash
-             FROM capture_observation_files f
-             JOIN capture_outcomes o USING(job_id)
-             LEFT JOIN consolidation_archives a
-               ON REPLACE(a.source_path, char(92), '/')
-                = REPLACE(f.path, char(92), '/')
-             WHERE a.source_path IS NULL
-             ORDER BY f.path
-             LIMIT ?1",
-        )
+        .prepare(COMMITTED_UNARCHIVED_FILES_SQL)
         .map_err(|source| V2StorageError::Database {
             database: "state",
             path: state_path.clone(),
