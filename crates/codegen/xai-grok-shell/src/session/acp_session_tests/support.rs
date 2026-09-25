@@ -176,7 +176,7 @@ async fn test_agent_from_config(
     use xai_grok_tools::computer::types::AsyncFileSystem;
     use xai_grok_tools::notification::ToolNotificationHandle;
     use xai_grok_tools::registry::types::SessionContext;
-    let builder = crate::tools::bridge::ToolBridge::get_builder();
+    let builder = crate::tools::bridge::ToolBridge::get_builder().with_mcp_file_input_preparation();
     let fs: std::sync::Arc<dyn AsyncFileSystem> = std::sync::Arc::new(LocalFs);
     let ctx = SessionContext {
         backend,
@@ -314,6 +314,7 @@ pub(crate) async fn create_test_actor_with_terminal(
     let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
+            max_request_bytes: None,
             base_url: "http://localhost".to_string(),
             model: "test".to_string(),
             max_completion_tokens: None,
@@ -336,6 +337,15 @@ pub(crate) async fn create_test_actor_with_terminal(
     );
     chat_state_handle.record_token_usage(total_tokens);
     let actor = SessionActor {
+        hook_disabled: Default::default(),
+        is_chat_kind: false,
+        vcs_kind: xai_grok_workspace::session::git::VcsKind::None,
+        vcs_root: None,
+        transient_retry_enabled: true,
+        transient_retries_prompt_total: std::cell::Cell::new(0),
+        transient_episode_start: std::cell::Cell::new(None),
+        status_wake: Default::default(),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         session_info: SessionInfo {
             id: acp::SessionId::new("test-actor"),
             cwd: cwd.as_str().to_string(),
@@ -372,9 +382,6 @@ pub(crate) async fn create_test_actor_with_terminal(
         compaction_at_tokens: std::cell::Cell::new(None),
         doom_loop_recovery: None,
         doom_loop_turn_tally: Default::default(),
-        transient_turn_retries: false,
-        transient_retries_prompt_total: std::cell::Cell::new(0),
-        transient_episode_start: std::cell::Cell::new(None),
         rate_limit_waits: Default::default(),
         sampling_gate: None,
         file_state_tracker: Arc::new(FileStateTracker::new()),
@@ -396,6 +403,12 @@ pub(crate) async fn create_test_actor_with_terminal(
             prefix_released: std::sync::atomic::AtomicBool::new(false),
             cancel: Default::default(),
         },
+        long_reasoning_reminder: crate::session::long_reasoning_reminder::LongReasoningReminder {
+            enabled: false,
+            tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+            delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+        },
+        long_reasoning_turn_state: Default::default(),
         memory: crate::session::memory_state::SessionMemory::empty(),
         session_start: std::time::Instant::now(),
         inference_idle_timeout: Duration::from_secs(300),
@@ -460,10 +473,9 @@ pub(crate) async fn create_test_actor_with_terminal(
         pending_classifier_completions: parking_lot::Mutex::new(std::collections::VecDeque::new()),
         goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
         managed_mcp_handle: Default::default(),
-        initial_client_mcp_servers: vec![],
+        initial_client_mcp_servers: Default::default(),
         tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
         mcp_announcements: Default::default(),
-        status_wake: Default::default(),
         status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         mcp_reminder_mode: McpReminderMode::Delta,
         mcp_reminder_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -488,7 +500,6 @@ pub(crate) async fn create_test_actor_with_terminal(
         turn_end_tx: Default::default(),
         client_hooks: Default::default(),
         hook_resolved_workspace_root: String::new(),
-        vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
         hook_load_errors: std::cell::RefCell::new(Vec::new()),
         plugin_registry: std::cell::RefCell::new(None),
         plugin_registry_handle: None,
@@ -776,7 +787,7 @@ pub(crate) async fn prepare_call(
     let mut deferred = Vec::new();
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        actor.prepare_tool_call(call, &mut deferred),
+        actor.prepare_tool_call(call, &mut deferred, None),
     )
     .await
     .expect("prepare_tool_call must not hang")
@@ -1039,4 +1050,134 @@ pub(crate) fn spawn_capturing_gateway_loop(
         }
     });
     (acp_updates, xai_updates)
+}
+#[cfg(test)]
+pub(crate) async fn actor_with_persistence_drain_and_sampler(
+    sampler: xai_grok_sampler::SamplerHandle,
+) -> std::sync::Arc<SessionActor> {
+    let (gateway_tx, mut gateway_rx) =
+        tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+    tokio::task::spawn_local(async move { while gateway_rx.recv().await.is_some() {} });
+    let (persistence_tx, mut persistence_rx) =
+        tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
+    tokio::task::spawn_local(async move {
+        while let Some(msg) = persistence_rx.recv().await {
+            if let PersistenceMsg::FlushAndAck { respond_to } = msg {
+                let _ = respond_to.send(Ok(()));
+            }
+        }
+    });
+    let (mut actor, _) = create_test_actor_with_terminal(
+        0,
+        256_000,
+        85,
+        gateway_tx,
+        persistence_tx,
+        Arc::new(DummyTerminal),
+    )
+    .await;
+    actor.sampler_handle = sampler;
+    std::sync::Arc::new(actor)
+}
+/// Fresh per-step transient-retry state for direct `handle_sampling_failure` calls: `step_attempts` used, full turn budget, no open episode.
+pub(crate) fn transient_state(step_attempts: u32, enabled: bool) -> TransientRetryState {
+    TransientRetryState {
+        step_attempts,
+        prompt_attempts: 0,
+        episode_start: None,
+        enabled,
+    }
+}
+pub(crate) fn ms(n: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(n)
+}
+pub(crate) async fn plain_actor() -> SessionActor {
+    let (gw_tx, _gw_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (persist_tx, _persist_rx) = tokio::sync::mpsc::unbounded_channel();
+    create_test_actor(100, 256_000, 80, gw_tx, persist_tx).await
+}
+pub(crate) async fn actor_with_mcp(
+    configs: Vec<acp::McpServer>,
+    initialized: bool,
+    initializing: Vec<String>,
+) -> SessionActor {
+    let a = plain_actor().await;
+    {
+        let mut st = a.mcp_state.lock().await;
+        st.configs = configs;
+        st.cancel_init();
+        if initialized || !initializing.is_empty() {
+            assert!(st.try_start_init(), "fixture claims init");
+            let handshaking_pending = !initializing.is_empty();
+            st.mark_servers_initializing(initializing);
+            if initialized {
+                st.finish_init();
+                if !handshaking_pending {
+                    st.complete_init();
+                }
+            }
+        }
+    }
+    a
+}
+pub(crate) fn stdio(name: &str, cmd: &str) -> acp::McpServer {
+    let args = if cmd == "sleep" {
+        vec!["300".to_string()]
+    } else {
+        vec![]
+    };
+    acp::McpServer::Stdio(
+        acp::McpServerStdio::new(name.to_string(), cmd)
+            .args(args)
+            .env(vec![]),
+    )
+}
+pub(crate) async fn register_stub(bridge: &crate::tools::bridge::ToolBridge, name: &'static str) {
+    bridge
+        .register_mcp_tools(
+            name.to_string(),
+            StubMcpTool(name),
+            Some(serde_json::json!({"type": "object"})),
+        )
+        .await
+        .expect("stub registration");
+}
+#[derive(Debug, Clone)]
+pub(crate) struct StubMcpTool(pub(crate) &'static str);
+impl xai_grok_tools::types::tool_metadata::ToolMetadata for StubMcpTool {
+    fn kind(&self) -> xai_grok_tools::types::tool::ToolKind {
+        xai_grok_tools::types::tool::ToolKind::Other
+    }
+    fn tool_namespace(&self) -> xai_grok_tools::types::tool::ToolNamespace {
+        xai_grok_tools::types::tool::ToolNamespace::MCP
+    }
+    fn description_template(&self) -> &str {
+        "stub MCP tool"
+    }
+}
+impl xai_tool_runtime::Tool for StubMcpTool {
+    type Args = serde_json::Value;
+    type Output = xai_grok_tools::types::output::ToolOutput;
+    fn id(&self) -> xai_tool_protocol::ToolId {
+        xai_tool_protocol::ToolId::new(self.0).expect("valid tool id")
+    }
+    fn description(
+        &self,
+        _ctx: &xai_tool_runtime::ListToolsContext,
+    ) -> xai_tool_types::ToolDescription {
+        xai_tool_types::ToolDescription::new(self.0, "stub MCP tool")
+    }
+    async fn run(
+        &self,
+        _ctx: xai_tool_runtime::ToolCallContext,
+        _args: serde_json::Value,
+    ) -> Result<Self::Output, xai_tool_runtime::ToolError> {
+        Ok(xai_grok_tools::types::output::ToolOutput::MCP(
+            xai_grok_tools::types::output::MCPOutput::errored(
+                self.0.into(),
+                "stub".into(),
+                "unused".into(),
+            ),
+        ))
+    }
 }

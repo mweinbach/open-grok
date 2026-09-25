@@ -2,11 +2,24 @@
 
 mod active_agent_message;
 mod permission;
+mod read_profile;
+mod tool_call;
+
+pub(crate) use read_profile::model_origin;
+#[cfg(not(feature = "test-support"))]
+pub(crate) use tool_call::tool_execution_span;
+pub(crate) use tool_call::{
+    CompletedTool, PreparedToolFacts, ToolCallProjection, ToolExecutionInput, coarse_span_outcome,
+    completed_event, record_tool_execution, requested_model_snapshot, tool_identity,
+};
+#[cfg(feature = "test-support")]
+pub use tool_call::{complete_projected_call, grep_output, tool_execution_span};
 
 pub(crate) use active_agent_message::*;
 pub(crate) use permission::*;
 
 use xai_grok_telemetry::events::SessionHarness;
+use xai_grok_tools::implementations::skills::types::SkillScope;
 
 /// Emit an `mcp.server_connection` span. `duration_ms` / `tool_count` /
 /// `error_type` are status-specific; pass `None` when not applicable.
@@ -39,6 +52,21 @@ pub(crate) fn emit_mcp_connection_span(
         span.record("error_type", e);
     }
     span.in_scope(|| {});
+}
+
+/// Plugin id is `plugin_source`; SkillScope on a plugin skill is install location.
+pub(crate) fn skill_source(scope: SkillScope, plugin_name: Option<&str>) -> &'static str {
+    if plugin_name.is_some() {
+        return "plugin";
+    }
+    match scope {
+        SkillScope::Local => "local",
+        SkillScope::Repo => "repo",
+        SkillScope::User => "user",
+        SkillScope::Server => "server",
+        SkillScope::Bundled => "bundled",
+        SkillScope::Plugin => "plugin",
+    }
 }
 
 /// Provenance for `skill.activated`'s `skill_source`: project (under `cwd`),

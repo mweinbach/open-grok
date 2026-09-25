@@ -117,7 +117,28 @@ fn backoff_ladder_clamps_at_last_rung() {
     assert_eq!(transient_backoff_delay(9), Duration::from_secs(30));
     assert_eq!(MAX_TRANSIENT_TURN_RETRIES, 3);
     assert_eq!(MAX_TRANSIENT_RETRIES_PER_PROMPT, 10);
-    assert_eq!(MAX_TRANSIENT_RETRY_WINDOW, Duration::from_secs(600));
+    assert_eq!(TRANSIENT_RETRY_WINDOW_FLOOR, Duration::from_secs(600));
+}
+
+#[test]
+fn episode_window_scales_with_idle_detector() {
+    use std::time::Duration;
+    assert_eq!(
+        transient_retry_window(Duration::from_secs(60)),
+        TRANSIENT_RETRY_WINDOW_FLOOR
+    );
+    assert_eq!(
+        transient_retry_window(Duration::from_secs(300)),
+        TRANSIENT_RETRY_WINDOW_FLOOR
+    );
+    assert_eq!(
+        transient_retry_window(Duration::from_secs(600)),
+        Duration::from_secs(1200)
+    );
+    assert_eq!(
+        transient_retry_window(Duration::from_secs(900)),
+        Duration::from_secs(1800)
+    );
 }
 
 /// The first idle-timeout failure of a step backs off and resubmits rather than killing the turn.
@@ -304,21 +325,36 @@ async fn episode_window_vetoes_after_wall_clock_budget() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (actor, _rx) = make_actor().await;
+            let (gateway_tx, _) = mpsc::unbounded_channel();
+            let (persistence_tx, _persistence_rx) = mpsc::unbounded_channel();
+            let mut actor =
+                create_test_actor(50_000, 100_000, 85, gateway_tx, persistence_tx).await;
+            // A 900s detector puts the effective window (1800s) well past the 600s floor.
+            actor.inference_idle_timeout = std::time::Duration::from_secs(900);
+            let actor = Arc::new(actor);
+            let idle_failure =
+                || error_of_kind(xai_grok_sampler::SamplingErrorKind::IdleTimeout, None);
+            // Paused clock: advance past the window instead of back-dating a live monotonic clock (which underflows on a freshly booted host)
             let episode_start = Some(tokio::time::Instant::now());
-            tokio::time::advance(MAX_TRANSIENT_RETRY_WINDOW + std::time::Duration::from_secs(1))
+            tokio::time::advance(TRANSIENT_RETRY_WINDOW_FLOOR + std::time::Duration::from_secs(1))
                 .await;
             let state = TransientRetryState {
                 episode_start,
                 ..transient_state(0, true)
             };
             let result = actor
-                .handle_sampling_failure_with_recovery(
-                    error_of_kind(xai_grok_sampler::SamplingErrorKind::IdleTimeout, None),
-                    0,
-                    state,
-                    false,
-                )
+                .handle_sampling_failure_with_recovery(idle_failure(), 0, state, false)
+                .await;
+            assert!(
+                matches!(result, Ok(SamplerFailureRecovery::RetryTransient { .. })),
+                "past the floor but inside the scaled window must still resubmit"
+            );
+            tokio::time::advance(
+                transient_retry_window(actor.inference_idle_timeout) - TRANSIENT_RETRY_WINDOW_FLOOR,
+            )
+            .await;
+            let result = actor
+                .handle_sampling_failure_with_recovery(idle_failure(), 0, state, false)
                 .await;
             assert!(
                 result.is_err(),

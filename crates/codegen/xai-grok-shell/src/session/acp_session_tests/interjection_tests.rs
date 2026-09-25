@@ -175,17 +175,11 @@ mod interjection_format_tests {
     }
 
     #[test]
-    fn interjection_reminds_to_finish_previous_work() {
+    fn interjection_does_not_defer_the_user() {
         let wrapped = format_interjection("please also add tests".to_string());
         assert!(
             !wrapped.contains("After completing your current task"),
             "interjection must not defer the user's message, got: {wrapped}"
-        );
-        assert!(
-            wrapped.trim_end().ends_with(
-                "</user_query>\nMake sure to complete any unfinished tasks from previous turns."
-            ),
-            "unfinished-task reminder must follow the wrapped query, got: {wrapped}"
         );
     }
 }

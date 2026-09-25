@@ -92,40 +92,18 @@ impl SessionActor {
                 );
                 ok_end_turn(0, None)
             }
+            // Prompt-turn path for clients without the pager-local `/flush` and `/dream`;
+            // the pager calls `x.ai/memory/flush` and `x.ai/memory/dream` instead.
             BuiltinAction::FlushMemory => {
-                if self.memory.is_enabled() {
-                    let did_flush = if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
-                        matches!(
-                            self.flush_v2_capture().await,
-                            crate::session::memory::v2_capture::FlushResult::Success
-                        )
-                    } else {
-                        self.run_memory_flush("slash_command", None).await
-                    };
-                    if !did_flush {
-                        tracing::info!(
-                            session_id = %self.session_info.id.0,
-                            "memory flush skipped via /flush: another flush already in progress",
-                        );
-                    }
-                } else {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        "memory flush skipped via /flush: memory not enabled for this session",
-                    );
-                }
+                let response = self.memory_flush_command().await;
+                self.send_host_turn_slash_command_output(&response.summary())
+                    .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::Dream => {
-                // No user-visible output — intentional, matches /flush behaviour.
-                if self.memory.is_enabled() {
-                    self.run_dream_slash_command().await;
-                } else {
-                    tracing::warn!(
-                        session_id = %self.session_info.id.0,
-                        "dream skipped via /dream: memory not enabled for this session",
-                    );
-                }
+                let response = self.memory_dream_command().await;
+                self.send_host_turn_slash_command_output(&response.summary())
+                    .await;
                 ok_end_turn(0, None)
             }
             BuiltinAction::ContextInfo => ok_end_turn(0, None),
@@ -734,145 +712,21 @@ impl SessionActor {
                 ok_end_turn(0, None)
             }
             BuiltinAction::Feedback { text } => self.execute_feedback_command(text).await,
-            BuiltinAction::MemoryStatus => {
-                let status = self.memory_v2_status().await;
-                self.send_host_turn_slash_command_output(&status).await;
-                ok_end_turn(0, None)
-            }
             BuiltinAction::MemoryBrowse => {
-                let file_infos = if let Some(ref storage) = *self.memory.storage.borrow() {
-                    match storage.list_memory_files() {
-                        Ok(files) => files
-                            .into_iter()
-                            .map(|path| {
-                                let meta = match std::fs::metadata(&path) {
-                                    Ok(m) => Some(m),
-                                    Err(e) => {
-                                        tracing::debug!(
-                                            path = %path.display(),
-                                            error = %e,
-                                            "skipping memory file with unreadable metadata",
-                                        );
-                                        None
-                                    }
-                                };
-                                crate::extensions::notification::MemoryFileInfo {
-                                    source: storage.classify_source(&path).to_string(),
-                                    path: path.display().to_string(),
-                                    size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                                    modified_epoch_secs: meta
-                                        .and_then(|m| m.modified().ok())
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| d.as_secs()),
-                                    generated: path
-                                        .file_name()
-                                        .is_some_and(|name| name == "MEMORY.md")
-                                        && storage.mode().is_v2(),
-                                }
-                            })
-                            .collect(),
-                        Err(e) => {
-                            tracing::warn!(
-                                session_id = %self.session_info.id.0,
-                                error = %e,
-                                "failed to list memory files",
-                            );
-                            self.send_host_turn_slash_command_output(&format!(
-                                "Failed to list memory files: {e}"
-                            ))
-                            .await;
-                            vec![]
-                        }
+                match self.memory_listing() {
+                    Ok(listing) => {
+                        self.send_xai_notification(XaiSessionUpdate::MemoryFiles {
+                            files: listing.files,
+                            enabled: listing.enabled,
+                            disabled_reason: listing.disabled_reason,
+                            capture_enabled: listing.capture_enabled,
+                            dream_enabled: listing.dream_enabled,
+                        })
+                        .await;
                     }
-                } else {
-                    self.send_host_turn_slash_command_output(
-                        "Memory is not enabled for this session.",
-                    )
-                    .await;
-                    vec![]
-                };
-                tracing::info!(
-                    session_id = %self.session_info.id.0,
-                    file_count = file_infos.len(),
-                    "memory browse: listing files",
-                );
-                self.send_xai_notification(XaiSessionUpdate::MemoryFiles {
-                    files: file_infos,
-                    enabled: self.memory.is_enabled(),
-                    disabled_reason: self.memory.disabled_reason(),
-                    capture_enabled: self.memory.can_capture_v2()
-                        || self.memory.uses_legacy_pipeline(),
-                    dream_enabled: self.memory.v2_config.can_run_manual_dream()
-                        || self.memory.uses_legacy_pipeline(),
-                })
-                .await;
-                ok_end_turn(0, None)
-            }
-            BuiltinAction::MemoryToggle { enabled } => {
-                tracing::info!(
-                    session_id = %self.session_info.id.0,
-                    enabled,
-                    "memory toggle via /memory slash command",
-                );
-                let msg = if enabled && !self.memory.is_enabled() {
-                    if let Some(ref params) = self.memory.backend_params {
-                        let storage = crate::session::memory::MemoryStorage::new(
-                            std::path::Path::new(&self.session_info.cwd),
-                            None,
-                        );
-                        if let Err(e) = storage.ensure_initialized() {
-                            tracing::warn!(error = %e, "failed to initialize memory storage on re-enable");
-                            format!("Memory could not be enabled: {e}")
-                        } else {
-                            let backend =
-                                crate::session::memory::MemoryBackendImpl::from_session_params(
-                                    storage.clone(),
-                                    params,
-                                );
-                            *self.memory.search_counter.borrow_mut() =
-                                Some(backend.search_counter.clone());
-                            let backend: std::sync::Arc<
-                                dyn xai_grok_tools::types::memory_backend::MemoryBackend,
-                            > = std::sync::Arc::new(backend);
-                            let bridge = self.agent.borrow().tool_bridge().clone();
-                            bridge.update_resource(backend.clone()).await;
-                            if let Err(e) = self.register_memory_tools(&bridge).await {
-                                tracing::warn!(error = %e, "memory tool registration failed during toggle");
-                            }
-                            *self.memory.storage.borrow_mut() = Some(storage);
-                            "Memory enabled for this session.".to_owned()
-                        }
-                    } else {
-                        "Memory cannot be enabled (not configured for this session).".to_owned()
-                    }
-                } else if !enabled && self.memory.is_enabled() {
-                    let bridge = self.agent.borrow().tool_bridge().clone();
-                    if !bridge.unregister_tool_by_name(
-                        xai_grok_tools::implementations::memory::MEMORY_SEARCH_TOOL_NAME,
-                    ) {
-                        tracing::debug!("memory_search tool was not registered during unregister");
-                    }
-                    if !bridge.unregister_tool_by_name(
-                        xai_grok_tools::implementations::memory::EXPERIENCE_SEARCH_TOOL_NAME,
-                    ) {
-                        tracing::debug!(
-                            "experience_search tool was not registered during unregister"
-                        );
-                    }
-                    if !bridge.unregister_tool_by_name(
-                        xai_grok_tools::implementations::memory::MEMORY_GET_TOOL_NAME,
-                    ) {
-                        tracing::debug!("memory_get tool was not registered during unregister");
-                    }
-                    *self.memory.storage.borrow_mut() = None;
-                    *self.memory.search_counter.borrow_mut() = None;
-                    "Memory disabled for this session.".to_owned()
-                } else {
-                    let state = if enabled { "enabled" } else { "disabled" };
-                    format!("Memory is already {state}.")
-                };
-                self.send_host_turn_slash_command_output(&msg).await;
-                self.refresh_goal_harness_enabled().await;
+                    // No modal: an empty list would render as a fresh store.
+                    Err(e) => self.send_host_turn_slash_command_output(&e).await,
+                }
                 ok_end_turn(0, None)
             }
             // GoalSet is handled directly in handle_prompt (before this
@@ -1059,13 +913,27 @@ impl SessionActor {
             return ok_end_turn(0, None);
         }
 
-        let (sampling_config, model_metadata, credentials) = tokio::join!(
+        let (sampling_config, model_metadata, credentials, conv) = tokio::join!(
             self.chat_state_handle.get_sampling_config(),
             self.chat_state_handle.get_last_model_metadata(),
             self.chat_state_handle.get_credentials(),
+            self.chat_state_handle.get_conversation(),
         );
-        let model_id = sampling_config.map(|c| c.model);
-        let resolved_model_id = model_metadata.resolved_model_id;
+        let live_model_id = sampling_config.map(|c| c.model);
+        let rated = slash_feedback_rated_turn(&conv);
+        let reasoning_effort = rated.reasoning_effort.map(|e| e.to_string());
+        let (model_id, resolved_model_id) = match rated.model_id {
+            Some(rated_id) => {
+                if model_metadata.resolved_model_id.as_ref() == Some(&rated_id) {
+                    (live_model_id, model_metadata.resolved_model_id)
+                } else if live_model_id.as_ref() != Some(&rated_id) {
+                    (Some(rated_id), None)
+                } else {
+                    (live_model_id, model_metadata.resolved_model_id)
+                }
+            }
+            None => (live_model_id, model_metadata.resolved_model_id),
+        };
         let client_version = credentials.client_version;
 
         use crate::session::feedback_manager::{SessionFeedbackData, SubmitOutcome};
@@ -1076,6 +944,7 @@ impl SessionActor {
                 SessionFeedbackData {
                     model_id,
                     resolved_model_id,
+                    reasoning_effort,
                     client_version,
                     session_cwd: self.session_info.cwd.clone(),
                 },
@@ -1106,4 +975,12 @@ impl SessionActor {
 
         ok_end_turn(0, None)
     }
+}
+
+pub(super) fn slash_feedback_rated_turn(
+    conversation: &[xai_grok_sampling_types::ConversationItem],
+) -> super::FeedbackTurnLookup {
+    super::slash_feedback_last_turn(conversation)
+        .map(|n| super::turn_texts_for_feedback(conversation, n))
+        .unwrap_or_default()
 }

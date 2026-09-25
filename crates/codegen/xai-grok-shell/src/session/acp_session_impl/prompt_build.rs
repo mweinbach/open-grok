@@ -320,6 +320,92 @@ pub(super) fn install_system_prompt(
         }
     }
 }
+/// A resumed head keeps its enriched prompt, but its `<memory>` section must match this
+/// process's memory state: a `/memory` toggle persists the section into the head, while
+/// enablement is re-resolved from config on every spawn. On a mismatch the fresh prompt replaces
+/// the head; an injected manifest block is kept only while memory is on. Returns whether it changed.
+pub(super) fn reconcile_resumed_memory_section(
+    conversation: &mut [ConversationItem],
+    system_prompt: &str,
+) -> bool {
+    let Some(ConversationItem::System(sys)) = conversation.first_mut() else {
+        return false;
+    };
+    let manifest_start = sys.content.find(xai_chat_state::MEMORY_CONTEXT_OPEN_TAG);
+    let head_prompt = manifest_start
+        .and_then(|start| sys.content.get(..start))
+        .unwrap_or(&sys.content);
+    let fresh_has_memory = has_memory_section(system_prompt);
+    if has_memory_section(head_prompt) == fresh_has_memory {
+        return false;
+    }
+    let manifest_block = manifest_start
+        .filter(|_| fresh_has_memory)
+        .and_then(|start| sys.content.get(start..))
+        .map(str::to_owned);
+    sys.content = match manifest_block {
+        Some(block) => std::sync::Arc::<str>::from(format!(
+            "{}\n\n{block}",
+            system_prompt.trim_end_matches('\n')
+        )),
+        None => std::sync::Arc::<str>::from(system_prompt),
+    };
+    true
+}
+/// The `<memory>` block rendered by `templates/prompt.md` when `memory_v2_enabled` is set.
+fn has_memory_section(prompt: &str) -> bool {
+    prompt.contains("\n<memory>\n")
+}
+#[cfg(test)]
+mod reconcile_resumed_memory_section_tests {
+    use super::reconcile_resumed_memory_section;
+    use xai_chat_state::MEMORY_CONTEXT_OPEN_TAG;
+    use xai_grok_sampling_types::conversation::ConversationItem;
+    const WITH_MEMORY: &str = "rules\n\n<memory>\nuse memory\n</memory>\n\nmore";
+    const WITHOUT_MEMORY: &str = "rules\n\nmore";
+    fn head(conv: &[ConversationItem]) -> &str {
+        match conv.first() {
+            Some(ConversationItem::System(s)) => s.content.as_ref(),
+            _ => panic!("first item is not System"),
+        }
+    }
+    #[test]
+    fn matching_heads_are_left_alone() {
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITH_MEMORY} (enriched)"
+        ))];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITH_MEMORY));
+        assert_eq!(head(&conv), format!("{WITH_MEMORY} (enriched)"));
+        let mut conv = vec![ConversationItem::system(WITHOUT_MEMORY)];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+    }
+    #[test]
+    fn memory_now_off_drops_section_and_manifest() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nindex\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITH_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+        assert_eq!(head(&conv), WITHOUT_MEMORY);
+    }
+    #[test]
+    fn memory_now_on_adds_section_and_keeps_manifest() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nindex\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITHOUT_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(reconcile_resumed_memory_section(&mut conv, WITH_MEMORY));
+        assert_eq!(head(&conv), format!("{WITH_MEMORY}\n\n{manifest}"));
+    }
+    #[test]
+    fn memory_word_inside_manifest_does_not_count_as_a_section() {
+        let manifest = format!("{MEMORY_CONTEXT_OPEN_TAG}\nnote says\n<memory>\n</memory-context>");
+        let mut conv = vec![ConversationItem::system(format!(
+            "{WITHOUT_MEMORY}\n\n{manifest}"
+        ))];
+        assert!(!reconcile_resumed_memory_section(&mut conv, WITHOUT_MEMORY));
+    }
+}
 #[cfg(test)]
 mod install_system_prompt_tests {
     use super::install_system_prompt;
@@ -621,6 +707,7 @@ impl SessionActor {
             .map(|s| s.as_str())
             .unwrap_or(&self.session_info.cwd);
         let cwd = std::path::Path::new(display_path);
+        let repo_status = self.resolve_repo_status_prefix().await;
         use xai_grok_agent::prompt::user_message::UserMessageTemplate;
         let (template, include_verification) = {
             let agent = self.agent.borrow();
@@ -630,30 +717,41 @@ impl SessionActor {
                 def.include_browser_verification(),
             )
         };
-        let repo_status = self.resolve_repo_status_prefix().await;
         let mut prefix_carries_fallback_date = false;
-        let mut out = if !matches!(template, UserMessageTemplate::Default) {
+        let (mut out, uses_legacy_prefix) = if !matches!(template, UserMessageTemplate::Default) {
             if let Some(rendered) = self
-                .build_templated_user_message(cwd, template.clone(), repo_status.as_ref())
+                .build_templated_user_message(cwd, template.clone())
                 .await
             {
-                rendered
+                (rendered, false)
             } else {
                 tracing::warn!(
                     "templated user message render failed; falling back to legacy prefix"
                 );
                 prefix_carries_fallback_date = !template.surfaces_local_date();
-                self.construct_legacy_prefix(cwd, repo_status.as_ref())
+                (
+                    self.construct_legacy_prefix(cwd, repo_status.as_ref()),
+                    true,
+                )
             }
         } else {
-            self.construct_legacy_prefix(cwd, repo_status.as_ref())
+            (
+                self.construct_legacy_prefix(cwd, repo_status.as_ref()),
+                true,
+            )
         };
-        if matches!(template, UserMessageTemplate::Default) && include_verification {
-            let (workspace_rules, mut user_rules) = self.gather_partitioned_rules();
-            user_rules.splice(
-                0..0,
-                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
-            );
+        if uses_legacy_prefix {
+            let (workspace_rules, discovered_user_rules) = if include_verification {
+                self.gather_partitioned_rules()
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let mut user_rules = xai_grok_agent::prompt::user_message::built_in_user_rules();
+            if include_verification {
+                user_rules
+                    .extend(xai_grok_agent::prompt::browser_verification::synthetic_user_rules());
+                user_rules.extend(discovered_user_rules);
+            }
             xai_grok_agent::prompt::user_message::append_rules_section(
                 &mut out,
                 &workspace_rules,
@@ -715,17 +813,13 @@ impl SessionActor {
         &self,
         cwd: &std::path::Path,
         template: xai_grok_agent::prompt::user_message::UserMessageTemplate,
-        repo_status: Option<&RepoStatusSnapshot>,
     ) -> Option<String> {
         use xai_grok_agent::prompt::user_message::UserMessageContext;
         self.wait_for_mcp_templated_prefix_ready(&template).await;
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let (vcs_root, vcs_status) = match repo_status {
-            Some(snapshot) => (snapshot.root.clone(), snapshot.templated_status()),
-            None => (None, None),
-        };
-        let (workspace_rules, user_rules) = self.gather_partitioned_rules();
-        let mut user_rules = user_rules;
+        let vcs_root = self.vcs_root.clone();
+        let (workspace_rules, discovered_user_rules) = self.gather_partitioned_rules();
+        let mut user_rules = xai_grok_agent::prompt::user_message::built_in_user_rules();
         let skills = self.slash_skills_for_resolve().await;
         let mcp_servers = self.gather_mcp_servers(cwd).await;
         if self
@@ -734,11 +828,9 @@ impl SessionActor {
             .definition()
             .include_browser_verification()
         {
-            user_rules.splice(
-                0..0,
-                xai_grok_agent::prompt::browser_verification::synthetic_user_rules(),
-            );
+            user_rules.extend(xai_grok_agent::prompt::browser_verification::synthetic_user_rules());
         }
+        user_rules.extend(discovered_user_rules);
         let shell = resolve_session_shell();
         let today_local = chrono::Local::now().date_naive();
         let mcps_root = Self::workspace_mcps_root(cwd).map(|p| p.to_string_lossy().to_string());
@@ -752,7 +844,6 @@ impl SessionActor {
             os_family: crate::util::uname::os_kernel_and_release(),
             shell,
             vcs_root,
-            vcs_status,
             today_local: Some(today_local),
             terminals_folder,
             workspace_rules,

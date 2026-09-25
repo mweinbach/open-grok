@@ -1053,7 +1053,7 @@ impl SessionActor {
             })
     }
 
-    pub(super) async fn flush_v2_capture(self: &Arc<Self>) -> FlushResult {
+    pub(super) async fn flush_v2_capture(self: &Arc<Self>) -> (FlushResult, Option<u32>) {
         if !self.memory.can_capture_v2() {
             use xai_grok_telemetry::memory_telemetry::{
                 MemoryV2Component, MemoryV2FailClosed, MemoryV2FailureClass,
@@ -1062,11 +1062,17 @@ impl SessionActor {
                 component: MemoryV2Component::Flush,
                 reason: MemoryV2FailureClass::Disabled,
             });
-            return FlushResult::TerminalFailure(MemoryV2FailureClass::Disabled);
+            return (
+                FlushResult::TerminalFailure(MemoryV2FailureClass::Disabled),
+                None,
+            );
         }
         let Some(storage) = self.memory.storage() else {
-            return FlushResult::TerminalFailure(
-                xai_grok_telemetry::memory_telemetry::MemoryV2FailureClass::Disabled,
+            return (
+                FlushResult::TerminalFailure(
+                    xai_grok_telemetry::memory_telemetry::MemoryV2FailureClass::Disabled,
+                ),
+                None,
             );
         };
         let session_id = self.session_info.id.to_string();
@@ -1082,11 +1088,17 @@ impl SessionActor {
         {
             Ok(Ok(state)) => state,
             Ok(Err(error)) => {
-                return FlushResult::TerminalFailure(classify_capture_error(&error));
+                return (
+                    FlushResult::TerminalFailure(classify_capture_error(&error)),
+                    None,
+                );
             }
             Err(error) => {
                 tracing::warn!(error = %error, "memory-v2 capture state task failed");
-                return FlushResult::TerminalFailure(MemoryV2FailureClass::Convergence);
+                return (
+                    FlushResult::TerminalFailure(MemoryV2FailureClass::Convergence),
+                    None,
+                );
             }
         };
         self.send_xai_notification(XaiSessionUpdate::MemoryFlushStarted)
@@ -1206,7 +1218,7 @@ impl SessionActor {
             path: None,
         })
         .await;
-        result
+        (result, Some(target))
     }
 
     async fn emit_v2_capture_activity(
@@ -1691,7 +1703,7 @@ mod tests {
         };
         let transcript = select_completed_turn_transcript(
             vec![
-                marked_user("/memory status", 4),
+                marked_user("/memory", 4),
                 ConversationItem::assistant("slash result"),
                 marked_user("cancelled question", 5),
                 ConversationItem::assistant("partial cancelled answer"),
@@ -2144,7 +2156,7 @@ mod tests {
                 tokio::time::advance(FLUSH_TIMEOUT).await;
 
                 assert_eq!(
-                    flush.await.unwrap(),
+                    flush.await.unwrap().0,
                     FlushResult::RetryableFailure(MemoryV2FailureClass::Storage)
                 );
                 actor.memory.stop_capture_worker().await;

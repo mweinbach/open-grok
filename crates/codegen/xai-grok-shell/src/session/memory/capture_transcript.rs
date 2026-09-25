@@ -106,6 +106,13 @@ pub(crate) fn condense_turn_transcript(
         original_items: items.len(),
         ..CondensationStats::default()
     };
+    // Encrypted reasoning is an opaque blob only the originating model can read;
+    // the extractor gets the summary text instead.
+    for item in &mut items {
+        if let ConversationItem::Reasoning(reasoning) = item {
+            reasoning.encrypted_content = None;
+        }
+    }
     let mut json = serialize(&items)?;
     stats.original_bytes = json.len();
     if budget.fits(&json, items.len()) {
@@ -368,6 +375,45 @@ mod tests {
         let plain = serde_json::to_string(&items).unwrap();
         let condensed = condense_turn_transcript(items, TranscriptBudget::for_attempt(1)).unwrap();
         assert_eq!(condensed.json, plain);
+        assert!(!condensed.stats.is_condensed());
+        assert!(condensed.stats.prompt_note().is_none());
+    }
+
+    #[test]
+    fn encrypted_reasoning_is_stripped_even_under_budget() {
+        let mut items = tool_loop(2, 100);
+        items.insert(
+            1,
+            ConversationItem::Reasoning(xai_grok_sampling_types::rs::ReasoningItem {
+                id: "rs_1".to_owned(),
+                summary: vec![xai_grok_sampling_types::rs::SummaryPart::SummaryText(
+                    xai_grok_sampling_types::rs::SummaryTextContent {
+                        text: "user prefers tabs".to_owned(),
+                    },
+                )],
+                content: None,
+                encrypted_content: Some("SEALEDCIPHERTEXT".to_owned()),
+                status: None,
+            }),
+        );
+        let condensed = condense_turn_transcript(items, TranscriptBudget::for_attempt(1)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&condensed.json).unwrap();
+        let reasoning = parsed.get(1).expect("reasoning item survives");
+        assert_eq!(
+            Some("reasoning"),
+            reasoning
+                .pointer("/type")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            Some("user prefers tabs"),
+            reasoning
+                .pointer("/summary/0/text")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert!(reasoning.get("encrypted_content").is_none());
+        assert!(!condensed.json.contains("SEALEDCIPHERTEXT"));
+        // Stripping the blob is not condensation: the model is not told reasoning was omitted.
         assert!(!condensed.stats.is_condensed());
         assert!(condensed.stats.prompt_note().is_none());
     }

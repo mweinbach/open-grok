@@ -277,7 +277,7 @@ async fn real_exit_plan_mode_disconnect_keeps_awaiting_persisted() {
             };
             let mut deferred = Vec::new();
             let outcome = actor
-                .prepare_tool_call(call, &mut deferred)
+                .prepare_tool_call(call, &mut deferred, None)
                 .await
                 .expect("prepare_tool_call should not error");
 
@@ -333,7 +333,7 @@ async fn real_exit_plan_mode_no_client_executes_tool() {
             };
             let mut deferred = Vec::new();
             let outcome = actor
-                .prepare_tool_call(call, &mut deferred)
+                .prepare_tool_call(call, &mut deferred, None)
                 .await
                 .expect("prepare_tool_call should not error");
             // Headless: the tool is prepared (it will execute and exit plan mode).

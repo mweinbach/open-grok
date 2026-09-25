@@ -214,6 +214,7 @@ pub(crate) async fn submit_feedback_workflow(
 pub(crate) struct SessionFeedbackData {
     pub model_id: Option<String>,
     pub resolved_model_id: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub client_version: Option<String>,
     pub session_cwd: String,
 }
@@ -433,6 +434,10 @@ impl FeedbackManager {
         submission.turn_number = Some(turn_number);
         submission.model_id = session_data.model_id;
         submission.resolved_model_id = session_data.resolved_model_id;
+        submission.reasoning_effort = session_data
+            .reasoning_effort
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         submission.last_user_message = None;
         submission.last_assistant_message = None;
         submission.tool_outcomes = tool_outcomes;

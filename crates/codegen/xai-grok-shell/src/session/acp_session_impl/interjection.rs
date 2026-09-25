@@ -143,6 +143,26 @@ impl SessionActor {
             .normalize_images_with_notices(wrapped, images, is_cursor)
             .await;
         if !is_cursor {
+            // The `<image_files>` block is the only durable record of where these images live.
+            // An interjection still goes through when the assets dir cannot be written.
+            if !images.is_empty() {
+                let persisted =
+                    crate::session::persistence::ensure_owner_only_session_dir(&self.session_info)
+                        .and_then(|session_dir| {
+                            crate::session::image_describe::persist_and_prepend_image_files(
+                                &session_dir,
+                                &images,
+                                wrapped.as_str(),
+                            )
+                        });
+                match persisted {
+                    Ok(with_files) => *wrapped = with_files,
+                    Err(error) => tracing::warn!(
+                        ?error,
+                        "interjection images not saved to assets; sending without <image_files>"
+                    ),
+                }
+            }
             return images;
         }
         if !images.is_empty() {
@@ -274,6 +294,7 @@ impl SessionActor {
                     skill_name: sk.name.clone(),
                     plugin_source: sk.plugin_name.clone(),
                     trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
+                    skill_origin: sk.origin.clone(),
                 },
             );
         }

@@ -2,6 +2,18 @@
 //! memory tool registration, and note rewriting.
 
 use super::*;
+use xai_grok_telemetry::session_end::{self, Phase};
+
+const DREAM_MODEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Stale-lock floor: the whole dream (model call plus post-call reindex) must finish inside this, so it must exceed the model timeout; doubling it leaves reindex headroom.
+const DREAM_LOCK_STALE_FLOOR_SECS: u64 = DREAM_MODEL_TIMEOUT.as_secs() * 2;
+
+/// Whether a dream attempt reached the model call. `Ran` reports its own result; `Skipped` returned
+/// before the model call, so a user-initiated caller surfaces the reason and `/dream` is never silent.
+enum DreamAttempt {
+    Ran(MemoryDreamDisposition),
+    Skipped(MemoryDreamDisposition, &'static str),
+}
 
 #[derive(Debug)]
 pub(super) struct MemoryFlushSnapshot {
@@ -126,10 +138,8 @@ impl SessionActor {
             crate::session::memory::experience_ledger::drain(self.memory.experience_run_id());
         let mut session_end_result = "disabled";
         let mut total_chunks_at_end = 0usize;
-        // Dream consolidates *prior* logs. Run after Written/Failed, or when
-        // save was Skipped for config (`save_on_end=false`) but the session
-        // still meets the size threshold. Empty/brief sessions stay off.
-        let mut run_exit_dream = false;
+        // Dream consolidation runs at session launch (spawn_dream_check), never
+        // at close: prior logs are consolidated when the next session starts.
         if !self.startup_hints.is_subagent && self.memory.uses_legacy_pipeline() {
             if let Some(storage) = self.memory.storage() {
                 let conversation = self.chat_state_handle.get_conversation().await;
@@ -180,7 +190,6 @@ impl SessionActor {
                 match &result {
                     crate::session::memory::hooks::SessionEndResult::Written(path_str) => {
                         session_end_result = "written";
-                        run_exit_dream = true;
                         self.reindex_and_embed(std::path::Path::new(path_str), "session")
                             .await;
                         self.send_xai_notification(XaiSessionUpdate::MemorySessionSaved {
@@ -190,17 +199,9 @@ impl SessionActor {
                     }
                     crate::session::memory::hooks::SessionEndResult::Skipped => {
                         session_end_result = "skipped";
-                        // `Skipped` also means save_on_end=false — still dream
-                        // when the conversation is substantial.
-                        run_exit_dream =
-                            crate::session::memory::hooks::queries_meeting_session_end_threshold(
-                                &conversation,
-                            )
-                            .is_some();
                     }
                     crate::session::memory::hooks::SessionEndResult::Failed(_) => {
                         session_end_result = "failed";
-                        run_exit_dream = true;
                     }
                 }
                 total_chunks_at_end = storage.total_chunk_count();
@@ -220,9 +221,6 @@ impl SessionActor {
                 target: xai_grok_telemetry::memory_log::TARGET,
                 "MEMORY_SUBAGENT_SKIP: skipping on_session_end for subagent session"
             );
-        }
-        if run_exit_dream {
-            self.maybe_run_dream().await;
         }
         let telem = self.memory.telemetry_snapshot();
         self.emit_memory_session_summary(&telem, total_chunks_at_end, session_end_result);
@@ -258,10 +256,6 @@ impl SessionActor {
     }
 
     /// Run dream consolidation if gates pass.
-    ///
-    /// Called at session end after the session summary is written.
-    /// Uses the same sampling client infrastructure as flush but sends
-    /// the dream prompt instead. The model call has a 60s timeout.
     pub(super) async fn maybe_run_dream(&self) {
         if self.startup_hints.is_subagent {
             tracing::debug!(
@@ -296,20 +290,26 @@ impl SessionActor {
             "MEMORY_DREAM: gates passed, starting consolidation"
         );
 
-        self.run_dream_inner(&storage, &lock, &sessions_dir, &sessions, "MEMORY_DREAM")
-            .await;
+        self.run_dream_inner(
+            &storage,
+            &lock,
+            &sessions_dir,
+            &sessions,
+            Some(&sid8),
+            "MEMORY_DREAM",
+        )
+        .await;
     }
 
-    /// Run dream from `/dream` slash command, bypassing time/session gates.
-    pub(super) async fn run_dream_slash_command(self: &Arc<Self>) {
+    /// Run dream from the `/dream` slash command, bypassing the time and session gates.
+    pub(super) async fn run_dream_slash_command(self: &Arc<Self>) -> MemoryDreamResponse {
         if self.memory.mode() == Some(crate::config::MemoryMode::V2) {
-            self.run_v2_dream_slash_command().await;
-            return;
+            return self.run_v2_dream_slash_command().await;
         }
         use crate::session::memory::dream_lock::sessions_since;
 
         let Some((storage, lock, sessions_dir, sid8)) = self.dream_context() else {
-            return;
+            return MemoryDreamResponse::new(MemoryDreamDisposition::Disabled);
         };
 
         let sessions = match sessions_since(
@@ -322,7 +322,7 @@ impl SessionActor {
                     target: xai_grok_telemetry::memory_log::TARGET,
                     "MEMORY_DREAM_SLASH: no session logs found, nothing to consolidate"
                 );
-                return;
+                return MemoryDreamResponse::new(MemoryDreamDisposition::NoWork);
             }
             Ok(s) => s,
             Err(e) => {
@@ -331,7 +331,7 @@ impl SessionActor {
                     error = %e,
                     "MEMORY_DREAM_SLASH: failed to list sessions"
                 );
-                return;
+                return MemoryDreamResponse::new(MemoryDreamDisposition::Failed);
             }
         };
 
@@ -341,27 +341,79 @@ impl SessionActor {
             "MEMORY_DREAM_SLASH: starting manual consolidation"
         );
 
-        self.run_dream_inner(
-            &storage,
-            &lock,
-            &sessions_dir,
-            &sessions,
-            "MEMORY_DREAM_SLASH",
-        )
-        .await;
+        // `/dream` is user-initiated, so a skip must be surfaced rather than logged silently.
+        match self
+            .run_dream_inner(
+                &storage,
+                &lock,
+                &sessions_dir,
+                &sessions,
+                None,
+                "MEMORY_DREAM_SLASH",
+            )
+            .await
+        {
+            DreamAttempt::Ran(disposition) => MemoryDreamResponse::new(disposition),
+            DreamAttempt::Skipped(disposition, reason) => {
+                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
+                    result: format!("skipped: {reason}"),
+                    path: None,
+                })
+                .await;
+                MemoryDreamResponse::new(disposition)
+            }
+        }
     }
 
-    /// Shared dream execution: build message, call model, execute, record result.
+    /// Shared dream execution: re-check the gate, build the message, call the model,
+    /// execute, and record the result.
+    /// `recheck_sid8` is `Some` for the gated (auto) path: the gate is re-evaluated
+    /// before the model call.
     async fn run_dream_inner(
         &self,
         storage: &crate::session::memory::MemoryStorage,
         lock: &crate::session::memory::dream_lock::DreamLock,
         sessions_dir: &std::path::Path,
         sessions: &[String],
+        recheck_sid8: Option<&str>,
         log_prefix: &str,
-    ) {
+    ) -> DreamAttempt {
         use crate::session::memory::dream::*;
 
+        // Floor the stale window above the whole dream so a live lock is never
+        // reclaimed mid-run; the engine enforces it when it acquires inside
+        // `execute_dream`.
+        let stale_lock_secs = self
+            .memory
+            .dream_config
+            .stale_lock_secs
+            .max(DREAM_LOCK_STALE_FLOOR_SECS);
+        // Re-check the gate for the auto path: the pre-check ran before a winner may
+        // have consolidated and closed the gate in the meantime. (The fork's dream
+        // engine acquires the lock inside `execute_dream`, so this re-check runs pre-lock.)
+        let rechecked_sessions;
+        let sessions: &[String] = match recheck_sid8 {
+            Some(sid8) => {
+                match check_dream_gates(&self.memory.dream_config, lock, sessions_dir, Some(sid8)) {
+                    DreamGate::Open { sessions } => {
+                        rechecked_sessions = sessions;
+                        &rechecked_sessions
+                    }
+                    other => {
+                        tracing::info!(
+                            target: xai_grok_telemetry::memory_log::TARGET,
+                            gate = ?other,
+                            "{log_prefix}: gate closed on recheck, skipping"
+                        );
+                        return DreamAttempt::Skipped(
+                            MemoryDreamDisposition::NoWork,
+                            "nothing new to consolidate",
+                        );
+                    }
+                }
+            }
+            None => sessions,
+        };
         let existing_memory = std::fs::read_to_string(storage.workspace_memory_file()).ok();
 
         let dream_msg =
@@ -372,12 +424,15 @@ impl SessionActor {
                         target: xai_grok_telemetry::memory_log::TARGET,
                         "{log_prefix}: no readable session content, skipping"
                     );
-                    return;
+                    return DreamAttempt::Skipped(
+                        MemoryDreamDisposition::NoWork,
+                        "no readable session content",
+                    );
                 }
             };
 
         let model_response = match tokio::time::timeout(
-            std::time::Duration::from_secs(30 * 60),
+            DREAM_MODEL_TIMEOUT,
             self.run_dream_model_call(&dream_msg.content),
         )
         .await
@@ -390,7 +445,7 @@ impl SessionActor {
                     "{log_prefix}: model call failed"
                 );
                 self.memory.record_dream_result(false);
-                return;
+                return DreamAttempt::Ran(MemoryDreamDisposition::Failed);
             }
             Err(_) => {
                 tracing::warn!(
@@ -398,7 +453,7 @@ impl SessionActor {
                     "{log_prefix}: model call timed out (30m)"
                 );
                 self.memory.record_dream_result(false);
-                return;
+                return DreamAttempt::Ran(MemoryDreamDisposition::Failed);
             }
         };
 
@@ -407,7 +462,7 @@ impl SessionActor {
             storage,
             &model_response,
             sessions.len(),
-            self.memory.dream_config.stale_lock_secs,
+            stale_lock_secs,
             sessions_dir,
             &dream_msg.processed_stems,
         );
@@ -458,6 +513,13 @@ impl SessionActor {
             sessions_cleaned = result.cleaned_stems.len(),
             "{log_prefix}: consolidation complete"
         );
+
+        DreamAttempt::Ran(match result.status {
+            DreamStatus::Completed { .. } => MemoryDreamDisposition::Completed,
+            DreamStatus::NothingToConsolidate => MemoryDreamDisposition::NoWork,
+            DreamStatus::Failed(_) => MemoryDreamDisposition::Failed,
+            DreamStatus::Skipped(_) => MemoryDreamDisposition::Busy,
+        })
     }
 
     /// Make the dream model call using the configured memory sampling route.

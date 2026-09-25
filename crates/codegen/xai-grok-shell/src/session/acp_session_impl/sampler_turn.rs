@@ -128,10 +128,14 @@ pub(super) const MAX_TRANSIENT_TURN_RETRIES: u32 = 3;
 /// Auto-recovery, stop-hook continuations, and the goal loop re-enter `process_conversation_turn` within one prompt and would reset a local.
 pub(super) const MAX_TRANSIENT_RETRIES_PER_PROMPT: u32 = 10;
 
-/// Wall-clock budget per recovery episode (first transient failure after a success until the next success).
-/// This bounds how many idle stalls can stack up: each stalled attempt burns a full idle-detector cycle before it even fails.
-pub(super) const MAX_TRANSIENT_RETRY_WINDOW: std::time::Duration =
+/// Floor of the per-episode wall clock; `transient_retry_window` is the effective bound.
+pub(super) const TRANSIENT_RETRY_WINDOW_FLOOR: std::time::Duration =
     std::time::Duration::from_secs(10 * 60);
+
+/// Checked at each failure; a stalled retry burns a detector cycle, so `2 * idle_timeout` keeps at least two admissible.
+pub(super) fn transient_retry_window(idle_timeout: std::time::Duration) -> std::time::Duration {
+    TRANSIENT_RETRY_WINDOW_FLOOR.max(idle_timeout.saturating_mul(2))
+}
 
 /// Turn-loop retry state for the transient arm.
 /// The window is evaluated at failure time (`tokio::time::Instant` so paused-clock tests can drive it).
@@ -143,7 +147,6 @@ pub(crate) struct TransientRetryState {
     pub(crate) prompt_attempts: u32,
     /// First transient failure of the current recovery episode (`None` until one happens; cleared on success).
     pub(crate) episode_start: Option<tokio::time::Instant>,
-    /// Spawn-resolved kill switch (foreground root sessions only).
     pub(crate) enabled: bool,
 }
 
@@ -156,12 +159,10 @@ pub(super) fn transient_display_ceiling(step_attempts: u32, prompt_attempts: u32
 }
 
 impl TransientRetryState {
-    fn budget_remaining(&self) -> bool {
+    fn budget_remaining(&self, window: std::time::Duration) -> bool {
         self.step_attempts < MAX_TRANSIENT_TURN_RETRIES
             && self.prompt_attempts < MAX_TRANSIENT_RETRIES_PER_PROMPT
-            && self
-                .episode_start
-                .is_none_or(|started| started.elapsed() < MAX_TRANSIENT_RETRY_WINDOW)
+            && self.episode_start.is_none_or(|s| s.elapsed() < window)
     }
 }
 
@@ -767,10 +768,30 @@ impl SessionActor {
     }
     pub(super) async fn prepare_tool_definitions_inner(&self) -> Vec<ToolDefinition> {
         let bridge = self.agent.borrow().tool_bridge().clone();
-        let defs = bridge.tool_definitions_builtins_only().await;
+
+        // Local mode: tool search is always enabled
+        let defs = if self.mcp_file_forms_hidden().await {
+            bridge.tool_definitions_builtins_only_inline_mcp().await
+        } else {
+            bridge.tool_definitions_builtins_only().await
+        };
+
         let plan_active = self.plan_mode.lock().is_active();
         filter_cursor_tools_by_plan_mode(defs, plan_active)
     }
+
+    /// Messages-backed models never see `use_tool`'s file forms: the Anthropic Messages API rejects the schema's
+    /// root-level union (`oneOf`) with HTTP 400, which fails every turn. Checked per request because a model switch
+    /// mid-session keeps the finalized toolset.
+    pub(crate) async fn mcp_file_forms_hidden(&self) -> bool {
+        self.chat_state_handle
+            .get_sampling_config()
+            .await
+            .is_some_and(|config| {
+                config.api_backend == xai_grok_sampling_types::ApiBackend::Messages
+            })
+    }
+
     pub(super) fn model_auth_facts(&self, model_id: &str) -> crate::agent::config::ModelAuthFacts {
         self.model_auth_state(model_id).0
     }
@@ -982,6 +1003,7 @@ impl SessionActor {
                 query_params: Default::default(),
                 env_http_headers: Default::default(),
                 context_window: std::num::NonZeroU64::new(256_000).unwrap(),
+                max_request_bytes: None,
                 reasoning_effort: None,
                 service_tier: None,
                 stream_tool_calls: None,
@@ -1093,6 +1115,7 @@ impl SessionActor {
             query_params: cfg.query_params.clone(),
             env_http_headers: cfg.env_http_headers.clone(),
             context_window: cfg.context_window.get(),
+            max_request_bytes: cfg.max_request_bytes,
             client_version: creds.client_version,
             reasoning_effort: cfg.reasoning_effort,
             service_tier: cfg.service_tier.clone(),
@@ -1875,7 +1898,15 @@ impl SessionActor {
                 return Ok(SamplerFailureRecovery::CompactAndResubmit);
             }
         }
-        let detailed_message = error.message.clone();
+
+        // Telemetry and notification for terminal failures
+        // The drainer already recorded `record_error_typed` from the `SamplingEvent::Failed` event
+        // Here we send the `RetryState::Failed` notification, which the drainer intentionally skips because it would fire mid-retry
+        let detailed_message = if error.kind == SamplingErrorKind::IdleTimeout {
+            crate::sampling::error::idle_timeout_user_message(self.inference_idle_timeout.as_secs())
+        } else {
+            error.message.clone()
+        };
 
         if encrypted_content_mismatch {
             self.signals_handle()
@@ -2160,7 +2191,8 @@ impl SessionActor {
         }
 
         if transient_retry_eligible(&error) && transient.enabled {
-            if transient.budget_remaining() {
+            if transient.budget_remaining(transient_retry_window(self.inference_idle_timeout)) {
+                // Count intercepted attempts; section 5 sees only the final one.
                 if matches!(error.kind, SamplingErrorKind::IdleTimeout) {
                     self.signals_handle().record_idle_timeout();
                 }

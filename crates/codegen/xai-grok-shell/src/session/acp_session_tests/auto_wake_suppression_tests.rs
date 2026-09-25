@@ -1305,17 +1305,18 @@ async fn handle_bridge_tool_success_runs_consumed_completion_sweep() {
             };
             let parsed_args = serde_json::json!({});
             let _ = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-1"),
-                    "tc-1",
-                    "get_task_output",
-                    "get_task_output",
-                    DrainedToolSuccess::new(result),
-                    0,
-                    "test-model",
-                    &parsed_args,
-                    None,
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-1"),
+                    call_id: "tc-1",
+                    requested_tool_name: "get_task_output",
+                    effective_tool_name: "get_task_output",
+                    drained: DrainedToolSuccess::new(result),
+                    concatenated_json_count: 0,
+                    coercion_note: None,
+                    model_id: "test-model",
+                    tool_parsed_args: &parsed_args,
+                    model_output_override: None,
+                })
                 .await;
             let state = actor.state.lock().await;
             let remaining_ids: Vec<&str> = state

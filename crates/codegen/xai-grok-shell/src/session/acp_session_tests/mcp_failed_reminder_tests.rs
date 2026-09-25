@@ -311,6 +311,8 @@ async fn handshaking_and_init_windows_defer_announcements() {
                 state.mark_server_ready("dead");
                 state.record_init_failure("dead", false, Some("timed out".to_string()));
                 state.record_init_failure("fresh", false, Some("refused".to_string()));
+                state.finish_init();
+                state.complete_init();
             }
             refresh_and_inject(&actor).await;
             let reminders = failed_reminders(&actor).await;

@@ -8,13 +8,27 @@ const V2_DREAM_MIN_PENDING_COUNT: usize = 20;
 const V2_DREAM_MAX_PENDING_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 const V2_PROMOTION_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const V2_PROMOTION_MAX_RETRIES: usize = 120;
-const DREAM_BUSY_NOTICE: &str = "busy";
-const DREAM_FAILED_NOTICE: &str = "failed";
-const DREAM_NO_WORK_NOTICE: &str = "no work";
-const DREAM_RECOVERED_NOTICE: &str = "recovered";
-const DREAM_RETRY_NOTICE: &str = "retry required";
-const DREAM_SHADOW_NOTICE: &str = "shadow complete";
-const DREAM_COMPLETED_NOTICE: &str = "completed";
+
+/// Content-free `MemoryDreamCompleted.result` vocabulary; the disposition is the typed form.
+pub(super) fn dream_notice(disposition: MemoryDreamDisposition) -> &'static str {
+    match disposition {
+        MemoryDreamDisposition::Busy => "busy",
+        MemoryDreamDisposition::Failed => "failed",
+        MemoryDreamDisposition::NoWork => "no work",
+        MemoryDreamDisposition::Recovered => "recovered",
+        MemoryDreamDisposition::RetryRequired => "retry required",
+        MemoryDreamDisposition::Shadow => "shadow complete",
+        MemoryDreamDisposition::Completed => "completed",
+        MemoryDreamDisposition::Cancelled => "cancelled",
+        MemoryDreamDisposition::Disabled => "disabled",
+    }
+}
+
+/// One `execute_v2_dream` pass: its outcome, and whether a coalesced trigger wants another pass.
+struct V2DreamPass {
+    outcome: MemoryDreamResponse,
+    coalesced: bool,
+}
 
 struct V2DreamModelFailure {
     class: xai_grok_telemetry::memory_telemetry::MemoryV2FailureClass,
@@ -610,21 +624,22 @@ impl SessionActor {
         }
     }
 
-    pub(super) async fn run_v2_dream_slash_command(self: &Arc<Self>) {
+    pub(super) async fn run_v2_dream_slash_command(self: &Arc<Self>) -> MemoryDreamResponse {
         self.run_v2_dream_with_cancel(
             V2DreamInvocation::Manual,
             self.memory.dream_workers.cancellation_token(),
             xai_grok_memory::system_v2_clock(),
         )
-        .await;
+        .await
     }
 
+    /// Runs Dream passes until no coalesced trigger remains; the last pass's outcome is returned.
     async fn run_v2_dream_with_cancel(
         self: &Arc<Self>,
         invocation: V2DreamInvocation,
         cancel: tokio_util::sync::CancellationToken,
         clock: xai_grok_memory::SharedV2Clock,
-    ) {
+    ) -> MemoryDreamResponse {
         use xai_grok_telemetry::memory_telemetry::{
             MemoryV2Component, MemoryV2FailClosed, MemoryV2FailureClass,
         };
@@ -633,60 +648,89 @@ impl SessionActor {
                 component: MemoryV2Component::Dream,
                 reason: MemoryV2FailureClass::Disabled,
             });
-            if matches!(invocation, V2DreamInvocation::Manual) {
-                self.send_host_turn_slash_command_output(
-                    "Memory-v2 Dream is disabled by this session's pinned rollout controls.",
-                )
-                .await;
-            }
-            return;
+            return MemoryDreamResponse::new(MemoryDreamDisposition::Disabled);
         }
         let cancel = cancel.child_token();
         if cancel.is_cancelled() {
-            return;
+            return MemoryDreamResponse::new(MemoryDreamDisposition::Cancelled);
         }
         let cancel_on_drop = V2DreamCancellationGuard(cancel.clone());
         let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
         let session = Arc::clone(self);
         let task = xai_grok_telemetry::session_ctx::spawn_local_in_session_ctx(async move {
+            let mut outcome = MemoryDreamResponse::new(MemoryDreamDisposition::Cancelled);
             loop {
                 if cancel.is_cancelled() {
                     break;
                 }
-                let coalesced = session.execute_v2_dream(&cancel, clock.clone()).await;
+                let pass = session.execute_v2_dream(&cancel, clock.clone()).await;
+                outcome = outcome.then(pass.outcome);
                 // Promotion can be deferred by the lease this Dream just released.
                 // Retrying here makes rollout activation converge without requiring
                 // a session restart or another completed turn.
                 session
                     .promote_v2_hidden_observations(false, clock.clone())
                     .await;
-                if !coalesced {
+                if !pass.coalesced {
                     break;
                 }
             }
-            let _ = completed_tx.send(());
+            let _ = completed_tx.send(outcome);
         });
         self.memory.dream_workers.track(task);
-        let _ = completed_rx.await;
+        let outcome = completed_rx
+            .await
+            .unwrap_or(MemoryDreamResponse::new(MemoryDreamDisposition::Failed));
         drop(cancel_on_drop);
+        outcome
     }
 
-    /// Execute one claim. Returns true when a coalesced trigger requires
-    /// another iteration in the same tracked caller task.
+    /// Sends the completion notification and packages the pass result.
+    async fn finish_v2_dream(
+        &self,
+        disposition: MemoryDreamDisposition,
+        observation_count: usize,
+        topics_affected: usize,
+        coalesced: bool,
+    ) -> V2DreamPass {
+        self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
+            result: dream_notice(disposition).to_owned(),
+            path: None,
+        })
+        .await;
+        V2DreamPass {
+            outcome: MemoryDreamResponse {
+                disposition,
+                observation_count,
+                topics_affected,
+            },
+            coalesced,
+        }
+    }
+
+    /// Execute one claim. `coalesced` is set when a trigger that arrived during
+    /// the pass requires another iteration in the same tracked caller task.
     async fn execute_v2_dream(
         &self,
         cancel: &tokio_util::sync::CancellationToken,
         clock: xai_grok_memory::SharedV2Clock,
-    ) -> bool {
+    ) -> V2DreamPass {
         use xai_grok_telemetry::memory_telemetry::{
             MemoryV2DreamDisposition, MemoryV2FailureClass,
         };
+        let cancelled = |coalesced| V2DreamPass {
+            outcome: MemoryDreamResponse::new(MemoryDreamDisposition::Cancelled),
+            coalesced,
+        };
         let started_at = std::time::Instant::now();
         if cancel.is_cancelled() {
-            return false;
+            return cancelled(false);
         }
         let Some(storage) = self.memory.storage() else {
-            return false;
+            return V2DreamPass {
+                outcome: MemoryDreamResponse::new(MemoryDreamDisposition::Disabled),
+                coalesced: false,
+            };
         };
         self.send_xai_notification(XaiSessionUpdate::MemoryDreamQueued)
             .await;
@@ -755,12 +799,9 @@ impl SessionActor {
                     started_at,
                     Some(MemoryV2FailureClass::Lease),
                 );
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_BUSY_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(MemoryDreamDisposition::Busy, 0, 0, false)
+                    .await;
             }
             Ok(Err(error)) => {
                 emit_v2_dream_lifecycle(
@@ -771,12 +812,9 @@ impl SessionActor {
                     Some(classify_consolidation_error(&error)),
                 );
                 tracing::warn!(error = %error, "memory-v2 Dream claim failed");
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_FAILED_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(MemoryDreamDisposition::Failed, 0, 0, false)
+                    .await;
             }
             Err(error) => {
                 emit_v2_dream_lifecycle(
@@ -787,24 +825,18 @@ impl SessionActor {
                     Some(MemoryV2FailureClass::Convergence),
                 );
                 tracing::warn!(error = %error, "memory-v2 Dream claim task panicked");
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_FAILED_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(MemoryDreamDisposition::Failed, 0, 0, false)
+                    .await;
             }
         };
         let (guard, input) = match outcome {
             V2DreamClaimOutcome::NoWork => {
                 emit_v2_dream_lifecycle(MemoryV2DreamDisposition::Noop, 0, 0, started_at, None);
                 self.memory.record_dream_neutral();
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_NO_WORK_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(MemoryDreamDisposition::NoWork, 0, 0, false)
+                    .await;
             }
             V2DreamClaimOutcome::Resumed(result) => {
                 emit_v2_dream_lifecycle(
@@ -815,18 +847,20 @@ impl SessionActor {
                     None,
                 );
                 self.memory.record_dream_result(true);
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_RECOVERED_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(
+                        MemoryDreamDisposition::Recovered,
+                        0,
+                        result.affected_topics.len(),
+                        false,
+                    )
+                    .await;
             }
             V2DreamClaimOutcome::Fresh { guard, input } => (guard, input),
         };
         if cancel.is_cancelled() {
             guard.fail_retryable("Dream task cancelled").await;
-            return true;
+            return cancelled(true);
         }
         self.send_xai_notification(XaiSessionUpdate::MemoryDreamStarted {
             observation_count: input.observations.len(),
@@ -843,7 +877,7 @@ impl SessionActor {
             biased;
             () = cancel.cancelled() => {
                 guard.fail_retryable("Dream task cancelled").await;
-                return true;
+                return cancelled(true);
             },
             response = self.run_v2_dream_model_call(&prompt) => response,
         };
@@ -858,10 +892,11 @@ impl SessionActor {
         }) {
             Ok(result) => result,
             Err(error) => {
+                let observation_count = guard.lease().observations.len();
                 emit_v2_dream_lifecycle_with_usage(
                     self,
                     MemoryV2DreamDisposition::Retry,
-                    guard.lease().observations.len(),
+                    observation_count,
                     0,
                     started_at,
                     Some(error.class),
@@ -871,17 +906,19 @@ impl SessionActor {
                 guard.fail_retryable(detail.clone()).await;
                 self.memory.record_dream_result(false);
                 tracing::warn!(error = %detail, "memory-v2 Dream model or plan failed");
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_RETRY_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                return false;
+                return self
+                    .finish_v2_dream(
+                        MemoryDreamDisposition::RetryRequired,
+                        observation_count,
+                        0,
+                        false,
+                    )
+                    .await;
             }
         };
         if cancel.is_cancelled() {
             guard.fail_retryable("Dream task cancelled").await;
-            return true;
+            return cancelled(true);
         }
         let (store, lease) = guard.into_parts();
         let observation_count = lease.observations.len();
@@ -918,12 +955,13 @@ impl SessionActor {
                         None,
                         usage.clone(),
                     );
-                    self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                        result: DREAM_SHADOW_NOTICE.to_owned(),
-                        path: None,
-                    })
-                    .await;
-                    coalesced
+                    self.finish_v2_dream(
+                        MemoryDreamDisposition::Shadow,
+                        observation_count,
+                        0,
+                        coalesced,
+                    )
+                    .await
                 }
                 Ok((Err(error), _)) => {
                     self.memory.record_dream_result(false);
@@ -937,12 +975,13 @@ impl SessionActor {
                         usage.clone(),
                     );
                     tracing::warn!(error = %error, "memory-v2 shadow completion failed");
-                    self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                        result: DREAM_RETRY_NOTICE.to_owned(),
-                        path: None,
-                    })
-                    .await;
-                    false
+                    self.finish_v2_dream(
+                        MemoryDreamDisposition::RetryRequired,
+                        observation_count,
+                        0,
+                        false,
+                    )
+                    .await
                 }
                 Err(error) => {
                     self.memory.record_dream_result(false);
@@ -956,12 +995,13 @@ impl SessionActor {
                         usage.clone(),
                     );
                     tracing::warn!(error = %error, "memory-v2 shadow completion task panicked");
-                    self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                        result: DREAM_FAILED_NOTICE.to_owned(),
-                        path: None,
-                    })
-                    .await;
-                    false
+                    self.finish_v2_dream(
+                        MemoryDreamDisposition::Failed,
+                        observation_count,
+                        0,
+                        false,
+                    )
+                    .await
                 }
             };
         }
@@ -990,12 +1030,13 @@ impl SessionActor {
                     usage.clone(),
                 );
                 self.memory.record_dream_result(true);
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_COMPLETED_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                coalesced
+                self.finish_v2_dream(
+                    MemoryDreamDisposition::Completed,
+                    observation_count,
+                    result.affected_topics.len(),
+                    coalesced,
+                )
+                .await
             }
             Ok((Err(error), _)) => {
                 emit_v2_dream_lifecycle_with_usage(
@@ -1009,12 +1050,13 @@ impl SessionActor {
                 );
                 self.memory.record_dream_result(false);
                 tracing::warn!(error = %error, "memory-v2 Dream commit failed");
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_RETRY_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                false
+                self.finish_v2_dream(
+                    MemoryDreamDisposition::RetryRequired,
+                    observation_count,
+                    0,
+                    false,
+                )
+                .await
             }
             Err(error) => {
                 emit_v2_dream_lifecycle_with_usage(
@@ -1028,12 +1070,8 @@ impl SessionActor {
                 );
                 self.memory.record_dream_result(false);
                 tracing::warn!(error = %error, "memory-v2 Dream commit task panicked");
-                self.send_xai_notification(XaiSessionUpdate::MemoryDreamCompleted {
-                    result: DREAM_FAILED_NOTICE.to_owned(),
-                    path: None,
-                })
-                .await;
-                false
+                self.finish_v2_dream(MemoryDreamDisposition::Failed, observation_count, 0, false)
+                    .await
             }
         }
     }

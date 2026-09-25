@@ -16,7 +16,59 @@
 
 use crate::config::PromptSuggestModelPin;
 use crate::sampling::ConversationItem;
-use crate::session::helpers::chat::floor_char_boundary;
+use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_tools::util::truncate_str;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SuggestReasoning {
+    pub(crate) effort: Option<ReasoningEffort>,
+    pub(crate) reserve_budget: bool,
+}
+
+/// Unset effort becomes low only on a reasoning model that is not the
+/// non-reasoning alias. That alias stays off even if the catalog lists effort.
+/// An explicit value is kept.
+pub(crate) fn suggest_request_effort(
+    configured: Option<ReasoningEffort>,
+    model: &str,
+    model_supports_reasoning: bool,
+) -> Option<ReasoningEffort> {
+    let alias = crate::util::config::NON_REASONING_PROMPT_SUGGEST_MODEL;
+    match configured {
+        Some(effort) => Some(effort),
+        None if model_supports_reasoning && model != alias => Some(ReasoningEffort::Low),
+        None => None,
+    }
+}
+
+pub(crate) fn resolve_suggest_reasoning(
+    configured: Option<ReasoningEffort>,
+    model: &str,
+    supports_reasoning_effort: bool,
+    supports_none: bool,
+) -> SuggestReasoning {
+    if let Some(effort) = configured
+        && !matches!(effort, ReasoningEffort::None)
+    {
+        return SuggestReasoning {
+            effort: supports_reasoning_effort.then_some(effort),
+            reserve_budget: supports_reasoning_effort,
+        };
+    }
+
+    if model != crate::util::config::NON_REASONING_PROMPT_SUGGEST_MODEL && supports_reasoning_effort
+    {
+        return SuggestReasoning {
+            effort: supports_none.then_some(ReasoningEffort::None),
+            reserve_budget: !supports_none,
+        };
+    }
+
+    SuggestReasoning {
+        effort: None,
+        reserve_budget: false,
+    }
+}
 
 /// Model used for suggestion calls when nothing pins one (no env /
 /// `[models] prompt_suggestion` / remote setting / client hint — see
@@ -108,18 +160,48 @@ Once a request was handled, predict the step AFTER it, never the request again \
     Format: 2-12 words, matching the user's own style and casing.\n\
     Reply with ONLY the suggestion text (or NONE) — no quotes, no markdown, no explanation.";
 
-/// One transcript line: role label + flattened text content.
-fn transcript_line(role: &str, text: &str) -> Option<String> {
+const TRUNCATION_MARKER: &str = "\n…";
+
+pub(crate) fn suggestion_size(s: &str) -> (usize, usize) {
+    (s.chars().count(), s.split_whitespace().count())
+}
+
+fn truncate_to(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        return text.to_owned();
+    }
+    if max_len <= TRUNCATION_MARKER.len() {
+        return truncate_str(text, max_len).to_owned();
+    }
+    let prefix = truncate_str(text, max_len - TRUNCATION_MARKER.len());
+    let floor = prefix.len() / 2;
+    let cut = prefix
+        .rfind('\n')
+        .filter(|&index| index >= floor)
+        .or_else(|| {
+            prefix
+                .rfind(char::is_whitespace)
+                .filter(|&index| index >= floor)
+        })
+        .unwrap_or(prefix.len());
+    let Some(head) = prefix.get(..cut) else {
+        return truncate_str(text, max_len).to_owned();
+    };
+    format!("{}{TRUNCATION_MARKER}", head.trim_end())
+}
+
+/// One transcript line: role label and flattened text content.
+fn transcript_line(role: &str, text: &str, cap: usize) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    let mut text = text;
-    if text.len() > MESSAGE_CAP_CHARS {
-        let cut = floor_char_boundary(text, MESSAGE_CAP_CHARS);
-        text = &text[..cut];
-    }
-    Some(format!("{role}: {text}"))
+    let body = if text.len() > cap {
+        truncate_to(text, cap)
+    } else {
+        text.to_owned()
+    };
+    Some(format!("{role}: {body}"))
 }
 
 /// Build the compact transcript from a conversation snapshot.
@@ -139,22 +221,27 @@ pub(crate) fn build_transcript(conversation: &[ConversationItem]) -> Option<Stri
 
     for item in conversation.iter().rev() {
         let line = match item {
-            ConversationItem::User(u) => {
-                if u.synthetic_reason.is_some() {
+            ConversationItem::User(u) if u.synthetic_reason.is_none() => {
+                let Some(line) = transcript_line("User", &item.text_content(), MESSAGE_CAP_CHARS)
+                else {
                     continue;
-                }
-                transcript_line("User", &item.text_content())
+                };
+                line
             }
             ConversationItem::Assistant(_) => {
-                let line = transcript_line("Agent", &item.text_content());
-                if line.is_some() {
-                    saw_assistant = true;
-                }
+                let cap = if saw_assistant {
+                    MESSAGE_CAP_CHARS
+                } else {
+                    TRANSCRIPT_BUDGET_CHARS.saturating_sub(used + "Agent: ".len())
+                };
+                let Some(line) = transcript_line("Agent", &item.text_content(), cap) else {
+                    continue;
+                };
+                saw_assistant = true;
                 line
             }
             _ => continue,
         };
-        let Some(line) = line else { continue };
         if used + line.len() > TRANSCRIPT_BUDGET_CHARS && !lines.is_empty() {
             break;
         }
@@ -224,7 +311,7 @@ pub(crate) fn is_repeat_of_user_message(
 /// filters, adapted to the compact-transcript prompt above.
 pub(crate) fn sanitize_suggestion(raw: &str) -> Option<String> {
     // First line only; the prompt asks for a single line but models drift.
-    let line = raw.trim().lines().next()?.trim();
+    let line = raw.trim().lines().next()?.trim().replace("<|eos|>", "");
 
     // Strip common wrappers the prompt forbids but models still emit.
     let line = line
@@ -456,6 +543,39 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_strips_eos_token() {
+        assert_eq!(
+            sanitize_suggestion("\"run the tests\"<|eos|>").as_deref(),
+            Some("run the tests")
+        );
+    }
+
+    #[test]
+    fn unset_effort_is_low_only_on_a_reasoning_model() {
+        assert_eq!(
+            suggest_request_effort(None, "grok-4.6", true),
+            Some(ReasoningEffort::Low)
+        );
+        assert_eq!(suggest_request_effort(None, "grok-4.6", false), None);
+        assert_eq!(
+            suggest_request_effort(
+                None,
+                crate::util::config::NON_REASONING_PROMPT_SUGGEST_MODEL,
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            suggest_request_effort(Some(ReasoningEffort::High), "grok-4.6", true),
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(
+            suggest_request_effort(Some(ReasoningEffort::None), "grok-4.6", true),
+            Some(ReasoningEffort::None)
+        );
+    }
+
+    #[test]
     fn sanitize_one_word_allowlist() {
         assert_eq!(sanitize_suggestion("yes").as_deref(), Some("yes"));
         assert_eq!(sanitize_suggestion("commit").as_deref(), Some("commit"));
@@ -560,11 +680,32 @@ mod tests {
         let long = "a".repeat(10_000);
         let conv = vec![user(&long), assistant("ok")];
         let t = build_transcript(&conv).unwrap();
-        assert!(
-            t.len() < 2_000,
-            "long message must be truncated: {}",
-            t.len()
-        );
+        let user_line = t.split("\n\n").next().unwrap();
+        assert!(user_line.starts_with("User: "));
+        assert!(user_line.contains(TRUNCATION_MARKER));
+        assert!(user_line.len() <= "User: ".len() + MESSAGE_CAP_CHARS);
+        assert!(t.ends_with("Agent: ok"));
+        assert!(!t.contains(&long));
+    }
+
+    #[test]
+    fn transcript_does_not_cap_newest_agent() {
+        let long = "c".repeat(10_000);
+        let conv = vec![user("hi"), assistant(&long)];
+        let t = build_transcript(&conv).unwrap();
+        assert!(t.contains(&long));
+        assert!(!t.contains(TRUNCATION_MARKER));
+    }
+
+    #[test]
+    fn transcript_bounds_newest_agent_by_pack() {
+        let long = "c".repeat(TRANSCRIPT_BUDGET_CHARS + 500);
+        let conv = vec![user("hi"), assistant(&long)];
+        let t = build_transcript(&conv).unwrap();
+        assert!(t.starts_with("Agent: "));
+        assert!(t.contains(TRUNCATION_MARKER));
+        assert!(t.len() <= TRANSCRIPT_BUDGET_CHARS);
+        assert!(!t.contains(&long));
     }
 
     #[test]

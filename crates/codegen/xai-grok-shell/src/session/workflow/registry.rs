@@ -285,7 +285,8 @@ fn is_compiled_in_builtin(name: &str) -> bool {
     BUILTIN_WORKFLOWS.iter().any(|builtin| builtin.name == name)
 }
 
-fn bundled_file_is_managed(path: &Path) -> bool {
+/// True only while the file is byte-identical to what the GCS bundle update wrote; an edited copy loses builtin privilege.
+pub(crate) fn bundled_file_is_managed(path: &Path) -> bool {
     let Some(workflows_dir) = path.parent() else {
         return false;
     };

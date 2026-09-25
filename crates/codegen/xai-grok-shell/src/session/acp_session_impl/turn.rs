@@ -710,6 +710,7 @@ impl SessionActor {
                             skill_name: sk.name.clone(),
                             plugin_source: sk.plugin_name.clone(),
                             trigger: xai_grok_telemetry::events::SkillTrigger::SlashCommand,
+                            skill_origin: sk.origin.clone(),
                         },
                     );
                     let skill_source = if sk.plugin_name.is_some() {
@@ -761,6 +762,9 @@ impl SessionActor {
         let model_id = self.current_model_id().await;
         let turn_number = self.chat_state_handle.get_prompt_index().await as u64;
         self.current_turn_number.set(turn_number);
+        self.long_reasoning_turn_state
+            .lock()
+            .begin_turn(turn_number, model_id.clone());
         self.transient_retries_prompt_total.set(0);
         self.transient_episode_start.set(None);
         let yolo_mode = self.permissions.is_yolo_mode();
@@ -1051,7 +1055,6 @@ impl SessionActor {
             self.retry_auth_required_servers().await;
             self.retry_unreachable_servers().await;
             self.maybe_inject_mcp_reminder().await;
-            self.maybe_inject_mcp_connecting_reminder().await;
             self.maybe_inject_date_rollover_reminder().await;
             if matches!(&origin, super::super::PromptOrigin::User) {
                 self.maybe_inject_user_info_update_reminder().await;
@@ -1627,10 +1630,11 @@ impl SessionActor {
                     attempts: doom_tally.attempts,
                     accepted_after_budget: doom_tally.accepted_after_budget,
                     top_trigger: doom_tally.top_trigger,
-                    model: doom_event_model,
+                    model: doom_event_model.clone(),
                 },
             );
         }
+        self.emit_long_reasoning_turn_event();
         match &result {
             Ok(TurnOutcome::Completed { .. }) | Ok(TurnOutcome::StationarityEnded { .. }) => {
                 for contributor in self.extension_registry.turn_lifecycle_contributors() {
@@ -2576,6 +2580,33 @@ impl SessionActor {
         snapshot
     }
 
+    /// Emitted whether or not the reminder is armed, so cohorts compare on identical properties.
+    /// Runs at turn end and when a cancel aborts the turn task (under the state lock, before a
+    /// replacement turn can be promoted); a second call after `finish_turn` is a no-op.
+    pub(super) fn emit_long_reasoning_turn_event(&self) {
+        let tally = self.long_reasoning_turn_state.lock().finish_turn();
+        if tally.model_calls == 0 {
+            return;
+        }
+        let policy = self.long_reasoning_reminder;
+        xai_grok_telemetry::session_ctx::log_session_event(
+            crate::agent::session_metrics::LongReasoningReminderTurn {
+                session_id: self.session_info.id.0.to_string(),
+                turn_number: tally.turn_number,
+                enabled: policy.enabled,
+                threshold_tokens: policy.tokens,
+                delay: policy.delay,
+                model_calls: tally.model_calls,
+                reasoning_tokens: tally.reasoning_tokens,
+                completion_tokens: tally.completion_tokens,
+                max_call_reasoning_tokens: tally.max_call_reasoning_tokens,
+                long_calls: tally.long_calls,
+                reminders_fired: tally.reminders_fired,
+                model: tally.model,
+            },
+        );
+    }
+
     /// Execute the two model-visible Code Mode control tools without sending
     /// them through the ordinary JSON function-call parser. The assistant call
     /// item has already been recorded before this method runs, so nested
@@ -2896,6 +2927,8 @@ impl SessionActor {
             );
         }
         let total_prep_ms = tool_prep_start.elapsed().as_millis() as u64;
+        self.maybe_inject_mcp_connecting_reminder().await;
+        self.maybe_inject_mcp_reminder().await;
         if let Some(ref mut pt) = prompt_timing {
             pt.record_tool_prep(mcp_wait_ms, total_prep_ms);
         }
@@ -2940,8 +2973,7 @@ impl SessionActor {
         let mut codex_auth_retry_attempted = false;
         let mut rate_limit_waits = self.rate_limit_wait_budget();
         let mut transient_retry_attempts: u32 = 0;
-        let transient_retry_enabled =
-            self.transient_turn_retries && !self.attach_non_interactive.get();
+        let transient_retry_enabled = self.transient_retry_enabled;
         let mut turn_span_totals = TurnSpanTotals::default();
         let mut model_fingerprint: Option<String> = None;
         let mut structured_output_retries: u32 = 0;
@@ -3116,6 +3148,28 @@ impl SessionActor {
                     return Err(self.surface_compact_auth_failure(e).await);
                 }
             }
+            let due_reminder = {
+                let mut state = self.long_reasoning_turn_state.lock();
+                if salvage.awaiting_continuation() {
+                    state.defer_due_reminder(self.long_reasoning_reminder);
+                    None
+                } else {
+                    state.take_due_reminder(self.long_reasoning_reminder)
+                }
+            };
+            if let Some(long_call_tokens) = due_reminder {
+                xai_grok_telemetry::unified_log::info(
+                    "shell.turn.long_reasoning_reminder",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "loop_index": loop_index,
+                        "reasoning_tokens": long_call_tokens,
+                        "threshold": self.long_reasoning_reminder.tokens,
+                        "delay": self.long_reasoning_reminder.delay,
+                    })),
+                );
+                self.push_system_reminder(crate::session::long_reasoning_reminder::REMINDER);
+            }
             tracing::debug!(use_backend_search, "backend_search: turn tool resolution");
             let mut tool_surface = base_tool_surface.clone();
             if structured_output_tool && let Some(schema) = json_schema.clone() {
@@ -3216,6 +3270,8 @@ impl SessionActor {
                     "transient_retry_attempts": transient_retry_attempts,
                 })),
             );
+            let requested_model =
+                crate::session::telemetry::requested_model_snapshot(request.model.as_deref());
             let model_timer = std::time::Instant::now();
             let (response, latency) = match self
                 .run_turn_via_sampler(
@@ -3591,6 +3647,11 @@ impl SessionActor {
             let cached_prompt_tokens = usage.map(|u| u.cached_prompt_tokens);
             let completion_tokens = usage.map(|u| u.completion_tokens);
             let reasoning_tokens = usage.map(|u| u.reasoning_tokens);
+            self.long_reasoning_turn_state.lock().record_call(
+                self.long_reasoning_reminder,
+                reasoning_tokens.unwrap_or(0),
+                completion_tokens.unwrap_or(0),
+            );
             let ttft_ms = latency.time_to_first_token_ms;
             let tokens_per_sec = match completion_tokens {
                 Some(ct) if ct > 0 => {
@@ -3700,11 +3761,6 @@ impl SessionActor {
                     .get_prompt_index()
                     .await
                     .saturating_sub(1) as u32;
-                if turn_index == 0
-                    && let Some(repo_status_wait_ms) = self.repo_status_prefetch.take_wait_ms()
-                {
-                    pt.record_repo_status_wait(repo_status_wait_ms);
-                }
                 pt.emit(
                     model_duration_ms,
                     turn_index,
@@ -4131,7 +4187,9 @@ impl SessionActor {
                 });
             }
             if !direct_tool_calls.is_empty() {
-                let execute_tool_calls_result = self.execute_tool_calls(direct_tool_calls).await;
+                let execute_tool_calls_result = self
+                    .execute_tool_calls(direct_tool_calls, requested_model)
+                    .await;
                 match execute_tool_calls_result {
                     Ok(ToolLoop::PermissionReject { tool_name, reason }) => {
                         return Ok(TurnOutcome::Cancelled {

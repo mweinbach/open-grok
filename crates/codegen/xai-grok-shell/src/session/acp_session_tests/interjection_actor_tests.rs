@@ -154,9 +154,51 @@ async fn drain_interjection_with_images_attaches_image_parts() {
         .await;
 }
 
-/// The drain strips `[Image #N: <path>]` → `[Image #N]` before the text
-/// reaches the model — same gate as the prompt path. Covers raw text from
-/// legacy clients AND the queue-interject harvest (raw `queue_meta.text`).
+/// A grok-build interjection persists its images under the session `assets/` dir and leads with the
+/// `<image_files>` block, like a prompt turn, so compaction can later list the paths.
+#[tokio::test]
+async fn grok_build_interjection_with_images_gets_image_files_block() {
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let (actor, _gateway_rx) = build_actor().await;
+            actor.pending_interjections.push(PendingInterjection {
+                text: "look at [Image #1]".to_string(),
+                attachments: vec![test_image_content()],
+            });
+
+            assert!(actor.drain_pending_interjections().await);
+
+            let conversation = actor.chat_state_handle.get_conversation().await;
+            let user_item = match conversation.last() {
+                Some(ConversationItem::User(u)) => u,
+                other => panic!("conversation tail must be a user item, got: {other:?}"),
+            };
+            assert_eq!(
+                user_item.synthetic_reason,
+                Some(SyntheticReason::Interjection)
+            );
+            let text = conversation.last().unwrap().text_content();
+            assert!(text.starts_with("<image_files>\n"), "got: {text}");
+            let path = text
+                .lines()
+                .find_map(|line| line.strip_prefix("1. "))
+                .unwrap_or_else(|| panic!("no persisted path line, got: {text}"));
+            assert!(
+                path.contains("/assets/image-") && std::path::Path::new(path).is_file(),
+                "path must point at the persisted asset, got: {path}"
+            );
+            assert!(
+                text.find("</image_files>") < text.find("<user_query>"),
+                "block must precede the wrapped query, got: {text}"
+            );
+            std::fs::remove_file(path).unwrap();
+        })
+        .await;
+}
+
+/// The drain strips `[Image #N: <path>]` down to `[Image #N]` before the text reaches the model, the same gate as the prompt path.
+/// Covers raw text from legacy clients and text harvested from a queued row (raw `queue_meta.text`).
 #[tokio::test]
 async fn drain_interjection_strips_placeholder_paths_from_text() {
     let local = tokio::task::LocalSet::new();

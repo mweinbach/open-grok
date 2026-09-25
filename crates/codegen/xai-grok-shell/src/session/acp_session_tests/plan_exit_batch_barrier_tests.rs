@@ -152,7 +152,7 @@ async fn assert_mixed_batch_snapshot(write_first: bool) {
 
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        actor.execute_tool_calls(batch),
+        actor.execute_tool_calls(batch, None),
     )
     .await
     .expect("execute_tool_calls must not hang")
@@ -306,10 +306,13 @@ async fn mixed_permission_cancel_skips_exit_reverse_request() {
 
             tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                actor.execute_tool_calls(vec![
-                    bash_call("call_bash_reject"),
-                    exit_plan_mode_call("call_exit"),
-                ]),
+                actor.execute_tool_calls(
+                    vec![
+                        bash_call("call_bash_reject"),
+                        exit_plan_mode_call("call_exit"),
+                    ],
+                    None,
+                ),
             )
             .await
             .expect("execute_tool_calls must not hang")

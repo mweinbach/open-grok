@@ -1226,17 +1226,15 @@ pub trait StorageAdapter: Send + Sync {
         )))
     }
 
-    /// Update the current model in summary (delegates to
-    /// `update_current_model_and_agent` with `agent_name = None`).
+    /// Update the current model in summary (delegates to `update_current_model_and_agent` with no agent change).
     async fn update_current_model(&self, info: &Info, model_id: &acp::ModelId) -> io::Result<()> {
         self.update_current_model_and_agent(info, model_id, None, None, None)
             .await
     }
 
-    /// Update the current model and agent name in summary.
-    /// `agent_name` is the resolved agent definition name
-    /// persisted so session resume doesn't depend on the mutable model catalog.
-    /// `None` leaves the existing `agent_name` unchanged (used by legacy callers
+    /// Update the current model and, when `agent` is set, the session's selected agent.
+    /// Persisted so session resume doesn't depend on the mutable model catalog.
+    /// `None` leaves the existing agent unchanged (used by legacy callers
     /// that only update the model ID).
     /// `resolved_tool_policy` persists the provider-route tool surface alongside
     /// the model identity when present; `None` leaves any existing policy alone.
@@ -1244,7 +1242,7 @@ pub trait StorageAdapter: Send + Sync {
         &self,
         info: &Info,
         model_id: &acp::ModelId,
-        agent_name: Option<&str>,
+        agent: Option<&crate::session::persistence::PersistedAgent>,
         reasoning_effort: Option<Option<ReasoningEffort>>,
         resolved_tool_policy: Option<crate::session::tool_surface::ResolvedToolPolicy>,
     ) -> io::Result<()>;

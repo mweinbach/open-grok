@@ -317,6 +317,7 @@ impl SessionActor {
                 query_params: sampling_config.query_params.clone(),
                 env_http_headers: sampling_config.env_http_headers.clone(),
                 context_window: new_context_window,
+                max_request_bytes: sampling_config.max_request_bytes,
                 reasoning_effort: sampling_config.reasoning_effort,
                 service_tier: sampling_config.service_tier.clone(),
                 stream_tool_calls: Some(sampling_config.stream_tool_calls),
@@ -376,9 +377,46 @@ impl SessionActor {
             .send(PersistenceMsg::CurrentModel {
                 model_id: model_id.clone(),
                 provider: sampling_config.provider,
-                agent_name: Some(agent_name),
+                agent: crate::session::persistence::PersistedAgent::Named(agent_name),
                 reasoning_effort: Some(sampling_config.reasoning_effort),
                 resolved_tool_policy: Some(resolved_tool_policy),
+            });
+        self.emit_status_snapshot_detached();
+        Ok(model_id)
+    }
+    /// Set the reasoning effort on the live sampling config, applying the same
+    /// support check and per-effort model routing as `apply_supported_effort`.
+    pub(super) async fn handle_set_reasoning_effort(
+        self: &std::sync::Arc<Self>,
+        effort: xai_grok_sampling_types::ReasoningEffort,
+    ) -> Result<acp::ModelId, acp::Error> {
+        let Some(mut cfg) = self.chat_state_handle.get_sampling_config().await else {
+            return Err(acp::Error::internal_error().data("session has no sampling config"));
+        };
+        if !self
+            .models_manager
+            .model_supports_reasoning_effort(&cfg.model)
+        {
+            return Err(acp::Error::invalid_params()
+                .data("the session's current model does not support reasoning effort"));
+        }
+        if let Some(routed) = self.models_manager.model_for_effort(&cfg.model, effort) {
+            cfg.model = routed;
+        }
+        cfg.reasoning_effort = Some(effort);
+        let provider = cfg.provider;
+        let model_id = acp::ModelId::new(cfg.model.clone());
+        self.chat_state_handle.update_sampling_config(cfg);
+        let agent_name = self.agent.borrow().definition().name.clone();
+        let _ = self
+            .notifications
+            .persistence_tx
+            .send(PersistenceMsg::CurrentModel {
+                model_id: model_id.clone(),
+                provider,
+                agent: crate::session::persistence::PersistedAgent::Named(agent_name),
+                reasoning_effort: Some(Some(effort)),
+                resolved_tool_policy: None,
             });
         self.emit_status_snapshot_detached();
         Ok(model_id)
@@ -451,6 +489,16 @@ impl SessionActor {
             })?;
         new_agent.set_tool_mode(tool_mode);
         Ok(new_agent)
+    }
+
+    /// Abort and join an in-flight prefire pass-1 and drop its NOTE1 cache.
+    pub(super) async fn abort_and_clear_prefire(&self) {
+        if let Some(handle) = self.compaction.prefire.take_handle() {
+            handle.abort();
+            let _ = handle.await;
+            self.compaction.prefire.finish();
+        }
+        self.compaction.prefire.clear();
     }
 
     async fn install_rebuilt_agent(

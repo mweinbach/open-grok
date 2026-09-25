@@ -583,7 +583,7 @@ fn fork_summary(
         worktree_label: target_worktree_identity
             .as_ref()
             .map(|identity| identity.label.clone()),
-        agent_name: source.agent_name,
+        agent: source.agent.clone(),
         sandbox_profile: source.sandbox_profile,
         reasoning_effort: source.reasoning_effort,
         last_turn_summary: if options.target_prompt_index.is_some() {

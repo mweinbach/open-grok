@@ -900,6 +900,20 @@ pub(crate) fn parse_remote_model_value(
     .flatten()
     .find(|value| !value.is_null())
     .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let (reasoning_efforts, reasoning_effort_server_default) = obj
+        .get("reasoningEfforts")
+        .or_else(|| obj.get("reasoning_efforts"))
+        .or_else(|| meta.and_then(|m| m.get("reasoningEfforts")))
+        .and_then(|v| v.as_array())
+        .map(|arr| xai_grok_sampling_types::parse_reasoning_effort_options(arr, "reasoningEfforts"))
+        .filter(|options| !options.is_empty())
+        .map(|options| (options, false))
+        .or_else(|| {
+            obj.get("capabilities")
+                .and_then(|v| v.as_object())
+                .and_then(parse_capabilities_reasoning_efforts)
+        })
+        .unwrap_or_default();
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
@@ -923,6 +937,9 @@ pub(crate) fn parse_remote_model_value(
         experimental_supported_tools: Vec::new(),
         apply_patch_tool_type: None,
         context_window,
+        max_request_bytes: get_u64(obj, "maxRequestBytes")
+            .or_else(|| get_u64(obj, "max_request_bytes"))
+            .and_then(std::num::NonZeroU64::new),
         auto_compact_threshold_percent: get_u64(obj, "autoCompactThresholdPercent")
             .or_else(|| get_u64(obj, "auto_compact_threshold_percent"))
             .and_then(|v| u8::try_from(v).ok()),
@@ -968,12 +985,23 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| meta.and_then(|m| m.get("supportsReasoningEffort")))
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
-        reasoning_efforts: obj
-            .get("reasoningEfforts")
-            .or_else(|| obj.get("reasoning_efforts"))
-            .or_else(|| meta.and_then(|m| m.get("reasoningEfforts")))
+        reasoning_efforts,
+        reasoning_effort_server_default,
+        variants: obj
+            .get("variants")
             .and_then(|v| v.as_array())
-            .map(|arr| xai_grok_sampling_types::parse_reasoning_effort_options(arr))
+            .map(|arr| {
+                arr
+                    .iter()
+                    .filter_map(|value| match serde_json::from_value(value.clone()) {
+                        Ok(variant) => Some(variant),
+                        Err(e) => {
+                            tracing::warn!("Dropping a model variant this build cannot read: {e}");
+                            None
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default(),
         supports_reasoning_summary_parameter: false,
         default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
@@ -1037,6 +1065,37 @@ pub(crate) fn parse_remote_model_value(
 }
 fn get_string(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+/// Effort menu from a `/v1/models` `capabilities` block: `reasoning_effort` is a bare-string list, `default_reasoning_effort` names the marked entry.
+/// The second value is true when no entry got marked, so the request omits the effort and the server applies its own.
+fn parse_capabilities_reasoning_efforts(
+    caps: &serde_json::Map<String, serde_json::Value>,
+) -> Option<(Vec<xai_grok_sampling_types::ReasoningEffortOption>, bool)> {
+    let arr = caps.get("reasoning_effort")?.as_array()?;
+    let mut options = xai_grok_sampling_types::parse_reasoning_effort_options(
+        arr,
+        "capabilities.reasoning_effort",
+    );
+    let mut marked = false;
+    if let Some(default) = caps
+        .get("default_reasoning_effort")
+        .filter(|v| !v.is_null())
+    {
+        let level = default
+            .as_str()
+            .and_then(|s| s.parse::<xai_grok_sampling_types::ReasoningEffort>().ok());
+        for option in &mut options {
+            option.default = level == Some(option.value);
+            marked |= option.default;
+        }
+        if !marked {
+            tracing::warn!(
+                value = %default,
+                "capabilities.default_reasoning_effort is not a listed level; leaving the server default"
+            );
+        }
+    }
+    Some((options, !marked))
 }
 /// Parse `env_key` / `envKey` as a single string or a string array.
 fn get_env_keys(

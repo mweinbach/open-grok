@@ -1,5 +1,7 @@
 //! Compacts the current conversation and generates a summary of the conversation which
 //! gets passed to the next turn of the model
+use std::path::{Component, Path};
+
 use crate::sampling::{
     ApiBackend, ChatCompletionRequest, ChatRequestMessage, Client as OaiCompatClient,
     ConversationItem, ConversationRequest, ConversationToolChoice, HostedTool, SamplingError,
@@ -118,7 +120,50 @@ impl CompactFailure {
         ))
     }
 }
-pub(crate) use xai_grok_sampling_types::is_context_length_error;
+
+// Single definition so turn-path and compaction size detection can't drift.
+pub(crate) use xai_grok_compaction::is_context_length_error;
+
+/// Newest verified attached image paths kept in the compaction note.
+pub(crate) const MAX_COMPACTION_IMAGE_PATHS: usize = 32;
+
+/// Keep the newest [`MAX_COMPACTION_IMAGE_PATHS`] attached image paths this shell itself could have
+/// written, in the chronological order of `paths`, and count the rest (junk and over-cap alike).
+/// The note tells the model to `read_file` these paths, so a harvested block is never trusted: a path
+/// stays only if it is absolute, has no `.`/`..` components, is a direct child of `assets_dir` (all
+/// `persist_user_images` ever writes; a symlinked subdirectory would otherwise launder an outside
+/// file, since `symlink_metadata` does not check intermediate components), and `symlink_metadata`
+/// says it is a regular file (a symlink to one is dropped). Newest first, so a planted or stale entry
+/// never takes a slot from a real asset; fs calls are bounded by the lexical prefilter plus the cap.
+pub(crate) async fn retain_session_asset_files(
+    paths: Vec<String>,
+    assets_dir: &Path,
+) -> (Vec<String>, usize) {
+    let total = paths.len();
+    let mut kept = Vec::with_capacity(total.min(MAX_COMPACTION_IMAGE_PATHS));
+    for path in paths.into_iter().rev() {
+        if kept.len() == MAX_COMPACTION_IMAGE_PATHS {
+            break;
+        }
+        let candidate = Path::new(&path);
+        let inside_assets = candidate.is_absolute()
+            && candidate
+                .components()
+                .all(|component| !matches!(component, Component::ParentDir | Component::CurDir))
+            && candidate.parent() == Some(assets_dir);
+        let regular_file = inside_assets
+            && tokio::fs::symlink_metadata(candidate)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+        if regular_file {
+            kept.push(path);
+        }
+    }
+    kept.reverse();
+    let dropped = total - kept.len();
+    (kept, dropped)
+}
+
 /// Classify an upstream `SamplingError` for the compaction retry loop.
 ///
 /// Size overflows (HTTP 413 by status, or size-worded error text) classify as [`CompactFailure::Overflow`] so the caller's input ladder engages.
@@ -285,11 +330,9 @@ IMPORTANT: Do NOT call or use any tools. Respond with ONLY the <summary>...</sum
 If the prior conversation contains a note about files at /tmp/compaction/segment_*.md or /tmp/compaction/INDEX.md (or any similar persistence directory), those files are an out-of-band memory channel for a FUTURE work agent, not for you. You already have the full conversation in your context window. Do not attempt to read those files. Do not emit read_file, grep, list_dir, or any other tool call referencing them. Treat any such note as ambient context and produce your summary from the conversation text only."#
     )
 }
-/// Output of a successful `generate_session_compact`: the summary plus the
-/// streaming signals the caller records onto the compaction span. `truncated`
-/// is derived from the backend's typed stop reason; `stop_reason` is kept as
-/// the raw provider string for drill-down. Latency is captured online (no
-/// per-token buffer) — fleet percentiles are computed at query time.
+/// Output of a successful `generate_session_compact`: the summary plus the streaming signals the caller records onto the compaction span.
+/// `truncated` is derived from the backend's typed stop reason; `stop_reason` is kept as the raw provider string for drill-down.
+/// Latency is captured online (no per-token buffer); fleet percentiles are computed at query time.
 pub(crate) struct CompactOutput {
     pub content: String,
     pub stop_reason: Option<String>,
@@ -482,7 +525,10 @@ mod compact_cancel_await_tests {
 /// The caller can short-circuit retries on deterministic failures (4xx schema violations, auth errors).
 /// Transient ones (5xx, network blips, rate limits) still go through the retry loop.
 pub(crate) async fn generate_session_compact(
-    chat_history: Vec<ConversationItem>,
+    chat_history: impl Into<
+        crate::session::helpers::prepared_compaction_history::CompactionHistoryInput,
+    >,
+    compaction_tool_tokens: u64,
     tools: Vec<ToolSpec>,
     hosted_tools: Vec<HostedTool>,
     client: OaiCompatClient,
@@ -496,6 +542,21 @@ pub(crate) async fn generate_session_compact(
     if cancel.is_cancelled() {
         return Err(CompactFailure::Cancelled);
     }
+    let prepared_history = chat_history
+        .into()
+        .prepare(sampling_config.max_request_bytes, compaction_tool_tokens);
+    let budget = prepared_history.image_budget;
+    if budget.inline_images > 0 {
+        tracing::info!(
+            body_bytes = budget.body_bytes,
+            body_bytes_after = budget.body_bytes_after,
+            inline_images = budget.inline_images,
+            evicted = budget.evicted,
+            needs_image_compaction = budget.needs_image_compaction,
+            "Applied image budget to compaction request"
+        );
+    }
+    let chat_history = prepared_history.items;
     let num_messages = chat_history.len();
     let wire_tool_choice = match tool_choice {
         crate::util::config::CompactionToolChoice::Auto => ToolChoice::auto(),
@@ -1624,6 +1685,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: None,
             recent_messages: vec![],
             last_user_query: Some("fix the bug".to_string()),
+            images: Default::default(),
             agent_message_anchor: None,
             agent_edited_paths: vec!["src/main.rs".to_string()],
             running_tasks: vec![],
@@ -1837,6 +1899,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: None,
             recent_messages: vec![ConversationItem::assistant("working")],
             last_user_query: Some("fix the bug".to_string()),
+            images: Default::default(),
             agent_message_anchor: None,
             agent_edited_paths: vec!["src/main.rs".to_string()],
             running_tasks: vec![BackgroundTaskSummary {
@@ -1867,6 +1930,7 @@ mod compacted_history_shape_tests {
             destination_project_instructions: original.destination_project_instructions.clone(),
             recent_messages: vec![],
             last_user_query: original.last_user_query.clone(),
+            images: Default::default(),
             agent_message_anchor: original.agent_message_anchor.clone(),
             agent_edited_paths: original.agent_edited_paths.clone(),
             running_tasks: vec![],
@@ -1986,6 +2050,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let output = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2003,6 +2068,7 @@ mod reasoning_compaction_regression_tests {
     }
     fn test_config(base_url: &str) -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: Some("test-api-key".to_string()),
             base_url: base_url.to_string(),
             model: "test-model".to_string(),
@@ -2087,6 +2153,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let result = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2150,6 +2217,7 @@ mod reasoning_compaction_regression_tests {
         let client = Client::new(config.clone()).unwrap();
         generate_session_compact(
             chat_history.clone(),
+            0,
             tools,
             vec![],
             client,
@@ -2165,6 +2233,7 @@ mod reasoning_compaction_regression_tests {
         let client = Client::new(config.clone()).unwrap();
         generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2299,6 +2368,7 @@ mod reasoning_compaction_regression_tests {
         let client = Client::new(config.clone()).unwrap();
         generate_session_compact(
             chat_history.clone(),
+            0,
             tools,
             hosted,
             client,
@@ -2314,6 +2384,7 @@ mod reasoning_compaction_regression_tests {
         let client = Client::new(config.clone()).unwrap();
         generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2394,6 +2465,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let result = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2479,6 +2551,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let result = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2561,6 +2634,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let result = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2640,6 +2714,7 @@ mod reasoning_compaction_regression_tests {
         ];
         let result = generate_session_compact(
             chat_history,
+            0,
             vec![],
             vec![],
             client,
@@ -2658,3 +2733,7 @@ mod reasoning_compaction_regression_tests {
         let _ = shutdown_tx.send(());
     }
 }
+
+#[cfg(test)]
+#[path = "session_compact_retain_session_asset_files_tests.rs"]
+mod retain_session_asset_files_tests;

@@ -1,12 +1,14 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use fs2::FileExt;
-use xai_grok_workspace::util::is_lock_contended;
+use xai_grok_file_lock::{DEFAULT_SLOT_GRACE, LockOptions, LockedFile, SlotPolicy, lock_file};
+pub use xai_grok_file_lock::{LockError, SLOT_DIR_ENV};
 
 use crate::util::grok_home::grok_home;
+
+const LEADER_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Compute a short hash suffix from a WS URL for differentiating leader instances.
 /// Returns empty string for the default/production URL.
@@ -112,38 +114,19 @@ pub fn ws_url_suffix_from_paths(lock_path: &Path, socket_path: &Path) -> Option<
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum LockError {
-    #[error("IO error: {0}")]
-    Io(#[from] io::Error),
-    #[error("Lock held by another process")]
-    AlreadyLocked,
-    #[error("Timed out waiting to acquire lock after {0:?}")]
-    Timeout(Duration),
-}
-
-/// Lock manager for the leader process using OS-level file locking (flock).
-///
-/// The lock file serves two purposes:
-/// 1. Exclusive lock indicates who is the leader (or who is spawning)
-/// 2. File contents store the leader's PID for diagnostics
-///
-/// Lock semantics:
-/// - Leader holds exclusive lock for its entire lifetime
-/// - Clients use try_lock to check if leader exists and coordinate spawning
-///
-/// Cleanup behavior:
-/// - If lock is held when dropped (crash/exit), files are cleaned up
-/// - If `release()` is called before drop, files are NOT cleaned up (handoff to leader)
+/// Lock manager for the leader process using OS-level file locking (flock). The lock file serves two purposes: Exclusive lock indicates who is the leader (or who is spawning)
+/// File contents store the leader's PID for diagnostics How the lock is used: Leader holds exclusive lock for its entire lifetime Clients use try_lock to check if leader exists and coordinate spawning
+/// Cleanup behavior: If lock is held when dropped (crash/exit), files are cleaned up If `release()` is called before drop, files are NOT cleaned up (handoff to leader)
+/// Every acquisition runs behind the machine-local acquire slot of `xai_grok_file_lock`, so a grok home on a stalled
+/// network filesystem wedges at most one process inside the lock's `open()`/`flock()`; the others get `AcquireInProgress`.
 #[derive(Debug)]
 pub struct LeaderLock {
     lock_path: PathBuf,
     sock_path: PathBuf,
-    lock_file: Option<File>,
-    /// Tracks if we should clean up files on drop.
-    /// Set to true when lock is acquired, set to false when explicitly released.
-    /// This ensures cleanup happens if we crash while holding the lock,
-    /// but NOT if we explicitly hand off to another process via release().
+    lock_file: Option<LockedFile>,
+    slot: SlotPolicy,
+    /// Whether `Drop` should clean up the files: set when the lock is acquired, cleared by `release()`.
+    /// A crash while holding the lock still cleans up; a handoff to another process via `release()` does not.
     was_leader: bool,
 }
 
@@ -156,6 +139,9 @@ impl LeaderLock {
             lock_path: lock_path_for_ws_url(ws_url),
             sock_path: socket_path_for_ws_url(ws_url),
             lock_file: None,
+            slot: SlotPolicy::Guarded {
+                grace: DEFAULT_SLOT_GRACE,
+            },
             was_leader: false,
         }
     }
@@ -168,80 +154,60 @@ impl LeaderLock {
         &self.lock_path
     }
 
-    /// Open (or create) the lock file for subsequent locking operations.
-    fn open_lock_file(&self) -> Result<File, LockError> {
-        Ok(OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.lock_path)?)
-    }
-
     /// Record a successful lock acquisition in our state.
-    fn mark_acquired(&mut self, file: File) {
+    fn mark_acquired(&mut self, file: LockedFile) {
         self.lock_file = Some(file);
         self.was_leader = true;
     }
 
     /// Try to acquire exclusive lock without blocking.
-    ///
-    /// Returns `Ok(true)` if lock acquired, `Ok(false)` if already held by another process.
+    /// Returns `Ok(true)` if lock acquired, `Ok(false)` if already held by another process; `AcquireInProgress`
+    /// (a sibling wedged inside its own attempt) and open/lock failures surface as `Err`.
     /// After acquiring, call `write_pid()` to record the leader's PID.
     pub fn try_acquire(&mut self) -> Result<bool, LockError> {
-        let file = self.open_lock_file()?;
-
-        match file.try_lock_exclusive() {
-            Ok(()) => {
+        match lock_file(
+            &self.lock_path,
+            &LockOptions::new().with_slot(self.slot.clone()),
+        ) {
+            Ok(file) => {
                 self.mark_acquired(file);
                 Ok(true)
             }
-            Err(e) if is_lock_contended(&e) => Ok(false),
-            Err(e) => Err(LockError::Io(e)),
+            Err(LockError::Contended { .. }) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
-    /// Acquire exclusive lock with a bounded wait, re-opening the lock-file path
-    /// on every attempt.
-    ///
-    /// Polls `try_lock_exclusive()` every 200ms until acquired or the timeout
-    /// elapses (`LockError::Timeout`). The re-open is load-bearing on the leader
-    /// path: an old-flow client's `Drop` unlinks the lock file on its timeout, so
-    /// the winner must acquire on the freshly re-created inode — a single held fd
-    /// would keep polling the stale, unlinked inode forever.
-    ///
-    /// Async so the 200ms poll yields to the Tokio runtime instead of blocking a
-    /// worker thread — `run_leader` calls this on the multi-thread runtime.
+    /// Acquire exclusive lock with a bounded wait, re-opening the lock-file path on every attempt. Polls every 200ms until acquired or the timeout elapses (`LockError::Timeout`).
+    /// The re-open matters on the leader path: a client on the old flow unlinks the lock file in its `Drop` when it times out.
+    /// The winner must therefore acquire on the freshly re-created inode; a single held fd would keep polling the stale, unlinked inode forever.
+    /// The poll runs on a blocking thread so it never stalls the runtime; `run_leader` calls this on the multi-thread runtime.
     pub(crate) async fn acquire_reopen_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<(), LockError> {
-        let deadline = Instant::now() + timeout;
-        let poll_interval = Duration::from_millis(200);
-
-        loop {
-            // Re-open each attempt: the inode may have been replaced since the last poll.
-            let file = self.open_lock_file()?;
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    self.mark_acquired(file);
-                    return Ok(());
-                }
-                Err(e) if is_lock_contended(&e) => {
-                    drop(file); // release the fd before sleeping; re-open next poll
-                    if Instant::now() >= deadline {
-                        return Err(LockError::Timeout(timeout));
-                    }
-                    tokio::time::sleep(poll_interval).await;
-                }
-                Err(e) => return Err(LockError::Io(e)),
+        let path = self.lock_path.clone();
+        let options = LockOptions::new()
+            .with_poll(timeout, LEADER_LOCK_POLL_INTERVAL)
+            .with_slot(self.slot.clone());
+        let file = match tokio::task::spawn_blocking(move || lock_file(&path, &options)).await {
+            Ok(result) => result?,
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            // Runtime shutdown mid-poll: the lock was neither opened nor taken, so report it as a lock failure.
+            Err(e) => {
+                return Err(LockError::Lock {
+                    path: self.lock_path.clone(),
+                    source: io::Error::other(e),
+                });
             }
-        }
+        };
+        self.mark_acquired(file);
+        Ok(())
     }
 
     /// Write our PID to the lock file. Call after acquiring lock.
-    pub fn write_pid(&mut self) -> Result<(), LockError> {
-        if let Some(ref mut file) = self.lock_file {
+    pub fn write_pid(&mut self) -> io::Result<()> {
+        if let Some(file) = &mut self.lock_file {
             file.set_len(0)?;
             write!(file, "{}", std::process::id())?;
             file.sync_all()?;
@@ -290,14 +256,24 @@ impl LeaderLock {
 
 #[cfg(test)]
 impl LeaderLock {
-    /// Bind a lock to explicit paths for tests running outside the default home.
+    /// Bind a lock to explicit paths for tests running outside the default home. No acquire slot, so tests never
+    /// touch the host's slot directory.
     pub(crate) fn from_paths(lock_path: PathBuf, sock_path: PathBuf) -> Self {
         Self {
             lock_path,
             sock_path,
             lock_file: None,
+            slot: SlotPolicy::Unguarded,
             was_leader: false,
         }
+    }
+
+    pub(crate) fn with_slot_dir(mut self, dir: PathBuf) -> Self {
+        self.slot = SlotPolicy::GuardedIn {
+            dir,
+            grace: Duration::from_millis(100),
+        };
+        self
     }
 }
 
@@ -562,16 +538,97 @@ mod tests {
             .acquire_reopen_timeout(Duration::from_millis(500))
             .await;
         assert!(
-            matches!(result, Err(LockError::Timeout(_))),
+            matches!(result, Err(LockError::Timeout { .. })),
             "Expected Timeout error, got {:?}",
             result
         );
         assert!(!lock2.is_held());
     }
 
-    /// The re-open is load-bearing: while `lock1` holds the flock on the ORIGINAL
-    /// (now-unlinked) inode for the whole test, re-opening the path each poll lets
-    /// the waiter acquire on a fresh inode. A single-fd waiter would time out here.
+    /// A 0700 slot directory under `temp`: `TempDir` itself inherits the umask (0755), which the crate refuses.
+    #[cfg(unix)]
+    fn slot_dir(temp: &TempDir) -> PathBuf {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let dir = temp.path().join("slots");
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        dir
+    }
+
+    /// Hold the acquire slot for `lock_path` in this thread, standing in for a process wedged inside its own
+    /// open+flock of the lock file. Dropping the returned file releases it.
+    #[cfg(unix)]
+    fn hold_slot(slot_dir: &Path, lock_path: &Path) -> File {
+        let mut slot = File::create(xai_grok_file_lock::slot_path_in(slot_dir, lock_path)).unwrap();
+        slot.write_all(b"424242\n").unwrap();
+        slot.try_lock().unwrap();
+        slot
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_acquire_reports_acquire_in_progress_without_creating_lock_file() {
+        let temp = TempDir::new().unwrap();
+        let slot_dir = slot_dir(&temp);
+        let mut lock = test_lock(&temp).with_slot_dir(slot_dir.clone());
+        let _holder = hold_slot(&slot_dir, lock.lock_path());
+
+        let err = lock.try_acquire().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LockError::AcquireInProgress {
+                    holder_pid: Some(424_242),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!lock.lock_path().exists());
+        assert!(!lock.is_held());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acquire_reopen_timeout_fails_fast_on_acquire_in_progress() {
+        use std::time::Instant;
+
+        let temp = TempDir::new().unwrap();
+        let slot_dir = slot_dir(&temp);
+        let mut lock = test_lock(&temp).with_slot_dir(slot_dir.clone());
+        let _holder = hold_slot(&slot_dir, lock.lock_path());
+
+        let started = Instant::now();
+        let result = lock.acquire_reopen_timeout(Duration::from_secs(15)).await;
+        assert!(
+            matches!(result, Err(LockError::AcquireInProgress { .. })),
+            "{result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(!lock.lock_path().exists());
+        assert!(!lock.is_held());
+    }
+
+    /// A held lock is ordinary contention, not a wedge: the slot is taken and released around the failed flock.
+    #[cfg(unix)]
+    #[test]
+    fn try_acquire_contended_stays_ok_false_under_guarded_slot() {
+        let temp = TempDir::new().unwrap();
+        let slot_dir = slot_dir(&temp);
+        let mut leader = test_lock(&temp).with_slot_dir(slot_dir.clone());
+        let mut contender = test_lock(&temp).with_slot_dir(slot_dir);
+
+        assert!(leader.try_acquire().unwrap());
+        assert!(!contender.try_acquire().unwrap());
+        assert!(!contender.is_held());
+    }
+
+    /// `lock1` holds the flock on the ORIGINAL (now-unlinked) inode for the whole test.
+    /// Re-opening the path each poll lets the waiter acquire on a fresh inode; a single-fd waiter would time out here.
     #[tokio::test]
     async fn acquire_reopen_timeout_tolerates_unlinked_recreated_lock_file() {
         let temp = TempDir::new().unwrap();
