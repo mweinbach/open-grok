@@ -841,13 +841,21 @@ pub(super) fn handle_btw_response(
     agent_id: AgentId,
     result: Result<String, String>,
     minimal_request_id: Option<uuid::Uuid>,
+    skipped_image_numbers: &[usize],
 ) -> Vec<Effect> {
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         use crate::views::btw_overlay::BtwOverlayState;
         if let Some(request_id) = minimal_request_id {
-            crate::minimal_api::finish_minimal_btw(agent, request_id, result);
+            // A dismissed or stale request ignores the answer. Don't toast either.
+            if crate::minimal_api::finish_minimal_btw(agent, request_id, result) {
+                app.pending_image_notices
+                    .extend(agent.skipped_image_send_notice(skipped_image_numbers));
+            }
             return vec![];
         }
+        // Cap drops and read failures are disjoint sets; the flush shows them as one message.
+        app.pending_image_notices
+            .extend(agent.skipped_image_send_notice(skipped_image_numbers));
         let question = match &agent.btw_state {
             Some(BtwOverlayState::Loading { question }) => question.clone(),
             _ => String::new(),

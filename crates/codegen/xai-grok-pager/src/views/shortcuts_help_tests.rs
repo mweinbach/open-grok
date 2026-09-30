@@ -865,8 +865,6 @@ fn initial_state_selects_first_hint_not_header() {
     assert_eq!(state.selected, 1, "selected should land on first Hint");
 }
 
-// ── handle_input tests ───────────────────────────────────────
-
 fn make_key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
 }
@@ -1648,8 +1646,6 @@ fn vim_i_enters_search_and_printables_type_afterward() {
     assert_eq!(type_j, ShortcutsHelpOutcome::Changed);
     assert_eq!(state.query(), "j", "printables must type in active search");
 }
-
-// ── vim_mode tests ───────────────────────────────────────────
 
 #[test]
 fn vim_mode_jk_navigate_without_starting_search() {

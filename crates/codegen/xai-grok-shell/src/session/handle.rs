@@ -40,6 +40,18 @@ pub(crate) enum SessionLiveState {
 /// `session/new` and `session/load` responses. Defined here so the shell that
 /// publishes it and the clients that read it share one spelling.
 pub const SCHEDULER_BACKGROUND_LOOPS_META_KEY: &str = "x.ai/schedulerBackgroundLoops";
+pub(crate) struct WorkGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl WorkGuard {
+    pub(crate) fn new(active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        active_work.fetch_add(1, std::sync::atomic::Ordering::Release);
+        Self(active_work)
+    }
+}
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
 /// Handle for interacting with a session actor.
 /// Note: Permission event receivers are returned separately from `spawn_session_actor`
 /// and should be stored/managed by the caller.
@@ -59,6 +71,7 @@ pub struct SessionHandle {
     /// resolve. The roster reads this synchronously to surface `NeedsInput`
     /// Never persisted.
     pub pending_interactions: crate::session::pending_interaction::PendingInteractions,
+    pub(crate) active_work: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Session info (id, cwd) - cached for quick access without querying persistence
     pub info: crate::session::info::Info,
     /// Resolved turn limit for this session; lets a spawned subagent inherit
@@ -78,19 +91,12 @@ pub struct SessionHandle {
     /// [`SessionActor::gateway_enabled`] for details.
     pub gateway_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub status_line_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// MCP server configs for this session (merged local + client-provided).
-    /// Stored on the handle so forked sessions can inherit the parent's
-    /// MCP servers without requiring a round-trip through the session actor.
-    ///
-    /// **Note:** This is a snapshot from `spawn_session_actor` time. If the
-    /// client later sends `UpdateMcpServers`, the handle's copy is NOT updated.
-    /// This is fine for forks that happen immediately after spawn, but callers
-    /// that need the latest MCP state should query the session actor via command.
-    pub mcp_servers: Vec<acp::McpServer>,
-    /// Client-provided MCP servers after vendor `mcps` kill-switch admission
-    /// (still pre-merge with disk/plugins/managed). Hot-reloads re-merge from
-    /// this seed so disabled-vendor servers rejected at ingress cannot reappear
-    /// merely because on-disk attribution vanished mid-session.
+    /// Admitted MCP servers (disk, client, and the current agent.md overlay).
+    /// Shared with the actor's `McpState`: config commits publish here, and forks
+    /// snapshot the cell so they see the current seat's servers and headers.
+    pub mcp_servers: super::mcp_servers::AdmittedMcpServers,
+    /// Client-provided MCP servers as admitted by the vendor `mcps` kill-switch, before merging with disk/plugin/managed servers.
+    /// Writers assign this through `with_resident_mut` before enqueue. The actor keeps its own copy, updated from `UpdateMcpServers.client_seed`.
     pub initial_client_mcp_servers: Vec<acp::McpServer>,
     /// Stable display path for forked sessions (original project path).
     ///

@@ -259,7 +259,7 @@ impl<'a> SvgRenderer<'a> {
             x, y, node.width, node.height, rx, fill, stroke
         ));
 
-        self.render_text(node.x, node.y, &node.label);
+        self.render_text(node, node.x, node.y);
     }
 
     fn render_start_state(&mut self, node: &LayoutNode) {
@@ -323,7 +323,7 @@ impl<'a> SvgRenderer<'a> {
             points, fill, stroke
         ));
 
-        self.render_text(node.x, node.y, &node.label);
+        self.render_text(node, node.x, node.y);
     }
 
     fn render_circle(&mut self, node: &LayoutNode) {
@@ -340,7 +340,7 @@ impl<'a> SvgRenderer<'a> {
             node.x, node.y, r, fill, stroke
         ));
 
-        self.render_text(node.x, node.y, &node.label);
+        self.render_text(node, node.x, node.y);
     }
 
     fn render_hexagon(&mut self, node: &LayoutNode) {
@@ -375,7 +375,7 @@ impl<'a> SvgRenderer<'a> {
             points, fill, stroke
         ));
 
-        self.render_text(node.x, node.y, &node.label);
+        self.render_text(node, node.x, node.y);
     }
 
     fn render_cylinder(&mut self, node: &LayoutNode) {
@@ -422,7 +422,7 @@ impl<'a> SvgRenderer<'a> {
 
         // Center text in the cylinder body (below the top ellipse cap)
         let body_center_y = (body_top + body_bottom) / 2.0;
-        self.render_text(node.x, body_center_y, &node.label);
+        self.render_text(node, node.x, body_center_y);
     }
 
     fn render_subroutine(&mut self, node: &LayoutNode) {
@@ -460,7 +460,7 @@ impl<'a> SvgRenderer<'a> {
             stroke
         ));
 
-        self.render_text(node.x, node.y, &node.label);
+        self.render_text(node, node.x, node.y);
     }
 
     fn render_asymmetric(&mut self, node: &LayoutNode) {
@@ -494,26 +494,27 @@ impl<'a> SvgRenderer<'a> {
             points, fill, stroke
         ));
 
-        self.render_text(node.x + point_offset / 4.0, node.y, &node.label);
+        self.render_text(node, node.x + point_offset / 4.0, node.y);
     }
 
-    fn render_text(&mut self, x: f64, y: f64, text: &str) {
+    fn render_text(&mut self, node: &LayoutNode, x: f64, y: f64) {
         let char_width = if self.is_state_diagram {
             scale_char_width(STATE_CHAR_WIDTH, self.options.font_size)
         } else {
             scale_char_width(DEFAULT_CHAR_WIDTH, self.options.font_size)
         };
-        let lines = wrap_text_lines(text, self.options.wrapping_width, char_width);
+        let lines = wrap_text_lines(&node.label, self.options.wrapping_width, char_width);
         if lines.is_empty() {
             return;
         }
+        let color = node.text_color.as_deref().unwrap_or(&self.theme.text_color);
         self.render_text_lines(
             x,
             y,
             &lines,
             self.options.font_size,
             DEFAULT_LINE_HEIGHT,
-            &self.theme.text_color,
+            color,
         );
     }
 

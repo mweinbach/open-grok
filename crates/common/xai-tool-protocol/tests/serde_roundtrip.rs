@@ -9,19 +9,20 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use xai_tool_protocol::{
-    AttachRoute, ConnectionId, ConnectionKind, ERROR_CODES, FrameSeq, HelloAckMsg, HelloMsg,
-    HookEvent, HookFrame, HookKind, IMAGE_CAPABILITIES_V1, JsonRpcId, JsonRpcVersion,
-    KNOWN_NOTIFICATION_KINDS, LastSeq, McpBlock, Method, NotificationFilter, NotificationSchemas,
-    PingFrame, PongFrame, RegistrationOutcome, RegistryError, RequestId, ServerBindAck,
-    ServerBindOutcome, ServerId, SessionAttachServerParams, SessionAttachServerResult,
-    SessionBindResult, SessionBindServerParams, SessionBindServerResult, SessionCloseParams,
-    SessionEvent, SessionId, SessionOpenParams, SessionPhase, SessionUnbindServerParams,
-    StreamingSpec, SubscribeAck, SubscribeNotificationsParams, SubscribeOutcome, ToolCallId,
-    ToolCallOutcome, ToolCallParams, ToolCallProgressFrame, ToolCallResult, ToolCapabilities,
-    ToolDefinitionMode, ToolDescriptionWithSchema, ToolErrorWire, ToolId, ToolNotificationFrame,
-    ToolOutputWire, ToolRegistration, ToolScope, ToolSearchResult, ToolServerRegistration,
-    ToolsChanged, ToolsListParams, ToolsListResult, ToolsSearchParams, ToolsSearchResultBody,
-    TransportKind, UnsubscribeAck, UnsubscribeNotificationsParams, UnsubscribeOutcome, UserId,
+    AttachRoute, AuthRefreshParams, AuthRefreshResult, ConnectionId, ConnectionKind, ERROR_CODES,
+    FrameSeq, HelloAckMsg, HelloMsg, HookEvent, HookFrame, HookKind, IMAGE_CAPABILITIES_V1,
+    JsonRpcId, JsonRpcVersion, KNOWN_NOTIFICATION_KINDS, LastSeq, McpBlock, Method,
+    NotificationFilter, NotificationSchemas, PingFrame, PongFrame, RegistrationOutcome,
+    RegistryError, RequestId, ServerBindAck, ServerBindOutcome, ServerId,
+    SessionAttachServerParams, SessionAttachServerResult, SessionBindResult,
+    SessionBindServerParams, SessionBindServerResult, SessionCloseParams, SessionEvent, SessionId,
+    SessionOpenParams, SessionPhase, SessionUnbindServerParams, StreamingSpec, SubscribeAck,
+    SubscribeNotificationsParams, SubscribeOutcome, ToolCallId, ToolCallOutcome, ToolCallParams,
+    ToolCallProgressFrame, ToolCallResult, ToolCapabilities, ToolDefinitionMode,
+    ToolDescriptionWithSchema, ToolErrorWire, ToolId, ToolNotificationFrame, ToolOutputWire,
+    ToolRegistration, ToolScope, ToolSearchResult, ToolServerRegistration, ToolsChanged,
+    ToolsListParams, ToolsListResult, ToolsSearchParams, ToolsSearchResultBody, TransportKind,
+    UnsubscribeAck, UnsubscribeNotificationsParams, UnsubscribeOutcome, UserId,
     WireCustomNotification, WireToolNotification, error_codes,
 };
 use xai_tool_types::ToolDescription;
@@ -241,6 +242,21 @@ fn handshake_messages_round_trip() {
     let parsed: HelloAckMsg =
         serde_json::from_value(legacy).expect("legacy hello_ack without capabilities parses");
     assert!(parsed.capabilities.is_empty());
+}
+
+#[test]
+fn auth_refresh_frames_round_trip_with_bare_fields() {
+    assert_eq!(Method::AuthRefresh.as_wire_str(), "auth.refresh");
+    let params = AuthRefreshParams {
+        access_token: "eyJ.at.jwt".to_owned(),
+    };
+    assert_eq!(json!({"access_token": "eyJ.at.jwt"}), roundtrip(&params));
+    assert!(
+        !format!("{params:?}").contains("eyJ.at.jwt"),
+        "Debug leaks the bearer"
+    );
+    let result = AuthRefreshResult { exp: 1_800_000_000 };
+    assert_eq!(json!({"exp": 1_800_000_000_i64}), roundtrip(&result));
 }
 
 fn sample_description(name: &str, namespace: Option<&str>) -> ToolDescription {
@@ -487,6 +503,7 @@ fn method_serialises_with_dot_notation_for_dotted_methods() {
         (Method::BotVncDescriptor, "bot.vncDescriptor"),
         (Method::BotTranscriptOffbox, "bot.transcript.offbox"),
         (Method::BotBindConversation, "bot.bindConversation"),
+        (Method::BotPresence, "bot.presence"),
         (Method::BotEvent, "bot.event"),
     ];
     for (m, expected) in cases {

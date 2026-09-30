@@ -62,9 +62,9 @@ mod transport;
 use crate::env::GrokBuildEnvironment;
 pub use client::{ClientError, DisconnectReason, LeaderClient, LeaderRegistration};
 pub use lock::{
-    LEADER_SOCKET_ENV, LeaderLock, LockError, compute_ws_url_suffix, lock_path_for_ws_url,
-    lock_path_for_ws_url_in, socket_path_for_ws_url, socket_path_for_ws_url_in,
-    ws_url_suffix_from_paths,
+    LEADER_SOCKET_ENV, LeaderLock, LockError, SLOT_DIR_ENV, compute_ws_url_suffix,
+    lock_path_for_ws_url, lock_path_for_ws_url_in, socket_path_for_ws_url,
+    socket_path_for_ws_url_in, ws_url_suffix_from_paths,
 };
 pub use protocol::{
     ClientCapabilities, ClientId, ClientMode, ControlCommand, ControlPayload,
@@ -1575,6 +1575,10 @@ pub async fn connect_or_spawn(
             Ok(false) => {
                 debug!("Lock held by another process, probing socket connectability");
             }
+            Err(e @ LockError::AcquireInProgress { .. }) => {
+                debug!(error = %e, "leader lock is being acquired by another process; not spawning a leader");
+                return Err(ConnectionError::Lock(e));
+            }
             Err(e) => {
                 return Err(e.into());
             }
@@ -1690,6 +1694,23 @@ fn path_is_under(path: &Path, dir: &Path) -> bool {
     let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     path.starts_with(&dir)
 }
+const LEADER_LOG_ROTATE_BYTES: u64 = 32 * 1024 * 1024;
+/// Truncating on every spawn erased the crashed leader's last lines, the only record of why it died.
+fn open_leader_log(log_path: &Path) -> std::io::Result<std::fs::File> {
+    if std::fs::metadata(log_path).is_ok_and(|m| m.len() > LEADER_LOG_ROTATE_BYTES) {
+        let rotated = log_path.with_extension("log.1");
+        if let Err(e) = std::fs::rename(log_path, &rotated) {
+            warn!(error = %e, path = %log_path.display(), "Failed to rotate leader log");
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+}
+/// Fallback leader RUST_LOG when neither GROK_LEADER_LOG nor RUST_LOG is set.
+const LEADER_DEFAULT_LOG_DIRECTIVES: &str =
+    "xai_grok_shell=info,xai_acp_lib=warn,xai_grok_mcp=warn";
 fn spawn_leader_subprocess(env_urls: &LeaderEnvUrls) -> Result<u32, ConnectionError> {
     let exe = resolve_exe_for_spawn()?;
     let mut cmd = Command::new(exe);
@@ -1714,7 +1735,7 @@ fn spawn_leader_subprocess(env_urls: &LeaderEnvUrls) -> Result<u32, ConnectionEr
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null());
     let log_path = crate::util::grok_home::grok_home().join("leader.log");
-    match std::fs::File::create(&log_path) {
+    match open_leader_log(&log_path) {
         Ok(log_file) => {
             info!("Leader stderr → log file");
             cmd.stderr(std::process::Stdio::from(log_file));
@@ -1726,7 +1747,7 @@ fn spawn_leader_subprocess(env_urls: &LeaderEnvUrls) -> Result<u32, ConnectionEr
     }
     let leader_log = std::env::var("GROK_LEADER_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "xai_grok_shell=info,xai_acp_lib=warn,xai_grok_mcp=warn".into());
+        .unwrap_or_else(|_| LEADER_DEFAULT_LOG_DIRECTIVES.into());
     cmd.env("RUST_LOG", leader_log);
     #[cfg(unix)]
     {
@@ -1941,6 +1962,12 @@ mod tests {
             "boom".into()
         )));
         assert!(!is_terminal_refusal(&ConnectionError::Cancelled));
+        assert!(!is_terminal_refusal(&ConnectionError::Lock(
+            LockError::AcquireInProgress {
+                path: PathBuf::from("/x/leader.lock"),
+                holder_pid: Some(1),
+            }
+        )));
     }
     /// Per-PID eviction budget: allows `max` attempts, then denies; a PID change
     /// resets the counter so a fresh zombie gets its own budget.

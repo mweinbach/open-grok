@@ -7,7 +7,7 @@ multiplexers, containers, and SSH sessions can handle these features differently
 ## Diagnose and Fix Terminal Problems
 
 Run `/doctor` in Grok to check the current session and see available fixes. If
-Grok cannot start, run `grok doctor` in your shell. Use `grok doctor --json`
+Grok cannot start, run `open-grok doctor` in your shell. Use `open-grok doctor --json`
 for a machine-readable report.
 
 Doctor checks the terminal, multiplexer, color support, keyboard and newline
@@ -16,7 +16,7 @@ included. The in-app command can also check live session details such as
 notification focus tracking and sandbox profile conflicts.
 
 A report can contain issues or recommendations and still exit successfully.
-`grok doctor --json` reports the same color capability when piped. Microphone
+`open-grok doctor --json` reports the same color capability when piped. Microphone
 checks do not start recording, so Doctor cannot detect macOS permission failures
 that appear only as silence during capture.
 
@@ -217,6 +217,25 @@ keys. Grok therefore does not negotiate the protocol there, and Shift+Enter can
 arrive as the same `CR` as Enter. This also affects VS Code reached over SSH when
 `TERM_PROGRAM` is not forwarded. Use `Alt+Enter` to insert a newline; `/doctor`
 reports `terminal.newline-fallback` with the detected explanation and workaround.
+
+### Cmd+Enter is not an advertised send or newline chord
+
+`Cmd+Enter` is not an advertised send or newline chord. Grok advertises
+only `Shift+Enter` and `Alt+Enter` as newline. Many terminals bind
+Cmd+Enter to fullscreen, so `SUPER` is excluded from the newline matcher,
+and a delivered `SUPER+Enter` does not match the agent's bare-Enter send
+binding. When Kitty (or another protocol that can deliver `SUPER`) does
+deliver `SUPER+Enter`, the composer still inserts a newline: the key
+misses send and lands in the textarea, which treats any Enter as a line
+break. Apple Terminal is a separate local path: CoreGraphics rescue
+treats held Cmd as modified Enter and inserts a newline on what arrives
+as bare Enter. Over SSH the Cmd modifier never arrives, so the chord
+looks like bare Enter and sends.
+
+The composer footer shows the working newline chord when the draft is
+non-empty. Over SSH it prefers `Alt+Enter`. You can also type `\` then
+Enter, or `/ml`. Do not expect Cmd+Enter to insert a newline on a remote
+session.
 
 ### Mouse scrolling stops working
 

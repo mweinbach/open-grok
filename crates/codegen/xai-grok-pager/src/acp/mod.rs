@@ -126,7 +126,8 @@ pub struct AcpConnection {
 /// CLI flags that affect agent configuration, threaded from PagerArgs.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectFlags {
-    pub subagents: bool,
+    /// `--no-subagents`. Only an explicit flag reaches the CLI tier of the resolver; otherwise env, config.toml, and the default decide, exactly as in `open-grok agent stdio`.
+    pub no_subagents: bool,
     pub experimental_memory: bool,
     pub no_memory: bool,
     pub disable_web_search: bool,
@@ -183,7 +184,7 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         raw_config: &raw_config,
         remote_settings: flags.remote_settings.as_ref(),
         is_headless: false,
-        cli_subagents: Some(flags.subagents),
+        cli_subagents: flags.no_subagents.then_some(false),
         cli_web_search_model: None,
         cli_session_summary_model: None,
         cli_experimental_memory: flags.experimental_memory,
@@ -434,8 +435,8 @@ fn unsupported_leader_flags(flags: &ConnectFlags) -> Vec<&'static str> {
     if flags.storage_mode.is_some() {
         out.push("--storage-mode");
     }
-    if flags.subagents {
-        out.push("--subagents");
+    if flags.no_subagents {
+        out.push("--no-subagents");
     }
     if !flags.permission_rules.is_empty() {
         out.push("--allow/--deny permission rules");
@@ -1151,7 +1152,7 @@ mod tests {
             no_memory: true,
             disable_web_search: true,
             storage_mode: Some("writeback".into()),
-            subagents: true,
+            no_subagents: true,
             ..Default::default()
         };
         let detected = unsupported_leader_flags(&flags);
@@ -1160,7 +1161,7 @@ mod tests {
         assert!(detected.contains(&"--no-memory"));
         assert!(detected.contains(&"--disable-web-search"));
         assert!(detected.contains(&"--storage-mode"));
-        assert!(detected.contains(&"--subagents"));
+        assert!(detected.contains(&"--no-subagents"));
     }
 
     #[test]

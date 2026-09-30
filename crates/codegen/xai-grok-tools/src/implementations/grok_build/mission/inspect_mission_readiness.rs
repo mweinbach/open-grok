@@ -61,6 +61,10 @@ Validates features.json structure, verifies that every feature references an exi
     fn requires_expr(&self) -> Expr<ToolRequirement> {
         Expr::True
     }
+
+    fn is_read_only(&self) -> bool {
+        true
+    }
 }
 
 impl xai_tool_runtime::Tool for InspectMissionReadinessTool {

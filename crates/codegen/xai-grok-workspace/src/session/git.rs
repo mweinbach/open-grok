@@ -246,7 +246,7 @@ pub(crate) fn strip_url_credentials(url_str: &str) -> String {
 /// push/fetch errors — so the token would otherwise leak to the FE and logs.
 /// Rewrites `scheme://<userinfo>@` → `scheme://` in place, preserving the rest
 /// (line structure, quotes, trailing punctuation) so diagnostics stay readable.
-pub(crate) fn scrub_git_output(text: &str) -> String {
+pub fn scrub_git_output(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut remaining = text;
     while let Some(pos) = remaining.find("://") {
@@ -3198,17 +3198,11 @@ pub async fn ensure_binding(
             )
             .await?;
         } else {
-            git_cli(
-                git_root,
-                &[
-                    "checkout",
-                    "-b",
-                    session_branch,
-                    "--end-of-options",
-                    base_ref,
-                ],
-            )
-            .await?;
+            // No `--end-of-options` here: `checkout` parses everything after
+            // it as paths, which breaks `-b <branch> <start-point>` ("Cannot
+            // update paths and switch to branch at the same time").
+            // `ensure_ref_arg_safe` above is the injection guard for both refs.
+            git_cli(git_root, &["checkout", "-b", session_branch, base_ref]).await?;
             created = true;
             seed_default_gitignore(git_root).await?;
         }

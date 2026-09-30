@@ -736,12 +736,69 @@ pub enum SubagentLimitDisposition {
     Failed,
 }
 
+/// Whether the parent's task tool advertised an explicit child-model argument.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelSelectionKind {
+    Selectable,
+    Inherited,
+}
+
+/// How the eligible model catalog classified when a task tool was constructed.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelCatalogKind {
+    Provisional,
+    Empty,
+    UnknownFamily,
+    FirstPartyOnly,
+    ThirdPartyOnly,
+    Mixed,
+}
+
+/// Which agent the presentation was latched for.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentPresentationAudience {
+    Primary,
+    Subagent,
+}
+
+/// One task-tool construction: what the catalog looked like and what the model was shown.
+#[derive(Serialize)]
+pub struct SubagentModelPresentationApplied {
+    pub selection: SubagentModelSelectionKind,
+    pub classification: SubagentModelCatalogKind,
+    pub eligible_count: u32,
+    pub inheritance_enabled: bool,
+    /// Tier that resolved the feature: `requirement` | `env` | `config` | `remote` | `default`.
+    pub feature_source: String,
+    pub audience: SubagentPresentationAudience,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentModelRejectionReason {
+    HiddenSelection,
+}
+
+/// An explicit child-model argument was refused; no child work ran.
+#[derive(Serialize)]
+pub struct SubagentModelOverrideRejected {
+    pub parent_session_id: String,
+    pub owner: SubagentOwnerKind,
+    pub reason: SubagentModelRejectionReason,
+}
+
 #[derive(Serialize)]
 pub struct SubagentLaunched {
     pub subagent_id: String,
     pub parent_session_id: String,
     pub subagent_type: String,
     pub owner: SubagentOwnerKind,
+    /// The selection mode of the originating task call; absent for harness-origin spawns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<SubagentModelSelectionKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_run_id: Option<String>,
     /// Time parked in the admission queue; absent if admitted immediately.
@@ -867,6 +924,7 @@ pub struct SubagentRateLimitWaited {
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowSourceKind {
     Builtin,
+    Bundled,
     File,
     Inline,
 }
@@ -910,6 +968,10 @@ pub enum WorkflowRunEndStatus {
 pub struct WorkflowRunEnded {
     pub run_id: String,
     pub parent_session_id: String,
+    pub source: WorkflowSourceKind,
+    /// Built-in workflow names only; user script names stay local.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_name: Option<String>,
     pub status: WorkflowRunEndStatus,
     /// Cumulative across the run's episodes.
     pub duration_ms: u64,
@@ -1158,6 +1220,38 @@ pub struct SkillDispatched {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_source: Option<String>,
     pub trigger: SkillTrigger,
+    /// The validated frontmatter `origin` slug (the tool that wrote the skill). None = hand-written, or no frontmatter in hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_origin: Option<String>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessSurfaceKind {
+    Skill,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessChangeOp {
+    Added,
+    Removed,
+}
+
+/// One item of the user's harness changed; emitted once per item alongside the count-only `skill_added` / `skill_removed`.
+#[derive(Serialize)]
+pub struct HarnessChanged {
+    pub kind: HarnessSurfaceKind,
+    pub op: HarnessChangeOp,
+    pub name: String,
+    /// Where the skill is loaded from, same vocabulary as `SkillDispatched::skill_source`; independent of `origin`.
+    pub skill_source: String,
+    /// The validated frontmatter `origin` slug. None = hand-written or unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_source: Option<String>,
+    pub success: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1199,6 +1293,52 @@ pub struct McpToolCalled {
     pub qualified_name: String,
     pub success: bool,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileInputKind {
+    Arguments,
+    Invocation,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileInputOutcome {
+    Success,
+    Failed,
+}
+
+#[derive(Serialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum McpFileLimitKind {
+    Source,
+    Sources,
+    Snapshots,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputUsed {
+    pub kind: McpFileInputKind,
+    pub model_id: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputCompleted {
+    pub kind: McpFileInputKind,
+    pub outcome: McpFileInputOutcome,
+    pub source_bytes: u64,
+    pub snapshot_bytes: u64,
+    pub duration_ms: u64,
+    pub model_id: String,
+}
+
+#[derive(Serialize)]
+pub struct McpFileInputLimitHit {
+    pub kind: McpFileLimitKind,
+    pub limit_bytes: u64,
+    pub observed_bytes: u64,
+    pub model_id: String,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1442,8 +1582,6 @@ pub struct PromptLatency {
     pub total_ms: u64,
     pub mcp_wait_ms: u64,
     pub tool_collection_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repo_status_wait_ms: Option<u64>,
     pub model_call_ms: u64,
     pub pre_model_ms: u64,
     pub mcp_server_count: u32,
@@ -1513,17 +1651,362 @@ pub struct ActionStationarityStop {
 // Tool Calls
 // ---------------------------------------------------------------------------
 
+/// Host invocation id. Only a UUID is representable, so a provider call id or a path cannot be written here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct InvocationId(String);
+
+impl InvocationId {
+    pub fn generate() -> Self {
+        Self(uuid::Uuid::now_v7().to_string())
+    }
+
+    pub fn from_host(id: &str) -> Option<Self> {
+        uuid::Uuid::parse_str(id).ok().map(|_| Self(id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Qualified registry id, or the one opaque class for unknown, custom, and dynamic names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct CanonicalToolId(String);
+
+impl CanonicalToolId {
+    pub const OPAQUE: &'static str = "opaque";
+
+    pub fn opaque() -> Self {
+        Self(Self::OPAQUE.to_owned())
+    }
+
+    /// `Namespace:id` from a finalized registration. Rejects aliases, MCP names, and paths.
+    pub fn from_qualified(id: &str) -> Option<Self> {
+        let (namespace, tool) = id.split_once(':')?;
+        if namespace.is_empty()
+            || tool.is_empty()
+            || namespace == "MCP"
+            || tool.contains(':')
+            || id.contains("__")
+            || id.contains('/')
+            || id.contains('\\')
+            || id.contains(' ')
+            || !namespace.chars().all(|c| c.is_ascii_alphanumeric())
+            || !tool.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        Some(Self(id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Managed behavior version. Anything else is omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ToolContractVersion(&'static str);
+
+impl ToolContractVersion {
+    pub const ALLOWED: &'static [&'static str] = &["current", "legacy-0.4.10"];
+
+    pub fn from_registered(version: &str) -> Option<Self> {
+        Self::ALLOWED
+            .iter()
+            .find(|known| **known == version)
+            .map(|known| Self(known))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.0
+    }
+}
+
+/// Requested model that product events already treat as a grok model id. Custom names stay absent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct ProductModelId(String);
+
+impl ProductModelId {
+    pub fn from_requested(model: &str) -> Option<Self> {
+        if !is_approved_model_id(model) || crate::redact_common::redact_owned(model).is_some() {
+            return None;
+        }
+        Some(Self(model.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn is_approved_model_id(model: &str) -> bool {
+    if model == "grok" {
+        return true;
+    }
+    let Some(rest) = model.strip_prefix("grok-") else {
+        return false;
+    };
+    !rest.is_empty()
+        && rest.len() <= 64
+        && !rest.starts_with('-')
+        && !rest.ends_with('-')
+        && !rest.contains("--")
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolSourceStatus {
+    Unknown,
+    Succeeded,
+    Empty,
+    Failed,
+    Partial,
+}
+
+impl ToolSourceStatus {
+    pub fn is_failure(self) -> bool {
+        matches!(self, Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+pub enum ToolSourceReason {
+    #[serde(rename = "not_instrumented")]
+    #[strum(serialize = "not_instrumented")]
+    NotInstrumented,
+    #[serde(rename = "search.unclassified_exit")]
+    #[strum(serialize = "search.unclassified_exit")]
+    SearchUnclassifiedExit,
+    #[serde(rename = "read.not_found")]
+    #[strum(serialize = "read.not_found")]
+    ReadNotFound,
+    #[serde(rename = "read.directory")]
+    #[strum(serialize = "read.directory")]
+    ReadDirectory,
+    #[serde(rename = "read.denied")]
+    #[strum(serialize = "read.denied")]
+    ReadDenied,
+    #[serde(rename = "read.ignored")]
+    #[strum(serialize = "read.ignored")]
+    ReadIgnored,
+    #[serde(rename = "read.binary")]
+    #[strum(serialize = "read.binary")]
+    ReadBinary,
+    #[serde(rename = "read.token_limit")]
+    #[strum(serialize = "read.token_limit")]
+    ReadTokenLimit,
+    #[serde(rename = "read.io")]
+    #[strum(serialize = "read.io")]
+    ReadIo,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum InvocationSource {
+    Model,
+    UserDirect,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ToolOutputLimit {
+    Unobserved,
+    NotLimited,
+    Limited,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadFileRole {
+    SkillEntry,
+    SkillSupport,
+    Instruction,
+    Memory,
+    Ordinary,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSkillMatch {
+    Registered,
+    Unregistered,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSkillSource {
+    Local,
+    Repo,
+    User,
+    Server,
+    Bundled,
+    Plugin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadSelection {
+    Full,
+    ModelWindow,
+    DefaultWindow,
+    SkillFullRead,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ReadLimitKind {
+    None,
+    Lines,
+    Bytes,
+    Tokens,
+    Multiple,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CapApplicability {
+    Applies,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum CapDisposition {
+    Unobserved,
+    WithinLimit,
+    Truncated,
+    Rejected,
+    Exempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadProfile {
+    pub read_file_role: ReadFileRole,
+    pub read_skill_match: ReadSkillMatch,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_skill_source: Option<ReadSkillSource>,
+    pub read_selection: ReadSelection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_source_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_returned_lines: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_returned_bytes: Option<i64>,
+    pub read_limit_kind: ReadLimitKind,
+    pub read_lines_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_lines_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_lines_observed: Option<i64>,
+    pub read_lines_disposition: CapDisposition,
+    pub read_bytes_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_bytes_observed: Option<i64>,
+    pub read_bytes_disposition: CapDisposition,
+    pub read_tokens_applicability: CapApplicability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_tokens_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_tokens_observed: Option<i64>,
+    pub read_tokens_disposition: CapDisposition,
+}
+
+/// Content-free location class. The path itself is not a product field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, strum::AsRefStr, strum::IntoStaticStr)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PathScope {
+    Workspace,
+    Tmp,
+    Home,
+    Other,
+}
+
+#[doc(hidden)]
+pub fn completed_for_test(tool_name: &str, model: &str) -> ToolCallCompleted {
+    ToolCallCompleted {
+        tool_name: tool_name.to_owned(),
+        outcome: xai_grok_session_events::types::ToolOutcome::Success,
+        hook_rewrote: false,
+        duration_ms: 1,
+        tool_result_size_bytes: None,
+        model_id: ProductModelId::from_requested(model),
+        invocation_id: InvocationId::from_host("018f6b6c-7b3a-7c3a-8c3a-000000000001")
+            .expect("fixed invocation id"),
+        tool_id: CanonicalToolId::opaque(),
+        tool_version: None,
+        source_status: ToolSourceStatus::Unknown,
+        source_reason: Some(ToolSourceReason::NotInstrumented),
+        path_scope: None,
+        invocation_source: None,
+        output_limit: None,
+        read: None,
+        external_model_id: model.to_owned(),
+        file_path: None,
+        parameters: None,
+    }
+}
+
 #[derive(Serialize)]
 pub struct ToolCallCompleted {
     pub tool_name: String,
     pub outcome: xai_grok_session_events::types::ToolOutcome,
     pub hook_rewrote: bool,
     pub duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_result_size_bytes: Option<u64>,
+    /// Snapshotted requested model, only when it is an approved grok model id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<ProductModelId>,
+    pub invocation_id: InvocationId,
+    pub tool_id: CanonicalToolId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_version: Option<ToolContractVersion>,
+    pub source_status: ToolSourceStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_reason: Option<ToolSourceReason>,
+    /// Registered read, search-replace, and write ids. A client-facing rename still qualifies.
+    /// Absent for an unknown id or a missing path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_scope: Option<PathScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocation_source: Option<InvocationSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<ToolOutputLimit>,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub read: Option<ReadProfile>,
+    /// Raw requested model for the external stream. Not a product field.
+    #[serde(skip)]
+    pub external_model_id: String,
     /// Primary file path of the call, for the external stream only
     /// (`#[serde(skip)]`: never serialized to product events/analytics). Always reduced to
     /// `file_extension`; the full path rides the `OTEL_LOG_TOOL_DETAILS` gate.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_result_size_bytes: Option<u64>,
     #[serde(skip)]
     pub file_path: Option<String>,
     /// Tool parameters for the external stream's `OTEL_LOG_TOOL_DETAILS`
@@ -1657,6 +2140,15 @@ pub struct AgentConnect {
     pub timeout_secs: Option<u64>,
     pub embedded_fallback: bool,
     pub auth_mode: crate::startup::AuthMode,
+}
+
+/// A `session/new` that never reached `session created`. Maps to the create-timeout counter only.
+#[derive(Serialize)]
+pub struct SessionCreateFailed {
+    pub outcome: crate::startup::StartupOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stuck_phase: Option<String>,
+    pub elapsed_ms: u64,
 }
 
 /// End to end startup: process start to a usable session, with the phase
@@ -2398,6 +2890,14 @@ telemetry_event!(
 telemetry_event!(SubagentLimitHit, "subagent_limit_hit");
 telemetry_event!(SubagentRateLimitWaited, "subagent_rate_limit_waited");
 telemetry_event!(
+    SubagentModelPresentationApplied,
+    "subagent_model_presentation_applied"
+);
+telemetry_event!(
+    SubagentModelOverrideRejected,
+    "subagent_model_override_rejected"
+);
+telemetry_event!(
     ActiveAgentMessageCompleted,
     "active_agent_message_completed"
 );
@@ -2438,6 +2938,7 @@ telemetry_event!(HookBlocked, "hook_blocked");
 telemetry_event!(ClientHookGate, "client_hook_gate");
 telemetry_event!(SkillAdded, "skill_added");
 telemetry_event!(SkillRemoved, "skill_removed");
+telemetry_event!(HarnessChanged, "harness_changed");
 telemetry_event!(
     SkillDispatched,
     "skill_dispatched",
@@ -2455,6 +2956,9 @@ telemetry_event!(
 );
 telemetry_event!(McpInitCompleted, "mcp_init_completed");
 telemetry_event!(McpToolCalled, "mcp_tool_called");
+telemetry_event!(McpFileInputUsed, "mcp_file_input_used");
+telemetry_event!(McpFileInputCompleted, "mcp_file_input_completed");
+telemetry_event!(McpFileInputLimitHit, "mcp_file_input_limit_hit");
 telemetry_event!(
     SessionHarness,
     "session_harness",
@@ -2466,6 +2970,9 @@ telemetry_event!(
     "session_new",
     external = crate::external::schema::map_session_new
 );
+// No external mapping: the fork defers upstream's SessionCreateTimeout
+// OTLP chain (see external/schema.rs); the product event still logs.
+telemetry_event!(SessionCreateFailed, "session_create_failed");
 telemetry_event!(
     PromptSubmitted,
     "prompt_submitted",
@@ -2596,6 +3103,10 @@ telemetry_event!(
     "doom_loop_recovery"
 );
 telemetry_event!(
+    crate::session_metrics::LongReasoningReminderTurn,
+    "long_reasoning_reminder"
+);
+telemetry_event!(
     crate::session_metrics::TraceUploadAttempted,
     "trace_upload_attempted"
 );
@@ -2659,6 +3170,10 @@ telemetry_event!(
 telemetry_event!(
     crate::memory_telemetry::MemoryV2GcCompleted,
     "memory_v2_gc_completed"
+);
+telemetry_event!(
+    crate::memory_telemetry::MemoryV2CarryoverCompleted,
+    "memory_v2_carryover_completed"
 );
 telemetry_event!(
     crate::memory_telemetry::MemoryV2Forgotten,
@@ -2785,6 +3300,8 @@ mod tests {
             ("DoomLoopDetected", "turn_number"),
             ("DoomLoopRecovery", "session_id"),
             ("DoomLoopRecovery", "turn_number"),
+            ("LongReasoningReminderTurn", "session_id"),
+            ("LongReasoningReminderTurn", "turn_number"),
             ("MemoryFlushComplete", "session_id"),
             ("MemoryFlushStart", "session_id"),
             ("MemoryInjection", "session_id"),
@@ -2914,43 +3431,94 @@ mod tests {
 
     #[test]
     fn tool_call_completed_omits_tool_result_size_bytes_when_absent() {
+        let mut with_size = completed_for_test("bash", "grok");
+        with_size.duration_ms = 7;
+        with_size.tool_result_size_bytes = Some(2_048);
         assert_eq!(
-            serde_json::to_value(ToolCallCompleted {
-                tool_name: "bash".into(),
-                outcome: xai_grok_session_events::types::ToolOutcome::Success,
-                hook_rewrote: false,
-                duration_ms: 7,
-                tool_result_size_bytes: Some(2_048),
-                file_path: None,
-                parameters: None,
-            })
-            .unwrap(),
+            serde_json::to_value(with_size).unwrap(),
             serde_json::json!({
                 "tool_name": "bash",
                 "outcome": "success",
                 "hook_rewrote": false,
                 "duration_ms": 7,
                 "tool_result_size_bytes": 2_048,
+                "model_id": "grok",
+                "invocation_id": "018f6b6c-7b3a-7c3a-8c3a-000000000001",
+                "tool_id": "opaque",
+                "source_status": "unknown",
+                "source_reason": "not_instrumented",
             })
         );
+        let mut without_size = completed_for_test("bash", "not-a-grok-model");
+        without_size.duration_ms = 7;
         assert_eq!(
-            serde_json::to_value(ToolCallCompleted {
-                tool_name: "bash".into(),
-                outcome: xai_grok_session_events::types::ToolOutcome::Success,
-                hook_rewrote: false,
-                duration_ms: 7,
-                tool_result_size_bytes: None,
-                file_path: None,
-                parameters: None,
-            })
-            .unwrap(),
+            serde_json::to_value(without_size).unwrap(),
             serde_json::json!({
                 "tool_name": "bash",
                 "outcome": "success",
                 "hook_rewrote": false,
                 "duration_ms": 7,
+                "invocation_id": "018f6b6c-7b3a-7c3a-8c3a-000000000001",
+                "tool_id": "opaque",
+                "source_status": "unknown",
+                "source_reason": "not_instrumented",
             })
         );
+    }
+
+    #[test]
+    fn read_profile_serializes_a_token_rejection_without_the_path() {
+        let mut event = completed_for_test("read_note", "grok-4.6");
+        event.file_path = Some("/tmp/secret-project/SKILL.md".into());
+        event.source_status = ToolSourceStatus::Failed;
+        event.source_reason = Some(ToolSourceReason::ReadTokenLimit);
+        event.output_limit = Some(ToolOutputLimit::Limited);
+        event.read = Some(ReadProfile {
+            read_file_role: ReadFileRole::SkillEntry,
+            read_skill_match: ReadSkillMatch::Unregistered,
+            read_skill_source: None,
+            read_selection: ReadSelection::Unknown,
+            read_source_bytes: None,
+            read_returned_lines: None,
+            read_returned_bytes: None,
+            read_limit_kind: ReadLimitKind::Tokens,
+            read_lines_applicability: CapApplicability::Applies,
+            read_lines_limit: Some(1_000),
+            read_lines_observed: None,
+            read_lines_disposition: CapDisposition::Unobserved,
+            read_bytes_applicability: CapApplicability::NotApplicable,
+            read_bytes_limit: None,
+            read_bytes_observed: None,
+            read_bytes_disposition: CapDisposition::Unobserved,
+            read_tokens_applicability: CapApplicability::Applies,
+            read_tokens_limit: Some(25_000),
+            read_tokens_observed: None,
+            read_tokens_disposition: CapDisposition::Rejected,
+        });
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            Some("tokens"),
+            json.get("read_limit_kind")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            Some("rejected"),
+            json.get("read_tokens_disposition")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert_eq!(
+            Some(25_000),
+            json.get("read_tokens_limit")
+                .and_then(serde_json::Value::as_i64)
+        );
+        assert!(json.get("read_tokens_observed").is_none());
+        assert_eq!(
+            Some("skill_entry"),
+            json.get("read_file_role")
+                .and_then(serde_json::Value::as_str)
+        );
+        assert!(!json.to_string().contains("secret-project"));
+        assert!(!json.to_string().contains("SKILL.md"));
     }
 
     #[test]
@@ -3161,6 +3729,7 @@ mod tests {
                 skill_name: "pdf".into(),
                 plugin_source: None,
                 trigger,
+                skill_origin: None,
             })
             .unwrap();
             assert_eq!(
@@ -3168,6 +3737,108 @@ mod tests {
                 serde_json::json!({ "skill_name": "pdf", "trigger": <&'static str>::from(trigger) })
             );
         }
+    }
+
+    #[test]
+    fn skill_dispatched_carries_skill_origin_when_set() {
+        let value = serde_json::to_value(SkillDispatched {
+            skill_name: "pdf".into(),
+            plugin_source: None,
+            trigger: SkillTrigger::SkillMdRead,
+            skill_origin: Some("learn".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "skill_name": "pdf",
+                "trigger": "skill_md_read",
+                "skill_origin": "learn",
+            }),
+            value
+        );
+    }
+
+    #[test]
+    fn harness_changed_name_and_shape() {
+        assert_eq!(HarnessChanged::NAME, "harness_changed");
+        let with_origin = serde_json::to_value(HarnessChanged {
+            kind: HarnessSurfaceKind::Skill,
+            op: HarnessChangeOp::Added,
+            name: "pdf".into(),
+            skill_source: "user".into(),
+            origin: Some("learn".into()),
+            plugin_source: None,
+            success: true,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "kind": "skill",
+                "op": "added",
+                "name": "pdf",
+                "skill_source": "user",
+                "origin": "learn",
+                "success": true,
+            }),
+            with_origin
+        );
+        let omitted = serde_json::to_value(HarnessChanged {
+            kind: HarnessSurfaceKind::Skill,
+            op: HarnessChangeOp::Removed,
+            name: "pdf".into(),
+            skill_source: "bundled".into(),
+            origin: None,
+            plugin_source: None,
+            success: false,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::json!({
+                "kind": "skill",
+                "op": "removed",
+                "name": "pdf",
+                "skill_source": "bundled",
+                "success": false,
+            }),
+            omitted
+        );
+    }
+
+    #[test]
+    fn workflow_run_ended_omits_workflow_name_when_none() {
+        let ended = |source: WorkflowSourceKind, workflow_name: Option<String>| {
+            serde_json::to_value(WorkflowRunEnded {
+                run_id: "wf_1".into(),
+                parent_session_id: "s1".into(),
+                source,
+                workflow_name,
+                status: WorkflowRunEndStatus::Interrupted,
+                duration_ms: 10,
+                agents_used: 0,
+                agent_budget: None,
+                agents_failed: 0,
+                peak_concurrent_agents: 0,
+                slot_waits: 0,
+                slot_wait_ms_total: 0,
+                slot_wait_ms_max: 0,
+            })
+            .unwrap()
+        };
+        let builtin = ended(WorkflowSourceKind::Builtin, Some("learn".into()));
+        assert_eq!(Some(&serde_json::json!("builtin")), builtin.get("source"));
+        assert_eq!(
+            Some(&serde_json::json!("learn")),
+            builtin.get("workflow_name")
+        );
+        let bundled = ended(WorkflowSourceKind::Bundled, Some("learn-traces".into()));
+        assert_eq!(Some(&serde_json::json!("bundled")), bundled.get("source"));
+        assert_eq!(
+            Some(&serde_json::json!("learn-traces")),
+            bundled.get("workflow_name")
+        );
+        let file = ended(WorkflowSourceKind::File, None);
+        assert_eq!(Some(&serde_json::json!("file")), file.get("source"));
+        assert_eq!(None, file.get("workflow_name"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use xai_grok_sampling_types::ReasoningEffort;
 
-use crate::session::persistence::Summary;
+use crate::session::persistence::{PersistedAgent, Summary};
 use crate::session::worktree::WorktreeIdentity;
 
 #[derive(Debug, Clone)]
@@ -44,7 +44,6 @@ impl CounterOp {
 #[derive(Debug, Clone)]
 pub(crate) struct ModelPatch {
     pub model_id: acp::ModelId,
-    pub agent_name: Option<String>,
     pub reasoning_effort: Option<Option<ReasoningEffort>>,
 }
 
@@ -107,6 +106,8 @@ pub(crate) struct SummaryPatch {
     pub last_turn_summary: Option<Option<(String, String)>>,
     pub session_kind_if_absent: Option<String>,
     pub last_recap: Option<Option<String>>,
+    /// The session's selected agent, applied as one unit (see [`Summary::set_agent`]).
+    pub agent: Option<PersistedAgent>,
 }
 
 impl Summary {
@@ -159,9 +160,6 @@ impl Summary {
         }
         if let Some(model) = &patch.model {
             self.current_model_id = model.model_id.clone();
-            if let Some(agent_name) = &model.agent_name {
-                self.agent_name = Some(agent_name.clone());
-            }
             if let Some(reasoning_effort) = &model.reasoning_effort {
                 self.reasoning_effort = *reasoning_effort;
             }
@@ -171,6 +169,9 @@ impl Summary {
         }
         if let Some(policy) = patch.resolved_tool_policy {
             self.resolved_tool_policy = Some(policy);
+        }
+        if let Some(agent) = &patch.agent {
+            self.set_agent(agent.clone());
         }
         if let Some(git_head) = &patch.git_head {
             self.head_commit = git_head.commit.clone();

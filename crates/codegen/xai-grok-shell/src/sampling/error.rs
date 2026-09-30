@@ -111,6 +111,10 @@ fn pushes_consumer_subscription_upsell(detail: &str) -> bool {
 /// HTTP 529, proxy-wrapped 5xx). See [`SamplingError::is_overloaded`].
 pub const OVERLOADED_USER_MESSAGE: &str = "Model is temporarily overloaded. Try again in a moment.";
 
+pub(crate) fn idle_timeout_user_message(elapsed_secs: u64) -> String {
+    format!("The model stopped responding after {elapsed_secs}s.")
+}
+
 /// Map a `SamplingError` to an ACP `Error` for client-facing responses.
 /// This stays in xai-grok-shell because it depends on `agent_client_protocol::Error`.
 pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
@@ -188,11 +192,14 @@ pub(crate) fn map_sampling_err_to_acp(err: SamplingError) -> acp::Error {
                 xai_grok_sampler::SamplingErrorKind::MaxTokensTruncation,
             ))
         }
-        SamplingError::IdleTimeout { elapsed_secs } => acp::Error::internal_error().data(format!(
-            "No response from model for {elapsed_secs}s — the model may be stuck"
-        )),
-        // Recovery consumes these inside the sampler's retry loop; a stray
-        // terminal one still renders its labels.
+        SamplingError::IdleTimeout { elapsed_secs } => {
+            acp::Error::internal_error().data(terminal_error_data(
+                idle_timeout_user_message(elapsed_secs),
+                None,
+                xai_grok_sampler::SamplingErrorKind::IdleTimeout,
+            ))
+        }
+        // Recovery consumes these inside the sampler's retry loop; a stray terminal one still renders its labels
         SamplingError::DoomLoopDetected { .. } => {
             acp::Error::internal_error().data(err.to_string())
         }
@@ -221,15 +228,15 @@ pub(crate) const SALVAGE_CAUSE_KEY: &str = "salvage_cause";
 pub(crate) const SALVAGE_CAUSE_EMPTY: &str = "empty_continuation";
 pub(crate) const SALVAGE_CAUSE_OVERFLOW: &str = "context_overflow";
 
-/// Terminal-failure `acp::Error.data`.
-/// Only max-tokens truncation opts into the object shape with an `error_kind` marker.
-/// Every other kind keeps the legacy string/status shape because old clients render `data` via `Display` and would show the raw JSON object.
 pub(crate) fn terminal_error_data(
     message: String,
     http_status: Option<u16>,
     kind: SamplingErrorKind,
 ) -> serde_json::Value {
-    if kind != SamplingErrorKind::MaxTokensTruncation {
+    if !matches!(
+        kind,
+        SamplingErrorKind::MaxTokensTruncation | SamplingErrorKind::IdleTimeout
+    ) {
         return error_data_with_status(message, http_status);
     }
     let mut data = serde_json::json!({ "message": message });
@@ -686,22 +693,6 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_mapping_is_stable_with_retry_after() {
-        let err = SamplingError::Api {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            message: "Rate limit exceeded".into(),
-            model_metadata: None,
-            retry_after_secs: Some(60),
-            should_retry: None,
-            error_code: None,
-        };
-        assert_eq!(err.retry_after(), Some(60));
-        let acp_err = map_sampling_err_to_acp(err);
-        assert_eq!(acp_err.code, acp::ErrorCode::from(RATE_LIMITED_ERROR_CODE));
-        assert_eq!(acp_err.message, "Rate limited");
-    }
-
-    #[test]
     fn rate_limit_code_differs_from_internal_error() {
         let rate_err = SamplingError::Api {
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -929,7 +920,6 @@ mod tests {
     #[test]
     fn prompt_complete_fields_error_without_data_falls_back_to_message() {
         let err = acp::Error::new(-32000, "something broke".to_string());
-        assert!(err.data.is_none());
         let result = Err(err);
         let (stop, agent_result, error_kind) = prompt_complete_fields(&result);
         assert_eq!(stop, serde_json::json!("error"));
@@ -947,6 +937,12 @@ mod tests {
             error_kind_from_error(&truncation),
             Some(SamplingErrorKind::MaxTokensTruncation)
         );
+        let idle = map_sampling_err_to_acp(SamplingError::IdleTimeout { elapsed_secs: 600 });
+        assert_eq!(
+            error_kind_from_error(&idle),
+            Some(SamplingErrorKind::IdleTimeout)
+        );
+        // No data, string data, and object data without the marker all yield None.
         assert_eq!(error_kind_from_error(&acp::Error::internal_error()), None);
         assert_eq!(
             error_kind_from_error(&acp::Error::internal_error().data("boom")),

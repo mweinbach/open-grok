@@ -731,6 +731,17 @@ pub struct ScreenModeRelaunch {
     /// Active session to reopen via `--resume`.
     pub session_id: String,
 }
+/// The coding-data write in flight. Its reply owns the banner ack; it holds the rollback a failure reverts to.
+/// `opted_in` is independent of `coding_data_retention_opt_out`, which is optimistic and which auth-meta refreshes rewrite mid-flight.
+/// `rollback_to_opted_in` starts from that mirror when idle and is inherited when this write replaces a pending one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingCodingDataWrite {
+    /// The choice the write carries.
+    pub opted_in: bool,
+    /// What a failure reverts to: the click-time mirror (possibly the unconfirmed fail-safe default), overwritten by an auth-meta refresh or a superseded write's success.
+    /// Replies are not ordered by server commit, so a late older success can still overwrite a newer value here.
+    pub rollback_to_opted_in: bool,
+}
 /// Root view component — owns all application state.
 pub struct AppView {
     /// Taken by whichever path reaches a usable session (or interactive idle) first.
@@ -1105,6 +1116,13 @@ pub struct AppView {
     pub welcome_on_workspace_mode: bool,
     /// Transient welcome toast: (message, wall-clock expiry).
     pub welcome_toast: Option<(String, std::time::Instant)>,
+    /// Nesting depth of `dispatch::dispatch`; image notices surface only when it returns to 0.
+    pub dispatch_depth: u32,
+    /// Image notices raised while one dispatch or ACP message runs (unbound placeholder, unreadable
+    /// attachment, dropped by a command). App-owned so a command that removes its own session
+    /// (`/new`, `/home` in minimal) cannot take the notice down with it; the `unified_log` event is
+    /// written against the originating session when the notice is raised.
+    pub pending_image_notices: Vec<String>,
     /// Sticky hover flag for the privacy banner buttons (redraw on enter/leave).
     pub welcome_on_privacy_banner: bool,
     /// Sticky hover flag for the welcome upgrade CTA (redraw on enter/leave).
@@ -1355,12 +1373,9 @@ pub struct AppView {
     pub privacy_banner_reshow_days: Option<u64>,
     /// Local `[privacy].privacy_banner_acked` (RFC 3339 UTC).
     pub privacy_banner_acked: Option<String>,
-    /// Accept awaits ACP success before ack.
-    pub privacy_banner_opt_in_inflight: bool,
-    /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed
-    /// on the `TaskResult`, so an older write's late reply — whose
-    /// `rollback_to_opted_in` was captured before the newer one — cannot
-    /// clobber the current value.
+    pub coding_data_pending_write: Option<PendingCodingDataWrite>,
+    /// Newest `SetCodingDataSharing` write. Bumped per dispatch and echoed on the `TaskResult`.
+    /// Only the newest result directly sets the mirror; an older success may update the pending rollback, which does not establish commit order.
     pub coding_data_write_seq: u64,
     /// Persisted `[cli].show_tips` mirror. `None` = no override (default `true`).
     pub show_tips: Option<bool>,
@@ -1370,6 +1385,8 @@ pub struct AppView {
     /// from the effective TOML merge like `show_tips`. `None` = unset in TOML
     /// (default `true`); toggles write the user layer.
     pub ask_user_question_timeout_enabled: Option<bool>,
+    /// `[features].subagent_model_inheritance` as the settings modal shows it: the saved user key plus the tiers seeded at startup.
+    pub subagent_model_inheritance: crate::settings::FeatureOverrideState,
     /// Whether ZDR users are allowed to use the product.
     /// Server-controlled via RemoteSettings (remote settings). Default `false` (blocked) during beta.
     pub zdr_access_enabled: bool,
@@ -1857,6 +1874,10 @@ impl AppView {
             None
         }
     }
+    /// Choice carried by the coding-data write in flight, if any.
+    pub fn coding_data_pending_opted_in(&self) -> Option<bool> {
+        self.coding_data_pending_write.map(|w| w.opted_in)
+    }
     /// Welcome privacy banner visibility gates.
     pub fn privacy_banner_should_show(&self) -> bool {
         if self.screen_mode.is_minimal() {
@@ -1866,6 +1887,9 @@ impl AppView {
             return false;
         }
         if self.is_zdr || self.is_team_non_admin() {
+            return false;
+        }
+        if self.coding_data_pending_write.is_some() {
             return false;
         }
         if !self.coding_data_retention_opt_out {
@@ -1927,6 +1951,9 @@ impl AppView {
         self.team_name = meta.team_name.clone();
         self.is_zdr = meta.is_zdr;
         self.team_role = meta.team_role.clone();
+        if let Some(pending) = self.coding_data_pending_write.as_mut() {
+            pending.rollback_to_opted_in = !meta.coding_data_retention_opt_out;
+        }
         self.coding_data_retention_opt_out = meta.coding_data_retention_opt_out;
         self.gate = meta.gate.clone();
         if was_gated && self.gate.is_none() {
@@ -2119,6 +2146,8 @@ impl AppView {
             #[cfg(feature = "local-workspace")]
             welcome_on_workspace_mode: false,
             welcome_toast: None,
+            dispatch_depth: 0,
+            pending_image_notices: Vec::new(),
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
@@ -2214,11 +2243,14 @@ impl AppView {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_opt_in_inflight: false,
+            coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
+            subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+                xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+            ),
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
@@ -2603,6 +2635,15 @@ impl AppView {
             None
         }
     }
+    /// Any key other than Enter closes the dashboard's send echo window.
+    fn close_dashboard_send_echo_window(&mut self, key_event: Option<&crossterm::event::KeyEvent>) {
+        if let Some(key) = key_event
+            && key.code != KeyCode::Enter
+            && let Some(d) = self.dashboard.as_mut()
+        {
+            d.last_send_at = None;
+        }
+    }
     /// App-level Esc owners that consume the key BEFORE any agent input
     /// routing — the render-boundary decision handed to the agent hint path
     /// (`AgentView::draw` → `esc_would_cancel_turn`, always false) so a hint
@@ -2672,6 +2713,11 @@ impl AppView {
                 .map(|sid| sid.0.as_ref()),
             _ => None,
         }
+    }
+    /// Show the queued image notices when no dispatch is in flight (a nested dispatch leaves them to
+    /// the outermost one); true when a visible surface changed.
+    pub fn flush_image_notices_if_root(&mut self) -> bool {
+        self.dispatch_depth == 0 && crate::app::dispatch::flush_image_notices(self)
     }
     /// Show a toast on the currently active view.
     ///
@@ -3550,6 +3596,7 @@ impl AppView {
                 }
             }
             ActiveView::AgentDashboard => {
+                self.close_dashboard_send_echo_window(key_event);
                 if let Some(outcome) = self.voice_esc_outcome(key_event) {
                     return outcome;
                 }
@@ -4366,6 +4413,11 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
             }
             if key!('s', CONTROL).matches(key) {
                 return InputOutcome::Action(Action::FetchSessionList);
+            }
+            if key!('p', CONTROL).matches(key) && !crate::input::key::is_text_input_key(key) {
+                // Fork has no optimistic home session (`LeaveHome`); Ctrl+P leaves
+                // welcome by creating a session, then forwards to open the palette.
+                return InputOutcome::ActionThenForward(Action::NewSession);
             }
             if ctx.has_pending_update && key!('u', CONTROL).matches(key) {
                 return InputOutcome::Action(Action::QuitForUpdate);
@@ -5380,11 +5432,13 @@ impl AppView {
                             panel.render(full_area, f.buffer_mut());
                         }
                         let has_cloud_modal = false;
-                        let cursor = if has_cloud_modal || self.tutorial.is_some() {
-                            None
-                        } else {
-                            result.cursor_pos
-                        };
+                        let has_remote_modal = false;
+                        let cursor =
+                            if has_cloud_modal || has_remote_modal || self.tutorial.is_some() {
+                                None
+                            } else {
+                                result.cursor_pos
+                            };
                         let on_url = self.welcome_auth_url_rect.as_ref().is_some_and(|r| {
                             matches!(self.auth_state, AuthState::Authenticating { .. })
                                 && self.last_mouse_pos.is_some_and(|(mx, my)| {
@@ -5545,14 +5599,17 @@ impl AppView {
                             }
                             let (cursor_pos, post_flush) = result;
                             let has_cloud = false;
+                            let has_remote_modal = false;
                             if has_cloud
+                                || has_remote_modal
                                 || self.import_claude_modal.is_some()
                                 || self.custom_provider_modal.is_some()
                                 || self.tutorial.is_some()
                             {
                                 link_spans.clear();
                             }
-                            let cursor = if has_cloud || self.tutorial.is_some() {
+                            let cursor = if has_cloud || has_remote_modal || self.tutorial.is_some()
+                            {
                                 None
                             } else {
                                 cursor_pos
@@ -5848,6 +5905,11 @@ impl AppView {
                 ActiveView::AgentDashboard if self.dashboard_session_picker.is_some()
             )
             || cloud_modal_open
+            || self.remote_modal_open()
+    }
+    /// The `/remote` modal, behind its backend feature like the field itself.
+    fn remote_modal_open(&self) -> bool {
+        false
     }
     /// Store the resolved per-tip gates and propagate the prompt-relevant tips
     /// (undo + plan nudge) to every agent's prompt. Reused by startup and the
@@ -6177,6 +6239,7 @@ impl AppView {
             needs_redraw |= agent.poll_scrollback_search();
             needs_redraw |= agent.tick_toast();
             needs_redraw |= agent.tick_extensions_result_notice();
+            needs_redraw |= agent.tick_memory_modal_status();
             needs_redraw |= !loading_replay && agent.tick_ephemeral_tip();
             needs_redraw |= agent.tick_mode_banner();
             needs_redraw |= agent.tick_selection_highlight();
@@ -6464,6 +6527,7 @@ impl AppView {
                         .extensions_modal
                         .as_ref()
                         .is_some_and(|m| m.result_notice.is_some())
+                    || agent.memory_modal_status_needs_tick()
                     || agent.ephemeral_tip_needs_tick()
                     || agent.mode_switch_banner.is_some()
                     || agent.has_drag_autoscroll()
@@ -6877,11 +6941,14 @@ pub(crate) mod tests {
             privacy_notice_rollout: false,
             privacy_banner_reshow_days: None,
             privacy_banner_acked: None,
-            privacy_banner_opt_in_inflight: false,
+            coding_data_pending_write: None,
             coding_data_write_seq: 0,
             show_tips: None,
             auto_update: None,
             ask_user_question_timeout_enabled: None,
+            subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+                xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+            ),
             zdr_access_enabled: false,
             usage_billing_redirect_url: None,
             access_gate_shown_logged: false,
@@ -6930,6 +6997,8 @@ pub(crate) mod tests {
             #[cfg(feature = "local-workspace")]
             welcome_on_workspace_mode: false,
             welcome_toast: None,
+            dispatch_depth: 0,
+            pending_image_notices: Vec::new(),
             welcome_on_privacy_banner: false,
             welcome_on_upgrade_cta: false,
             welcome_changelog_cta_rect: None,
@@ -8074,6 +8143,39 @@ pub(crate) mod tests {
         assert!(
             !app.needs_animation(),
             "a cleared badge flash must stop requesting ticks"
+        );
+    }
+    #[test]
+    fn needs_animation_gates_memory_modal_copy_message() {
+        use crate::views::memory_modal::MemoryModalState;
+        use crate::views::modal::ActiveModal;
+        let mut app = test_app_with_agent();
+        let id = super::super::agent::AgentId(0);
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.active_modal = Some(ActiveModal::MemoryBrowser {
+            state: Box::new(MemoryModalState::new(Vec::new())),
+        });
+        assert!(
+            !app.needs_animation(),
+            "an idle memory modal must not request ticks"
+        );
+        let Some(ActiveModal::MemoryBrowser { state }) =
+            app.agents.get_mut(&id).unwrap().active_modal.as_mut()
+        else {
+            panic!("memory modal open");
+        };
+        state.report_copy(&crate::clipboard::CopyDelivery::File {
+            path: std::path::PathBuf::from("/tmp/last-copy.txt"),
+        });
+        assert!(
+            app.needs_animation(),
+            "copy message countdown must keep ticks alive"
+        );
+        let cleared = (0..=120).any(|_| app.tick());
+        assert!(cleared, "tick must expire the copy message");
+        assert!(
+            !app.needs_animation(),
+            "expired copy message must stop requesting ticks"
         );
     }
     #[test]
@@ -10566,6 +10668,20 @@ pub(crate) mod tests {
             outcome,
             InputOutcome::ActionThenForward(Action::NewSession)
         ));
+    }
+    #[test]
+    fn welcome_done_ctrl_p_leaves_home() {
+        for focused in [true, false] {
+            let mut app = test_app();
+            app.auth_state = AuthState::Done;
+            app.welcome_prompt_focused = focused;
+            let outcome = app.handle_input(&key_event(KeyCode::Char('p'), KeyModifiers::CONTROL));
+            assert!(
+                matches!(outcome, InputOutcome::ActionThenForward(Action::NewSession)),
+                "focused={focused}: Ctrl+P must leave home to open the command palette, got {outcome:?}"
+            );
+            assert!(app.welcome_prompt.text().is_empty());
+        }
     }
     #[test]
     fn welcome_done_ctrl_w_opens_new_worktree_dialog() {

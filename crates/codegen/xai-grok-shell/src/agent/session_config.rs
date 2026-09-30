@@ -1,6 +1,6 @@
 use agent_client_protocol as acp;
 use serde::Serialize;
-use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption};
+use xai_grok_sampling_types::{ReasoningEffort, ReasoningEffortOption, effort_label};
 
 use crate::session::unified_list::SessionKind;
 
@@ -49,20 +49,6 @@ impl GrokSessionDetail {
             title,
         }
     }
-}
-
-fn effort_label(effort: ReasoningEffort) -> String {
-    match effort {
-        ReasoningEffort::None => "None",
-        ReasoningEffort::Minimal => "Minimal",
-        ReasoningEffort::Low => "Low",
-        ReasoningEffort::Medium => "Medium",
-        ReasoningEffort::High => "High",
-        ReasoningEffort::Xhigh => "X-High",
-        ReasoningEffort::Max => "Max",
-        ReasoningEffort::Ultra => "Ultra",
-    }
-    .to_string()
 }
 
 /// The built-in session-picker modes used when the model has no server list.

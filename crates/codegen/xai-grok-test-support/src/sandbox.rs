@@ -361,6 +361,12 @@ fn baseline_env_from_parent(
         "GIT_CONFIG_GLOBAL".into(),
         grok_home.join("gitconfig").into_os_string(),
     );
+    // Leader-lock acquire slots stay inside the sandbox instead of the developer's `/tmp/opengrok-file-lock-<uid>`.
+    // Literal on purpose: `xai_grok_file_lock::SLOT_DIR_ENV` lives in a crate this one does not depend on.
+    env.insert(
+        "OPENGROK_FILE_LOCK_SLOT_DIR".into(),
+        temp.join("lock-slots").into_os_string(),
+    );
     env
 }
 
@@ -707,6 +713,10 @@ mod tests {
         assert_eq!(
             env_value(&sandbox, "TMPDIR"),
             Some(sandbox.temp_dir().into())
+        );
+        assert_eq!(
+            env_value(&sandbox, "OPENGROK_FILE_LOCK_SLOT_DIR"),
+            Some(sandbox.temp_dir().join("lock-slots").into())
         );
         assert_eq!(
             env_value(&sandbox, "XAI_API_KEY").as_deref(),

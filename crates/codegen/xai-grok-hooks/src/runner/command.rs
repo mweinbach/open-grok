@@ -2060,12 +2060,14 @@ mod tests {
             session_id: "test-session",
             workspace_root: "/tmp",
             process_scope: None,
+            disabled: Default::default(),
         }
     }
 
     fn make_scoped_ctx(scope: xai_grok_tools::util::ProcessScope) -> RunContext<'static> {
         RunContext {
             process_scope: Some(scope),
+            disabled: Default::default(),
             ..make_ctx()
         }
     }
@@ -2171,6 +2173,7 @@ mod tests {
             session_id: "test-session",
             workspace_root: &workspace,
             process_scope: None,
+            disabled: Default::default(),
         };
         let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 
@@ -2879,6 +2882,7 @@ mod tests {
             session_id: "test-session",
             workspace_root: &workspace,
             process_scope: None,
+            disabled: Default::default(),
         };
         let (result, _, _) = run_command_hook(&spec, &envelope, &ctx, GateKind::Observe).await;
 

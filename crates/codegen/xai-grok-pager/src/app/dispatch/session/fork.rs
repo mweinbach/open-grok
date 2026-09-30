@@ -254,6 +254,7 @@ pub(in crate::app::dispatch) fn dispatch_fork_resolved(
             // Fork resumes the parent session, which carries its own model.
             model_id: None,
             preferred_session_id: None,
+            minted_session_id: None,
             chat_kind: parent_chat_kind,
         }]
     } else {
@@ -534,6 +535,7 @@ pub(in crate::app::dispatch) fn handle_fork_session_failed(
     tracing::error!(agent = ?agent_id, error = %error, "Fork session failed");
     if let Some(agent) = app.agents.get_mut(&agent_id) {
         agent.pending_extensions_fetch = false;
+        agent.session_starting_since = None;
         agent.session.finish_command();
         let elapsed = agent.turn_elapsed();
         agent.mark_turn_finished(crate::app::cancel_latency::TurnEnd::Aborted);

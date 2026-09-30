@@ -1120,10 +1120,10 @@ fn startup_hints_from_meta_prefers_session_request_over_init() {
 }
 #[test]
 fn startup_hints_from_meta_session_object_wins_whole_not_merged() {
-    let session = serde_json::json!({ "startupHints": { "skipGitStatus": true } });
+    let session = serde_json::json!({ "startupHints": { "isSubagent": true } });
     let init = serde_json::json!({ "startupHints": { "nonInteractive": true } });
     let hints = startup_hints_from_meta(session.as_object(), init.as_object());
-    assert!(hints.skip_git_status);
+    assert!(hints.is_subagent);
     assert!(!hints.non_interactive);
 }
 #[test]
@@ -1380,6 +1380,7 @@ fn make_test_handle(
         pending_interactions: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),
+        active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         info: crate::session::info::Info {
             id: acp::SessionId::new("test"),
             cwd: test_cwd_str,
@@ -1390,8 +1391,8 @@ fn make_test_handle(
         chat_state_handle: xai_chat_state::ChatStateHandle::noop(),
         signals_handle: crate::session::signals::SessionSignalsHandle::new(),
         gateway_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-        mcp_servers: vec![],
-        initial_client_mcp_servers: vec![],
+        mcp_servers: Default::default(),
+        initial_client_mcp_servers: Default::default(),
         display_cwd: None,
         feedback_manager: std::sync::Arc::new(
             crate::session::feedback_manager::FeedbackManager::local_only("test"),
@@ -2191,6 +2192,54 @@ fn build_minimal_agent_for_tests() -> MvpAgent {
     let cfg = AgentConfig::default();
     MvpAgent::new(gateway, &cfg, auth_manager, None).expect("valid test config")
 }
+async fn new_root_session(agent: &MvpAgent, cwd: &std::path::Path) -> acp::SessionId {
+    agent.set_auth_method(acp::AuthMethodId::new("cached_token"));
+    let init = acp::InitializeRequest::new(acp::ProtocolVersion::V1).client_capabilities(
+        acp::ClientCapabilities::new()
+            .fs(acp::FileSystemCapabilities::new())
+            .terminal(false),
+    );
+    agent.initialize_request.set(init).unwrap();
+    let sid = uuid::Uuid::now_v7().to_string();
+    let meta = serde_json::json!({ "sessionId": sid, "modelId": "test-model" })
+        .as_object()
+        .cloned();
+    agent
+        .new_session_inner(acp::NewSessionRequest::new(cwd.to_path_buf()).meta(meta))
+        .await
+        .expect("session/new succeeds")
+        .session_id
+}
+#[test]
+fn new_session_records_setup_phases_for_bisection() {
+    xai_grok_telemetry::unified_log::redirect_to_temp_for_tests();
+    run_local_for_bridge_test(|| async {
+        let agent = build_minimal_agent_for_tests();
+        let cwd = tempfile::tempdir().unwrap();
+        let mark = xai_grok_telemetry::unified_log::snapshot_log()
+            .unwrap_or_default()
+            .len();
+        let sid = new_root_session(&agent, cwd.path()).await;
+        agent.remove_session(&sid);
+        let log = xai_grok_telemetry::unified_log::snapshot_log().unwrap_or_default();
+        let appended = String::from_utf8_lossy(log.get(mark.min(log.len())..).unwrap_or(&[]));
+        for phase in [
+            "resolve_workspace",
+            "plugin_registry",
+            "mcp_merge",
+            "persistence_init",
+            "spawn_session_actor",
+            "git_discovery",
+        ] {
+            let needle = format!("\"phase\":\"{phase}\"");
+            assert!(
+                appended.contains(needle.as_str()),
+                "session/new must record {phase} in unified.jsonl; got:\n{appended}"
+            );
+        }
+        assert!(appended.contains("\"msg\":\"session created\""));
+    });
+}
 fn session_usage_request(session_id: &str) -> acp::ExtRequest {
     acp::ExtRequest::new(
         "x.ai/session/usage",
@@ -2818,6 +2867,9 @@ mod eligibility_gates {
 fn find_model_by_id_prefers_key_then_falls_back_to_slug() {
     let entry = |model: &str| ModelEntry {
         info: config::ModelInfo {
+            max_request_bytes: None,
+            reasoning_effort_server_default: false,
+            variants: Vec::new(),
             user_selectable: true,
             id: None,
             model: model.to_string(),
@@ -3229,7 +3281,10 @@ async fn prepare_video_gen_config_disabled_when_zdr_flag_set() {
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = true;
     assert!(matches!(
         agent.prepare_video_gen_config(),
-        VideoGenConfig::Disabled
+        VideoGenConfig::Enabled {
+            zdr_restricted: true,
+            ..
+        }
     ));
     agent.cfg.borrow_mut().zdr_video_output_s3 = Some(zdr_s3());
     agent.cfg.borrow_mut().disable_zdr_incompatible_tools = false;
@@ -3350,7 +3405,7 @@ async fn openai_image_gen_config_uses_isolated_codex_identity() {
     };
     assert_eq!(provider, ImageGenerationProvider::OpenAi);
     assert!(
-        api_key.is_empty(),
+        api_key.is_none(),
         "the OAuth-only OpenAI route must not copy the token into the unused static field"
     );
     assert_eq!(base_url, crate::codex_auth::inference_base_url());

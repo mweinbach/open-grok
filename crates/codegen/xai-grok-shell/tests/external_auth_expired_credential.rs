@@ -211,8 +211,6 @@ async fn connect(
                     json!({
                         "startupHints": {
                             "nonInteractive": true,
-                            "skipGitStatus": true,
-                            "skipProjectLayout": true,
                         },
                         "clientType": client_type,
                         "clientVersion": "0.0-test",

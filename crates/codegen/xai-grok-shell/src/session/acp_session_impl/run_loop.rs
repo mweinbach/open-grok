@@ -27,6 +27,22 @@ mod yolo_toggle_report_tests {
         assert_eq!(yolo_toggle_report(true, true), None);
     }
 }
+fn spawn_dream_check(session: &Arc<SessionActor>) -> tokio::task::JoinHandle<()> {
+    let session = session.clone();
+    tokio::task::spawn_local(async move {
+        session.memory.await_init_reindex().await;
+        session.maybe_run_dream().await;
+    })
+}
+/// Abort a still-running dream and wait for it to stop, so session-end index work never overlaps it.
+/// A finished dream makes this a no-op; a live one is parked on the model call, so the abort returns
+/// at once without stamping the marker, leaving the gate open for the next launch.
+async fn stop_dream(dream_task: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = dream_task.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
 /// Best-effort removal of this session's per-session scratch staging on
 /// teardown. A no-op in builds without a scratch producer.
 fn cleanup_session_scratch(_session: &SessionActor) {}
@@ -335,6 +351,10 @@ pub(super) async fn run_session(
         None => tokio::time::sleep(std::time::Duration::MAX),
     };
     tokio::pin!(dream_check_sleep);
+    let mut dream_task: Option<tokio::task::JoinHandle<()>> = None;
+    if !session.startup_hints.is_subagent && session.memory.uses_legacy_pipeline() {
+        dream_task = Some(spawn_dream_check(&session));
+    }
     loop {
         tokio::select! {
                 biased;
@@ -371,15 +391,15 @@ pub(super) async fn run_session(
                 }
                 // Dream check timer — periodically run dream consolidation.
                 _ = &mut dream_check_sleep, if session.dream_check_timeout.is_some()
-                    && session.memory.uses_legacy_pipeline() => {
+                    && session.memory.uses_legacy_pipeline()
+                    && !session.startup_hints.is_subagent => {
                     tracing::debug!(target: xai_grok_telemetry::memory_log::TARGET,
                         "MEMORY_DREAM_CHECK: timer fired");
-                    tokio::task::spawn_local({
-                        let session = session.clone();
-                        async move {
-                            session.maybe_run_dream().await;
-                        }
-                    });
+                    // Only start a new dream when the previous one has finished; a shorter check
+                    // interval must not abort an in-flight consolidation.
+                    if dream_task.as_ref().is_none_or(|h| h.is_finished()) {
+                        dream_task = Some(spawn_dream_check(&session));
+                    }
                     if let Some(timeout) = session.dream_check_timeout {
                         dream_check_sleep.as_mut().reset(tokio::time::Instant::now() + timeout);
                     }
@@ -602,6 +622,8 @@ pub(super) async fn run_session(
                         fire_session_end_hooks(&session, "channel_closed").await;
                         session.memory.stop_capture_worker().await;
                         session.memory.dream_workers.cancel_and_join().await;
+                        // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                        stop_dream(&mut dream_task).await;
                         session
                             .run_session_end_memory_pipeline(
                                 "channel closed, session summary saved",
@@ -824,10 +846,13 @@ pub(super) async fn run_session(
                             }
                         }
                         SessionCommand::GetCurrentModel { responds_to } => {
-                            let model = session.chat_state_handle.get_sampling_config().await
-                                .map(|c| c.model)
+                            let current = session.chat_state_handle.get_sampling_config().await
+                                .map(|c| crate::session::CurrentModel {
+                                    id: c.model,
+                                    reasoning_effort: c.reasoning_effort,
+                                })
                                 .unwrap_or_default();
-                            let _ = responds_to.send(model);
+                            let _ = responds_to.send(current);
                         }
                         SessionCommand::GetCurrentPromptMode { responds_to } => {
                             let mode = *session.current_prompt_mode.lock();
@@ -1177,24 +1202,22 @@ pub(super) async fn run_session(
                         SessionCommand::FlushMemory { respond_to } => {
                             let s = session.clone();
                             tokio::task::spawn_local(async move {
-                                if s.memory.is_enabled() {
-                                    let did_flush =
-                                        if s.memory.mode() == Some(crate::config::MemoryMode::V2) {
-                                            matches!(
-                                                s.flush_v2_capture().await,
-                                                crate::session::memory::v2_capture::FlushResult::Success
-                                            )
-                                        } else {
-                                            s.run_memory_flush("user_requested", None).await
-                                        };
-                                    let _ = respond_to.send(Ok(did_flush));
-                                } else {
-                                    let _ = respond_to.send(Err(
-                                        acp::Error::invalid_request()
-                                            .data("memory is not enabled for this session".to_string())
-                                    ));
-                                }
+                                let _ = respond_to.send(s.memory_flush_command().await);
                             });
+                        }
+                        SessionCommand::MemoryDream { respond_to } => {
+                            let s = session.clone();
+                            tokio::task::spawn_local(async move {
+                                let _ = respond_to.send(s.memory_dream_command().await);
+                            });
+                        }
+                        SessionCommand::MemoryList { respond_to } => {
+                            let _ = respond_to.send(session.memory_listing());
+                        }
+                        SessionCommand::MemoryToggle { enabled, respond_to } => {
+                            // Awaited inline so concurrent toggles cannot interleave mid-transition.
+                            let response = session.memory_toggle_and_list(enabled).await;
+                            let _ = respond_to.send(response);
                         }
                         SessionCommand::MemoryForget {
                             path,
@@ -1375,6 +1398,14 @@ pub(super) async fn run_session(
                                     request_id,
                                 });
                         }
+                        SessionCommand::NoteInterruptedTurn { turn } => {
+                            session.push_system_reminder(&turn.model_reminder());
+                            tracing::info!(
+                                trace_turn = turn.trace_turn,
+                                prompt_id = %turn.prompt_id,
+                                "Injected interrupted-turn reminder for the model"
+                            );
+                        }
                         SessionCommand::CopyFile { respond_to } => {
                             // Flush the actor-owned replay buffer first so any
                             // buffered notifications (e.g. streamed reasoning
@@ -1422,7 +1453,10 @@ pub(super) async fn run_session(
                         SessionCommand::UpdateAttachPolicy { startup_hints } => {
                             session.apply_attach_policy(&startup_hints);
                         }
-                        SessionCommand::UpdateMcpServers { mcp_servers, respond_to } => {
+                        SessionCommand::UpdateMcpServers { mcp_servers, client_seed, respond_to } => {
+                            if let Some(seed) = client_seed {
+                                *session.initial_client_mcp_servers.borrow_mut() = seed;
+                            }
                             if session.startup_hints.is_subagent {
                                 tracing::debug!(
                                     session_id = %session.session_info.id.0,
@@ -1431,6 +1465,12 @@ pub(super) async fn run_session(
                                 let _ = respond_to.send(Ok(()));
                                 continue;
                             }
+                            let mut mcp_servers = mcp_servers;
+                            crate::session::agent_mcp::apply_agent_mcp_overlay(
+                                &mut mcp_servers,
+                                session.agent.borrow().definition(),
+                                std::path::Path::new(&session.session_info.cwd),
+                            );
                             tracing::info!(
                                 "Updating MCP servers for session '{}' ({} servers)",
                                 session.session_info.id.0,
@@ -1985,23 +2025,13 @@ pub(super) async fn run_session(
                             tokio::task::spawn_local(async move {
                                 use prod_mc_cli_chat_proxy_types::feedback_types::FeedbackToolOutcome;
 
-                                // When the client provided a turn_number (per-turn
-                                // feedback on a specific assistant message in the
-                                // chat history), look up THAT turn's user/assistant
-                                // text.
-                                let turn_idx =
-                                    turn_number.and_then(|n| usize::try_from(n).ok());
-                                let (last_user_message, last_assistant_message) = match turn_idx {
-                                    Some(n) => {
-                                        let conv = s.chat_state_handle.get_conversation().await;
-                                        turn_texts_for_feedback(&conv, n)
-                                    }
-                                    None => {
-                                        tokio::join!(
-                                            s.chat_state_handle.get_last_user_query_text(),
-                                            s.chat_state_handle.get_last_assistant_text(),
-                                        )
-                                    }
+                                let conv = s.chat_state_handle.get_conversation().await;
+                                let turn_idx = turn_number
+                                    .and_then(|n| usize::try_from(n).ok())
+                                    .or_else(|| slash_feedback_last_turn(&conv));
+                                let lookup = match turn_idx {
+                                    Some(n) => turn_texts_for_feedback(&conv, n),
+                                    None => FeedbackTurnLookup::default(),
                                 };
 
                                 let sh = s.signals_handle();
@@ -2012,8 +2042,8 @@ pub(super) async fn run_session(
                                 let signals = signals.unwrap_or_default();
 
                                 let ctx = FeedbackContext {
-                                    last_user_message,
-                                    last_assistant_message,
+                                    last_user_message: lookup.user_text,
+                                    last_assistant_message: lookup.assistant_text,
                                     tool_outcomes: tool_outcomes
                                         .into_iter()
                                         .map(|o| FeedbackToolOutcome {
@@ -2027,6 +2057,9 @@ pub(super) async fn run_session(
                                     context_tokens_used: signals.context_tokens_used,
                                     context_window_tokens: signals.context_window_tokens,
                                     session_cwd: s.tool_context.cwd.as_path().to_string_lossy().to_string(),
+                                    reasoning_effort: lookup.reasoning_effort,
+                                    model_id: lookup.model_id,
+                                    model_fingerprint: lookup.model_fingerprint,
                                 };
                                 let _ = responds_to.send(ctx);
                             });
@@ -2483,6 +2516,8 @@ pub(super) async fn run_session(
                             fire_session_end_hooks(&session, "shutdown").await;
                             session.memory.stop_capture_worker().await;
                             session.memory.dream_workers.cancel_and_join().await;
+                            // Stop the dream before the end-pipeline reindex so their index writes cannot race.
+                            stop_dream(&mut dream_task).await;
                             session
                                 .run_session_end_memory_pipeline("session summary saved")
                                 .await;
@@ -2495,39 +2530,143 @@ pub(super) async fn run_session(
         }
     }
 }
-/// Extract the user query text and assistant response text for the
-/// `turn_number`-th turn (0-based) of a conversation snapshot. Used by
-/// the `GetFeedbackContext` handler when a client supplies a `turn_number`
-/// (per-turn thumbs button on a specific assistant message).
+pub(super) fn slash_feedback_last_turn(
+    conversation: &[xai_grok_sampling_types::ConversationItem],
+) -> Option<usize> {
+    use xai_grok_sampling_types::ConversationItem;
+    if let Some(n) = conversation.iter().rev().find_map(|item| match item {
+        ConversationItem::User(u) => u.prompt_index,
+        _ => None,
+    }) {
+        return Some(n);
+    }
+    let mut seen_unmarked_preamble = false;
+    let mut n = 0usize;
+    for item in conversation {
+        let ConversationItem::User(u) = item else {
+            continue;
+        };
+        if u.synthetic_reason.is_none() && !seen_unmarked_preamble {
+            seen_unmarked_preamble = true;
+            continue;
+        }
+        if !u
+            .synthetic_reason
+            .as_ref()
+            .is_some_and(|r| r.starts_prompt_turn())
+        {
+            continue;
+        }
+        n += 1;
+    }
+    n.checked_sub(1)
+}
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(super) struct FeedbackTurnLookup {
+    pub user_text: Option<String>,
+    pub assistant_text: Option<String>,
+    pub reasoning_effort: Option<crate::sampling::ReasoningEffort>,
+    pub model_id: Option<String>,
+    pub model_fingerprint: Option<String>,
+}
 pub(super) fn turn_texts_for_feedback(
     conversation: &[xai_grok_sampling_types::ConversationItem],
     turn_number: usize,
-) -> (Option<String>, Option<String>) {
+) -> FeedbackTurnLookup {
     use xai_grok_sampling_types::ConversationItem;
-    let Some(start) = conversation
+    let user_prompt_index = |item: &ConversationItem| match item {
+        ConversationItem::User(u) => u.prompt_index,
+        _ => None,
+    };
+    let is_unmarked_prompt_user = |item: &ConversationItem| match item {
+        ConversationItem::User(u) => {
+            u.prompt_index.is_none()
+                && u.synthetic_reason
+                    .as_ref()
+                    .is_some_and(|r| r.starts_prompt_turn())
+        }
+        _ => false,
+    };
+    let (start, exact) = if let Some(i) = conversation
+        .iter()
+        .position(|item| user_prompt_index(item) == Some(turn_number))
+    {
+        (i, true)
+    } else {
+        let mut seen_unmarked_preamble = false;
+        let mut n = 0usize;
+        let mut i = None;
+        for (idx, item) in conversation.iter().enumerate() {
+            let ConversationItem::User(u) = item else {
+                continue;
+            };
+            if u.prompt_index.is_some() {
+                break;
+            }
+            if u.synthetic_reason.is_none() && !seen_unmarked_preamble {
+                seen_unmarked_preamble = true;
+                continue;
+            }
+            if !u
+                .synthetic_reason
+                .as_ref()
+                .is_some_and(|r| r.starts_prompt_turn())
+            {
+                continue;
+            }
+            if n == turn_number {
+                i = Some(idx);
+                break;
+            }
+            n += 1;
+        }
+        let Some(i) = i else {
+            return FeedbackTurnLookup::default();
+        };
+        (i, false)
+    };
+    let end = conversation
         .iter()
         .enumerate()
-        .filter(|(_, item)| matches!(item, ConversationItem::User(_)))
-        .nth(turn_number)
-        .map(|(i, _)| i)
-    else {
-        return (None, None);
+        .skip(start + 1)
+        .find_map(|(i, item)| {
+            (user_prompt_index(item).is_some() || (!exact && is_unmarked_prompt_user(item)))
+                .then_some(i)
+        })
+        .unwrap_or(conversation.len());
+    let Some(raw) = conversation.get(start).map(|item| item.text_content()) else {
+        return FeedbackTurnLookup::default();
     };
-    let raw = conversation[start].text_content();
     let extracted = xai_chat_state::compaction_utils::extract_user_query(&raw);
     let user_text = (!extracted.is_empty()).then_some(extracted);
-    let assistant_text = conversation
+    let window = conversation.get(start + 1..end).unwrap_or(&[]);
+    let assistant_text = window.iter().find_map(|item| {
+        let ConversationItem::Assistant(a) = item else {
+            return None;
+        };
+        (!a.content.trim().is_empty()).then(|| a.content.as_ref().to_owned())
+    });
+    let reasoning_effort = window.iter().find_map(|item| {
+        let ConversationItem::Assistant(a) = item else {
+            return None;
+        };
+        a.reasoning_effort
+    });
+    let (model_id, model_fingerprint) = window
         .iter()
-        .skip(start + 1)
-        .take_while(|item| !matches!(item, ConversationItem::User(_)))
         .find_map(|item| {
-            if let ConversationItem::Assistant(a) = item
-                && !a.content.trim().is_empty()
-            {
-                Some(a.content.as_ref().to_owned())
-            } else {
-                None
-            }
-        });
-    (user_text, assistant_text)
+            let ConversationItem::Assistant(a) = item else {
+                return None;
+            };
+            let id = a.model_id.clone()?;
+            Some((Some(id), a.model_fingerprint.clone()))
+        })
+        .unwrap_or((None, None));
+    FeedbackTurnLookup {
+        user_text,
+        assistant_text,
+        reasoning_effort,
+        model_id,
+        model_fingerprint,
+    }
 }

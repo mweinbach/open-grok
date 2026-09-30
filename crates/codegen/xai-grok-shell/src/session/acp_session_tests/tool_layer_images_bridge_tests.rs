@@ -72,17 +72,18 @@ async fn handle_bridge_tool_success_multimodal_mcp_image_deferred_followup() {
             let payload = vision_ok_png_b64();
             let parsed_args = serde_json::json!({});
             let followups = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-mcp-img"),
-                    "tc-mcp-img",
-                    "browser_screenshot",
-                    "browser_screenshot",
-                    DrainedToolSuccess::new(mcp_screenshot_result(&payload)),
-                    0,
-                    "test-model",
-                    &parsed_args,
-                    None,
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-mcp-img"),
+                    call_id: "tc-mcp-img",
+                    requested_tool_name: "browser_screenshot",
+                    effective_tool_name: "browser_screenshot",
+                    drained: DrainedToolSuccess::new(mcp_screenshot_result(&payload)),
+                    concatenated_json_count: 0,
+                    coercion_note: None,
+                    model_id: "test-model",
+                    tool_parsed_args: &parsed_args,
+                    model_output_override: None,
+                })
                 .await
                 .expect("bridge success");
             assert!(
@@ -141,17 +142,18 @@ async fn handle_bridge_tool_success_replacement_drops_images_and_keeps_reminders
             );
             let parsed_args = serde_json::json!({});
             let followups = actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-mcp-replaced"),
-                    "tc-mcp-replaced",
-                    "browser_screenshot",
-                    "browser_screenshot",
-                    DrainedToolSuccess::new(result),
-                    0,
-                    "test-model",
-                    &parsed_args,
-                    Some("[redacted]".to_string()),
-                )
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-mcp-replaced"),
+                    call_id: "tc-mcp-replaced",
+                    requested_tool_name: "browser_screenshot",
+                    effective_tool_name: "browser_screenshot",
+                    drained: DrainedToolSuccess::new(result),
+                    concatenated_json_count: 0,
+                    coercion_note: None,
+                    model_id: "test-model",
+                    tool_parsed_args: &parsed_args,
+                    model_output_override: Some("[redacted]".to_string()),
+                })
                 .await
                 .expect("bridge success");
             assert!(
@@ -182,9 +184,14 @@ fn prepared_post_tool_use_call(id: &str, tool_name: &str) -> PreparedToolCall {
         tool_call_id: acp::ToolCallId::new(id),
         tool_name: tool_name.to_string(),
         raw_arguments: "{}".to_string(),
+        mcp_file: None,
         parsed_args: serde_json::json!({}),
-        model_id: "test-model".to_string(),
+        model_id: Some("test-model".to_string()),
+        invocation_id: "018f6b6c-7b3a-7c3a-8c3a-000000000001".to_string(),
+        tool_id: "opaque".to_string(),
+        tool_version: None,
         concatenated_json_count: 0,
+        coercion_note: None,
         dispatch_target_name: None,
         is_read_only: false,
         rewriting_hook: None,
@@ -262,17 +269,18 @@ async fn post_tool_use_replacement_reaches_model_original_stays_on_record() {
                 "the real dispatch+plan wiring must produce the replacement"
             );
             actor
-                .handle_bridge_tool_success(
-                    &acp::ToolCallId::new("tc-redact"),
-                    "tc-redact",
-                    "search__memory",
-                    "search__memory",
+                .handle_bridge_tool_success(BridgeToolSuccess {
+                    tool_call_id: &acp::ToolCallId::new("tc-redact"),
+                    call_id: "tc-redact",
+                    requested_tool_name: "search__memory",
+                    effective_tool_name: "search__memory",
                     drained,
-                    0,
-                    "test-model",
-                    &serde_json::json!({}),
+                    concatenated_json_count: 0,
+                    coercion_note: None,
+                    model_id: "test-model",
+                    tool_parsed_args: &serde_json::json!({}),
                     model_output_override,
-                )
+                })
                 .await
                 .expect("bridge success");
             let conv = actor.chat_state_handle.get_conversation().await;

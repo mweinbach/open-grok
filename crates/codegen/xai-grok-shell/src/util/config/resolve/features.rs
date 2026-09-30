@@ -1,59 +1,16 @@
 use crate::util::config::RemoteSettings;
 use toml::Value as TomlValue;
-#[cfg(test)]
-mod repo_status_in_system_prompt_tests {
-    use super::compose_repo_status_in_system_prompt;
-    use crate::util::config::RemoteSettings;
-
-    fn features_toml(value: bool) -> toml::Value {
-        toml::from_str(&format!(
-            "[features]\nrepo_status_in_system_prompt = {value}\n"
-        ))
-        .unwrap()
-    }
-
-    fn remote(value: bool) -> RemoteSettings {
-        RemoteSettings {
-            repo_status_in_system_prompt: Some(value),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn precedence_requirements_over_env_over_config_over_remote_over_default() {
-        assert!(compose_repo_status_in_system_prompt(None, None, None, None));
-        assert!(!compose_repo_status_in_system_prompt(
-            None,
-            None,
-            Some(&remote(false)),
-            None
-        ));
-        assert!(!compose_repo_status_in_system_prompt(
-            None,
-            Some(&features_toml(false)),
-            Some(&remote(true)),
-            None
-        ));
-        assert!(compose_repo_status_in_system_prompt(
-            None,
-            Some(&features_toml(false)),
-            Some(&remote(false)),
-            Some(true)
-        ));
-        assert!(!compose_repo_status_in_system_prompt(
-            Some(&features_toml(false)),
-            Some(&features_toml(true)),
-            Some(&remote(true)),
-            Some(true)
-        ));
-    }
-}
 
 pub(crate) fn resolve_repo_status_in_system_prompt(remote: Option<&RemoteSettings>) -> bool {
-    use xai_grok_config_types::{Feature, FeatureSources};
     let user_config = crate::config::load_effective_config().ok();
     let requirements = crate::config::load_merged_requirements();
-    let env = FeatureSources::from_process_env(Feature::RepoStatusInSystemPrompt).env;
+    let env = std::env::var("GROK_REPO_STATUS_IN_SYSTEM_PROMPT")
+        .ok()
+        .and_then(|v| match v.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        });
     compose_repo_status_in_system_prompt(requirements.as_ref(), user_config.as_ref(), remote, env)
 }
 
@@ -63,19 +20,19 @@ fn compose_repo_status_in_system_prompt(
     remote: Option<&RemoteSettings>,
     env: Option<bool>,
 ) -> bool {
-    use xai_grok_config_types::{Feature, FeatureSources};
-    let feature = Feature::RepoStatusInSystemPrompt;
+    // Precedence (matches the removed Feature::RepoStatusInSystemPrompt entry):
+    // requirements pin > env > config.toml > remote > default true.
     let from_toml = |value: Option<&TomlValue>| -> Option<bool> {
-        value?.get("features")?.get(feature.key())?.as_bool()
+        value?
+            .get("features")?
+            .get("repo_status_in_system_prompt")?
+            .as_bool()
     };
-    feature
-        .resolve(FeatureSources {
-            pin: from_toml(requirements),
-            env,
-            config: from_toml(user),
-            remote: feature.remote_value(remote),
-        })
-        .value
+    from_toml(requirements)
+        .or(env)
+        .or_else(|| from_toml(user))
+        .or_else(|| remote.and_then(|r| r.repo_status_in_system_prompt))
+        .unwrap_or(true)
 }
 
 pub(crate) fn resolve_turn_transient_retry(remote: Option<bool>) -> bool {

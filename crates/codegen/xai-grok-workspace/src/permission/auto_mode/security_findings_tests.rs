@@ -1,9 +1,10 @@
 use super::*;
 use ClassifierSecurityFinding::*;
 
-const ALL: [ClassifierSecurityFinding; 9] = [
+const ALL: [ClassifierSecurityFinding; 10] = [
     FailClosedPolicy,
     UnparseableShell,
+    UnresolvedArgument,
     OpaqueShell,
     ExecOrAmbientGit,
     EnvInjection,
@@ -21,6 +22,7 @@ fn tokens_are_stable_and_unique() {
         [
             "fail_closed_policy",
             "unparseable_shell",
+            "unresolved_argument",
             "opaque_shell",
             "exec_or_ambient_git",
             "env_injection",
@@ -113,14 +115,15 @@ fn assessment_is_ordered_and_deduplicated() {
 #[test]
 fn grant_floor_subset_is_exactly_the_broad_grant_findings() {
     // Findings that must block a broad grant / sandbox auto-allow.
-    for f in [
+    let floor = [
         FileWrite,
         UnvettedEnv,
         EnvInjection,
         OpaqueShell,
         ExecOrAmbientGit,
         SpecialExecSurface,
-    ] {
+    ];
+    for f in floor {
         let a: BashSecurityAssessment = [f].into_iter().collect();
         assert!(
             a.constrains_broad_grant(),
@@ -128,7 +131,7 @@ fn grant_floor_subset_is_exactly_the_broad_grant_findings() {
         );
     }
     // Findings the broad-grant path handles via their own decision arms.
-    for f in [DangerousCommand, UnparseableShell, FailClosedPolicy] {
+    for f in ALL.into_iter().filter(|f| !floor.contains(f)) {
         let a: BashSecurityAssessment = [f].into_iter().collect();
         assert!(
             !a.constrains_broad_grant(),

@@ -6,10 +6,6 @@ use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use agent_client_protocol as acp;
 
-// ---------------------------------------------------------------------------
-// Permission dispatch
-// ---------------------------------------------------------------------------
-
 use crate::views::permission_view::{McpScope, PermissionFocus, PermissionViewState};
 use xai_grok_workspace::permission::{BashCommandSelectedTerms, McpScopeSelection};
 

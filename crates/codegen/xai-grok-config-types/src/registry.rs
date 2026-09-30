@@ -2,7 +2,7 @@ use crate::{
     RemoteSettings,
     flags::{BoolFlag, ConfigSource, Resolved},
 };
-use xai_grok_config::env_bool;
+use xai_grok_config::{CampaignEntry, ConfigLayers, env_bool};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumIter)]
 pub enum Feature {
     SessionSearch,
@@ -21,8 +21,8 @@ pub enum Feature {
     BackendTools,
     AutoWake,
     SubagentWorktreeSnapshot,
+    SubagentModelInheritance,
     ActiveAgentMessages,
-    RepoStatusInSystemPrompt,
 }
 #[derive(Debug, Clone, Copy)]
 pub struct FeatureSpec {
@@ -46,6 +46,43 @@ impl FeatureSources {
             env: env_bool(feature.env()),
             ..Self::default()
         }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeatureConfigLayer {
+    SystemManaged,
+    Managed,
+    Campaign,
+    Overlay,
+}
+impl FeatureConfigLayer {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SystemManaged => "the system managed_config.toml",
+            Self::Managed => "managed_config.toml",
+            Self::Campaign => "an active campaign",
+            Self::Overlay => "the GROK_CONFIG overlay",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureLayerValue {
+    pub layer: FeatureConfigLayer,
+    pub value: bool,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FeatureConfigLayers {
+    pub pin: Option<bool>,
+    pub user: Option<bool>,
+    pub above_user: Option<FeatureLayerValue>,
+    pub below_user: Option<FeatureLayerValue>,
+}
+impl FeatureConfigLayers {
+    pub fn merged(&self) -> Option<bool> {
+        self.above_user
+            .map(|layer| layer.value)
+            .or(self.user)
+            .or(self.below_user.map(|layer| layer.value))
     }
 }
 pub const FEATURES: &[FeatureSpec] = &[
@@ -178,20 +215,20 @@ pub const FEATURES: &[FeatureSpec] = &[
         remote: Some(|settings| settings.subagent_worktree_snapshot_enabled),
     },
     FeatureSpec {
+        id: Feature::SubagentModelInheritance,
+        key: "subagent_model_inheritance",
+        path: "features.subagent_model_inheritance",
+        env: "GROK_SUBAGENT_MODEL_INHERITANCE",
+        default_enabled: false,
+        remote: Some(|settings| settings.subagent_model_inheritance_enabled),
+    },
+    FeatureSpec {
         id: Feature::ActiveAgentMessages,
         key: "active_agent_messages",
         path: "features.active_agent_messages",
         env: "GROK_ACTIVE_AGENT_MESSAGES",
         default_enabled: false,
         remote: Some(|settings| settings.active_agent_messages_enabled),
-    },
-    FeatureSpec {
-        id: Feature::RepoStatusInSystemPrompt,
-        key: "repo_status_in_system_prompt",
-        path: "features.repo_status_in_system_prompt",
-        env: "GROK_REPO_STATUS_IN_SYSTEM_PROMPT",
-        default_enabled: true,
-        remote: Some(|settings| settings.repo_status_in_system_prompt),
     },
 ];
 impl Feature {
@@ -214,13 +251,19 @@ impl Feature {
         let read = self.spec().remote?;
         read(settings?)
     }
+    pub fn default_enabled(self) -> bool {
+        self.spec().default_enabled
+    }
     pub fn off_reason(self, sources: FeatureSources) -> Option<String> {
         let resolved = self.resolve(sources);
         if resolved.value {
             return None;
         }
+        Some(self.source_label(resolved.source))
+    }
+    pub fn source_label(self, source: ConfigSource) -> String {
         let spec = self.spec();
-        Some(match resolved.source {
+        match source {
             ConfigSource::Requirement => "a requirements.toml pin or an MDM policy".to_owned(),
             ConfigSource::Env => format!("the {} environment variable", spec.env),
             ConfigSource::Config
@@ -233,7 +276,48 @@ impl Feature {
             ConfigSource::Remote => "a remote setting".to_owned(),
             ConfigSource::Default => "the default".to_owned(),
             ConfigSource::Cli => "a command line override".to_owned(),
-        })
+        }
+    }
+    pub fn config_layers(
+        self,
+        layers: &ConfigLayers,
+        active_campaigns: &[CampaignEntry],
+    ) -> FeatureConfigLayers {
+        let key_in = |document: &toml::Value| -> Option<bool> {
+            document.get("features")?.get(self.key())?.as_bool()
+        };
+        let layer_value = |layer: FeatureConfigLayer, document: &toml::Value| {
+            key_in(document).map(|value| FeatureLayerValue { layer, value })
+        };
+        let pin = [
+            &layers.mdm_requirements,
+            &layers.system_requirements,
+            &layers.user_requirements,
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(key_in);
+        let user = key_in(&layers.user);
+        let below_user = layer_value(FeatureConfigLayer::Managed, &layers.managed)
+            .or_else(|| layer_value(FeatureConfigLayer::SystemManaged, &layers.system_managed));
+        let campaign = active_campaigns
+            .iter()
+            .find_map(|entry| entry.patch.get("features")?.get(self.key())?.as_bool())
+            .map(|value| FeatureLayerValue {
+                layer: FeatureConfigLayer::Campaign,
+                value,
+            });
+        let above_user = layers
+            .env_overlay
+            .as_ref()
+            .and_then(|overlay| layer_value(FeatureConfigLayer::Overlay, overlay))
+            .or(campaign);
+        FeatureConfigLayers {
+            pin,
+            user,
+            above_user,
+            below_user,
+        }
     }
     pub fn resolve(self, sources: FeatureSources) -> Resolved<bool> {
         let spec = self.spec();

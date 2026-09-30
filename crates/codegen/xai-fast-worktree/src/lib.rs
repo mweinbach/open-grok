@@ -19,6 +19,7 @@ pub mod db;
 #[cfg(feature = "metadata")]
 pub mod discovery;
 mod git;
+mod grove_api;
 mod metrics;
 #[cfg(target_os = "linux")]
 pub(crate) mod mount_info;
@@ -78,6 +79,10 @@ pub use git::{
     StaleWorktreeMatch, remove_stale_worktree_registration, remove_stale_worktree_registrations,
     remove_stale_worktree_registrations_under,
 };
+pub use grove_api::{
+    CAP_FORK_FROM_BACKING, NfsStatusGroveExt, dest_is_grove_projection, source_is_grove_parent,
+    source_keeps_grove_create,
+};
 pub use metrics::{
     grove_wt_create_count, grove_wt_create_last_duration_ns, record_grove_wt_create,
 };
@@ -85,10 +90,13 @@ pub use nfs::create_latency_stamp;
 pub use nfs::{
     CleanArtifactsReply, DetachReply, NfsAdopted, NfsCreateDecision, NfsStatusView,
     NfsWorktreeClient, NfsWorktreeOpts, SalvageReply, dest_is_known_unmounted, dest_is_mountpoint,
-    dest_is_nfs_mount, source_is_linked_local_view,
+    dest_is_nfs_mount, dest_is_projected_mount, source_is_linked_local_view,
 };
 pub use sync::{SourceDirtyState, SyncReport, WorktreeSync, collect_source_dirty_state};
-pub use worktree::{STRATEGY_GROVE_FUSE, STRATEGY_GROVE_NFS, STRATEGY_NFS, is_grove_strategy};
+pub use worktree::{
+    ArmSkip, STRATEGY_GROVE_FUSE, STRATEGY_GROVE_NFS, STRATEGY_NFS, is_grove_strategy,
+    render_arm_skips,
+};
 
 pub fn local_salvage(
     _dest: &std::path::Path,

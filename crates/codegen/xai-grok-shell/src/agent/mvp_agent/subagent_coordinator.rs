@@ -671,7 +671,7 @@ impl MvpAgent {
                 .and_then(|h| h.allowed_subagent_types.clone()),
             parent_mcp_configs: parent_handle
                 .as_ref()
-                .map(|h| h.mcp_servers.clone())
+                .map(|h| h.mcp_servers.snapshot())
                 .unwrap_or_default(),
             managed_mcp_state: self.managed_mcp_cache.clone(),
             parent_mcp_pool: None,

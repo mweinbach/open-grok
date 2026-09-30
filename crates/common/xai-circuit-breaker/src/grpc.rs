@@ -2,6 +2,7 @@
 //! gRPC analogue of [`crate::RetryPolicy`]. Behind the `grpc` feature.
 
 use crate::retry_policy::Disposition;
+use std::error::Error;
 use tonic::Code;
 
 /// Maps a gRPC [`Code`] to a [`Disposition`].
@@ -39,6 +40,20 @@ impl GrpcRetryPolicy {
     /// `true` iff `code` is in the retryable set.
     pub fn is_retryable(&self, code: Code) -> bool {
         self.retryable.contains(&code)
+    }
+
+    /// [`Self::is_retryable`] on the code, or a `status` the client synthesized
+    /// from a connection failure (GOAWAY, connection closed, channel timeout),
+    /// which carries the error as source where a server-sent status never does.
+    /// `ResourceExhausted` (ENHANCE_YOUR_CALM) and `PermissionDenied`
+    /// (INADEQUATE_SECURITY) are peer verdicts and stay terminal.
+    pub fn is_retryable_status(&self, status: &tonic::Status) -> bool {
+        self.is_retryable(status.code())
+            || (status.source().is_some()
+                && matches!(
+                    status.code(),
+                    Code::Internal | Code::Cancelled | Code::Unknown | Code::Unavailable
+                ))
     }
 }
 
@@ -112,5 +127,30 @@ mod tests {
         let policy = GrpcRetryPolicy::new(&[Code::ResourceExhausted]);
         assert!(policy.is_retryable(Code::ResourceExhausted));
         assert!(!policy.is_retryable(Code::Unavailable));
+    }
+
+    /// The shape a tonic client synthesizes from a connection failure: the
+    /// code tonic picked plus the `tonic::transport::Error` as source. An
+    /// invalid URI is the one such error constructible without a runtime.
+    fn synthesized(mut status: tonic::Status) -> tonic::Status {
+        let transport_error = tonic::transport::Endpoint::from_shared("not a uri")
+            .expect_err("an invalid URI is rejected");
+        status.set_source(std::sync::Arc::new(transport_error));
+        status
+    }
+
+    #[test]
+    fn client_synthesized_connection_failures_are_retryable() {
+        use tonic::Status;
+        let policy = GrpcRetryPolicy::DEFAULT;
+        // GOAWAY / connection closed arrive as Internal, the channel timeout as Cancelled.
+        assert!(policy.is_retryable_status(&synthesized(Status::internal("h2 protocol error"))));
+        assert!(policy.is_retryable_status(&synthesized(Status::cancelled("Timeout expired"))));
+        // The same codes sent by the server carry no source and stay terminal.
+        assert!(!policy.is_retryable_status(&Status::internal("h2 protocol error")));
+        assert!(!policy.is_retryable_status(&Status::cancelled("Timeout expired")));
+        // Peer verdicts (ENHANCE_YOUR_CALM, INADEQUATE_SECURITY) are not connection failures.
+        assert!(!policy.is_retryable_status(&synthesized(Status::resource_exhausted("calm"))));
+        assert!(!policy.is_retryable_status(&synthesized(Status::permission_denied("tls"))));
     }
 }

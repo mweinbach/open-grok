@@ -651,7 +651,10 @@ impl Default for EndpointsConfig {
         }
     }
 }
-pub use xai_grok_config_types::{BoolFlag, ConfigSource, LazinessDetectorPerModelConfig, Resolved};
+pub use xai_grok_config_types::{
+    BoolFlag, ConfigSource, FEATURES, Feature, FeatureConfigLayer, FeatureConfigLayers,
+    FeatureLayerValue, FeatureSources, LazinessDetectorPerModelConfig, Resolved,
+};
 /// Resolution result for a `/goal` role's model selection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) enum GoalRoleModelChoice {
@@ -710,7 +713,8 @@ pub struct RuntimeResolutionContext<'a> {
     pub raw_config: &'a toml::Value,
     pub remote_settings: Option<&'a crate::util::config::RemoteSettings>,
     pub is_headless: bool,
-    /// `Some(true)` = CLI explicitly enabled, `None` = defer to config/env/remote.
+    /// `Some(false)` means the CLI explicitly disabled it (`--no-subagents`), `Some(true)` explicitly enabled it; `None` defers to env/config/default.
+    /// Every entrypoint (TUI, `open-grok agent stdio`, headless) passes `None` unless a flag was given, so they resolve identically.
     pub cli_subagents: Option<bool>,
     pub cli_web_search_model: Option<&'a str>,
     pub cli_session_summary_model: Option<&'a str>,
@@ -1383,7 +1387,7 @@ impl SuggestionsConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct StorageConfig {
-    /// Number of days to keep stale sessions before cleanup. Default: 30.
+    /// Unset or `0` disables cleanup; there is no default TTL.
     pub cleanup_ttl_days: Option<u32>,
 }
 /// `[paths]` configuration: extra directories to scan for skills, rules, etc.
@@ -1449,6 +1453,9 @@ pub struct Config {
     /// object. See [`crate::util::config::DoomLoopRecoverySettings`].
     #[serde(default)]
     pub doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings,
+    /// One type serves this TOML table and the remote `long_reasoning_reminder` object.
+    #[serde(default)]
+    pub long_reasoning_reminder: crate::util::config::LongReasoningReminderSettings,
     /// `[worktree]` section (currently `[worktree.auto_gc]` only).
     #[serde(default)]
     pub worktree: WorktreeConfigSection,
@@ -1600,7 +1607,7 @@ pub struct Config {
     /// CLI `--no-memory` flag. Stored for `ConfigReloader` hot-reload re-resolution.
     #[serde(skip)]
     pub cli_no_memory: bool,
-    /// Original CLI `--subagents` tri-state, preserved for re-resolution
+    /// Original CLI subagents tri-state (`--no-subagents` is `Some(false)`), preserved for re-resolution
     /// when remote settings settings are refreshed on /new.
     #[serde(skip)]
     pub cli_subagents: Option<bool>,
@@ -1906,6 +1913,7 @@ impl Default for Config {
             workflows: WorkflowsConfig::default(),
             session_bus: SessionBusConfig::default(),
             doom_loop_recovery: crate::util::config::DoomLoopRecoverySettings::default(),
+            long_reasoning_reminder: crate::util::config::LongReasoningReminderSettings::default(),
             worktree: WorktreeConfigSection::default(),
             auto_mode: AutoModeConfig::default(),
             config_models: IndexMap::new(),
@@ -2294,7 +2302,7 @@ impl Config {
     /// Must be called after `new_from_toml_cfg` on the **primary startup path**
     /// before the config is handed to `MvpAgent`. Project definitions are overlaid
     /// per cwd after that cwd's authoritative folder-trust resolve.
-    pub fn resolve_subagents(&mut self, cli_flag: bool, raw_config: &toml::Value) {
+    pub fn resolve_subagents(&mut self, cli_flag: Option<bool>, raw_config: &toml::Value) {
         let sa = crate::config::SubagentsConfig::resolve(cli_flag, raw_config);
         let remote_settings = self.remote_settings.clone();
         self.resolve_subagent_limits(&sa, remote_settings.as_ref());
@@ -2354,8 +2362,7 @@ impl Config {
         self.cli_subagents = ctx.cli_subagents;
         self.web_search_model_override = ctx.cli_web_search_model.map(|s| s.to_owned());
         self.session_summary_model_override = ctx.cli_session_summary_model.map(|s| s.to_owned());
-        let cli_flag = ctx.cli_subagents.unwrap_or(false);
-        self.resolve_subagents(cli_flag, ctx.raw_config);
+        self.resolve_subagents(ctx.cli_subagents, ctx.raw_config);
         let env = std::env::var(crate::config::SubagentsConfig::ENV_MAX_DEPTH).ok();
         let toml_max = ctx
             .raw_config
@@ -2492,6 +2499,10 @@ impl Config {
     }
     pub fn is_telemetry_enabled(&self) -> bool {
         self.resolve_telemetry_mode().value.is_enabled()
+    }
+    /// Whether product analytics may run. Every product analytics check calls this.
+    pub fn product_analytics_enabled(&self, auth: Option<&crate::auth::GrokAuth>) -> bool {
+        self.is_telemetry_enabled() && !auth.is_some_and(|auth| auth.is_zdr_team())
     }
     pub fn is_trace_upload_enabled(&self) -> bool {
         self.resolve_trace_upload().value
@@ -2703,6 +2714,16 @@ impl Config {
                     Policy::clamp_window_tokens,
                 ),
         })
+    }
+    pub(crate) fn resolve_long_reasoning_reminder(
+        &self,
+    ) -> crate::session::long_reasoning_reminder::LongReasoningReminder {
+        crate::session::long_reasoning_reminder::LongReasoningReminder::resolve(
+            &self.long_reasoning_reminder,
+            self.remote_settings
+                .as_ref()
+                .and_then(|s| s.long_reasoning_reminder.as_ref()),
+        )
     }
     /// Automatic worktree GC policy. Precedence: env kill/dry-run >
     /// `[worktree.auto_gc]` TOML > remote `worktree_auto_gc` > defaults.
@@ -3238,6 +3259,20 @@ impl Config {
             .config(self.features.cancel_rewind)
             .feature_flag(ff)
             .default(true)
+            .resolve()
+    }
+    /// Subagent model inheritance: children reuse the parent's model instead of
+    /// resolving their own. Precedence: env `GROK_SUBAGENT_MODEL_INHERITANCE` >
+    /// config `[features]` > remote settings > default (false).
+    pub(crate) fn resolve_subagent_model_inheritance(&self) -> Resolved<bool> {
+        let ff = self
+            .remote_settings
+            .as_ref()
+            .and_then(|s| s.subagent_model_inheritance_enabled);
+        BoolFlag::env("GROK_SUBAGENT_MODEL_INHERITANCE")
+            .config(self.features.subagent_model_inheritance)
+            .feature_flag(ff)
+            .default(false)
             .resolve()
     }
     /// Resolve whether to use grok's default OAuth2 (xAI auth.x.ai).
@@ -4029,6 +4064,8 @@ pub fn resolve_model_list_with_provider_catalogs(
         ModelProvider::OpenCodeGo,
         opencode_go_authoritative,
     );
+    let mut explicit_supports_effort_false_keys = std::collections::HashSet::new();
+    let mut explicit_menu_keys = std::collections::HashSet::new();
     for (key, model_override) in &cfg.config_models {
         let had_base = resolved.contains_key(key);
         let base = resolved.shift_remove(key);
@@ -4050,6 +4087,14 @@ pub fn resolve_model_list_with_provider_catalogs(
             }
         });
         let effective = with_provider.as_ref().unwrap_or(model_override);
+        if effective.supports_reasoning_effort == Some(false)
+            && effective.reasoning_efforts.is_empty()
+        {
+            explicit_supports_effort_false_keys.insert(key.as_str());
+        }
+        if !effective.reasoning_efforts.is_empty() {
+            explicit_menu_keys.insert(key.as_str());
+        }
         let mut entry = effective.apply(key, base, &cfg.endpoints);
         let session_bearer_unsafe = !crate::util::is_xai_api_bearer_url(&entry.info.base_url)
             || entry
@@ -4118,7 +4163,44 @@ pub fn resolve_model_list_with_provider_catalogs(
                 ),
             );
         }
+        // Menus donate within a provider partition only: a slug match across
+        // providers must never leak one provider's effort menu into another.
+        let mut menu_donors: std::collections::HashMap<
+            ModelProvider,
+            std::collections::HashMap<String, (Vec<ReasoningEffortOption>, bool)>,
+        > = std::collections::HashMap::new();
+        for (key, e) in &resolved {
+            if e.info.reasoning_efforts.is_empty() {
+                continue;
+            }
+            let same_key = *key == e.info.model;
+            let provider_donors = menu_donors.entry(e.info.provider).or_default();
+            if same_key
+                || (!explicit_menu_keys.contains(key.as_str())
+                    && !provider_donors.contains_key(&e.info.model))
+            {
+                provider_donors.insert(
+                    e.info.model.clone(),
+                    (
+                        e.info.reasoning_efforts.clone(),
+                        e.info.reasoning_effort_server_default,
+                    ),
+                );
+            }
+        }
         for entry in resolved.values_mut() {
+            if entry.info.reasoning_efforts.is_empty()
+                && let Some((menu, server_default)) = menu_donors
+                    .get(&entry.info.provider)
+                    .and_then(|m| m.get(&entry.info.model))
+            {
+                tracing::debug!(
+                    model = %entry.info.model,
+                    "slug-match: inheriting reasoning_efforts from sibling catalog entry"
+                );
+                entry.info.reasoning_efforts.clone_from(menu);
+                entry.info.reasoning_effort_server_default = *server_default;
+            }
             let Some(provider_donors) = donors.get(&entry.info.provider) else {
                 continue;
             };
@@ -4161,6 +4243,13 @@ pub fn resolve_model_list_with_provider_catalogs(
     }
     apply_global_extra_headers(&mut resolved, &cfg.models);
     apply_global_scalar_defaults(&mut resolved, &cfg.models);
+    for key in &explicit_supports_effort_false_keys {
+        if let Some(entry) = resolved.get_mut(*key) {
+            entry.info.reasoning_efforts.clear();
+            entry.info.reasoning_effort = None;
+            entry.info.reasoning_effort_server_default = false;
+        }
+    }
     for entry in resolved.values_mut() {
         entry.info.derive_reasoning_effort_fields();
     }
@@ -4253,7 +4342,7 @@ pub fn find_model_by_id<'a>(
 ) -> Option<&'a ModelEntry> {
     models
         .get(model_id)
-        .or_else(|| models.values().find(|m| m.model == model_id))
+        .or_else(|| models.values().find(|m| m.info.has_model_id(model_id)))
 }
 /// Whether the EFFECTIVE Auto-mode classifier model supports reasoning effort:
 /// the model actually routed to (`aux_model` when the aux sampler resolved) else
@@ -4268,6 +4357,14 @@ pub fn effective_classifier_supports_re(
     find_model_by_id(models, aux_model.unwrap_or(session_model))
         .map(|e| e.info().supports_reasoning_effort)
         .unwrap_or(false)
+}
+/// The id to send for a specific reasoning effort, for backends that spell
+/// the effort into the model id.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelVariant {
+    pub effort: ReasoningEffort,
+    pub model_id: String,
 }
 /// JSON-only subset of `ModelEntryConfig`.
 #[derive(Debug, Default, Deserialize)]
@@ -4315,6 +4412,8 @@ struct DefaultModelJson {
     supports_reasoning_effort: bool,
     #[serde(default)]
     reasoning_efforts: Vec<ReasoningEffortOption>,
+    #[serde(default)]
+    variants: Vec<ModelVariant>,
     /// When false, only OAuth users see this in the picker.
     #[serde(default = "default_true")]
     supported_in_api: bool,
@@ -4443,6 +4542,7 @@ fn default_models(
                 name: m.name,
                 description: m.description,
                 context_window,
+                max_request_bytes: None,
                 auto_compact_threshold_percent: m.auto_compact_threshold_percent,
                 system_prompt_label: m.system_prompt_label,
                 temperature: m.temperature,
@@ -4472,6 +4572,8 @@ fn default_models(
                 reasoning_effort: m.reasoning_effort,
                 supports_reasoning_effort: m.supports_reasoning_effort,
                 reasoning_efforts: m.reasoning_efforts,
+                reasoning_effort_server_default: false,
+                variants: m.variants,
                 supports_reasoning_summary_parameter: m.provider == ModelProvider::Codex,
                 // The embedded catalog is only an offline fallback. Supported
                 // Codex models default to detailed summaries; live models.json
@@ -4561,6 +4663,12 @@ pub struct ModelEntryConfig {
     /// above are derived from this list when it is non-empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// True when the endpoint advertised the menu without naming a default; the request then omits the effort so the server applies its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_server_default: bool,
+    /// The id to send for each effort, empty unless the backend spells the effort into the model id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<ModelVariant>,
     /// Whether this model accepts the Responses `reasoning.summary` member.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub supports_reasoning_summary_parameter: bool,
@@ -4576,6 +4684,9 @@ pub struct ModelEntryConfig {
     /// Used for auto-compact threshold calculations.
     /// Required — BYOK users must explicitly set this in config.toml.
     pub context_window: NonZeroU64,
+    /// Provider request-body cap in bytes; unset resolves to the `api_backend` default (30 MB for `messages`, else 50 MiB).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<NonZeroU64>,
     /// Per-model auto-compact threshold (0-100). When the session's token
     /// usage exceeds this percentage of `context_window`, the conversation
     /// is summarized. Resolver precedence:
@@ -4698,6 +4809,7 @@ pub struct ConfigModelOverride {
     #[serde(default)]
     pub env_http_headers: IndexMap<String, String>,
     pub context_window: Option<u64>,
+    pub max_request_bytes: Option<NonZeroU64>,
     /// Explicit raw Codex context budget, allowed above the advertised maximum.
     pub max_context_window: Option<u64>,
     pub auto_compact_token_limit: Option<u64>,
@@ -4906,6 +5018,9 @@ impl ConfigModelOverride {
                     Some(raw.min(u128::from(u64::MAX)) as u64);
             }
         }
+        if self.max_request_bytes.is_some() {
+            entry.info.max_request_bytes = self.max_request_bytes;
+        }
         if let Some(v) = self.use_concise {
             entry.info.use_concise = v;
         }
@@ -4939,6 +5054,7 @@ impl ConfigModelOverride {
         }
         if !self.reasoning_efforts.is_empty() {
             entry.info.reasoning_efforts = self.reasoning_efforts.clone();
+            entry.info.reasoning_effort_server_default = false;
         }
         if self.supports_reasoning_effort == Some(false) {
             entry.info.reasoning_effort = None;
@@ -5037,6 +5153,9 @@ pub struct ModelInfo {
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub env_http_headers: IndexMap<String, String>,
     pub context_window: NonZeroU64,
+    /// Explicit request-body cap only; `sampling_config_for_model` applies the `api_backend` default so the catalog never persists it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_bytes: Option<NonZeroU64>,
     /// Per-model auto-compact threshold (0-100). `None` defers to the
     /// global / default tiers in `resolve_auto_compact_threshold_percent`.
     pub auto_compact_threshold_percent: Option<u8>,
@@ -5071,6 +5190,12 @@ pub struct ModelInfo {
     /// Per-model reasoning-effort menu (source of truth); legacy fields derived from it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasoning_efforts: Vec<ReasoningEffortOption>,
+    /// The menu came without a default; leave `reasoning_effort` unset so the request omits it and the server applies its own.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub reasoning_effort_server_default: bool,
+    /// The id to send for each effort, empty unless the backend spells the effort into the model id.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<ModelVariant>,
     /// Service tiers this model can run with (Codex Fast/Flex routing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub service_tiers: Vec<xai_grok_sampling_types::ModelServiceTier>,
@@ -5138,6 +5263,7 @@ impl ModelInfo {
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
+            max_request_bytes: None,
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
             use_concise: false,
@@ -5150,6 +5276,8 @@ impl ModelInfo {
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_server_default: false,
+            variants: Vec::new(),
             service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
@@ -5188,6 +5316,7 @@ impl ModelInfo {
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: entry.context_window,
+            max_request_bytes: entry.max_request_bytes,
             auto_compact_threshold_percent: entry.auto_compact_threshold_percent,
             system_prompt_label: entry.system_prompt_label.clone(),
             use_concise: entry.use_concise,
@@ -5200,6 +5329,8 @@ impl ModelInfo {
             reasoning_effort: entry.reasoning_effort,
             supports_reasoning_effort: entry.supports_reasoning_effort,
             reasoning_efforts: entry.reasoning_efforts.clone(),
+            reasoning_effort_server_default: entry.reasoning_effort_server_default,
+            variants: entry.variants.clone(),
             service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: entry.supports_reasoning_summary_parameter,
             default_reasoning_summary: entry.default_reasoning_summary,
@@ -5223,19 +5354,21 @@ impl ModelInfo {
         }
         self.supports_reasoning_effort = true;
         if self.reasoning_effort.is_none() {
-            let default = self
+            let first = if self.reasoning_effort_server_default {
+                None
+            } else {
+                // An unmarked OpenRouter menu leaves reasoning up to the
+                // gateway. Its first option is not an advertised default.
+                (self.provider != ModelProvider::OpenRouter)
+                    .then(|| self.reasoning_efforts.first())
+                    .flatten()
+            };
+            self.reasoning_effort = self
                 .reasoning_efforts
                 .iter()
                 .find(|opt| opt.default)
-                .or_else(|| {
-                    // An unmarked OpenRouter menu leaves reasoning up to the
-                    // gateway. Its first option is not an advertised default.
-                    (self.provider != ModelProvider::OpenRouter)
-                        .then(|| self.reasoning_efforts.first())
-                        .flatten()
-                })
+                .or(first)
                 .map(|opt| opt.value);
-            self.reasoning_effort = default;
         }
     }
     /// Whether this model appears in the picker for the given auth mode.
@@ -5247,6 +5380,37 @@ impl ModelInfo {
     /// | false    | false              | visible    | **hidden**   |
     pub fn visible_for_auth(&self, is_session_auth: bool) -> bool {
         !self.hidden && (is_session_auth || self.supported_in_api)
+    }
+    /// One rule for the model list, explicit task-model admission, and the task-model presentation.
+    pub(crate) fn is_picker_eligible(&self, is_session_auth: bool) -> bool {
+        self.user_selectable && self.visible_for_auth(is_session_auth)
+    }
+
+    /// Whether `id` is one of the ids this model sends: its own, or the one it uses at some effort.
+    pub(crate) fn has_model_id(&self, id: &str) -> bool {
+        self.model == id || self.variants.iter().any(|variant| variant.model_id == id)
+    }
+
+    /// The id to send at this effort.
+    ///
+    /// Every variant must name an effort this model offers and a non-empty id, or it routes to something nobody can select.
+    pub(crate) fn model_at(&self, effort: ReasoningEffort) -> &str {
+        debug_assert!(
+            self.variants.iter().all(|variant| {
+                !variant.model_id.is_empty()
+                    && (self.reasoning_efforts.is_empty()
+                        || self
+                            .reasoning_efforts
+                            .iter()
+                            .any(|option| option.value == variant.effort))
+            }),
+            "model {} has a variant with an empty id or an effort its menu does not offer",
+            self.model
+        );
+        self.variants
+            .iter()
+            .find(|variant| variant.effort == effort)
+            .map_or(self.model.as_str(), |variant| variant.model_id.as_str())
     }
 
     /// Provider-aware picker visibility for the combined Open Grok catalog.
@@ -5678,6 +5842,11 @@ pub struct Features {
     /// `None` = defer to remote settings / default (false).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagent_worktree_snapshot: Option<bool>,
+    /// Subagent model inheritance: children reuse the parent's model instead of
+    /// resolving their own. `None` = defer to env / remote settings / default
+    /// (false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_model_inheritance: Option<bool>,
     /// Per-`Ready`-client transport-liveness pollers + the
     /// session-actor `StatusDispatcher`.
     ///
@@ -6205,6 +6374,7 @@ pub fn resolve_aux_model_sampling_config(
                 query_params: IndexMap::new(),
                 env_http_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
+                max_request_bytes: None,
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,
                 use_concise: false,
@@ -6217,6 +6387,8 @@ pub fn resolve_aux_model_sampling_config(
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                reasoning_effort_server_default: false,
+                variants: Vec::new(),
                 service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
@@ -6462,6 +6634,10 @@ pub fn sampling_config_for_model(
         query_params: info.query_params.clone(),
         env_http_headers: info.env_http_headers.clone(),
         context_window: info.context_window.get(),
+        max_request_bytes: Some(
+            info.max_request_bytes
+                .unwrap_or_else(|| info.api_backend.default_max_request_bytes()),
+        ),
         client_version: info
             .provider
             .profile()
@@ -6627,6 +6803,7 @@ fn resolve_hidden_default_web_search_sampling_config(
             query_params: IndexMap::new(),
             env_http_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
+            max_request_bytes: None,
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
             use_concise: false,
@@ -6640,6 +6817,8 @@ fn resolve_hidden_default_web_search_sampling_config(
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_server_default: false,
+            variants: Vec::new(),
             service_tiers: Vec::new(),
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
@@ -8248,6 +8427,7 @@ reasoning_effort = "low"
     ) -> ModelEntry {
         ModelEntry {
             info: ModelInfo {
+                variants: Vec::new(),
                 user_selectable: true,
                 id: None,
                 model: model.to_string(),
@@ -8271,6 +8451,7 @@ reasoning_effort = "low"
                 query_params: IndexMap::new(),
                 env_http_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(200_000).unwrap(),
+                max_request_bytes: None,
                 auto_compact_threshold_percent: None,
                 system_prompt_label: None,
                 use_concise: false,
@@ -8283,6 +8464,7 @@ reasoning_effort = "low"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                reasoning_effort_server_default: false,
                 service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
@@ -9255,6 +9437,70 @@ reasoning_effort = "low"
         assert_eq!(config.context_window, 256_000);
     }
     #[test]
+    fn unset_max_request_bytes_defaults_from_api_backend() {
+        let raw_config: toml::Value = toml::from_str(
+            r#"
+            [model.capped-messages]
+            model = "claude"
+            base_url = "https://api.example.com/v1"
+            api_backend = "messages"
+            context_window = 1000000
+            max_request_bytes = 20000000
+
+            [model.uncapped-messages]
+            model = "claude"
+            base_url = "https://api.example.com/v1"
+            api_backend = "messages"
+            context_window = 1000000
+
+            [model.uncapped-chat]
+            model = "m"
+            base_url = "https://api.example.com/v1"
+            api_backend = "chat_completions"
+            context_window = 1000000
+
+            [model.uncapped-responses]
+            model = "m"
+            base_url = "https://api.example.com/v1"
+            api_backend = "responses"
+            context_window = 1000000
+            "#,
+        )
+        .unwrap();
+        let cfg = Config::new_from_toml_cfg(&raw_config).expect("config should parse");
+        let resolved = resolve_model_list(&cfg, None);
+        let max_request_bytes = |key: &str| {
+            let model = resolved.get(key).expect("model should exist");
+            sampling_config_for_model(
+                model,
+                resolve_credentials(model, None),
+                None,
+                None,
+                None,
+                None,
+            )
+            .max_request_bytes
+        };
+        assert_eq!(
+            NonZeroU64::new(20_000_000),
+            max_request_bytes("capped-messages"),
+            "an explicit cap overrides the backend default"
+        );
+        assert_eq!(
+            NonZeroU64::new(30_000_000),
+            max_request_bytes("uncapped-messages"),
+            "a messages model budgets to the 30 MB Messages host cap"
+        );
+        assert_eq!(
+            NonZeroU64::new(50 * 1024 * 1024),
+            max_request_bytes("uncapped-chat")
+        );
+        assert_eq!(
+            NonZeroU64::new(50 * 1024 * 1024),
+            max_request_bytes("uncapped-responses")
+        );
+    }
+    #[test]
     fn parses_model_api_backend_responses() {
         let raw_config: toml::Value = toml::from_str(
             r#"
@@ -9482,12 +9728,13 @@ reasoning_effort = "low"
     }
     /// Non-Messages backends keep their existing default (false) since adaptive
     /// thinking is Anthropic-specific and other providers vary per upstream model.
+    /// The row aliases a wire id with no catalog menu, so the assertion isolates the backend default from slug propagation.
     #[test]
     fn model_chat_completions_backend_does_not_auto_default_supports_reasoning_effort() {
         let raw_config: toml::Value = toml::from_str(
             r#"
             [model.my-openai]
-            model = "grok-4.5"
+            model = "upstream-model"
             base_url = "https://api.example.com/v1"
             context_window = 200000
             api_backend = "chat_completions"
@@ -9658,6 +9905,7 @@ reasoning_effort = "low"
     #[test]
     fn model_info_from_config_propagates_use_concise() {
         let entry = ModelEntryConfig {
+            variants: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -9680,6 +9928,7 @@ reasoning_effort = "low"
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
+            max_request_bytes: None,
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
             api_base_url: None,
@@ -9693,6 +9942,7 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_server_default: false,
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
@@ -9829,6 +10079,7 @@ reasoning_effort = "low"
     #[test]
     fn model_info_from_config_propagates_agent_type() {
         let entry = ModelEntryConfig {
+            variants: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -9851,6 +10102,7 @@ reasoning_effort = "low"
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
+            max_request_bytes: None,
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
             api_base_url: None,
@@ -9864,6 +10116,7 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_server_default: false,
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
@@ -10360,6 +10613,7 @@ reasoning_effort = "low"
     #[test]
     fn inference_idle_timeout_propagates_to_model_info() {
         let entry = ModelEntryConfig {
+            variants: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -10382,6 +10636,7 @@ reasoning_effort = "low"
             auth_scheme: None,
             extra_headers: IndexMap::new(),
             context_window: NonZeroU64::new(200_000).unwrap(),
+            max_request_bytes: None,
             auto_compact_threshold_percent: None,
             system_prompt_label: None,
             api_base_url: None,
@@ -10395,6 +10650,7 @@ reasoning_effort = "low"
             reasoning_effort: None,
             supports_reasoning_effort: false,
             reasoning_efforts: Vec::new(),
+            reasoning_effort_server_default: false,
             supports_reasoning_summary_parameter: false,
             default_reasoning_summary: ReasoningSummary::None,
             supports_backend_search: false,
@@ -11604,6 +11860,101 @@ reasoning_effort = "low"
             "env wins over config + remote"
         );
         unsafe { std::env::remove_var("GROK_DOOM_LOOP_RECOVERY") };
+    }
+    #[test]
+    #[serial]
+    fn resolve_long_reasoning_reminder_precedence() {
+        use crate::session::long_reasoning_reminder::LongReasoningReminder;
+        use crate::util::config::LongReasoningReminderSettings;
+        let _env = EnvGuard::unset("GROK_LONG_REASONING_REMINDER");
+        assert_eq!(
+            LongReasoningReminder {
+                enabled: false,
+                tokens: 1000,
+                delay: 1
+            },
+            Config::default().resolve_long_reasoning_reminder(),
+            "default is OFF with default tuning"
+        );
+        let remote_on = Config {
+            remote_settings: Some(crate::util::config::RemoteSettings {
+                long_reasoning_reminder: Some(LongReasoningReminderSettings {
+                    enabled: Some(true),
+                    tokens: Some(3000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            LongReasoningReminder {
+                enabled: true,
+                tokens: 3000,
+                delay: 1
+            },
+            remote_on.resolve_long_reasoning_reminder(),
+            "remote gate enables; remote tokens apply, delay falls to the default"
+        );
+        let toml_off = Config {
+            long_reasoning_reminder: LongReasoningReminderSettings {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            ..remote_on.clone()
+        };
+        assert_eq!(
+            LongReasoningReminder {
+                enabled: false,
+                tokens: 3000,
+                delay: 1
+            },
+            toml_off.resolve_long_reasoning_reminder(),
+            "TOML false beats a remote true; remote tuning still resolves for telemetry"
+        );
+        let toml_on = Config {
+            long_reasoning_reminder: LongReasoningReminderSettings {
+                enabled: Some(true),
+                tokens: Some(500),
+                ..Default::default()
+            },
+            remote_settings: Some(crate::util::config::RemoteSettings {
+                long_reasoning_reminder: Some(LongReasoningReminderSettings {
+                    enabled: Some(false),
+                    tokens: Some(3000),
+                    delay: Some(4),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            LongReasoningReminder {
+                enabled: true,
+                tokens: 500,
+                delay: 4
+            },
+            toml_on.resolve_long_reasoning_reminder(),
+            "TOML true beats a remote false; TOML tokens beat remote, remote delay fills in"
+        );
+        let _env = EnvGuard::set("GROK_LONG_REASONING_REMINDER", "0");
+        assert!(
+            !toml_on.resolve_long_reasoning_reminder().enabled,
+            "env kill switch wins over TOML + remote"
+        );
+        let _env = EnvGuard::set(
+            "GROK_LONG_REASONING_REMINDER",
+            r#"{"enabled": true, "tokens": 9000}"#,
+        );
+        assert_eq!(
+            LongReasoningReminder {
+                enabled: true,
+                tokens: 9000,
+                delay: 1
+            },
+            toml_off.resolve_long_reasoning_reminder(),
+            "env JSON enables over a TOML false and its tokens win; delay falls through"
+        );
     }
     /// The `[doom_loop_recovery]` TOML section deserializes through the
     /// standard config path (no bespoke parser).
@@ -14147,6 +14498,52 @@ hooks = true
     }
     #[test]
     #[serial]
+    fn resolve_runtime_fields_cli_no_subagents_disables_over_config() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str("[subagents]\nenabled = true").unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: false,
+            cli_subagents: Some(false),
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert!(!cfg.subagents_enabled);
+        assert_eq!(Some(false), cfg.cli_subagents);
+    }
+    #[test]
+    #[serial]
+    fn resolve_runtime_fields_partial_subagents_table_stays_enabled() {
+        clear_runtime_env_vars();
+        let raw: toml::Value = toml::from_str("[subagents]\nmax_depth = 2\n").unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).unwrap();
+        cfg.resolve_runtime_fields(&RuntimeResolutionContext {
+            raw_config: &raw,
+            remote_settings: None,
+            is_headless: true,
+            cli_subagents: None,
+            cli_web_search_model: None,
+            cli_session_summary_model: None,
+            cli_experimental_memory: false,
+            cli_no_memory: false,
+            disable_web_search: false,
+            todo_gate: false,
+            laziness_debug_log: None,
+            storage_mode: None,
+        });
+        assert!(cfg.subagents_enabled);
+        assert_eq!(2, cfg.subagents_max_depth);
+    }
+    #[test]
+    #[serial]
     fn resolve_runtime_fields_model_overrides_from_cli() {
         clear_runtime_env_vars();
         let raw = empty_config();
@@ -14431,6 +14828,7 @@ default = "grok-4.5"
     ) -> ModelEntry {
         ModelEntry {
             info: ModelInfo {
+                variants: Vec::new(),
                 user_selectable: true,
                 id: None,
                 model: slug.to_owned(),
@@ -14454,6 +14852,7 @@ default = "grok-4.5"
                 query_params: IndexMap::new(),
                 env_http_headers: IndexMap::new(),
                 context_window: NonZeroU64::new(context_window).unwrap(),
+                max_request_bytes: None,
                 use_concise: false,
                 agent_type: default_agent_type(),
                 inference_idle_timeout_secs: None,
@@ -14464,6 +14863,7 @@ default = "grok-4.5"
                 reasoning_effort: None,
                 supports_reasoning_effort: false,
                 reasoning_efforts: Vec::new(),
+                reasoning_effort_server_default: false,
                 service_tiers: Vec::new(),
                 supports_reasoning_summary_parameter: false,
                 default_reasoning_summary: ReasoningSummary::None,
@@ -14930,6 +15330,161 @@ default = "grok-4.5"
             efforts[0].id, "low",
             "config.toml list must override remote"
         );
+    }
+    /// The prefetched `grok-4.6-build` row: a `["low", "high"]` menu with `high` marked default plus the legacy `high` scalar.
+    fn prefetched_menu_donor() -> ModelEntry {
+        let mut entry = prefetch_model_entry("grok-4.6-build", 200_000, ApiBackend::default());
+        entry.info.reasoning_efforts = ["low", "high"]
+            .into_iter()
+            .map(|id| ReasoningEffortOption {
+                id: id.to_string(),
+                value: id.parse().unwrap(),
+                label: id.to_string(),
+                description: None,
+                default: id == "high",
+            })
+            .collect();
+        entry.info.reasoning_effort = Some(ReasoningEffort::High);
+        entry
+    }
+    /// Resolves `config_toml` (rows pointing at `model = "grok-4.6-build"`) against `donor` prefetched under the wire id.
+    /// A custom models endpoint keeps the built-in `grok-4.6` catalog row (which has its own menu) out of Layer 1.
+    fn resolve_with_menu_donor(
+        config_toml: &str,
+        donor: ModelEntry,
+    ) -> IndexMap<String, ModelEntry> {
+        let raw: toml::Value = toml::from_str(config_toml).unwrap();
+        let mut cfg = Config::new_from_toml_cfg(&raw).expect("config should parse");
+        cfg.endpoints.models_base_url = Some("https://test.example.com/v1".to_owned());
+        let mut prefetched = IndexMap::new();
+        prefetched.insert("grok-4.6-build".to_owned(), donor);
+        resolve_model_list(&cfg, Some(prefetched))
+    }
+    /// Resolves a single `[model."{key}"]` row (`model = "grok-4.6-build"`, no menu) against `donor`; `key` is the
+    /// wire id itself or an alias of it.
+    fn resolve_row_with_menu_donor(key: &str, extra_toml: &str, donor: ModelEntry) -> ModelEntry {
+        let config_toml = format!(
+            r#"
+            [model."{key}"]
+            model = "grok-4.6-build"
+            base_url = "https://test.example.com/v1"
+            {extra_toml}
+            "#
+        );
+        resolve_with_menu_donor(&config_toml, donor)
+            .shift_remove(key)
+            .expect("config key must exist")
+    }
+    fn effort_ids(info: &ModelInfo) -> Vec<&str> {
+        info.reasoning_efforts
+            .iter()
+            .map(|o| o.id.as_str())
+            .collect()
+    }
+    #[test]
+    fn slug_propagation_inherits_reasoning_efforts_and_derives_legacy_fields() {
+        let info = resolve_row_with_menu_donor("grok-4.6", "", prefetched_menu_donor()).info;
+        assert_eq!(effort_ids(&info), ["low", "high"]);
+        assert!(info.supports_reasoning_effort);
+        assert_eq!(info.reasoning_effort, Some(ReasoningEffort::High));
+    }
+    /// A config alias with its own restricted menu is that row's choice, not a donor: the same-key fetched row
+    /// keeps feeding the other empty aliases of the wire id.
+    #[test]
+    fn slug_propagation_prefers_same_key_menu_donor_over_restricted_alias() {
+        let resolved = resolve_with_menu_donor(
+            r#"
+            [model."grok-4.6"]
+            model = "grok-4.6-build"
+            base_url = "https://test.example.com/v1"
+
+            [model."grok-4.6-cheap"]
+            model = "grok-4.6-build"
+            base_url = "https://test.example.com/v1"
+            reasoning_efforts = ["low"]
+            "#,
+            prefetched_menu_donor(),
+        );
+        let info = |key: &str| &resolved.get(key).expect(key).info;
+        assert_eq!(effort_ids(info("grok-4.6-build")), ["low", "high"]);
+        assert_eq!(effort_ids(info("grok-4.6")), ["low", "high"]);
+        assert_eq!(
+            info("grok-4.6").reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert_eq!(effort_ids(info("grok-4.6-cheap")), ["low"]);
+    }
+    /// Inheriting an unmarked `capabilities` menu must carry the server-default flag along, or the alias would
+    /// derive `.first()` (`low`) where the same-key row sends nothing.
+    #[test]
+    fn slug_inherited_unmarked_capabilities_menu_keeps_no_default_effort() {
+        let row = serde_json::json!({
+            "id": "grok-4.6-build",
+            "capabilities": { "reasoning_effort": ["low", "medium", "high", "xhigh"] }
+        });
+        let parsed =
+            crate::remote::client::parse_remote_model_value(&row, "https://test.example.com/v1")
+                .expect("row parses");
+        let entry =
+            resolve_row_with_menu_donor("grok-4.6", "", ModelEntry::from_config_entry(&parsed));
+        assert_eq!(effort_ids(&entry.info), ["low", "medium", "high", "xhigh"]);
+        assert!(entry.info.supports_reasoning_effort);
+        assert!(entry.info.reasoning_effort_server_default);
+        assert_eq!(entry.info.reasoning_effort, None);
+        assert_eq!(resolve_sampling(&entry, None).reasoning_effort, None);
+    }
+    /// An explicit `supports_reasoning_effort = false` in config discards the menu whether it arrives through the
+    /// same-key base (wire-id key) or through slug propagation (alias key), and the scalar whether it came from the
+    /// catalog row or from the config row itself, so nothing reaches the wire.
+    #[test]
+    fn explicit_supports_reasoning_effort_false_discards_inherited_menu() {
+        for key in ["grok-4.6-build", "grok-4.6"] {
+            let mut donor = prefetched_menu_donor();
+            donor.info.reasoning_effort_server_default = true;
+            let entry = resolve_row_with_menu_donor(
+                key,
+                r#"
+            supports_reasoning_effort = false
+            reasoning_effort = "high"
+            "#,
+                donor,
+            );
+            assert!(entry.info.reasoning_efforts.is_empty(), "{key}");
+            assert!(!entry.info.supports_reasoning_effort, "{key}");
+            assert!(!entry.info.reasoning_effort_server_default, "{key}");
+            assert_eq!(entry.info.reasoning_effort, None, "{key}");
+            assert_eq!(
+                resolve_sampling(&entry, None).reasoning_effort,
+                None,
+                "{key}"
+            );
+        }
+    }
+    /// A `/v1/models` row whose `capabilities` names no default keeps the menu but sends no effort, so the
+    /// server applies its own instead of the lowest listed tier.
+    #[test]
+    fn capabilities_menu_without_default_resolves_to_no_reasoning_effort() {
+        let mut cfg = Config::default();
+        cfg.endpoints.models_base_url = Some("https://test.example.com/v1".to_owned());
+        let row = serde_json::json!({
+            "id": "grok-4.6-build",
+            "capabilities": { "reasoning_effort": ["low", "medium", "high", "xhigh"] }
+        });
+        let parsed =
+            crate::remote::client::parse_remote_model_value(&row, "https://test.example.com/v1")
+                .expect("row parses");
+        let mut prefetched = IndexMap::new();
+        prefetched.insert(
+            "grok-4.6-build".to_owned(),
+            ModelEntry::from_config_entry(&parsed),
+        );
+        let info = resolve_model_list(&cfg, Some(prefetched))
+            .shift_remove("grok-4.6-build")
+            .expect("grok-4.6-build key must exist")
+            .info;
+        assert_eq!(info.reasoning_efforts.len(), 4);
+        assert!(info.supports_reasoning_effort);
+        assert_eq!(info.reasoning_effort, None);
     }
     #[test]
     fn resolve_model_list_inherits_context_window_from_default_when_prefetched_has_fallback() {

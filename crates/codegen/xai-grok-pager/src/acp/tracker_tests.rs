@@ -1325,7 +1325,7 @@ fn test_search_tool_call_flow() {
         );
     }
 }
-/// ScrollbackState with an explicit `expanded_by_default` shape override (flag-independent: the `Some` beats the `collapsed_edit_blocks` cache).
+/// Scrollback with pager.toml `expanded_by_default` set. Does not touch the flag cache.
 fn edit_config_scrollback(expanded_by_default: bool) -> ScrollbackState {
     use crate::appearance::AppearanceConfig;
     let mut sb = ScrollbackState::new();
@@ -1354,6 +1354,11 @@ fn pending_other_tool_call(tc_id: &Arc<str>) -> acp::SessionUpdate {
 /// There Edit's `finished_display_mode()` returns `None`, and `finish_running` would otherwise leave a stale mode in place.
 #[test]
 fn edit_tool_upgrade_resets_display_mode_to_default() {
+    std::thread::spawn(edit_tool_upgrade_resets_display_mode_to_default_body)
+        .join()
+        .unwrap();
+}
+fn edit_tool_upgrade_resets_display_mode_to_default_body() {
     use crate::scrollback::types::DisplayMode;
     /// Drive Pending(Other) through InProgress(Edit) to Completed.
     /// Returns the display mode observed after the InProgress upgrade and after completion.
@@ -1404,6 +1409,7 @@ fn edit_tool_upgrade_resets_display_mode_to_default() {
         );
         entry.display_mode
     }
+    crate::appearance::cache::set_collapsed_edit_blocks(false);
     let (upgraded, completed) = upgrade_path("toolu_edit_001", false);
     assert_eq!(
         upgraded,
@@ -2377,6 +2383,46 @@ fn execute_block_keeps_full_command_sets_header_display_when_peeled() {
         searchable.contains("cd /proj && echo hi"),
         "searchable_text must retain full command: {searchable}"
     );
+}
+#[test]
+fn read_text_content_becomes_numbered_lines_with_the_sent_range() {
+    const TEXT: &str = "fn main() {}\nfn run() {}\n";
+    let range = || Some(LineRange::new(10, 11));
+    let counts = serde_json::json!({ "totalLines": 40, "range": { "start": 10, "end": 11 } });
+    let read = |raw_output: Option<serde_json::Value>, content: Vec<acp::ToolCallContent>| {
+        let call = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("read-1")),
+            "src/main.rs".to_string(),
+        )
+        .kind(acp::ToolKind::Read)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({ "path": "src/main.rs" })))
+        .raw_output(raw_output)
+        .content(content)
+        .locations(vec![]);
+        match tool_call_to_block(&call, None) {
+            RenderBlock::ToolCall(ToolCallBlock::Read(block)) => {
+                (block.content, block.total_lines, block.line_range)
+            }
+            other => panic!("expected read block, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        read(Some(counts.clone()), vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(40), range())
+    );
+    assert_eq!(
+        read(None, vec![TEXT.into()]),
+        (Some(TEXT.to_owned()), Some(2), None)
+    );
+    assert_eq!(
+        read(
+            Some(serde_json::json!({ "type": "Text", "text": "**File:** rust.md\n1 | # Rust\n" })),
+            vec![TEXT.into()],
+        ),
+        (None, None, None)
+    );
+    assert_eq!(read(Some(counts), vec![]), (None, Some(40), range()));
 }
 #[test]
 fn activity_none_after_finish_turn() {
@@ -4828,6 +4874,30 @@ fn call_mcp_tool_coerced_to_use_tool_renders_block() {
     assert_eq!(ut.tool_name, "grafana__search");
 }
 #[test]
+fn a_failed_tool_search_shows_its_output_text_as_the_error() {
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("mcp2")),
+        "Search tools slack",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .content(vec![])
+    .raw_input(Some(
+        serde_json::json!({ "variant": "SearchTool", "query": "slack" }),
+    ))
+    .raw_output(Some(serde_json::json!({
+        "type": "SearchTool",
+        "result_count": 0,
+        "content": "no such server: slack"
+    })))
+    .locations(vec![]);
+    let block = tool_call_to_block(&tc, None);
+    let RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(st)) = block else {
+        panic!("expected IntegrationSearch block, got {block:?}");
+    };
+    assert_eq!(st.error.as_deref(), Some("no such server: slack"));
+}
+#[test]
 fn call_mcp_tool_no_raw_input_does_not_panic() {
     let tc = acp::ToolCall::new(
         acp::ToolCallId::new(Arc::from("mcp2")),
@@ -4973,4 +5043,76 @@ fn tier_restricted_media_shows_upsell_text_not_error() {
         "upsell text must be shown in the card body, got: {:?}",
         block.output
     );
+}
+/// The daemon client hand-builds the media card's JSON (it cannot depend on `MediaGenOutput`); this pins that the
+/// exact shape it sends — `type` + `path` only — renders as a media ref for both spellings, and that the fuller
+/// shape the built-in tools send does too.
+#[test]
+fn daemon_generate_image_output_shape_renders_as_a_media_ref() {
+    let outputs = [
+        (
+            "ImageGen",
+            serde_json::json!({ "type": "ImageGen", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageEdit",
+            serde_json::json!({ "type": "ImageEdit", "path": "/work/proj/assets/cat.png" }),
+        ),
+        (
+            "ImageGen",
+            serde_json::json!({
+                "type": "ImageGen",
+                "path": "/work/proj/assets/cat.png",
+                "filename": "cat.png",
+                "session_folder": "assets",
+            }),
+        ),
+    ];
+    for (variant, output) in outputs {
+        let tc = acp::ToolCall::new(
+            acp::ToolCallId::new(Arc::from("daemon-image")),
+            "Generate image: \"a cat\"",
+        )
+        .kind(acp::ToolKind::Other)
+        .status(acp::ToolCallStatus::Completed)
+        .raw_input(Some(serde_json::json!({
+            "variant": variant, "prompt": "a cat", "aspect_ratio": "16:9",
+        })))
+        .raw_output(Some(output.clone()))
+        .locations(vec![]);
+        assert_eq!(
+            media_gen_ref(&tc),
+            Some((std::path::PathBuf::from("/work/proj/assets/cat.png"), false)),
+            "{output}"
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Other(block)) = tool_call_to_block(&tc, None)
+        else {
+            panic!("expected an Other tool-call block for {output}");
+        };
+        assert!(block.is_success(), "{output}");
+    }
+}
+/// A refused generation (the server's access error) fails the card with the reason, and draws no image.
+#[test]
+fn daemon_generate_image_refusal_is_a_failed_card_with_the_reason() {
+    let reason = "Developer, Sand, or training access required";
+    let tc = acp::ToolCall::new(
+        acp::ToolCallId::new(Arc::from("daemon-image")),
+        "Generate image: \"a cat\"",
+    )
+    .kind(acp::ToolKind::Other)
+    .status(acp::ToolCallStatus::Failed)
+    .raw_input(Some(serde_json::json!({
+        "variant": "ImageGen", "prompt": "a cat", "aspect_ratio": "auto",
+    })))
+    .content(vec![acp::ToolCallContent::from(acp::ContentBlock::Text(
+        acp::TextContent::new(reason.to_string()),
+    ))])
+    .locations(vec![]);
+    assert_eq!(media_gen_ref(&tc), None);
+    let RenderBlock::ToolCall(ToolCallBlock::Other(block)) = tool_call_to_block(&tc, None) else {
+        panic!("expected an Other tool-call block");
+    };
+    assert!(!block.is_success());
+    assert_eq!(block.error.as_deref(), Some(reason));
 }

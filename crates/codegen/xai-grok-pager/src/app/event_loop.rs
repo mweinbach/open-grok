@@ -30,6 +30,7 @@ use super::session_load_barrier::{
     AcpDrainArm, SessionLoadAcpTick, SessionLoadBarrier, session_load_agent_id,
 };
 use super::{PagerArgs, PagerTerminal, acp_handler, dispatch, effects};
+use crate::app::reader_thread::ReaderThread;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TimedInputEvent {
@@ -38,7 +39,7 @@ pub(crate) struct TimedInputEvent {
 }
 
 impl TimedInputEvent {
-    fn now(event: Event) -> Self {
+    pub(super) fn now(event: Event) -> Self {
         Self {
             event,
             arrived_at: std::time::Instant::now(),
@@ -1093,6 +1094,7 @@ pub(crate) async fn run(
         tokio::sync::oneshot::Receiver<Option<xai_grok_update::auto_update::UpdateAvailable>>,
     >,
     mut writer_event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::render::draw::WriterEvent>,
+    reader_thread: &mut ReaderThread,
 ) -> anyhow::Result<RunResult> {
     // Initialize tracing capture. The channel `rx` will be wired to a
     // TracingModel (and ultimately a tracing pane) once integrated.
@@ -1507,13 +1509,14 @@ pub(crate) async fn run(
     let managed_config = xai_grok_shell::config::load_managed_config().ok();
 
     // Full merge when every layer parses; partial merge below if any layer fails.
-    let effective_config = match xai_grok_shell::config::load_effective_config() {
-        Ok(raw) => Some(raw),
-        Err(e) => {
-            tracing::debug!(error = %e, "failed to load effective config, using partial layers");
-            None
-        }
-    };
+    let (config_layers, effective_config) =
+        match xai_grok_shell::config::load_effective_config_with_layers() {
+            Ok((layers, raw)) => (Some(layers), Some(raw)),
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to load effective config, using partial layers");
+                (None, None)
+            }
+        };
     let compat = xai_grok_shell::agent::config::resolve_compat_sessions_from_raw(
         effective_config.as_ref().ok_or(()),
         remote_settings.as_ref(),
@@ -1551,7 +1554,11 @@ pub(crate) async fn run(
         managed_config.as_ref(),
         remote_settings.as_ref(),
     );
-
+    app.subagent_model_inheritance = crate::settings::FeatureOverrideState::from_layers(
+        xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+        config_layers.as_ref(),
+        remote_settings.as_ref(),
+    );
     app.subscription_watch_interval_secs = remote_settings
         .as_ref()
         .and_then(|rs| rs.subscription_watch_interval_secs);
@@ -1942,77 +1949,13 @@ pub(crate) async fn run(
             Some(serde_json::json!({ "count": startup_typeahead.len() })),
         );
     }
-    // The reader thread owns the sole strong sender, so when it dies (e.g. a
+    // The reader thread owns the sole strong sender (see `ReaderThread`), so when it dies (e.g. a
     // terminal spewing bytes crossterm cannot parse) or on shutdown (`input_rx`
     // dropped) the channel closes and `input_rx.recv()` returns `None`, exiting
     // the loop.
-    let reader_input_tx = input_tx;
-    // Set true around tty handoffs (e.g. $EDITOR) so the reader stops touching
-    // stdin and the inheriting child process keeps every keystroke. The handoff
-    // does not proceed until `reader_parked` acknowledges this pause.
     let input_paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader_paused = input_paused.clone();
-    // Set by the reader once it has parked (stopped calling crossterm) so the
-    // $EDITOR handoff can wait for it: poll/read share one global lock, so the
-    // main-thread drain must be the sole crossterm caller.
     let reader_parked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader_parked_thread = reader_parked.clone();
-    std::thread::spawn(move || {
-        use std::sync::atomic::Ordering;
-        // Short enough that a pause / receiver-drop is observed promptly, long
-        // enough to keep the thread parked when idle. A `poll()` timeout here
-        // does NOT wake the main loop -- only a successful `send` does -- so the
-        // idle event loop still parks (no reintroduced metronome tick).
-        const POLL_TIMEOUT: Duration = Duration::from_millis(100);
-        let mut consecutive_event_errors: u32 = 0;
-        loop {
-            // Shutdown observed within one poll cycle in every state (idle or
-            // paused); the send() break below covers close-while-sending.
-            if reader_input_tx.is_closed() {
-                break;
-            }
-            // While a tty handoff owns stdin, do not read(): the child (e.g. the
-            // editor) must keep its bytes. Re-check soon without touching stdin.
-            if reader_paused.load(Ordering::Acquire) {
-                // Signal the handoff that the reader is no longer in crossterm.
-                reader_parked_thread.store(true, Ordering::Release);
-                std::thread::sleep(POLL_TIMEOUT);
-                continue;
-            }
-            // Active path: this thread owns crossterm again this iteration.
-            reader_parked_thread.store(false, Ordering::Release);
-            // poll()+read() (not a bare blocking read) so the pause flag and a
-            // dropped receiver are observed within POLL_TIMEOUT.
-            let event = match crossterm::event::poll(POLL_TIMEOUT) {
-                Ok(true) => crossterm::event::read(),
-                Ok(false) => continue,
-                Err(e) => Err(e),
-            };
-            match event {
-                Ok(ev) => {
-                    consecutive_event_errors = 0;
-                    let timed = TimedInputEvent::now(ev);
-                    if reader_input_tx.send(timed).is_err() {
-                        break; // event loop has shut down
-                    }
-                }
-                Err(e) => {
-                    // VTE terminals / SSH PTYs can emit garbage that crossterm's
-                    // parser rejects; skip transient errors rather than kill the
-                    // TUI (ratatui#1275), bailing only if they never stop.
-                    consecutive_event_errors += 1;
-                    if consecutive_event_errors >= 50 {
-                        tracing::error!(
-                            "crossterm read returned {consecutive_event_errors} \
-                             consecutive errors, exiting reader: {e}"
-                        );
-                        break;
-                    }
-                    tracing::warn!("crossterm read error (skipping): {e}");
-                }
-            }
-        }
-    });
+    *reader_thread = ReaderThread::spawn(input_tx, input_paused.clone(), reader_parked.clone());
     let mut acp_rx = connection.rx;
     let connection_cancel = connection.cancel;
     let mut leader_status_rx = connection.leader_status_rx;
@@ -2954,13 +2897,18 @@ pub(crate) async fn run(
                 // without its `session/prompt` RPC response arriving
                 // (see `dispatch::reconcile_overdue_turn_ends`).
                 let reconciled = dispatch::reconcile_overdue_turn_ends(&mut app);
+                // The reconcile drains queues outside any dispatched action; its image notices show now.
+                let notice_shown = app.flush_image_notices_if_root();
                 if let Some(effs) = reconciled {
                     if process_effects(effs, &mut tasks, &mut app, &progress_tx) {
                         break;
                     }
                     presenter.request(false);
-                } else if app.tick() {
-                    presenter.request(false);
+                } else {
+                    let ticked = app.tick();
+                    if ticked || notice_shown {
+                        presenter.request(false);
+                    }
                 }
                 // Keep ticking as long as there are running animations
                 // or pending actions waiting to expire.
@@ -4519,10 +4467,20 @@ pub(crate) fn retarget_suppress_code_restore(app: &mut AppView, from: &str, to: 
     }
 }
 
+pub(crate) fn session_create_or_load(effs: &[super::actions::Effect]) -> bool {
+    effs.iter().any(|e| {
+        matches!(
+            e,
+            Effect::CreateSession { .. }
+                | Effect::CreateWorktreeSession { .. }
+                | Effect::LoadSession { .. }
+        )
+    })
+}
+
 /// Shared [`SessionFlags`] builder (interactive loop + leader-cluster).
 pub(crate) fn session_flags_for_effects(
     app: &mut AppView,
-    #[cfg_attr(not(feature = "local-workspace"), allow(unused_variables))]
     effs: &[super::actions::Effect],
 ) -> effects::SessionFlags {
     effects::SessionFlags {
@@ -4531,6 +4489,8 @@ pub(crate) fn session_flags_for_effects(
         ask_user: app.ask_user,
         restore_code: take_load_restore_code(app, effs),
         agent_override: app.agent_override.clone(),
+        defer_builtin_agent_profile: session_create_or_load(effs)
+            && crate::views::agents_modal::config_agent_is_explicit(),
         yolo_mode: app.default_yolo,
         auto_mode: super::dispatch::effective_auto(
             app.default_yolo,
@@ -4582,7 +4542,12 @@ fn process_effects(
     progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
 ) -> bool {
     let flags = session_flags_for_effects(app, &effs);
-    for eff in effs {
+    let mut effs = effs.into_iter().peekable();
+    while let Some(eff) = effs.next() {
+        let Some(eff) = effects::take_coalesced_interjects(eff, &mut effs, tasks, &app.acp_tx)
+        else {
+            continue;
+        };
         let (quit, meta) = effects::execute(eff, tasks, &app.acp_tx, &app.cwd, &flags, progress_tx);
         // Install auth abort handle if the current auth state still matches.
         if let Some((seq, abort_handle)) = meta.auth_abort_handle
@@ -4632,6 +4597,7 @@ mod tests {
             git_ref: None,
             model_id: None,
             preferred_session_id: None,
+            minted_session_id: None,
             chat_kind: false,
         };
         assert!(welcome_oneshot_applies_to_effects(std::slice::from_ref(
@@ -4982,6 +4948,7 @@ mod tests {
             git_ref: None,
             model_id: None,
             preferred_session_id: None,
+            minted_session_id: None,
             chat_kind: false,
         };
         assert_eq!(

@@ -975,7 +975,7 @@ const INJECTION_ENV_KEYS: &[&str] = &[
 
 const INJECTION_ENV_KEY_PREFIXES: &[&str] = &["DYLD_", "GIT_CONFIG"];
 
-fn env_key_risk(key: &str) -> EnvRisk {
+pub(crate) fn env_key_risk(key: &str) -> EnvRisk {
     if is_safe_env_key(key) {
         EnvRisk::Safe
     } else if INJECTION_ENV_KEYS.contains(&key)

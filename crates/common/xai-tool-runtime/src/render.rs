@@ -87,6 +87,8 @@ impl ToolOutput for String {}
 /// Lets `xai_tool_types::TaskOutputOutput` be used directly as a `Tool::Output`
 /// (handy for stub/test tools and pass-through proxies).
 impl ToolOutput for xai_tool_types::TaskOutputOutput {}
+impl ToolOutput for xai_tool_types::GrepSearchOutput {}
+impl ToolOutput for xai_tool_types::WebSearchOutput {}
 
 /// Lets `xai_tool_types::SubagentCompletedOutput` be used directly as a
 /// `Tool::Output` (the `task` tool's structured completion output).

@@ -56,8 +56,10 @@ async fn memory_flush_waits_for_response_and_drains_lifecycle_notifications() {
                 .unwrap();
             response_rx.await.unwrap().unwrap();
         }
-        let response =
-            serde_json::value::to_raw_value(&serde_json::json!({"flushed": true})).unwrap();
+        let response = serde_json::value::to_raw_value(
+            &serde_json::json!({"flushed": true, "disposition": "flushed"}),
+        )
+        .unwrap();
         request
             .response_tx
             .send(Ok(acp::ExtResponse::new(response.into())))
@@ -81,7 +83,14 @@ async fn memory_flush_rejects_skipped_or_malformed_responses() {
     use agent_client_protocol as acp;
     use xai_acp_lib::AcpAgentMessage;
 
-    for response in [r#"{"flushed":false}"#, "{}", "null"] {
+    for (response, expected) in [
+        (
+            r#"{"flushed":false,"disposition":"failed"}"#,
+            "memory flush skipped",
+        ),
+        (r#"{}"#, "memory flush returned an unreadable response"),
+        (r#"null"#, "memory flush returned an unreadable response"),
+    ] {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (_client_tx, mut client_rx) = tokio::sync::mpsc::unbounded_channel();
         let session_id = acp::SessionId::new("flush-session");
@@ -106,12 +115,7 @@ async fn memory_flush_rejects_skipped_or_malformed_responses() {
             ),
             server,
         );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("memory flush skipped")
-        );
+        assert!(result.unwrap_err().to_string().contains(expected));
     }
 }
 

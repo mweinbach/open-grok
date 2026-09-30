@@ -14,6 +14,7 @@ xai-grok-version = { workspace = true }
 
 # Shared prompt-queue wire types
 xai-prompt-queue = { workspace = true }
+xai-tool-types = { workspace = true }
 
 # Presentation-primitives layer (extracted)
 xai-grok-pager-render = { path = "../xai-grok-pager-render" }
@@ -57,6 +58,7 @@ portable-pty = "0.9"
 # Utilities
 derive_more = { workspace = true, features = ["deref", "deref_mut"] }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 shlex = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 clap_complete = { workspace = true }
@@ -130,7 +132,7 @@ base64 = { workspace = true }
 image = { workspace = true, features = ["png", "jpeg", "tiff", "gif", "webp"] }
 
 # ID generation
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 # Path computation (plan file, etc.)
 dirs = { workspace = true }
@@ -172,10 +174,12 @@ core-foundation = { workspace = true }
 windows-sys = { version = "0.59", features = ["Win32_System_Console"] }
 
 [dev-dependencies]
+xai-interjection-core = { workspace = true }
 xai-grok-status-line = { path = "../xai-grok-status-line", features = ["test-support"] }
 xai-grok-pager-render = { path = "../xai-grok-pager-render", features = ["test-support"] }
 xai-grok-shell = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
+wiremock = { workspace = true }
 insta = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }

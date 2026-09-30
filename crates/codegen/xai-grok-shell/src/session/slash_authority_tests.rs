@@ -44,6 +44,7 @@ fn eligible_builtin_requires_an_always_on_gate() {
         argument_hint: None,
         aliases: &[],
         gate: super::super::slash_commands::BuiltinGate::Memory,
+        workflow_projection: super::super::slash_commands::WorkflowProjection::None,
         model_authored_eligibility: ModelAuthoredEligibility::ExactCanonical,
         resolve: |_| BuiltinAction::Compact { user_context: None },
     };

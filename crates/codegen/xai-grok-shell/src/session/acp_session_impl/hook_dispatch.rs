@@ -105,7 +105,14 @@ impl SessionActor {
             session_id: &self.session_info.id.0,
             workspace_root: &self.hook_resolved_workspace_root,
             process_scope: self.tool_context.process_scope.clone(),
+            disabled: self.hook_disabled.borrow().clone(),
         }
+    }
+
+    /// Re-read the disabled-hooks file after this session changed it or reloaded its hooks.
+    pub(super) fn refresh_hook_disabled(&self) {
+        *self.hook_disabled.borrow_mut() =
+            std::sync::Arc::new(crate::util::hooks::disabled_hooks_snapshot());
     }
 
     /// Send a hook annotation to the TUI scrollback.
@@ -284,8 +291,7 @@ impl SessionActor {
         }
 
         let tool_result = serde_json::to_value(output).unwrap_or(serde_json::Value::Null);
-        let raw_input: serde_json::Value =
-            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let raw_input = prepared.hook_arguments().into_owned();
         let (tool_input_value, tool_input_truncated) = truncate_payload(raw_input);
         let (tool_result_value, tool_result_truncated) = truncate_payload(tool_result);
         let hook_tool_name = prepared.hook_tool_name().to_owned();
@@ -350,8 +356,7 @@ impl SessionActor {
         if !self.may_have_hooks_for(xai_grok_hooks::event::HookEventName::PostToolUseFailure) {
             return Vec::new();
         }
-        let raw_input: serde_json::Value =
-            serde_json::from_str(&prepared.raw_arguments).unwrap_or(serde_json::Value::Null);
+        let raw_input = prepared.hook_arguments().into_owned();
         let (tool_input, tool_input_truncated) = xai_grok_hooks::event::truncate_payload(raw_input);
         let hook_tool_name = prepared.hook_tool_name();
         self.dispatch_post_tool_use_failure_hook(

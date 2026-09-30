@@ -69,8 +69,23 @@ async fn run_turn(
     Duration,
     usize,
 ) {
+    run_turn_attached(server, enabled, false).await
+}
+
+async fn run_turn_attached(
+    server: &MockInferenceServer,
+    enabled: bool,
+    non_interactive: bool,
+) -> (
+    Result<TurnOutcome, agent_client_protocol::Error>,
+    CapturedRetries,
+    Duration,
+    usize,
+) {
     let (actor, retries) =
         actor_under_test(server, SessionKind::Main, sampler_surfaces_5xx(), enabled).await;
+    actor.attach_non_interactive.set(non_interactive);
+    // Drive the real turn loop; the request is built inside it.
     let requests_before = server.request_count();
     let started = tokio::time::Instant::now();
     let outcome = tokio::time::timeout(
@@ -186,6 +201,83 @@ fn kill_switch_off_fails_on_first_transient() {
         })
     });
 }
+
+#[test]
+fn headless_root_session_resubmits() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .expect("mock inference server");
+            server.enqueue_response("/v1/responses", overloaded_503());
+
+            let (outcome, retries, _elapsed, submissions) =
+                run_turn_attached(&server, true, true).await;
+
+            assert!(
+                outcome.is_ok(),
+                "headless attach: one 503 then success must complete the turn: {:?}",
+                outcome.as_ref().map(|_| "TurnOutcome").err()
+            );
+            assert_eq!(submissions, 2, "original + one resubmit");
+            assert_eq!(
+                retrying_events(&retries),
+                vec![(1, 3, "Server error; retrying request".to_string())],
+                "the headless client is told about the resubmit too"
+            );
+        })
+    });
+}
+
+#[test]
+fn headless_kill_switch_off_fails_on_first_transient() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .expect("mock inference server");
+            server.enqueue_response("/v1/responses", overloaded_503());
+
+            let (outcome, retries, _elapsed, submissions) =
+                run_turn_attached(&server, false, true).await;
+
+            assert!(
+                outcome.is_err(),
+                "headless with the switch off: first 503 is terminal"
+            );
+            assert_eq!(submissions, 1, "no resubmits");
+            assert!(retrying_events(&retries).is_empty());
+        })
+    });
+}
+
+#[test]
+fn headless_exhausts_to_the_original_terminal() {
+    on_session_stack(|| {
+        run_paused(|| async {
+            let server = MockInferenceServer::start_with_models(vec![MockModelEntry::new("test")])
+                .await
+                .expect("mock inference server");
+            for _ in 0..4 {
+                server.enqueue_response("/v1/responses", overloaded_503());
+            }
+
+            let (outcome, retries, _elapsed, submissions) =
+                run_turn_attached(&server, true, true).await;
+
+            assert!(
+                outcome.is_err(),
+                "headless: the step budget is the same 3 resubmits"
+            );
+            assert_eq!(submissions, 4, "original + three resubmits");
+            assert_eq!(retrying_events(&retries).len(), 3);
+        })
+    });
+}
+
+// Not covered here: IdleTimeout through the loop
+// The sampler's stall detection is I/O-time based, so it cannot fire under the paused clock
+// Eligibility for the kind is pinned at the handler level instead
 
 /// The cumulative budget is prompt-scoped: turn-loop re-entries must share one 10-resubmit budget, not get a fresh 3 per entry.
 /// Auto-recovery re-enters this way, calling `process_conversation_turn_with_recovery` repeatedly without a new prompt.

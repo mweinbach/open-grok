@@ -11,8 +11,8 @@ use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 impl AgentView {
     /// Close the `/jump` picker (if open) and restore the viewport it opened
-    /// from. Shared by the `Esc` dismiss path and the rewind / inline-edit entry
-    /// points, so a shadowed picker can't reappear stale.
+    /// from. Shared by the `Esc` dismiss path and the rewind entry points, so a
+    /// shadowed picker can't reappear stale.
     pub(crate) fn dismiss_jump_picker(&mut self) {
         if let Some(js) = self.jump_state.take() {
             self.restore_jump_viewport(js.restore);
@@ -33,15 +33,12 @@ impl AgentView {
     }
 
     /// True when another prompt overlay owns the input slot, so the `/jump`
-    /// picker must not open and an open one must be dismissed: rewind, inline
-    /// edit, the `/btw` panel, or a pending permission / question / cancel-turn /
-    /// plan-approval overlay. One predicate keeps dispatch, key, mouse, and
-    /// scroll routing from disagreeing on the owner.
+    /// picker must not open and an open one must be dismissed: rewind, the `/btw`
+    /// panel, or a pending permission / question / cancel-turn / plan-approval
+    /// overlay. One predicate keeps dispatch, key, mouse, and scroll routing from
+    /// disagreeing on the owner.
     pub(crate) fn jump_slot_taken(&self) -> bool {
-        self.rewind_state.is_some()
-            || self.inline_edit.is_some()
-            || self.btw_state.is_some()
-            || !self.no_input_overlay_pending()
+        self.rewind_state.is_some() || self.btw_state.is_some() || !self.no_input_overlay_pending()
     }
 
     /// Drop the picker when another overlay owns the input slot

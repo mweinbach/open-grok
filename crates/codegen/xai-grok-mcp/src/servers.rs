@@ -421,9 +421,41 @@ enum UnreachableRetry {
     },
 }
 
+/// Admitted server list shared with the session handle.
+///
+/// `update_configs` and `update_configs_diff` publish into this cell, so a
+/// handle that cloned it at spawn sees the current seat, including headers.
+/// A fork snapshots that list instead of the spawn-time overlay.
+#[derive(Clone)]
+pub struct AdmittedMcpServers(Arc<parking_lot::Mutex<Vec<acp::McpServer>>>);
+
+impl AdmittedMcpServers {
+    pub fn new(servers: Vec<acp::McpServer>) -> Self {
+        Self(Arc::new(parking_lot::Mutex::new(servers)))
+    }
+
+    /// Copy the list. Forks keep this copy; later seat switches do not rewrite it.
+    pub fn snapshot(&self) -> Vec<acp::McpServer> {
+        self.0.lock().clone()
+    }
+
+    pub fn replace(&self, servers: Vec<acp::McpServer>) {
+        *self.0.lock() = servers;
+    }
+}
+
+impl Default for AdmittedMcpServers {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
 /// Consolidated MCP state behind a single lock. Generation counter detects stale inits.
 pub struct McpState {
     pub configs: Vec<acp::McpServer>,
+    /// Shared with the session handle. Private so commits go through
+    /// [`Self::update_configs`] / [`Self::update_configs_diff`].
+    admitted: AdmittedMcpServers,
     pub meta_config_map: McpMetaConfigMap,
     /// Clients owned by this session; cleared on config changes.
     pub owned_clients: crate::owned_clients::OwnedClients,
@@ -501,8 +533,10 @@ impl McpState {
     }
 
     pub fn new_with_meta(configs: Vec<acp::McpServer>, meta_config_map: McpMetaConfigMap) -> Self {
+        let admitted = AdmittedMcpServers::new(configs.clone());
         Self {
             configs,
+            admitted,
             meta_config_map,
             owned_clients: crate::owned_clients::OwnedClients::new(),
             shared_clients: HashMap::new(),
@@ -675,6 +709,7 @@ impl McpState {
         self.mcp_tool_icons.clear();
         self.disabled_tool_registrations.clear();
         self.configs = new_configs;
+        self.publish_admitted();
         self.init_progress.cancel();
         self.auth_required.clear();
         self.init_failed.clear();
@@ -682,6 +717,16 @@ impl McpState {
         self.generation = self.generation.wrapping_add(1);
         true
     }
+
+    /// Handle clones share this cell. Forks call [`AdmittedMcpServers::snapshot`].
+    pub fn admitted_servers(&self) -> AdmittedMcpServers {
+        self.admitted.clone()
+    }
+
+    fn publish_admitted(&self) {
+        self.admitted.replace(self.configs.clone());
+    }
+
     fn forget_server(&mut self, name: &str) {
         self.owned_clients.remove(name);
         self.auth_required.remove(name);
@@ -771,6 +816,7 @@ impl McpState {
         );
 
         self.configs = new_configs;
+        self.publish_admitted();
         self.init_progress.cancel();
         self.generation = self.generation.wrapping_add(1);
 
@@ -812,8 +858,31 @@ impl McpState {
     /// `false` (per-server work remains) AND `is_initializing()` is
     /// `true` (so wait-loops keep waiting instead of kicking off a
     /// second init).
+    ///
+    /// A pre-finish pass that already settled a failure reads as
+    /// abandoned instead (see [`Self::is_init_abandoned`]).
     pub fn is_initializing(&self) -> bool {
-        self.init_progress.is_in_progress()
+        match &self.init_progress {
+            InitProgress::Starting { .. } => !self.has_settled_init_failure(),
+            InitProgress::Finished { handshaking } => !handshaking.is_empty(),
+            InitProgress::NotStarted => false,
+        }
+    }
+
+    /// The pass that owned init is gone with handshakes still marked.
+    ///
+    /// Fork approximation: without upstream's `InitClaimGuard` owner
+    /// tracking, a settled failure (`init_failed` / `auth_required`)
+    /// on a pre-finish pass stands in for a dead owner. Post-finish
+    /// drain keeps reporting initializing until handshakes settle, as
+    /// before — only the pre-finish window can read as abandoned.
+    pub fn is_init_abandoned(&self) -> bool {
+        matches!(self.init_progress, InitProgress::Starting { .. })
+            && self.has_settled_init_failure()
+    }
+
+    fn has_settled_init_failure(&self) -> bool {
+        !self.init_failed.is_empty() || !self.auth_required.is_empty()
     }
 
     /// Returns `true` once `finish_init` has fired, regardless of
@@ -845,6 +914,13 @@ impl McpState {
     /// every handshake has reported via [`Self::mark_server_ready`].
     pub fn finish_init(&mut self) {
         self.init_progress.finish();
+    }
+
+    /// Mark init fully complete: finish (if starting) and drain the
+    /// handshaking set so `is_initialized()` reads true.
+    pub fn complete_init(&mut self) {
+        self.init_progress.finish();
+        self.init_progress.clear_handshaking();
     }
 
     /// Cancel initialization back to [`InitProgress::NotStarted`].
@@ -4637,6 +4713,10 @@ impl McpClient {
             ClientState::Ready { service, .. } => !service.is_transport_closed(),
             _ => false,
         }
+    }
+
+    pub async fn is_ready(&self) -> bool {
+        self.state_kind().await == ClientStateKind::Ready
     }
 
     /// Atomic classification for the liveness watcher.

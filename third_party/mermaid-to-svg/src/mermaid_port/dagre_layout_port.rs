@@ -336,6 +336,7 @@ fn extract_local_layout(
                     label: meta.label.clone(),
                     fill_color: meta.fill_color.clone(),
                     stroke_color: meta.stroke_color.clone(),
+                    text_color: None,
                 },
             );
         }

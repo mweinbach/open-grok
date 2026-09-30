@@ -530,11 +530,12 @@ fn write_summary(
         generated_title: Some(format!("Benchmark session {ordinal}")),
         title_is_manual: false,
         worktree_label: worktree_label.map(str::to_owned),
-        agent_name: Some("benchmark-agent".to_owned()),
+        agent: Default::default(),
         sandbox_profile: Some("workspace".to_owned()),
         reasoning_effort: None,
         last_turn_summary: None,
         last_turn_summary_prompt_id: None,
+        last_recap: None,
         cache_affinity_id: None,
     };
     let summary_path = session_dir.join("summary.json");

@@ -1,6 +1,6 @@
 //! Headless single-turn mode (`open-grok -p "prompt"`).
 //!
-//! Runs the agent in-process via `spawn_grok_shell` and drives the ACP lifecycle (init, auth, session, prompt).
+//! Runs the agent in-process and drives the ACP lifecycle (init, auth, session, prompt).
 //! Streams to stdout and exits via `CancellationToken`.
 
 use std::collections::HashSet;
@@ -14,6 +14,7 @@ use agent_client_protocol as acp;
 use xai_acp_lib::{AcpAgentTx, AcpClientMessageBox, AcpClientRx, acp_send};
 use xai_grok_shell::agent::auth_method::AuthMethodKind;
 use xai_grok_shell::agent::config::Config as AgentConfig;
+use xai_grok_shell::extensions::memory::MemoryFlushResponse;
 use xai_grok_shell::extensions::task::{CancelSubagentRequest, KillTaskRequest};
 use xai_grok_shell::sampling::error::{
     RATE_LIMITED_ERROR_CODE, error_detail_from_data, format_rate_limited_user_message,
@@ -25,14 +26,14 @@ use xai_grok_shell::util::config as cli_config;
 use xai_grok_telemetry::startup::PendingStartup;
 
 use crate::acp::model_state::{EffortTokenError, ModelState};
-use crate::acp::spawn::{AgentShutdownGuard, spawn_grok_shell};
+use crate::acp::spawn::{AgentShutdownGuard, SpawnedAgent, spawn_grok_shell};
 use crate::client_identity::{HEADLESS_CLIENT_TYPE, pager_client_version};
 use crate::headless::reducer::{
-    Lifecycle, McpServer, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update,
-    reducer_for,
+    Lifecycle, Reducer, SessionContext, StreamEvent, TurnEnd, map_session_update, reducer_for,
 };
 
 mod ext_protocol;
+mod mcp_init;
 mod reducer;
 use ext_protocol::{ExtEvent, handle_ext_notification, reply_headless_ext_method};
 
@@ -71,7 +72,7 @@ pub struct HeadlessOptions {
     pub deny_rules: Vec<String>,
     pub max_turns: Option<u32>,
     pub permission_mode_flag: Option<String>,
-    /// Effort token (`--reasoning-effort` / `--effort`); resolved like `/effort` after models load.
+    /// Effort token (`--reasoning-effort` / `--effort`); a menu id or canonical level after models load.
     pub reasoning_effort: Option<String>,
     /// Wait for background tasks to report `task_completed` before exiting (default true).
     pub wait_for_background: bool,
@@ -261,7 +262,7 @@ impl HeadlessEmitter {
 
     fn on_thought_chunk(&mut self, text: &str) {
         match self.format {
-            OutputFormat::Plain => { /* no-op */ }
+            OutputFormat::Plain => {}
             OutputFormat::Json => {
                 self.thought_buffer.push_str(text);
             }
@@ -406,27 +407,6 @@ fn stop_reason_wire(reason: acp::StopReason) -> String {
     .to_string()
 }
 
-/// Configured MCP servers for the `init` line; all report `"connected"` (status is not resolved here).
-fn mcp_server_names(cwd: &Path) -> Vec<McpServer> {
-    let servers =
-        cli_config::load_mcp_servers(cwd, &xai_grok_tools::types::compat::CompatConfig::default());
-    servers
-        .iter()
-        .filter_map(|s| {
-            let name = match s {
-                acp::McpServer::Http(h) => h.name.clone(),
-                acp::McpServer::Sse(h) => h.name.clone(),
-                acp::McpServer::Stdio(h) => h.name.clone(),
-                _ => return None,
-            };
-            Some(McpServer {
-                name,
-                status: "connected".to_string(),
-            })
-        })
-        .collect()
-}
-
 fn auto_respond_to_permissions(
     args: &acp::RequestPermissionRequest,
     option_kinds: &[acp::PermissionOptionKind],
@@ -533,6 +513,16 @@ fn selected_provider_auth(
     }
 }
 
+/// The same backend switch the TUI applies; the shell unless another backend is enabled.
+async fn spawn_agent(
+    agent_config: AgentConfig,
+    cancel: &CancellationToken,
+    memory_config: Option<xai_grok_shell::config::MemoryConfig>,
+    options: &HeadlessOptions,
+) -> Result<SpawnedAgent> {
+    let _ = options;
+    spawn_grok_shell(agent_config, cancel, memory_config).await
+}
 /// Authenticate via the agent's `defaultAuthMethodId`, failing closed when none is available.
 /// Returns whether the selected method is API-key auth.
 async fn authenticate(
@@ -581,8 +571,6 @@ fn build_headless_init_request(
     }
     meta["startupHints"] = serde_json::json!({
         "nonInteractive": true,
-        "skipGitStatus": true,
-        "skipProjectLayout": true,
     });
 
     acp::InitializeRequest::new(acp::ProtocolVersion::V1)
@@ -766,9 +754,17 @@ async fn apply_headless_model_and_effort(
             .resolve_by_name_or_id(name)
             .unwrap_or_else(|| acp::ModelId::new(name))
     } else {
-        models.current.clone().ok_or_else(|| {
-            anyhow::anyhow!("--effort/--reasoning-effort: no active model to apply effort to")
-        })?
+        match models.current.clone() {
+            Some(id) => id,
+            None if effort_token
+                .is_some_and(|token| parse_canonical_effort_token(token).is_some()) =>
+            {
+                return Ok(());
+            }
+            None => {
+                anyhow::bail!("--effort/--reasoning-effort: no active model to apply effort to");
+            }
+        }
     };
 
     let effort = match effort_token {
@@ -787,7 +783,7 @@ async fn apply_headless_model_and_effort(
             }
             None
         }
-        Some(token) => match models.resolve_effort_for_model(&model_id, token) {
+        Some(token) => match models.resolve_cli_effort_for_model(&model_id, token) {
             Ok(effort) => Some(effort),
             // Soft-ignore effort on a non-supporting model; still apply `-m`.
             Err(EffortTokenError::Unsupported) => {
@@ -798,7 +794,9 @@ async fn apply_headless_model_and_effort(
                 );
                 None
             }
-            Err(err) => anyhow::bail!("--effort/--reasoning-effort: {}", err.message()),
+            Err(err) => {
+                anyhow::bail!("--effort/--reasoning-effort: {}", err.message())
+            }
         },
     };
 
@@ -1064,7 +1062,7 @@ pub async fn run_single_turn(
 
     let cancel = CancellationToken::new();
     let memory_config = agent_config.memory_config.clone();
-    let spawned = match spawn_grok_shell(agent_config, &cancel, memory_config).await {
+    let spawned = match spawn_agent(agent_config, &cancel, memory_config, &options).await {
         Ok(s) => s,
         Err(e) => {
             report_startup_failure(&timer);
@@ -1230,6 +1228,11 @@ pub async fn run_single_turn(
 
     // Seed the reducer's session context BEFORE applying model/effort so a later failure carries it.
     {
+        let mcp_servers = if options.output_format == OutputFormat::StreamingMessagesJson {
+            mcp_init::resolve_mcp_servers_for_init(&acp_tx, &session_id, &session_cwd).await
+        } else {
+            Vec::new()
+        };
         let model = options
             .model
             .clone()
@@ -1243,7 +1246,7 @@ pub async fn run_single_turn(
             model,
             cwd: session_cwd.to_string_lossy().to_string(),
             permission_mode,
-            mcp_servers: mcp_server_names(&session_cwd),
+            mcp_servers,
             include_partial_messages: options.include_partial_messages,
             api_key_auth: is_api_key_auth,
             context_window: session_models.get_context_window(),
@@ -1261,10 +1264,12 @@ pub async fn run_single_turn(
             .and_then(|m| session_models.resolve_by_name_or_id(m))
             .or_else(|| session_models.current.clone());
         match target {
-            Some(model_id) => matches!(
-                session_models.resolve_effort_for_model(&model_id, token),
-                Err(EffortTokenError::UnknownToken { .. } | EffortTokenError::NoActiveModel)
-            ),
+            Some(model_id) => {
+                matches!(
+                    session_models.resolve_cli_effort_for_model(&model_id, token),
+                    Err(EffortTokenError::UnknownToken { .. } | EffortTokenError::NoActiveModel)
+                )
+            }
             None => true,
         }
     };
@@ -1524,11 +1529,12 @@ pub async fn run_single_turn(
             if let Some(usage) = xai_grok_shell::sampling::error::prompt_usage_from_error(&err) {
                 match serde_json::to_value(&usage) {
                     Ok(v) => emitter.usage = Some(v),
-                    // Log rather than swallow: a serialize failure would drop the frozen spend fields.
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "headless: failed to serialize prompt-error usage; spend fields dropped"
-                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "headless: failed to serialize prompt-error usage; spend fields dropped"
+                        )
+                    }
                 }
             }
             let stop_reason_override =
@@ -1611,12 +1617,10 @@ async fn run_headless_memory_flush(
         &mut completed_bg,
     );
     let response = response.map_err(|error| anyhow::anyhow!("memory flush failed: {error}"))?;
-    let flushed = serde_json::from_str::<serde_json::Value>(response.0.get())
-        .ok()
-        .and_then(|value| value.get("flushed")?.as_bool())
-        .unwrap_or(false);
-    if !flushed {
-        anyhow::bail!("memory flush skipped (already in progress or not started)");
+    let response = serde_json::from_str::<MemoryFlushResponse>(response.0.get())
+        .map_err(|e| anyhow::anyhow!("memory flush returned an unreadable response: {e}"))?;
+    if !response.flushed {
+        anyhow::bail!("memory flush skipped: {}", response.summary());
     }
     Ok(())
 }

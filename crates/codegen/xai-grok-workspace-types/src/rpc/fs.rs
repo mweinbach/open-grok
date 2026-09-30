@@ -78,6 +78,31 @@ pub struct PutFilesRes {
     pub results: Vec<PutFileResult>,
 }
 
+/// Leaves room for base64 expansion and RPC metadata within the hub's default 8 MiB frame limit.
+pub const MAX_SESSION_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_SESSION_IMAGE_BASE64_BYTES: usize = MAX_SESSION_IMAGE_BYTES.div_ceil(3) * 4;
+
+/// Store a generated image in the bound session's own folder, never in the workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreSessionImageReq {
+    /// Standard base64-encoded image bytes.
+    pub content_base64: String,
+    /// Filename extension: jpg, png, webp, or gif.
+    pub extension: String,
+}
+
+impl WorkspaceRpc for StoreSessionImageReq {
+    const METHOD: &'static str = "workspace.store_session_image";
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    type Response = StoreSessionImageRes;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreSessionImageRes {
+    /// Absolute host path, returned only after the complete image has been stored.
+    pub file_path: String,
+}
+
 /// A single file to read, with optional cache validation and byte-range support.
 ///
 /// # Byte-range and UTF-8 alignment
@@ -332,6 +357,13 @@ pub const CLIENT_FS_LIST_METHOD: &str = "workspace.client_fs_list";
 pub const CLIENT_FS_STAT_METHOD: &str = "workspace.client_fs_stat";
 /// Wire method name for [`ClientFsReadFileReq`].
 pub const CLIENT_FS_READ_FILE_METHOD: &str = "workspace.client_fs_read_file";
+/// Wire method name for [`ClientFsWriteFileReq`].
+pub const CLIENT_FS_WRITE_FILE_METHOD: &str = "workspace.client_fs_write_file";
+
+/// Per-chunk decoded byte cap for [`ClientFsWriteFileReq`]; base64 of 4 MiB is ≈5.4 MiB, inside the hub's 8 MiB frame.
+pub const MAX_CLIENT_FS_WRITE_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+/// Per-file cap on a staged [`ClientFsWriteFileReq`] upload.
+pub const MAX_CLIENT_FS_WRITE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Filesystem node kind. Wire values match the shell's `x.ai/fs/list`
 /// node `type` strings.
@@ -544,6 +576,70 @@ pub struct ClientFsReadFileRes {
     /// Whether the returned payload bytes were valid UTF-8.
     #[serde(rename = "type")]
     pub content_type: FsContentType,
+}
+
+/// Binary-safe staged write: one call per chunk, sharing `uploadId`, in offset order; the last chunk sets `finalize`.
+/// Bytes accumulate in a temp file beside the target and become visible at `path` only when the finalizing chunk renames it into place.
+/// Requires a bound session; the staged upload belongs to that session.
+/// `path` and `overwrite` are pinned by the first chunk: a later `path` must resolve to the same target, and a later `overwrite` is ignored.
+/// A retry of the last staged chunk (same offset and length, not finalizing) is a no-op that returns the staged size.
+///
+/// Failures arrive as a hub error whose message starts with one of these prefixes, each followed by `: ` and detail;
+/// unless noted the staged upload is dropped and must restart from offset 0:
+/// - `invalid_upload_id` — `uploadId` violates the alphabet or length (nothing staged).
+/// - `chunk_too_large` — a chunk decodes to more than [`MAX_CLIENT_FS_WRITE_CHUNK_BYTES`].
+/// - `too_large` — the file would exceed [`MAX_CLIENT_FS_WRITE_FILE_BYTES`].
+/// - `too_many_uploads` — the session is at its ceiling of concurrent uploads or staged bytes (a first chunk stages nothing).
+/// - `name_too_long` — the staging file name would exceed 255 bytes (nothing staged).
+/// - `exists` — the target exists and `overwrite` is `false`, on the first chunk or at finalize.
+/// - `staging_conflict` — a foreign file already occupies the staging name (nothing staged).
+/// - `out_of_order` — `offset` is not the staged length, `offset != 0` with nothing staged, or two chunks of one id raced.
+/// - `path_mismatch` — a later chunk's `path` resolves to a different target.
+///
+/// Other failures (no bound session, path escapes, `not a file`, I/O errors, the client-fs ops being disabled) carry free-form messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientFsWriteFileReq {
+    /// Path relative to the client-fs base (see [`ClientFsListReq::path`]); absolute paths inside the base are accepted.
+    /// Escapes are rejected.
+    pub path: String,
+    /// Caller-chosen id shared by every chunk of one file; scoped to the bound session.
+    /// ASCII letters, digits, `-` and `_` only, at most 64 characters.
+    pub upload_id: String,
+    /// Base64 chunk (at most [`MAX_CLIENT_FS_WRITE_CHUNK_BYTES`] decoded).
+    pub content_base64: String,
+    /// Byte offset of this chunk; must equal the bytes staged so far (or exactly replay the last staged chunk).
+    pub offset: u64,
+    /// Rename the staged file onto `path` after writing this chunk (`true` for the only chunk of a small file).
+    #[serde(default)]
+    pub finalize: bool,
+    /// Create missing parent directories on the first chunk.
+    #[serde(default = "default_true")]
+    pub create_dirs: bool,
+    /// Replace an existing file on finalize (default `false` ⇒ `exists` error before any bytes are staged).
+    /// Read from the first chunk only.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+impl WorkspaceRpc for ClientFsWriteFileReq {
+    const METHOD: &'static str = CLIENT_FS_WRITE_FILE_METHOD;
+    const ACTIVITY: RpcActivityClass = RpcActivityClass::Mutation;
+    type Response = ClientFsWriteFileRes;
+}
+
+/// Response for [`ClientFsWriteFileReq`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientFsWriteFileRes {
+    /// Bytes staged so far for `uploadId` (the full size on finalize).
+    pub size: u64,
+    /// SHA-256 hex digest of the full content; present only on finalize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// Final absolute host path; present only on finalize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -760,5 +856,84 @@ mod tests {
         assert_eq!(ClientFsListReq::METHOD, CLIENT_FS_LIST_METHOD);
         assert_eq!(ClientFsStatReq::METHOD, CLIENT_FS_STAT_METHOD);
         assert_eq!(ClientFsReadFileReq::METHOD, CLIENT_FS_READ_FILE_METHOD);
+    }
+
+    /// Pins the `client_fs_write_file` wire shape: camelCase keys, defaults for the optional flags, and finalize-only response fields omitted while staging.
+    #[test]
+    fn client_fs_write_file_wire_stability_snapshot() {
+        use serde_json::json;
+
+        let minimal: ClientFsWriteFileReq = serde_json::from_value(json!({
+            "path": "out/a.bin", "uploadId": "u1", "contentBase64": "AAEC", "offset": 0
+        }))
+        .unwrap();
+        assert_eq!(
+            minimal,
+            ClientFsWriteFileReq {
+                path: "out/a.bin".into(),
+                upload_id: "u1".into(),
+                content_base64: "AAEC".into(),
+                offset: 0,
+                finalize: false,
+                create_dirs: true,
+                overwrite: false,
+            }
+        );
+
+        let full = ClientFsWriteFileReq {
+            path: "out/a.bin".into(),
+            upload_id: "u1".into(),
+            content_base64: "AAEC".into(),
+            offset: 4_194_304,
+            finalize: true,
+            create_dirs: false,
+            overwrite: true,
+        };
+        let wire = serde_json::to_value(&full).unwrap();
+        assert_eq!(
+            wire,
+            json!({
+                "path": "out/a.bin",
+                "uploadId": "u1",
+                "contentBase64": "AAEC",
+                "offset": 4_194_304,
+                "finalize": true,
+                "createDirs": false,
+                "overwrite": true,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientFsWriteFileReq>(wire).unwrap(),
+            full
+        );
+
+        let staged = ClientFsWriteFileRes {
+            size: 3,
+            hash: None,
+            file_path: None,
+        };
+        assert_eq!(serde_json::to_value(&staged).unwrap(), json!({ "size": 3 }));
+        let finalized = ClientFsWriteFileRes {
+            size: 3,
+            hash: Some("abc123".into()),
+            file_path: Some("/home/u/out/a.bin".into()),
+        };
+        let wire = serde_json::to_value(&finalized).unwrap();
+        assert_eq!(
+            wire,
+            json!({ "size": 3, "hash": "abc123", "filePath": "/home/u/out/a.bin" })
+        );
+        assert_eq!(
+            serde_json::from_value::<ClientFsWriteFileRes>(wire).unwrap(),
+            finalized
+        );
+        assert_eq!(
+            <ClientFsWriteFileReq as WorkspaceRpc>::METHOD,
+            "workspace.client_fs_write_file"
+        );
+        assert_eq!(
+            <ClientFsWriteFileReq as WorkspaceRpc>::ACTIVITY,
+            RpcActivityClass::Mutation
+        );
     }
 }

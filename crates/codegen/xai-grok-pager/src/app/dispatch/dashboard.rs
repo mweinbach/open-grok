@@ -50,6 +50,7 @@ pub(super) fn ensure_dashboard_state(app: &mut AppView) {
         return;
     }
     let mut state = dashboard_state_from_persisted(app);
+    state.set_preview_enabled(app.current_ui.dashboard_preview_enabled(), &mut app.agents);
     state.gc_stale_refs(&dashboard_alive_fn(&app.agents));
     state.adopt_slash_mru(app.slash_mru.clone());
     state.adopt_command_tags(app.command_tags.clone());
@@ -338,8 +339,6 @@ fn dispatch_dashboard_load_local_build(
     session_id: String,
     cwd_hint: Option<std::path::PathBuf>,
 ) -> Vec<Effect> {
-    use crate::views::dashboard::DashboardRowId;
-
     let resolved = cwd_hint
         .and_then(|cwd| {
             xai_grok_shell::session::resolve_local_session(&session_id, &cwd.to_string_lossy())
@@ -355,11 +354,21 @@ fn dispatch_dashboard_load_local_build(
         return vec![];
     };
 
+    dispatch_dashboard_load_session(app, resolved_id, Some(resolved_cwd))
+}
+
+fn dispatch_dashboard_load_session(
+    app: &mut AppView,
+    session_id: String,
+    session_cwd: Option<std::path::PathBuf>,
+) -> Vec<Effect> {
+    use crate::views::dashboard::DashboardRowId;
+
     #[cfg(feature = "local-workspace")]
     {
         app.welcome_history_load_as_build = true;
     }
-    if let Some(existing_id) = focus_if_session_already_open(app, resolved_id.as_str(), false) {
+    if let Some(existing_id) = focus_if_session_already_open(app, session_id.as_str(), false) {
         #[cfg(feature = "local-workspace")]
         {
             app.welcome_history_load_as_build = false;
@@ -368,7 +377,7 @@ fn dispatch_dashboard_load_local_build(
         return vec![];
     }
 
-    let effects = dispatch_load_session(app, resolved_id, Some(resolved_cwd), false);
+    let effects = dispatch_load_session(app, session_id, session_cwd, false);
     if let Some(new_id) = effects.iter().find_map(|effect| match effect {
         Effect::LoadSession { agent_id, .. } => Some(*agent_id),
         _ => None,
@@ -395,6 +404,9 @@ pub(super) fn dispatch_dashboard_pick_session(app: &mut AppView, index: usize) -
         return vec![];
     };
     let cwd_hint = (!entry.cwd.is_empty()).then(|| std::path::PathBuf::from(entry.cwd));
+    if crate::app::is_daemon_session_row(&entry.source) {
+        return dispatch_dashboard_load_session(app, entry.id, cwd_hint);
+    }
     dispatch_dashboard_load_local_build(app, entry.id, cwd_hint)
 }
 
@@ -1298,6 +1310,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
 
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
 
@@ -1438,6 +1451,7 @@ pub(super) fn dispatch_dashboard_dispatch_slash(app: &mut AppView, text: String)
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app,
+                subagent_model_inheritance: subagent_model_inheritance_from_app,
                 scheduler_background_loops: scheduler_background_loops_seed,
                 local_feature_flags: xai_grok_shell::util::config::load_local_feature_flags_sync(),
             },
@@ -1743,7 +1757,7 @@ pub(super) fn dispatch_dashboard_peek_reply(
                 entry.images = images;
             }
         }
-        maybe_drain_queue(agent)
+        maybe_drain_queue(agent, &mut app.pending_image_notices)
     };
     note_peek_page_flip(app, agent_id, drain.page_flip_entry);
     let mut effects = drain.effects;

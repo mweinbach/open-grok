@@ -147,8 +147,6 @@ fn accept_word_select_tip_no_op_when_tip_not_showing() {
     );
 }
 
-// ── /plan slash command tests ─────────────────────────────────────
-
 #[test]
 fn slash_plan_no_args_not_in_plan_enters_plan_mode() {
     let mut app = test_app_with_agent();
@@ -1946,6 +1944,198 @@ fn cycle_always_approve_with_nudge_jumps_to_plan() {
     );
 }
 
+#[test]
+fn turning_always_approve_off_restages_ask() {
+    let mut app = test_app_with_agent();
+    app.default_yolo = true;
+    app.current_ui.permission_mode = Some("always-approve".into());
+    {
+        let agent = app
+            .agents
+            .get_mut(&AgentId(0))
+            .expect("the test agent exists");
+        agent.session.session_id = None;
+        agent.session.yolo_mode = true;
+        agent.deferred_permission_mode = Some("always-approve");
+    }
+
+    dispatch(Action::ToggleYolo, &mut app);
+
+    let agent = &app.agents[&AgentId(0)];
+    assert!(!agent.session.is_yolo());
+    assert_eq!(agent.deferred_permission_mode, Some("ask"));
+}
+
+/// The jump skips the shared body, so it has to clear the soft-default flag itself.
+#[test]
+fn cycle_with_nudge_clears_the_soft_default_flag() {
+    let mut app = test_app_with_agent();
+    publish_agent_ask_plan(&mut app);
+    app.permission_mode_from_soft_default = true;
+    let _ = app
+        .agents
+        .get_mut(&AgentId(0))
+        .expect("the test agent exists")
+        .ephemeral_tip
+        .show(
+            crate::tips::plan_nudge::plan_nudge_tip(),
+            &mut std::collections::HashMap::new(),
+        );
+
+    let _ = press_shift_tab(&mut app);
+
+    assert!(!app.permission_mode_from_soft_default);
+}
+
+/// Before the session binds, the staged word is the only way the choice reaches the agent.
+#[test]
+fn turning_always_approve_on_before_a_session_stages_it() {
+    let mut app = test_app_with_agent();
+    app.agents
+        .get_mut(&AgentId(0))
+        .expect("the test agent exists")
+        .session
+        .session_id = None;
+
+    dispatch(Action::ToggleYolo, &mut app);
+
+    assert_eq!(
+        app.agents[&AgentId(0)].deferred_permission_mode,
+        Some("always-approve")
+    );
+}
+
+/// Picking a mode by name stages that word, so a staged Auto cannot outlive a later Ask.
+#[test]
+fn picking_ask_restages_ask_over_a_staged_auto() {
+    let mut app = test_app_with_agent();
+    {
+        let agent = app
+            .agents
+            .get_mut(&AgentId(0))
+            .expect("the test agent exists");
+        agent.session.session_id = None;
+        agent.deferred_permission_mode = Some("auto");
+    }
+
+    crate::app::dispatch::modes::set_permission_mode(
+        &mut app,
+        crate::app::actions::PermissionModeKind::Ask,
+    );
+
+    assert_eq!(
+        app.agents[&AgentId(0)].deferred_permission_mode,
+        Some("ask")
+    );
+}
+
+/// Turning always-approve off leaves a staged Auto alone.
+#[test]
+fn turning_always_approve_off_keeps_a_staged_auto() {
+    let mut app = test_app_with_agent();
+    {
+        let agent = app
+            .agents
+            .get_mut(&AgentId(0))
+            .expect("the test agent exists");
+        agent.session.session_id = None;
+        agent.session.yolo_mode = true;
+        agent.deferred_permission_mode = Some("auto");
+    }
+
+    dispatch(Action::ToggleYolo, &mut app);
+
+    assert_eq!(
+        app.agents[&AgentId(0)].deferred_permission_mode,
+        Some("auto")
+    );
+}
+
+/// Reconnecting refuses the press, and the nudge shortcut must not slip Plan through first.
+#[test]
+fn cycle_with_nudge_does_nothing_while_reconnecting() {
+    let mut app = test_app_with_agent();
+    publish_agent_ask_plan(&mut app);
+    app.reconnect_pending = true;
+    let _ = app
+        .agents
+        .get_mut(&AgentId(0))
+        .expect("the test agent exists")
+        .ephemeral_tip
+        .show(
+            crate::tips::plan_nudge::plan_nudge_tip(),
+            &mut std::collections::HashMap::new(),
+        );
+
+    let effects = dispatch(Action::CycleMode, &mut app);
+
+    assert!(effects.is_empty());
+    assert!(!app.agents[&AgentId(0)].plan_mode_active);
+}
+
+/// Ask sits between Agent and Plan, so the nudge jump must not depend on where the cycle starts.
+#[test]
+fn cycle_with_nudge_jumps_to_plan_from_a_published_ask() {
+    let mut app = test_app_with_agent();
+    publish_agent_ask_plan(&mut app);
+    {
+        let agent = app
+            .agents
+            .get_mut(&AgentId(0))
+            .expect("the test agent exists");
+        agent.session_mode = xai_grok_tools::types::SessionMode::Ask;
+        let _ = agent.ephemeral_tip.show(
+            crate::tips::plan_nudge::plan_nudge_tip(),
+            &mut std::collections::HashMap::new(),
+        );
+    }
+
+    let (banner, _) = press_shift_tab(&mut app);
+
+    assert_eq!(banner, "Switched to mode: Plan");
+}
+
+/// Gives the test agent the default, ask, and plan modes.
+fn publish_agent_ask_plan(app: &mut AppView) {
+    app.agents
+        .get_mut(&AgentId(0))
+        .expect("the test agent exists")
+        .apply_session_modes(Some(acp::SessionModeState::new(
+            "default",
+            vec![
+                acp::SessionMode::new("default", "Agent"),
+                acp::SessionMode::new("ask", "Ask"),
+                acp::SessionMode::new("plan", "Plan"),
+            ],
+        )));
+}
+
+/// Sends one Shift+Tab and returns the banner plus the labelled effects.
+fn press_shift_tab(app: &mut AppView) -> (String, Vec<String>) {
+    let effects = dispatch(Action::CycleMode, app)
+        .iter()
+        .map(effect_label)
+        .collect();
+    let banner = app.agents[&AgentId(0)]
+        .mode_switch_banner
+        .as_ref()
+        .map(|(msg, _)| msg.clone())
+        .unwrap_or_default();
+    (banner, effects)
+}
+
+/// Labels a cycle effect as `set_mode:<id>` or `persist:<canonical>`.
+fn effect_label(effect: &Effect) -> String {
+    match effect {
+        Effect::SetSessionMode { mode_id, .. } => format!("set_mode:{}", mode_id.0),
+        Effect::PersistPermissionMode {
+            canonical,
+            persist: crate::app::actions::PermissionModePersist::BestEffort,
+            ..
+        } => format!("persist:{canonical}"),
+        other => format!("{other:?}"),
+    }
+}
 /// Auto + plan nudge showing: Shift+Tab jumps to Plan (not Always-Approve),
 /// clears auto, retires the nudge, and persists ask.
 #[test]
@@ -2000,6 +2190,54 @@ fn cycle_auto_with_nudge_jumps_to_plan() {
         )),
         "expected PersistPermissionMode(ask), got {effects:?}"
     );
+}
+
+#[test]
+fn cycle_mode_walks_the_published_modes_then_always_approve() {
+    let mut app = test_app_with_agent();
+    publish_agent_ask_plan(&mut app);
+
+    let presses: Vec<_> = (0..4).map(|_| press_shift_tab(&mut app)).collect();
+
+    assert_eq!(
+        vec![
+            ("Switched to mode: Ask", vec!["set_mode:ask".to_owned()]),
+            ("Switched to mode: Plan", vec!["set_mode:plan".to_owned()]),
+            (
+                "Switched to mode: Always-Approve",
+                vec![
+                    "set_mode:default".to_owned(),
+                    "persist:always-approve".to_owned()
+                ]
+            ),
+            ("Switched to mode: Agent", vec!["persist:ask".to_owned()]),
+        ],
+        presses
+            .iter()
+            .map(|(banner, effects)| (banner.as_str(), effects.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert!(!app.agents[&AgentId(0)].session.is_yolo());
+}
+
+#[test]
+fn cycle_mode_under_the_policy_pin_returns_to_the_first_published_mode() {
+    let mut app = test_app_with_agent();
+    app.yolo_policy_block = Some(POLICY_WARNING);
+    publish_agent_ask_plan(&mut app);
+
+    press_shift_tab(&mut app);
+    press_shift_tab(&mut app);
+
+    let (banner, effects) = press_shift_tab(&mut app);
+
+    assert_eq!("Switched to mode: Agent", banner);
+    assert_eq!(
+        vec!["set_mode:default".to_owned(), "persist:ask".to_owned()],
+        effects
+    );
+    assert_eq!(Some(POLICY_WARNING), agent_toast(&app).as_deref());
+    assert!(!app.agents[&AgentId(0)].session.is_yolo());
 }
 
 /// Shared/peek cycle body with Always-Approve + nudge must NOT jump to Plan:

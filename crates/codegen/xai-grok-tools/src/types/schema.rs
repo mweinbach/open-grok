@@ -80,17 +80,6 @@ where
             .map_err(serde::de::Error::custom),
     }
 }
-/// Deserialize `Option<u32>` from a JSON number or numeric string (integers or whole floats).
-pub fn deserialize_lenient_u32<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    deserialize_lenient_option_u64(deserializer)?
-        .map(|u| {
-            u32::try_from(u).map_err(|_| serde::de::Error::custom("number out of range for u32"))
-        })
-        .transpose()
-}
 /// Deserialize `Option<u64>` from a JSON number or numeric string (integers or whole floats).
 pub fn deserialize_lenient_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
@@ -139,6 +128,8 @@ where
             .map_err(serde::de::Error::custom),
     }
 }
+/// Grep's number schemas and `u32` deserializer moved to `xai-tool-types` with the grep types
+pub use xai_tool_types::{LenientNumberSchema, LenientNumberSchemaMin0, deserialize_lenient_u32};
 /// Lenient boolean deserializers (shared via `xai-tool-types`), re-exported so
 /// fields reference them under the same `crate::types::schema::` path as above.
 pub use xai_tool_types::{deserialize_lenient_bool, deserialize_lenient_option_bool};

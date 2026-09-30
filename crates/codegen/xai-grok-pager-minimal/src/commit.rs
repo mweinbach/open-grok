@@ -344,12 +344,21 @@ fn insert_committed(
     } else {
         full_h
     };
+    // Off-screen paint then wrap-aware emit: a dense `insert_before` grid turns pads and soft wraps into hard breaks.
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width,
+        height: commit_h,
+    };
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    paint_committed(&mut buf, &renderer, width, full_h, footer_style);
+    let wraps = commit_wrap_flags(&renderer, buf.area.height, full_h);
+    let rows = super::full_view::buffer_to_semantic_rows(&buf, &wraps);
     // Propagated (not swallowed): the caller must NOT mark the entry committed
     // when the terminal write failed — print-once means a marked-but-unprinted
     // block can never be emitted again (bugbot).
-    terminal.insert_before(commit_h, move |buf| {
-        paint_committed(buf, renderer, width, full_h, footer_style);
-    })?;
+    terminal.insert_before_rows(&rows)?;
     insert_gap(terminal);
     Ok(())
 }
@@ -372,7 +381,7 @@ pub(super) fn insert_gap(terminal: &mut PagerTerminal) {
 /// without a live terminal.
 fn paint_committed(
     buf: &mut ratatui::buffer::Buffer,
-    renderer: EntryRenderer<'_>,
+    renderer: &EntryRenderer<'_>,
     width: u16,
     full_h: u16,
     footer_style: Style,
@@ -402,6 +411,22 @@ fn paint_committed(
         let text = format!("\u{2026} {hidden} more lines \u{00b7} /transcript to view");
         buf.set_span(buf.area.x, y, &Span::styled(text, style), width);
     }
+    super::full_view::trim_trailing_pads(buf);
+}
+
+/// Renderer joiners for the painted commit. A cap footer is not a wrap continuation.
+fn commit_wrap_flags(renderer: &EntryRenderer<'_>, height: u16, full_h: u16) -> Vec<bool> {
+    let mut wraps = renderer.row_soft_wraps(height);
+    if height > 0 && height < full_h {
+        let last = usize::from(height) - 1;
+        if let Some(flag) = wraps.get_mut(last) {
+            *flag = false;
+        }
+        if let Some(flag) = last.checked_sub(1).and_then(|i| wraps.get_mut(i)) {
+            *flag = false;
+        }
+    }
+    wraps
 }
 
 /// Commit the active agent's newly-finalized blocks into native scrollback.

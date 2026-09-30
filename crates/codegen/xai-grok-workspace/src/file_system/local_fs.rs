@@ -33,11 +33,20 @@ impl AsyncFileSystem for LocalFs {
     }
 
     async fn read_file(&self, path: &Path) -> Result<Vec<u8>, FsError> {
-        Ok(fs::read(path).await?)
+        Ok(xai_grok_tools::util::file_reader::read_file(
+            path,
+            xai_grok_tools::util::file_reader::FileReadOptions::default(),
+        )
+        .await?)
     }
 
     async fn try_read_file(&self, path: &Path) -> Result<Option<Vec<u8>>, FsError> {
-        match fs::read(path).await {
+        match xai_grok_tools::util::file_reader::read_file(
+            path,
+            xai_grok_tools::util::file_reader::FileReadOptions::default(),
+        )
+        .await
+        {
             Ok(bytes) => Ok(Some(bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),

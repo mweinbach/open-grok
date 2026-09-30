@@ -16,6 +16,16 @@ fn provider_session_models(model: &str, provider: &str) -> acp::SessionModelStat
 fn simulate_release_build() {
     unsafe { std::env::set_var(xai_grok_version::TEST_VERSION_ENV, "0.0.0-sim") };
 }
+fn pending_trust_workspace() -> (tempfile::TempDir, std::path::PathBuf, AppView) {
+    use xai_grok_workspace::trust::workspace_key;
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    let workspace = workspace_key(repo.path());
+    let mut app = test_app();
+    app.trust_state = TrustState::Pending {
+        workspace: workspace.clone(),
+    };
+    (repo, workspace, app)
+}
 #[test]
 fn voice_on_welcome_creates_session_and_records() {
     if !xai_grok_voice::AUDIO_SUPPORTED {
@@ -524,6 +534,8 @@ fn worktree_session_failed_without_session_returns_to_welcome() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -555,6 +567,8 @@ fn worktree_session_failed_with_fork_parent_keeps_agent() {
         Action::TaskComplete(TaskResult::WorktreeSessionFailed {
             agent_id: id,
             error: error_msg.into(),
+            orphaned_worktree_root: None,
+            timed_out: false,
         }),
         &mut app,
     );
@@ -735,6 +749,7 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -746,6 +761,43 @@ fn session_failed_keeps_agent_clears_loading_and_toasts() {
         agent.toast.as_ref().map(|(m, _)| m.as_str()),
         Some("Session creation failed: No space left on device"),
     );
+}
+#[test]
+fn session_failed_names_step_only_on_timeout() {
+    for (timed_out, error, expected) in [
+        (
+            true,
+            "raw wire timeout text",
+            "Couldn't start the session: it timed out while loading your plugins. It may still \
+             finish in the background, so give it a moment before trying again.",
+        ),
+        (
+            false,
+            "No space left on device",
+            "Session creation failed: No space left on device",
+        ),
+    ] {
+        let mut app = test_app_with_agent();
+        let id = AgentId(0);
+        {
+            let a = app.agents.get_mut(&id).unwrap();
+            a.session.session_id = Some(acp::SessionId::new("existing"));
+            a.session_starting_since = Some(std::time::Instant::now());
+            a.session_new_phase = Some(xai_grok_shell::agent::SessionSetupPhase::PluginRegistry);
+        }
+        dispatch(
+            Action::TaskComplete(TaskResult::SessionFailed {
+                agent_id: id,
+                error: error.to_string(),
+                timed_out,
+            }),
+            &mut app,
+        );
+        assert_eq!(
+            Some(expected),
+            app.agents[&id].toast.as_ref().map(|(m, _)| m.as_str()),
+        );
+    }
 }
 #[test]
 fn session_failed_orphan_returns_to_welcome_with_warning() {
@@ -765,6 +817,7 @@ fn session_failed_orphan_returns_to_welcome_with_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -791,6 +844,7 @@ fn session_failed_orphan_with_fallback_toasts() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -816,6 +870,7 @@ fn session_failed_orphan_does_not_steal_other_active_agent() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -841,6 +896,7 @@ fn session_failed_orphan_on_welcome_with_survivor_uses_startup_warning() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -1350,16 +1406,11 @@ fn finish_trust_resolves_and_replays_startup() {
 #[serial_test::serial(OPENGROK_HOME)]
 #[test]
 fn trust_folder_grants_and_resolves() {
-    use xai_grok_workspace::trust::{TrustStore, workspace_key};
+    use xai_grok_workspace::trust::TrustStore;
     let home = tempfile::tempdir().expect("home tempdir");
     unsafe { std::env::set_var("OPENGROK_HOME", home.path()) };
     simulate_release_build();
-    let repo = tempfile::tempdir().expect("repo tempdir");
-    let workspace = workspace_key(repo.path());
-    let mut app = test_app();
-    app.trust_state = TrustState::Pending {
-        workspace: workspace.clone(),
-    };
+    let (_repo, workspace, mut app) = pending_trust_workspace();
     let _ = dispatch(Action::TrustFolder, &mut app);
     assert!(matches!(app.trust_state, TrustState::Done));
     assert!(
@@ -1932,6 +1983,7 @@ fn session_failed_orphan_restores_dashboard_attach_to_survivor() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: fail_id,
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -1968,6 +2020,7 @@ fn session_failed_last_orphan_clears_dashboard_attach() {
         Action::TaskComplete(TaskResult::SessionFailed {
             agent_id: AgentId(0),
             error: "No space left on device".to_string(),
+            timed_out: false,
         }),
         &mut app,
     );
@@ -3746,6 +3799,7 @@ mod welcome_workspace_mode {
                 git_ref: None,
                 model_id: None,
                 preferred_session_id: None,
+                minted_session_id: None,
                 chat_kind: false,
             }],
             true
@@ -3760,6 +3814,7 @@ mod welcome_workspace_mode {
                     git_ref: None,
                     model_id: None,
                     preferred_session_id: None,
+                    minted_session_id: None,
                     chat_kind: false,
                 }],
                 true

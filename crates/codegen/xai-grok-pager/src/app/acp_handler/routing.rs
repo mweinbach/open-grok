@@ -30,6 +30,19 @@ impl SessionMatch {
     }
 }
 
+/// The session and scrollback that own the task rows for `session_id`.
+/// A subagent's `session_id` returns its child view.
+pub(crate) fn task_view_by_session_id<'a>(
+    app: &'a mut AppView,
+    session_id: &str,
+) -> Option<(
+    &'a mut AgentSession,
+    &'a mut crate::scrollback::state::ScrollbackState,
+)> {
+    let (matched, _, agent) = resolve_notif_agent(app, &acp::SessionId::new(session_id))?;
+    resolve_target_view(agent, matched, session_id)
+}
+
 /// Resolve the agent that owns a notification's `session_id` and whether the
 /// active view is affected.
 ///
@@ -83,6 +96,18 @@ pub(super) fn mcp_target_agent<'a>(
             Some((true, agent))
         }
     }
+}
+
+/// The in-flight create a setup-phase notification targets, matched only by `pending_session_id`
+/// (not the bound id, so a late phase can't re-stain a live session; no active-view fallback).
+pub(super) fn setup_phase_target_agent<'a>(
+    app: &'a mut AppView,
+    session_id: &str,
+) -> Option<&'a mut AgentView> {
+    let sid = acp::SessionId::new(session_id);
+    app.agents
+        .values_mut()
+        .find(|agent| agent.pending_session_id.as_ref() == Some(&sid))
 }
 
 /// Given a matched session and the owning agent, borrow the correct

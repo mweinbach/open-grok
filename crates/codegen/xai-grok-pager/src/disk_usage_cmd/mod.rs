@@ -3,41 +3,52 @@
 //! `-shm` and `-wal` sidecars, so sizes are collected before it opens.
 
 mod display;
-
+use crate::fs_size::{
+    BucketSize, Measure, Volume, WalkIssues, modified_at, physical_buckets, physical_dir_size,
+    physical_file_size, volume_bytes,
+};
+use anyhow::{Context, Result};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-
-use anyhow::{Context, Result};
-use serde::Serialize;
 use xai_fast_worktree::{
     ListFilter, RegistryOpen, SqliteFailureKind, WORKTREE_POOL_DIR, WORKTREES_DIR, WorktreeDb,
     WorktreeKind, WorktreeRecord, WorktreeStatus, classify_sqlite_error, discover_worktrees,
     managed_worktree_roots, path_under_worktree_roots, resolve_grok_home,
 };
-
-use crate::fs_size::{
-    BucketSize, Measure, Volume, WalkIssues, modified_at, physical_buckets, physical_dir_size,
-    physical_file_size, volume_bytes,
-};
-
-/// Bumped when a `--json` field changes meaning or is removed; additions are free.
-const SCHEMA_VERSION: u32 = 1;
-
+/// Bump when a field changes meaning or is removed. Additions are free.
+const SCHEMA_VERSION: u32 = 2;
 #[derive(Clone, Debug, clap::Args)]
 #[command(
     after_help = "Lists every top-level directory in the Open Grok home, largest first, then every \
 worktree under `worktrees/` and `worktree_pool/` with its size, age, and label. To reclaim space, preview a sweep with \
-`open-grok worktree gc --max-age 7d --dry-run`: without `--max-age`, gc expires nothing, and it \
-visits only worktrees the registry tracks."
+`open-grok worktree gc --max-age 7d --dry-run`: without `--max-age`, gc expires nothing, it \
+visits only worktrees the registry tracks, and it keeps a worktree whose work \
+it cannot find elsewhere. Inspect Grove artifacts with `open-grok worktree redirect list <mount>` \
+and purge them with `open-grok worktree clean-artifacts <mount> --yes`."
 )]
 pub struct DiskUsageArgs {
     /// Emit machine-readable JSON output.
     #[arg(long)]
     pub json: bool,
+    /// Purge live redirect contents and ownership-proven orphan jails.
+    #[arg(long, requires = "yes", group = "clean_mode")]
+    pub clean: bool,
+    /// Delete only ownership-proven orphan redirect jails.
+    #[arg(long, requires = "yes", group = "clean_mode")]
+    pub clean_orphaned: bool,
+    /// Confirm an irreversible redirect cleanup.
+    #[arg(long, requires = "clean_mode")]
+    pub yes: bool,
 }
-
 pub fn run(args: DiskUsageArgs) -> Result<()> {
+    run_inner(args)
+}
+fn run_inner(args: DiskUsageArgs) -> Result<()> {
+    if args.clean || args.clean_orphaned {
+        anyhow::bail!("redirect cleanup is not available in this build");
+    }
     // The registry's own resolution, unlike xai_grok_config::grok_home().
     let grok_home = resolve_grok_home()?;
     let mut out = std::io::stdout().lock();
@@ -45,17 +56,17 @@ pub fn run(args: DiskUsageArgs) -> Result<()> {
         .try_exists()
         .with_context(|| format!("cannot stat {}", grok_home.display()))?;
     if !present {
+        let report = empty_report(&grok_home);
         if args.json {
-            return write_report(&empty_report(&grok_home), args.json, &mut out);
+            return write_report(&report, args.json, &mut out);
         }
-        let written = display::print_missing_home(&grok_home.to_string_lossy(), &mut out);
-        return Ok(crate::util::ignore_broken_pipe(written)?);
+        return Ok(crate::util::ignore_broken_pipe(
+            display::print_missing_home_report(&report, &mut out),
+        )?);
     }
-    // Rows store canonical paths, so the home must match to strip-prefix.
     let grok_home = dunce::canonicalize(&grok_home).unwrap_or(grok_home);
     write_report(&collect_report(&grok_home)?, args.json, &mut out)
 }
-
 fn write_report(report: &DiskUsageReport, json: bool, out: &mut impl Write) -> Result<()> {
     let rendered = if json {
         Some(serde_json::to_string_pretty(report)?)
@@ -68,14 +79,12 @@ fn write_report(report: &DiskUsageReport, json: bool, out: &mut impl Write) -> R
     };
     Ok(crate::util::ignore_broken_pipe(written)?)
 }
-
 fn empty_report(grok_home: &Path) -> DiskUsageReport {
     DiskUsageReport {
         grok_home: grok_home.to_string_lossy().into_owned(),
         ..DiskUsageReport::default()
     }
 }
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct SkipCounts {
     skipped_entries: u64,
@@ -84,7 +93,6 @@ pub(crate) struct SkipCounts {
     /// Directories on another filesystem. No total and no row holds them.
     other_filesystem_dirs: u64,
 }
-
 impl From<WalkIssues> for SkipCounts {
     fn from(issues: WalkIssues) -> Self {
         Self {
@@ -95,7 +103,6 @@ impl From<WalkIssues> for SkipCounts {
         }
     }
 }
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RegistryState {
@@ -105,7 +112,16 @@ pub(crate) enum RegistryState {
     Unopenable,
     Corrupt,
 }
-
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct OrphanedRedirection {
+    id: String,
+    bytes: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct UnattributedRedirectDir {
+    path: String,
+    bytes: u64,
+}
 #[derive(Debug, Serialize)]
 pub(crate) struct DiskUsageReport {
     schema_version: u32,
@@ -119,6 +135,12 @@ pub(crate) struct DiskUsageReport {
     /// Largest first.
     top_level_dirs: Vec<DirUsage>,
     root_files_bytes: u64,
+    #[serde(default)]
+    redirections_bytes: u64,
+    #[serde(default)]
+    orphaned_redirections: Vec<OrphanedRedirection>,
+    #[serde(default)]
+    unattributed_redirect_dirs: Vec<UnattributedRedirectDir>,
     #[serde(flatten)]
     skips: SkipCounts,
     /// Not followed, so a symlinked `worktrees/` leaves the total short.
@@ -129,7 +151,6 @@ pub(crate) struct DiskUsageReport {
     /// Largest first.
     worktrees: Vec<WorktreeUsage>,
 }
-
 impl Default for DiskUsageReport {
     fn default() -> Self {
         Self {
@@ -140,6 +161,9 @@ impl Default for DiskUsageReport {
             volume_available_bytes: None,
             top_level_dirs: Vec::new(),
             root_files_bytes: 0,
+            redirections_bytes: 0,
+            orphaned_redirections: Vec::new(),
+            unattributed_redirect_dirs: Vec::new(),
             skips: SkipCounts::default(),
             unfollowed_dir_symlinks: 0,
             worktrees_outside_managed_roots: 0,
@@ -149,7 +173,6 @@ impl Default for DiskUsageReport {
         }
     }
 }
-
 impl DiskUsageReport {
     fn worktrees_dominate(&self) -> bool {
         let dir_bytes: u64 = self
@@ -158,12 +181,10 @@ impl DiskUsageReport {
             .filter(|e| e.name == WORKTREES_DIR || e.name == WORKTREE_POOL_DIR)
             .filter_map(|e| e.bytes)
             .sum();
-        // Rows can exceed total_bytes when worktrees/ is a symlink.
         let row_bytes: u64 = self.worktrees.iter().filter_map(|w| w.bytes).sum();
         let worktree_bytes = dir_bytes.max(row_bytes);
         worktree_bytes > 0 && worktree_bytes.saturating_mul(2) >= self.total_bytes
     }
-
     fn total_exceeds_volume_used(&self) -> bool {
         let Some(capacity) = self.volume_capacity_bytes else {
             return false;
@@ -174,20 +195,17 @@ impl DiskUsageReport {
         self.total_bytes > capacity.saturating_sub(available)
     }
 }
-
 /// `bytes` is `None` for a directory on another filesystem: nothing sized it.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct DirUsage {
     name: String,
     bytes: Option<u64>,
 }
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Registration {
     Untracked,
     Tracked(TrackedRow),
 }
-
 impl Registration {
     fn record(&self) -> Option<&TrackedRow> {
         match self {
@@ -196,9 +214,8 @@ impl Registration {
         }
     }
 }
-
-/// `last_accessed_at` is stamped by session and agent activity, not by a
-/// shell parked in the tree. `db rebuild` registers rows with no `git_ref`.
+/// `last_accessed_at` is stamped by session and agent activity, not by a shell parked in the tree.
+/// `db rebuild` registers rows with no `git_ref`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TrackedRow {
     id: String,
@@ -209,7 +226,6 @@ pub(crate) struct TrackedRow {
     repo_name: String,
     git_ref: Option<String>,
 }
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct WorktreeUsage {
     bytes: Option<u64>,
@@ -218,7 +234,6 @@ pub(crate) struct WorktreeUsage {
     last_modified_at: Option<i64>,
     path: String,
 }
-
 /// Hand-written so the enum stays flat on the wire: twelve keys, fixed order.
 impl Serialize for WorktreeUsage {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -240,7 +255,6 @@ impl Serialize for WorktreeUsage {
         row.end()
     }
 }
-
 impl WorktreeUsage {
     fn tracked(rec: WorktreeRecord, canonical_path: &Path, size: Measure) -> Self {
         let label = rec.label().map(String::from);
@@ -260,7 +274,6 @@ impl WorktreeUsage {
             path: canonical_path.to_string_lossy().into_owned(),
         }
     }
-
     fn untracked(kind: WorktreeKind, canonical_path: &Path, size: Measure) -> Self {
         Self {
             bytes: size.bytes(),
@@ -270,18 +283,15 @@ impl WorktreeUsage {
             path: canonical_path.to_string_lossy().into_owned(),
         }
     }
-
     pub(crate) fn is_tracked(&self) -> bool {
         self.registration.record().is_some()
     }
-
     pub(crate) fn label(&self) -> &str {
         self.registration
             .record()
             .and_then(|r| r.label.as_deref())
             .unwrap_or("")
     }
-
     /// What gc's age pass measures: the newer of created and last accessed.
     pub(crate) fn age_stamp(&self) -> Option<i64> {
         match self.registration.record() {
@@ -294,8 +304,11 @@ impl WorktreeUsage {
         }
     }
 }
-
 fn collect_report(grok_home: &Path) -> Result<DiskUsageReport> {
+    collect_report_in(grok_home, &[])
+}
+fn collect_report_in(grok_home: &Path, data_dirs: &[PathBuf]) -> Result<DiskUsageReport> {
+    let _ = data_dirs;
     let mut top_level_dirs = Vec::new();
     let mut root_files_bytes = 0u64;
     let mut issues = WalkIssues::default();
@@ -357,8 +370,6 @@ fn collect_report(grok_home: &Path) -> Result<DiskUsageReport> {
         .iter()
         .filter_map(|e| e.bytes)
         .fold(root_files_bytes, u64::saturating_add);
-
-    // Sizing first keeps this open's journal sidecar out of the total.
     let (registry, records, registry_path) = load_registry(grok_home);
     let rows = collect_worktrees(grok_home, records, &worktree_sizes, volume);
     issues.merge(rows.issues);
@@ -371,6 +382,9 @@ fn collect_report(grok_home: &Path) -> Result<DiskUsageReport> {
         volume_available_bytes,
         top_level_dirs,
         root_files_bytes,
+        redirections_bytes: 0,
+        orphaned_redirections: Vec::new(),
+        unattributed_redirect_dirs: Vec::new(),
         skips: issues.into(),
         unfollowed_dir_symlinks,
         worktrees_outside_managed_roots: rows.outside_managed_roots,
@@ -379,35 +393,32 @@ fn collect_report(grok_home: &Path) -> Result<DiskUsageReport> {
         worktrees: rows.rows,
     })
 }
-
 fn load_registry(grok_home: &Path) -> (RegistryState, Vec<WorktreeRecord>, PathBuf) {
     classify(WorktreeDb::open_read_only(grok_home))
 }
-
-/// The arm an open failed on decides nothing: a busy writer and an IO blip
-/// fail the same call damage does. The error code decides `Corrupt`.
+/// The arm an open failed on decides nothing: a busy writer, an IO blip, and file damage all fail the same call.
+/// The error code alone decides `Corrupt`.
 fn classify(open: RegistryOpen) -> (RegistryState, Vec<WorktreeRecord>, PathBuf) {
     match open {
-        RegistryOpen::Opened { path, db } => match db.list(&ListFilter {
-            include_dead: true,
-            ..Default::default()
-        }) {
-            Ok(records) => (RegistryState::Read, records, path),
-            Err(e) => (from_sqlite(e), Vec::new(), path),
-        },
+        RegistryOpen::Opened { path, db } => {
+            match db.list(&ListFilter {
+                include_dead: true,
+                ..Default::default()
+            }) {
+                Ok(records) => (RegistryState::Read, records, path),
+                Err(e) => (from_sqlite(e), Vec::new(), path),
+            }
+        }
         RegistryOpen::Absent { path } => (RegistryState::Absent, Vec::new(), path),
         RegistryOpen::Busy { path, error } => {
             (failed(RegistryState::Busy, error), Vec::new(), path)
         }
-        // The network arm reads the header at open, so damage lands here.
         RegistryOpen::Failed { path, error } => (from_sqlite(error), Vec::new(), path),
     }
 }
-
 fn from_sqlite(e: anyhow::Error) -> RegistryState {
     failed(state_for(classify_sqlite_error(&e)), e)
 }
-
 fn state_for(kind: SqliteFailureKind) -> RegistryState {
     match kind {
         SqliteFailureKind::Busy => RegistryState::Busy,
@@ -415,7 +426,6 @@ fn state_for(kind: SqliteFailureKind) -> RegistryState {
         SqliteFailureKind::Other => RegistryState::Unopenable,
     }
 }
-
 fn failed(state: RegistryState, e: anyhow::Error) -> RegistryState {
     tracing::error!(
         error = format!("{e:#}"),
@@ -424,14 +434,12 @@ fn failed(state: RegistryState, e: anyhow::Error) -> RegistryState {
     );
     state
 }
-
 #[derive(Default)]
 struct WorktreeRows {
     rows: Vec<WorktreeUsage>,
     issues: WalkIssues,
     outside_managed_roots: u64,
 }
-
 fn collect_worktrees(
     grok_home: &Path,
     registered: Vec<WorktreeRecord>,
@@ -465,13 +473,11 @@ fn collect_worktrees(
             out.outside_managed_roots += 1;
         }
     }
-
     for found in discover_worktrees(grok_home).found {
         let path = dunce::canonicalize(&found.path).unwrap_or(found.path);
         if !known.insert(path.clone()) {
             continue;
         }
-        // A symlink under a managed root can canonicalize outside it.
         if !path_under_worktree_roots(&path, &roots) {
             out.outside_managed_roots += 1;
             continue;
@@ -484,7 +490,6 @@ fn collect_worktrees(
         .sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path)));
     out
 }
-
 fn row_size(
     path: &Path,
     sizes: &HashMap<PathBuf, Measure>,
@@ -516,6 +521,5 @@ fn row_size(
         }
     }
 }
-
 #[cfg(test)]
 mod tests;

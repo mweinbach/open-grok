@@ -11,7 +11,9 @@ pub(crate) use crate::image_budget::{
     IMAGE_COMPACT_PLACEHOLDER, IMAGE_COMPACT_RECLAIM_TARGET_BYTES, IMAGE_COMPACT_TRIGGER_BYTES,
     compact_images_to_byte_budget, conversation_body_bytes, inline_image_count,
 };
-use crate::image_budget::{ImageBudgetOutcome, apply_image_budget};
+use crate::image_budget::{
+    ImageBudgetOutcome, apply_image_budget_with_limits, image_budget_limits,
+};
 use crate::types::PruningConfig;
 
 /// Placeholder inserted when a tool result is hard-cleared.
@@ -70,7 +72,13 @@ impl ChatStateActor {
             }
             self.rebase_turn_capture_offset();
         }
-        let budgeted = apply_image_budget(self.state.conversation.clone());
+        let (trigger_bytes, reclaim_target_bytes) =
+            image_budget_limits(self.state.sampling_config.max_request_bytes);
+        let budgeted = apply_image_budget_with_limits(
+            self.state.conversation.clone(),
+            trigger_bytes,
+            reclaim_target_bytes,
+        );
         let ImageBudgetOutcome {
             body_bytes,
             body_bytes_after,
@@ -82,8 +90,8 @@ impl ChatStateActor {
         if inline_images > 0 {
             self.send_event(ChatStateEvent::ImageBudget {
                 body_bytes,
-                trigger_bytes: crate::image_budget::IMAGE_COMPACT_TRIGGER_BYTES,
-                reclaim_target_bytes: crate::image_budget::IMAGE_COMPACT_RECLAIM_TARGET_BYTES,
+                trigger_bytes,
+                reclaim_target_bytes,
                 inline_images,
                 needs_image_compaction,
                 evicted,

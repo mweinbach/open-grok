@@ -3,7 +3,11 @@
 //! See the module-level docs in `mod.rs` for the architectural rationale.
 
 use agent_client_protocol as acp;
-use xai_grok_shell::agent::config::UiConfig;
+use xai_grok_shell::agent::config::{
+    ConfigSource, Feature, FeatureConfigLayers, FeatureSources, Resolved, UiConfig,
+};
+use xai_grok_shell::config::EffectiveConfigLayers;
+use xai_grok_shell::util::config::RemoteSettings;
 use xai_grok_tools::implementations::grok_build::ask_user_question;
 
 // ---------------------------------------------------------------------------
@@ -422,6 +426,103 @@ pub enum SettingValue {
     Int(i64),
 }
 
+/// The one write of the user key on disk right now, and the newest intent waiting behind it.
+/// Writing one key at a time keeps the disk in toggle order whatever the runtime does with the tasks; a failed write settles the mirror back on `persisted`.
+#[derive(Debug, Clone, Copy)]
+pub struct PendingWrite {
+    /// What the disk held when the write was issued, then what each completed write left there.
+    pub persisted: Option<bool>,
+    /// The newest value toggled while the write was pending; its completion issues it unless it already matches `persisted`.
+    pub queued: Option<Option<bool>>,
+}
+
+/// A registry `[features]` row as the settings modal sees it.
+/// The user `config.toml` key is the only layer the modal writes; the other tiers are seeded once so the effective value can be re-resolved after a local write without re-reading disk.
+#[derive(Debug, Clone, Copy)]
+pub struct FeatureOverrideState {
+    pub feature: Feature,
+    /// The pin and the config tier split around the user key (`config.user` is the saved override, `None` when no key is saved).
+    pub config: FeatureConfigLayers,
+    /// Environment and remote; `resolve` takes the pin and config tiers from `config`.
+    pub other_tiers: FeatureSources,
+    /// `None` while no write of the user key is pending.
+    pub writes: Option<PendingWrite>,
+}
+
+impl FeatureOverrideState {
+    /// Every tier unset: the compiled default applies.
+    pub fn new(feature: Feature) -> Self {
+        FeatureOverrideState {
+            feature,
+            config: FeatureConfigLayers::default(),
+            other_tiers: FeatureSources::default(),
+            writes: None,
+        }
+    }
+
+    /// Seed from the layers and campaign patches the shell's `Config` is merged from, so the config tier here is the one
+    /// the next agent latches. A layer that fails to load leaves the pin and the config tier unset.
+    pub fn from_layers(
+        feature: Feature,
+        layers: Option<&EffectiveConfigLayers>,
+        remote: Option<&RemoteSettings>,
+    ) -> Self {
+        let mut state = FeatureOverrideState {
+            feature,
+            config: FeatureConfigLayers::default(),
+            other_tiers: FeatureSources {
+                remote: feature.remote_value(remote),
+                ..FeatureSources::from_process_env(feature)
+            },
+            writes: None,
+        };
+        if let Some(layers) = layers {
+            state.reseed_config_layers(layers);
+        }
+        state
+    }
+
+    /// Re-read the pin and the config tier from `layers`, as after the campaign set changed.
+    /// The user key's mirror stays only while a write is pending, since the disk is then behind it.
+    pub fn reseed_config_layers(&mut self, layers: &EffectiveConfigLayers) {
+        let pending_user = self.writes.is_some().then_some(self.config.user);
+        self.config = self
+            .feature
+            .config_layers(&layers.layers, &layers.active_campaigns);
+        if let Some(user) = pending_user {
+            self.config.user = user;
+        }
+    }
+
+    /// What the feature resolves to at the next start, given the saved override.
+    pub fn resolve(&self) -> Resolved<bool> {
+        self.feature.resolve(FeatureSources {
+            pin: self.config.pin,
+            config: self.config.merged(),
+            ..self.other_tiers
+        })
+    }
+
+    /// Names the tier that outranks the user key: a pin, the environment, or a config layer above the user file.
+    /// A layer below it never forces the row: a saved key would decide.
+    pub fn forced_by(&self) -> Option<String> {
+        let source = self.resolve().source;
+        match source {
+            ConfigSource::Requirement | ConfigSource::Env => {
+                Some(self.feature.source_label(source))
+            }
+            ConfigSource::Config => Some(self.config.above_user?.layer.label().to_owned()),
+            ConfigSource::Remote
+            | ConfigSource::Default
+            | ConfigSource::Cli
+            | ConfigSource::UserConfig
+            | ConfigSource::ManagedConfig
+            | ConfigSource::SystemManagedConfig
+            | ConfigSource::EnvOverlay => None,
+        }
+    }
+}
+
 /// Why `coding_data_sharing` cannot be changed in the settings modal.
 /// Computed by `AppView::coding_data_sharing_lock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,6 +652,8 @@ pub struct PagerLocalSnapshot {
     /// language actually in effect when `[ui].voice_stt_language` is unset but
     /// an explicit `[voice].language` applies.
     pub voice_stt_language: String,
+    /// Mirrors `AppView::subagent_model_inheritance` at snapshot time.
+    pub subagent_model_inheritance: FeatureOverrideState,
     /// Restart-required local feature flags read from effective config.toml.
     /// The settings setter updates this map optimistically while persistence
     /// runs, then the success/failure path refreshes it from disk.
@@ -620,6 +723,9 @@ impl Default for PagerLocalSnapshot {
             auto_mode_gate: false,
             ask_user_question_timeout_enabled: None,
             voice_stt_language: xai_grok_voice::STT_LANGUAGE_DEFAULT.to_string(),
+            subagent_model_inheritance: FeatureOverrideState::new(
+                Feature::SubagentModelInheritance,
+            ),
             local_feature_flags: xai_grok_shell::util::config::LOCAL_FEATURE_FLAG_SPECS
                 .iter()
                 .map(|spec| (spec.key, spec.default))
@@ -917,6 +1023,7 @@ pub fn current_value_for(
         "compact_mode" => Some(SettingValue::Bool(ui.compact_mode)),
         "show_timestamps" => Some(SettingValue::Bool(ui.show_timestamps.unwrap_or(true))),
         "show_timeline" => Some(SettingValue::Bool(ui.show_timeline_enabled())),
+        "dashboard_preview" => Some(SettingValue::Bool(ui.dashboard_preview_enabled())),
         // Cache is the send-path source of truth (same pattern as group_tool_verbs).
         "page_flip_on_send" => Some(SettingValue::Bool(
             crate::appearance::cache::load_page_flip_on_send(),
@@ -1095,6 +1202,10 @@ pub fn current_value_for(
                 .ask_user_question_timeout_enabled
                 .unwrap_or(ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED),
         )),
+        // The value the shell latches at the next start, every tier included; the detail text separates the saved key from it
+        "subagent_model_inheritance" => Some(SettingValue::Bool(
+            pager.subagent_model_inheritance.resolve().value,
+        )),
         // default_selected_permission: maps `[ui].default_selected_permission`
         // onto one of the four registry canonicals. `None` / unrecognised on
         // disk → `always_allow_all_sessions` (the effective default — the
@@ -1216,7 +1327,7 @@ pub fn current_value_for(
     }
 }
 
-/// Consent chooser: no docs tip, and no `d` reset (hint or key).
+/// Consent chooser: no docs tip, and no `d` reset inside the chooser (hint or key).
 pub fn is_consent_chooser(key: &str) -> bool {
     key == "coding_data_sharing"
 }
@@ -1380,6 +1491,9 @@ mod tests {
                         ui.show_timeline_enabled(),
                         "show_timeline default drifts from UiConfig::default()"
                     );
+                }
+                ("dashboard_preview", SettingKind::Bool { default }) => {
+                    assert_eq!(ui.dashboard_preview_enabled(), *default);
                 }
                 ("page_flip_on_send", SettingKind::Bool { default }) => {
                     assert_eq!(
@@ -1637,6 +1751,14 @@ mod tests {
                         ask_user_question::DEFAULT_ASK_USER_QUESTION_TIMEOUT_ENABLED,
                         "toolset.ask_user_question.timeout_enabled default drifts from the \
                          shared resolver const in xai-grok-tools"
+                    );
+                }
+                // subagent_model_inheritance: no UiConfig mirror (a `[features]` row); anchored on the FEATURES row
+                ("subagent_model_inheritance", SettingKind::Bool { default }) => {
+                    assert_eq!(
+                        *default,
+                        Feature::SubagentModelInheritance.default_enabled(),
+                        "subagent_model_inheritance default drifts from the FEATURES row"
                     );
                 }
                 ("codex_persistent_mode", SettingKind::Bool { default }) => {
@@ -2270,6 +2392,60 @@ mod tests {
         assert_eq!(
             current_value_for("fork_secondary_model", &stale_ui, &pager),
             Some(SettingValue::String("retired-model".to_string())),
+        );
+    }
+
+    /// The row shows the next-start resolution (a saved key over remote, a pin over both) and is fixed only by a layer above the user file.
+    #[test]
+    fn feature_override_state_resolves_saved_over_remote_and_is_fixed_by_layers_above_the_user() {
+        use xai_grok_shell::agent::config::{FeatureConfigLayer, FeatureLayerValue};
+        let feature = Feature::SubagentModelInheritance;
+        let mut state = FeatureOverrideState::new(feature);
+        assert!(!state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        state.other_tiers.remote = Some(true);
+        assert!(state.resolve().value);
+        state.config.user = Some(false);
+        assert!(!state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        // A managed layer shows through while no user key exists, but a key would decide, so it never fixes the row
+        state.config.below_user = Some(FeatureLayerValue {
+            layer: FeatureConfigLayer::SystemManaged,
+            value: true,
+        });
+        assert_eq!(None, state.forced_by());
+        state.config.user = None;
+        assert!(state.resolve().value);
+        assert_eq!(None, state.forced_by());
+
+        // The overlay beats a user key, so it fixes the row even with one saved
+        state.config.user = Some(true);
+        state.config.above_user = Some(FeatureLayerValue {
+            layer: FeatureConfigLayer::Overlay,
+            value: false,
+        });
+        assert!(!state.resolve().value);
+        assert_eq!(
+            Some(FeatureConfigLayer::Overlay.label().to_owned()),
+            state.forced_by()
+        );
+
+        state.config.pin = Some(true);
+        assert!(state.resolve().value);
+        assert_eq!(
+            Some(feature.source_label(ConfigSource::Requirement)),
+            state.forced_by()
+        );
+
+        let pager = PagerLocalSnapshot {
+            subagent_model_inheritance: state,
+            ..Default::default()
+        };
+        assert_eq!(
+            Some(SettingValue::Bool(true)),
+            current_value_for("subagent_model_inheritance", &UiConfig::default(), &pager)
         );
     }
 

@@ -762,3 +762,26 @@
             "gated-off Auto must display as Ask"
         );
     }
+
+    #[test]
+    fn subagent_model_inheritance_remote_tier_follows_presence_not_value() {
+        let mut app = make_app_with_agent("sess-smi-remote");
+        app.subagent_model_inheritance.other_tiers.remote = Some(true);
+        let push = |params: serde_json::Value| {
+            acp::ExtNotification::new(
+                "x.ai/settings/update",
+                serde_json::value::to_raw_value(&params).unwrap().into(),
+            )
+        };
+
+        // An older shell, or one without settings yet, omits the key; the seeded tier must survive.
+        let _ = handle_ext_notification(&push(serde_json::json!({})), &mut app);
+        assert_eq!(Some(true), app.subagent_model_inheritance.other_tiers.remote);
+
+        let _ = handle_ext_notification(&push(serde_json::json!({ "subagent_model_inheritance_enabled": false })), &mut app);
+        assert_eq!(Some(false), app.subagent_model_inheritance.other_tiers.remote);
+
+        // The shell sends null once fetched settings lack the value.
+        let _ = handle_ext_notification(&push(serde_json::json!({ "subagent_model_inheritance_enabled": null })), &mut app);
+        assert_eq!(None, app.subagent_model_inheritance.other_tiers.remote);
+    }

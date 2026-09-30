@@ -16,8 +16,21 @@ use std::sync::Arc;
 #[cfg(feature = "audio")]
 use crate::error::VoiceError;
 
+/// Why there is no bearer for `wss://api.x.ai/v1/stt`; neither variant is a cue to try another credential.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VoiceAuthError {
+    #[error(
+        "voice needs an xAI credential for this account: sign in with an xAI login or set XAI_API_KEY"
+    )]
+    ForeignSession,
+    #[error(
+        "not signed in — run `open-grok login`, set XAI_API_KEY, or set a model api_key/env_key"
+    )]
+    NotSignedIn,
+}
+
 pub trait VoiceAuthProvider: std::fmt::Debug + Send + Sync + 'static {
-    fn bearer(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>>;
+    fn bearer(&self) -> Pin<Box<dyn Future<Output = Result<String, VoiceAuthError>> + Send + '_>>;
 }
 
 /// Shared provider handed to the voice pipeline.
@@ -25,9 +38,9 @@ pub type SharedVoiceAuth = Arc<dyn VoiceAuthProvider>;
 
 #[cfg(feature = "audio")]
 pub(crate) async fn require_bearer(auth: &SharedVoiceAuth) -> Result<String, VoiceError> {
-    auth.bearer().await.ok_or_else(|| {
-        VoiceError::Auth("not signed in — run `open-grok login` or set XAI_API_KEY".into())
-    })
+    auth.bearer()
+        .await
+        .map_err(|error| VoiceError::Auth(error.to_string()))
 }
 
 /// A fixed bearer that never refreshes.
@@ -45,8 +58,8 @@ impl std::fmt::Debug for StaticVoiceAuth {
 }
 
 impl VoiceAuthProvider for StaticVoiceAuth {
-    fn bearer(&self) -> Pin<Box<dyn Future<Output = Option<String>> + Send + '_>> {
-        Box::pin(ready(Some(self.0.clone())))
+    fn bearer(&self) -> Pin<Box<dyn Future<Output = Result<String, VoiceAuthError>> + Send + '_>> {
+        Box::pin(ready(Ok(self.0.clone())))
     }
 }
 
@@ -69,7 +82,7 @@ mod tests {
     #[tokio::test]
     async fn static_provider_resolves() {
         let provider = StaticVoiceAuth::shared("  sk-test  ").unwrap();
-        assert_eq!(provider.bearer().await.as_deref(), Some("sk-test"));
+        assert_eq!(provider.bearer().await.as_deref(), Ok("sk-test"));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use crate::ast::{
     Edge, EdgeStyle, FlowchartGraph, GraphDirection, Node, NodeShape, Statement, StyleStatement,
     Subgraph,
@@ -100,6 +102,8 @@ struct Parser<'a> {
     lines: Vec<&'a str>,
     current_line: usize,
     next_subgraph_index: usize,
+    class_defs: HashMap<String, Vec<(String, String)>>,
+    node_classes: HashMap<String, Vec<String>>,
 }
 
 impl<'a> Parser<'a> {
@@ -109,12 +113,15 @@ impl<'a> Parser<'a> {
             lines,
             current_line: 0,
             next_subgraph_index: 0,
+            class_defs: HashMap::new(),
+            node_classes: HashMap::new(),
         }
     }
 
     fn parse(&mut self) -> Result<FlowchartGraph, MermaidError> {
         let direction = self.parse_graph_declaration()?;
-        let statements = self.parse_statements()?;
+        let mut statements = self.parse_statements()?;
+        self.apply_class_styles(&mut statements);
 
         Ok(FlowchartGraph {
             direction,
@@ -203,13 +210,19 @@ impl<'a> Parser<'a> {
                 statements.push(Statement::Subgraph(self.parse_subgraph()?));
             } else if line.starts_with("style ") {
                 statements.push(Statement::Style(self.parse_style()?));
+            } else if line.starts_with("classDef ") {
+                self.parse_class_def();
+            } else if is_ignored_flowchart_directive(line) {
+                self.advance();
             } else if self.line_contains_edge(line) {
                 let edge_statements = self.parse_edge_chain(line)?;
                 statements.extend(edge_statements);
                 self.advance();
             } else {
-                if let Some(node) = self.try_parse_node(line) {
-                    statements.push(Statement::Node(node));
+                for (_, node) in self.parse_node_group_str(line) {
+                    if let Some(node) = node {
+                        statements.push(Statement::Node(node));
+                    }
                 }
                 self.advance();
             }
@@ -223,19 +236,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_edge_chain(&mut self, line: &str) -> Result<Vec<Statement>, MermaidError> {
-        let mut statements = Vec::new();
+        let mut edges = Vec::new();
+        let mut all_nodes: Vec<(String, Option<Node>)> = Vec::new();
         let mut remaining = line.trim();
-        let mut collected_nodes: Vec<(String, Option<Node>)> = Vec::new();
 
         let first_node_end = self.find_edge_start(remaining).unwrap_or(remaining.len());
-        let first_node_str = remaining[..first_node_end].trim();
-        if let Some(node) = self.try_parse_node(first_node_str) {
-            collected_nodes.push((node.id.clone(), Some(node)));
-        } else {
-            let id = self.extract_node_id(first_node_str);
-            collected_nodes.push((id, None));
-        }
-        remaining = &remaining[first_node_end..];
+        let mut prev_group = self.parse_node_group_str(&remaining[..first_node_end]);
+        all_nodes.extend(prev_group.iter().cloned());
+        remaining = remaining[first_node_end..].trim_start();
 
         while !remaining.is_empty() {
             let (edge_style, label, edge_len) = self.parse_edge_syntax(remaining)?;
@@ -248,34 +256,49 @@ impl<'a> Parser<'a> {
                 break;
             }
 
-            let (next_id, next_node) = if let Some(node) = self.try_parse_node(next_node_str) {
-                (node.id.clone(), Some(node))
-            } else {
-                let id = self.extract_node_id(next_node_str);
-                (id, None)
-            };
-
-            if let Some((from_id, _)) = collected_nodes.last() {
-                statements.push(Statement::Edge(Edge {
-                    from: from_id.clone(),
-                    to: next_id.clone(),
-                    label,
-                    style: edge_style,
-                }));
+            let next_group = self.parse_node_group_str(next_node_str);
+            for (from_id, _) in &prev_group {
+                for (to_id, _) in &next_group {
+                    edges.push(Statement::Edge(Edge {
+                        from: from_id.clone(),
+                        to: to_id.clone(),
+                        label: label.clone(),
+                        style: edge_style,
+                    }));
+                }
             }
 
-            collected_nodes.push((next_id, next_node));
-            remaining = &remaining[next_node_end..];
+            all_nodes.extend(next_group.iter().cloned());
+            prev_group = next_group;
+            remaining = remaining[next_node_end..].trim_start();
         }
 
-        let mut node_statements: Vec<Statement> = collected_nodes
+        let mut statements: Vec<Statement> = all_nodes
             .into_iter()
             .filter_map(|(_, node_opt)| node_opt.map(Statement::Node))
             .collect();
-        node_statements.append(&mut statements);
-        statements = node_statements;
-
+        statements.append(&mut edges);
         Ok(statements)
+    }
+
+    fn parse_node_group_str(&mut self, s: &str) -> Vec<(String, Option<Node>)> {
+        split_ampersand_group(s)
+            .into_iter()
+            .map(|part| self.parse_one_node(part))
+            .collect()
+    }
+
+    fn parse_one_node(&mut self, raw: &str) -> (String, Option<Node>) {
+        let (body, classes) = split_class_annotation(raw);
+        let node = self.try_parse_node(body);
+        let id = match &node {
+            Some(n) => n.id.clone(),
+            None => self.extract_node_id(body),
+        };
+        if !classes.is_empty() && !id.is_empty() {
+            self.node_classes.insert(id.clone(), classes);
+        }
+        (id, node)
     }
 
     /// Byte index where the first edge token starts, ignoring tokens inside
@@ -398,9 +421,21 @@ impl<'a> Parser<'a> {
 
     fn extract_node_id(&self, s: &str) -> String {
         let s = s.trim();
-        for (open, _close) in [('[', ']'), ('(', ')'), ('{', '}'), ('<', '>')] {
-            if let Some(idx) = s.find(open) {
-                return s[..idx].trim().to_string();
+        let bytes = s.as_bytes();
+        let mut in_quote = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            if in_quote {
+                if b == b'"' {
+                    in_quote = false;
+                }
+                continue;
+            }
+            if b == b'"' {
+                in_quote = true;
+                continue;
+            }
+            if matches!(b, b'[' | b'(' | b'{' | b'<') {
+                return s[..i].trim().to_string();
             }
         }
         s.to_string()
@@ -634,17 +669,7 @@ impl<'a> Parser<'a> {
 
         let node_id = parts[0].to_string();
         let properties = if parts.len() > 1 {
-            parts[1]
-                .split(',')
-                .filter_map(|prop| {
-                    let kv: Vec<&str> = prop.splitn(2, ':').collect();
-                    if kv.len() == 2 {
-                        Some((kv[0].trim().to_string(), kv[1].trim().to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+            parse_style_properties(parts[1])
         } else {
             Vec::new()
         };
@@ -656,4 +681,182 @@ impl<'a> Parser<'a> {
             properties,
         })
     }
+
+    fn parse_class_def(&mut self) {
+        let Some(line) = self.current_line_content() else {
+            return;
+        };
+        let rest = line.strip_prefix("classDef ").unwrap_or(line).trim();
+        if let Some((name, props_str)) = rest.split_once(char::is_whitespace) {
+            let name = name.trim();
+            if !name.is_empty() {
+                self.class_defs
+                    .insert(name.to_string(), parse_style_properties(props_str));
+            }
+        }
+        self.advance();
+    }
+
+    fn apply_class_styles(&self, statements: &mut Vec<Statement>) {
+        let mut styled = HashSet::new();
+        collect_styled_node_ids(statements, &mut styled);
+        for (node_id, classes) in &self.node_classes {
+            if styled.contains(node_id) {
+                continue;
+            }
+            let mut properties = Vec::new();
+            for class in classes {
+                if let Some(props) = self.class_defs.get(class) {
+                    properties.extend(props.iter().cloned());
+                }
+            }
+            if !properties.is_empty() {
+                statements.push(Statement::Style(StyleStatement {
+                    node_id: node_id.clone(),
+                    properties,
+                }));
+            }
+        }
+    }
+}
+
+fn parse_style_properties(props_str: &str) -> Vec<(String, String)> {
+    props_str
+        .split(',')
+        .filter_map(|prop| {
+            let (k, v) = prop.split_once(':')?;
+            let k = k.trim();
+            let v = v.trim();
+            if k.is_empty() || v.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
+        })
+        .collect()
+}
+
+fn collect_styled_node_ids(statements: &[Statement], out: &mut HashSet<String>) {
+    for stmt in statements {
+        match stmt {
+            Statement::Style(style) => {
+                out.insert(style.node_id.clone());
+            }
+            Statement::Subgraph(subgraph) => {
+                collect_styled_node_ids(&subgraph.statements, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn is_ignored_flowchart_directive(line: &str) -> bool {
+    let head = line.split_whitespace().next().unwrap_or("");
+    matches!(
+        head,
+        "class" | "click" | "linkStyle" | "direction" | "accTitle" | "accDescr"
+    )
+}
+
+fn split_ampersand_group(s: &str) -> Vec<&str> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    let bytes = s.as_bytes();
+    let mut depth: usize = 0;
+    let mut in_quote = false;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_quote {
+            if b == b'"' {
+                in_quote = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => {
+                in_quote = true;
+                i += 1;
+            }
+            b'[' | b'(' | b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b']' | b')' | b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'&' if depth == 0
+                && i > 0
+                && bytes[i - 1].is_ascii_whitespace()
+                && i + 1 < bytes.len()
+                && bytes[i + 1].is_ascii_whitespace() =>
+            {
+                let part = s[start..i].trim();
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+                start = i + 1;
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let part = s[start..].trim();
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        vec![s]
+    } else {
+        parts
+    }
+}
+
+fn split_class_annotation(s: &str) -> (&str, Vec<String>) {
+    let bytes = s.as_bytes();
+    let mut depth: usize = 0;
+    let mut in_quote = false;
+    for i in 0..bytes.len() {
+        let b = bytes[i];
+        if in_quote {
+            if b == b'"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_quote = true,
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => depth = depth.saturating_sub(1),
+            b':' if depth == 0
+                && bytes.get(i + 1) == Some(&b':')
+                && bytes.get(i + 2) == Some(&b':') =>
+            {
+                let body = s[..i].trim_end();
+                let rest = s[i + 3..].trim();
+                let classes: Vec<String> = rest
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|c| {
+                        !c.is_empty()
+                            && c.chars()
+                                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+                    })
+                    .map(str::to_string)
+                    .collect();
+                if classes.is_empty() {
+                    return (s.trim(), Vec::new());
+                }
+                return (body, classes);
+            }
+            _ => {}
+        }
+    }
+    (s.trim(), Vec::new())
 }

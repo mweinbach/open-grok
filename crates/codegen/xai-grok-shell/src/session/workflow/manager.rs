@@ -6,15 +6,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_telemetry::events::{WorkflowRunStarted, WorkflowSourceKind};
 use xai_workflow::{Journal, WorkflowOutcome, WorkflowRunParams};
 
 use super::host_service::{
     HostDrainOutcome, TelemetryHook, WorkflowHostParams, spawn_workflow_host_service,
 };
 use super::notify::WorkflowNotifySender;
-use super::registry::{ResolvedWorkflow, WorkflowSource};
+use super::registry::{ResolvedWorkflow, WorkflowSource, bundled_file_is_managed};
 use super::store::WorkflowRunStore;
-use super::tracker::WorkflowTracker;
+use super::tracker::{WorkflowRunState, WorkflowRunStatus, WorkflowTracker};
+use crate::agent::models::task_model_policy::LatchedTaskModelSelection;
 
 pub(crate) const WORKFLOW_MAX_ACTIVE_RUNS_PER_SESSION: usize = 4;
 pub(crate) const WORKFLOW_DEFAULT_AGENT_BUDGET: u64 = xai_workflow::DEFAULT_AGENT_BUDGET;
@@ -67,6 +69,7 @@ pub(crate) struct WorkflowManager {
     session_dir: Option<PathBuf>,
     cwd: PathBuf,
     tracker: Arc<parking_lot::Mutex<WorkflowTracker>>,
+    active_work: Arc<std::sync::atomic::AtomicUsize>,
     store: WorkflowRunStore,
     notify: WorkflowNotifySender,
     subagent_event_tx: mpsc::UnboundedSender<
@@ -78,6 +81,8 @@ pub(crate) struct WorkflowManager {
     active: HashMap<String, ActiveRun>,
     retiring: Vec<(String, oneshot::Receiver<()>)>,
     max_concurrent_agents: usize,
+    /// `agent()` spawns carry the owning session's mode instead of reclassifying.
+    task_model_selection: LatchedTaskModelSelection,
 }
 
 impl WorkflowManager {
@@ -87,6 +92,7 @@ impl WorkflowManager {
         session_dir: Option<PathBuf>,
         cwd: PathBuf,
         tracker: Arc<parking_lot::Mutex<WorkflowTracker>>,
+        active_work: Arc<std::sync::atomic::AtomicUsize>,
         store: WorkflowRunStore,
         notify: WorkflowNotifySender,
         subagent_event_tx: mpsc::UnboundedSender<
@@ -96,12 +102,14 @@ impl WorkflowManager {
         session_cmd_tx: mpsc::UnboundedSender<crate::session::commands::SessionCommand>,
         templates: HashMap<String, String>,
         max_concurrent_agents: usize,
+        task_model_selection: LatchedTaskModelSelection,
     ) -> Self {
         Self {
             session_id,
             session_dir,
             cwd,
             tracker,
+            active_work,
             store,
             notify,
             subagent_event_tx,
@@ -113,6 +121,7 @@ impl WorkflowManager {
             max_concurrent_agents: super::host_service::workflow_max_concurrent_agents(
                 max_concurrent_agents,
             ),
+            task_model_selection,
         }
     }
 
@@ -271,14 +280,31 @@ impl WorkflowManager {
             .emit(&state, self.tracker.lock().elapsed_ms(&run_id), 0);
 
         let active = xai_grok_telemetry::activity::WORKFLOW_RUNS_ACTIVE.enter();
+        let work = crate::session::handle::WorkGuard::new(self.active_work.clone());
         debug_assert!(
             xai_grok_telemetry::activity::WORKFLOW_RUNS_ACTIVE.get() >= 1,
             "WorkflowRunStarted must stamp a self-inclusive count"
         );
+        let source_kind = match &resolved.source {
+            WorkflowSource::Builtin => WorkflowSourceKind::Builtin,
+            WorkflowSource::Inline => WorkflowSourceKind::Inline,
+            WorkflowSource::File(path) if bundled_file_is_managed(path) => {
+                WorkflowSourceKind::Bundled
+            }
+            WorkflowSource::File(_) => WorkflowSourceKind::File,
+        };
+        // Platform-provided names leave the machine (compiled-in or hash-verified bundle content);
+        // user script names and paths stay local
+        let workflow_name = matches!(
+            source_kind,
+            WorkflowSourceKind::Builtin | WorkflowSourceKind::Bundled
+        )
+        .then(|| state.name.clone());
         log_run_started(
             &run_id,
             &self.session_id,
-            &resolved.source,
+            source_kind,
+            workflow_name.as_deref(),
             &state,
             self.max_concurrent_agents,
             spec.resume_run_id.is_some(),
@@ -312,6 +338,7 @@ impl WorkflowManager {
                 telemetry: self.telemetry.clone(),
                 stats: agent_stats.clone(),
                 cancel: cancel.clone(),
+                task_model_selection: self.task_model_selection.clone(),
             },
             host_rx,
         );
@@ -350,6 +377,7 @@ impl WorkflowManager {
         let watcher_cancel = cancel.clone();
         let watcher_session_id = self.session_id.clone();
         let watcher_agent_stats = agent_stats;
+        let watcher_workflow_name = workflow_name;
         let execution_epoch = self.tracker.lock().execution_epoch(&run_id).unwrap_or(0);
         tokio::spawn(async move {
             let _active = active;
@@ -416,6 +444,8 @@ impl WorkflowManager {
                     RunEndMetadata {
                         run_id: &watcher_run_id,
                         parent_session_id: &watcher_session_id,
+                        source: source_kind,
+                        workflow_name: watcher_workflow_name.as_deref(),
                         status: xai_grok_telemetry::events::WorkflowRunEndStatus::Superseded,
                         duration_ms: elapsed,
                         agents_used,
@@ -434,6 +464,8 @@ impl WorkflowManager {
                     RunEndMetadata {
                         run_id: &watcher_run_id,
                         parent_session_id: &watcher_session_id,
+                        source: source_kind,
+                        workflow_name: watcher_workflow_name.as_deref(),
                         status: xai_grok_telemetry::events::WorkflowRunEndStatus::Interrupted,
                         duration_ms: 0,
                         agents_used: 0,
@@ -471,6 +503,8 @@ impl WorkflowManager {
                     RunEndMetadata {
                         run_id: &watcher_run_id,
                         parent_session_id: &watcher_session_id,
+                        source: source_kind,
+                        workflow_name: watcher_workflow_name.as_deref(),
                         status: run_ended_status(state.status),
                         duration_ms: elapsed,
                         agents_used: state.agents_used,
@@ -530,6 +564,7 @@ impl WorkflowManager {
             session_dir,
             std::env::temp_dir(),
             tracker.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             store,
             notify,
             mpsc::unbounded_channel().0,
@@ -537,6 +572,7 @@ impl WorkflowManager {
             mpsc::unbounded_channel().0,
             std::collections::HashMap::new(),
             super::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         )));
         (manager, tracker)
     }
@@ -771,26 +807,21 @@ impl WorkflowManager {
     }
 }
 
+/// `workflow_name` is already privacy-filtered by `launch`; both lifecycle events must carry the same value.
 fn log_run_started(
     run_id: &str,
     parent_session_id: &str,
-    source: &WorkflowSource,
+    source: WorkflowSourceKind,
+    workflow_name: Option<&str>,
     state: &crate::session::workflow::tracker::WorkflowRunState,
     max_concurrent_agents: usize,
     resumed: bool,
 ) {
-    use xai_grok_telemetry::events::{WorkflowRunStarted, WorkflowSourceKind};
     xai_grok_telemetry::session_ctx::log_event(WorkflowRunStarted {
         run_id: run_id.to_owned(),
         parent_session_id: parent_session_id.to_owned(),
-        source: match source {
-            WorkflowSource::Builtin => WorkflowSourceKind::Builtin,
-            WorkflowSource::Inline => WorkflowSourceKind::Inline,
-            WorkflowSource::File(_) => WorkflowSourceKind::File,
-        },
-        // Only built-in workflow names leave the machine; user script names
-        // and paths stay local.
-        workflow_name: (*source == WorkflowSource::Builtin).then(|| state.name.clone()),
+        source,
+        workflow_name: workflow_name.map(str::to_owned),
         agent_budget: state.agent_budget,
         max_concurrent_agents: u32::try_from(max_concurrent_agents).unwrap_or(u32::MAX),
         resumed,
@@ -800,6 +831,8 @@ fn log_run_started(
 struct RunEndMetadata<'a> {
     run_id: &'a str,
     parent_session_id: &'a str,
+    source: WorkflowSourceKind,
+    workflow_name: Option<&'a str>,
     status: xai_grok_telemetry::events::WorkflowRunEndStatus,
     duration_ms: u64,
     agents_used: u64,
@@ -810,6 +843,8 @@ fn log_run_ended(episode: RunEndMetadata<'_>, stats: &super::host_service::Workf
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::WorkflowRunEnded {
         run_id: episode.run_id.to_owned(),
         parent_session_id: episode.parent_session_id.to_owned(),
+        source: episode.source,
+        workflow_name: episode.workflow_name.map(str::to_owned),
         status: episode.status,
         duration_ms: episode.duration_ms,
         agents_used: episode.agents_used,
@@ -912,6 +947,7 @@ mod tests {
             session_dir,
             std::env::temp_dir(),
             tracker,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             store,
             notify,
             subagent_tx,
@@ -919,6 +955,7 @@ mod tests {
             mpsc::unbounded_channel().0,
             HashMap::new(),
             crate::session::workflow::host_service::DEFAULT_WORKFLOW_MAX_CONCURRENT_AGENTS,
+            LatchedTaskModelSelection::default(),
         );
         (manager, event_rx, cancels)
     }
@@ -1630,7 +1667,7 @@ mod tests {
     #[tokio::test]
     async fn workflow_spawns_await_to_completion() {
         use xai_grok_tools::implementations::grok_build::task::types::{
-            SubagentEvent, SubagentResult,
+            ModelOverrideProvenance, SubagentEvent, SubagentResult,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1658,7 +1695,9 @@ mod tests {
         );
         assert_eq!(
             req.runtime_overrides.model_override_provenance,
-            xai_grok_tools::implementations::grok_build::task::types::ModelOverrideProvenance::Tool,
+            ModelOverrideProvenance::Tool {
+                selection: Default::default(),
+            },
             "script model overrides are untrusted tool provenance"
         );
         assert_eq!(

@@ -11,6 +11,27 @@ use std::path::PathBuf;
 use std::time::Instant;
 use xai_grok_shell::extensions::notification::RetryState;
 use xai_grok_shell::extensions::notification::SessionUpdate as XaiSessionUpdate;
+pub(super) fn test_agent(app: &AppView, id: AgentId) -> &AgentView {
+    let Some(agent) = app.agents.get(&id) else {
+        panic!("expected agent {id:?}");
+    };
+    agent
+}
+pub(super) fn test_subagent<'a>(parent: &'a AgentView, sid: &str) -> &'a AgentView {
+    let Some(child) = parent.subagent_views.get(sid) else {
+        panic!("expected subagent {sid}");
+    };
+    child.as_ref()
+}
+pub(super) fn json_set(
+    value: &mut serde_json::Value,
+    key: impl Into<String>,
+    v: serde_json::Value,
+) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert(key.into(), v);
+    }
+}
 pub(super) fn make_session(session_id: Option<&str>) -> AgentSession {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     AgentSession {
@@ -2054,6 +2075,7 @@ pub(super) fn seed_owner_agent_with_open_modal(app: &mut AppView) {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".into(),
             wire_source: McpWireSource::Local,
             plugin_name: None,

@@ -33,6 +33,7 @@ members = [
     "crates/codegen/xai-grok-env",
     "crates/codegen/xai-grok-extra-ca",
     "crates/codegen/xai-grok-feedback",
+    "crates/codegen/xai-grok-file-lock",
     "crates/codegen/xai-grok-foreign-sessions",
     "crates/codegen/xai-grok-hooks",
     "crates/codegen/xai-grok-http",
@@ -255,7 +256,7 @@ smallvec = "1"
 strip-ansi-escapes = "0.2.1"
 strum = { version = "0.27", features = ["derive"] }
 supports-color = "3.0"
-syntect = "5.3"
+syntect = { version = "5.3", default-features = false, features = ["default-onig"] }
 tar = "0.4"
 tempfile = "3"
 terminput = "0.3"
@@ -282,9 +283,10 @@ tower-http = "0.6"
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "smallvec", "tracing-log", "std", "ansi"] }
+tree-sitter = "0.26"
 ts-rs = "12.0"
 tui-scrollbar = "0.2"
-two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+two-face = { version = "0.4", default-features = false, features = ["syntect-onig"] }
 unicode-normalization = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
@@ -324,6 +326,7 @@ xai-grok-diag-server = { path = "crates/codegen/xai-grok-diag-server" }
 xai-grok-env = { path = "crates/codegen/xai-grok-env" }
 xai-grok-extra-ca = { path = "crates/codegen/xai-grok-extra-ca" }
 xai-grok-feedback = { path = "crates/codegen/xai-grok-feedback" }
+xai-grok-file-lock = { path = "crates/codegen/xai-grok-file-lock" }
 xai-grok-foreign-sessions = { path = "crates/codegen/xai-grok-foreign-sessions" }
 xai-grok-http = { path = "crates/codegen/xai-grok-http" }
 xai-grok-markdown = { path = "crates/codegen/xai-grok-markdown" }

@@ -1001,7 +1001,7 @@ pub fn build_hints(
     selected_is_user_prompt: bool,
     selected_is_agent_message: bool,
     selected_is_credit_limit: bool,
-    shift_enter_unavailable: bool,
+    prefer_alt_enter_newline: bool,
     scrollback_search: Option<&ScrollbackSearchState>,
 ) -> Vec<HintItem> {
     let mut hints = match active_pane {
@@ -1053,7 +1053,7 @@ pub fn build_hints(
         }
         ActivePane::Prompt => {
             let mut hints = Vec::new();
-            let newline_key = if shift_enter_unavailable {
+            let newline_key = if prefer_alt_enter_newline {
                 crate::key!(Enter, ALT)
             } else {
                 crate::key!(Enter, SHIFT)
@@ -1070,8 +1070,12 @@ pub fn build_hints(
                     hints.push(HintItem::new(key, "send now"));
                 }
             }
-            if shift_enter_unavailable && !multiline_mode && prompt.can_send() {
-                hints.push(HintItem::new(crate::key!(Enter, ALT), "newline"));
+            if !multiline_mode && prompt.can_send() {
+                hints.push(if prefer_alt_enter_newline {
+                    HintItem::new(newline_key, "newline")
+                } else {
+                    HintItem::paired(newline_key, crate::key!(Enter, ALT), "newline")
+                });
             }
             if prompt.file_ref_near_cursor() {
                 hints.push(HintItem::new(crate::key!(':'), "lines"));
@@ -1809,17 +1813,18 @@ mod tests {
     }
     fn prompt_hints_with_text(
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
     ) -> Vec<HintItem> {
-        prompt_hints_with_text_and_turn(multiline_mode, shift_enter_unavailable, false)
+        prompt_hints_with_text_and_turn("hello", multiline_mode, prefer_alt_enter_newline, false)
     }
     fn prompt_hints_with_text_and_turn(
+        text: &str,
         multiline_mode: bool,
-        shift_enter_unavailable: bool,
+        prefer_alt_enter_newline: bool,
         is_turn_running: bool,
     ) -> Vec<HintItem> {
         let mut prompt = PromptWidget::default();
-        prompt.textarea.insert_str("hello");
+        prompt.textarea.insert_str(text);
         let registry = ActionRegistry::defaults();
         build_hints(
             ActivePane::Prompt,
@@ -1845,13 +1850,13 @@ mod tests {
             false,
             false,
             false,
-            shift_enter_unavailable,
+            prefer_alt_enter_newline,
             None,
         )
     }
     #[test]
     fn prompt_idle_submit_hint_is_send() {
-        let hints = prompt_hints_with_text_and_turn(false, false, false);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"send") && !labels.contains(&"queue"),
@@ -1860,7 +1865,7 @@ mod tests {
     }
     #[test]
     fn prompt_running_submit_hint_is_queue_and_send_now() {
-        let hints = prompt_hints_with_text_and_turn(false, false, true);
+        let hints = prompt_hints_with_text_and_turn("hello", false, false, true);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             labels.contains(&"queue"),
@@ -2080,22 +2085,66 @@ mod tests {
     }
     #[test]
     fn prompt_legacy_vte_adds_alt_enter_newline_hint() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, true);
-        let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("legacy VTE must surface an explicit Alt+Enter newline hint");
+        let [key] = newline.keys.as_slice() else {
+            panic!(
+                "prefer-Alt newline must be a single key, got {:?}",
+                newline.keys
+            );
+        };
         assert!(
-            labels.contains(&"newline"),
-            "legacy VTE must surface an explicit Alt+Enter newline hint; \
-             got {labels:?}"
+            key.modifiers.contains(KeyModifiers::ALT)
+                && !key.modifiers.contains(KeyModifiers::SHIFT),
+            "legacy VTE newline must be Alt+Enter, got {:?}",
+            key.modifiers
         );
     }
     #[test]
-    fn prompt_modern_terminal_no_newline_hint() {
+    fn prompt_modern_terminal_pairs_shift_and_alt_newline() {
+        use crossterm::event::KeyModifiers;
         let hints = prompt_hints_with_text(false, false);
+        let newline = hints
+            .iter()
+            .find(|h| h.label == "newline")
+            .expect("sendable draft must surface a newline hint");
+        let [shift, alt] = newline.keys.as_slice() else {
+            panic!(
+                "local modern newline must pair Shift+Enter / Alt+Enter, got {:?}",
+                newline.keys
+            );
+        };
+        assert!(
+            shift.modifiers.contains(KeyModifiers::SHIFT),
+            "first chord must be Shift+Enter, got {:?}",
+            shift.modifiers
+        );
+        assert!(
+            alt.modifiers.contains(KeyModifiers::ALT),
+            "second chord must be Alt+Enter, got {:?}",
+            alt.modifiers
+        );
+    }
+    #[test]
+    fn prompt_empty_draft_no_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("", false, false, false);
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "modern terminals must not show the legacy-VTE newline hint \
-             (Shift+Enter works natively); got {labels:?}"
+            "empty composer must not show newline; got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_btw_draft_shows_newline_hint() {
+        let hints = prompt_hints_with_text_and_turn("/btw what about retries", false, true, false);
+        assert!(
+            hints.iter().any(|h| h.label == "newline"),
+            "/btw draft must show newline; got {:?}",
+            hints.iter().map(|h| h.label.as_ref()).collect::<Vec<_>>()
         );
     }
     #[test]
@@ -2104,8 +2153,39 @@ mod tests {
         let labels: Vec<&str> = hints.iter().map(|h| h.label.as_ref()).collect();
         assert!(
             !labels.contains(&"newline"),
-            "multiline mode must not show the legacy-VTE newline hint \
+            "multiline mode must not show the extra newline hint \
              (Enter already inserts a newline); got {labels:?}"
+        );
+    }
+    #[test]
+    fn prompt_newline_footer_renders_alt_enter_when_prefer_alt() {
+        use crate::views::shortcuts_bar::ShortcutsBar;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        let hints = prompt_hints_with_text(false, true);
+        let area = Rect::new(0, 0, 80, 1);
+        let mut buf = Buffer::empty(area);
+        ShortcutsBar::new(&hints)
+            .compact(5, None)
+            .render(area, &mut buf);
+        let text: String = (0..80)
+            .map(|x| buf.cell((x, 0)).expect("cell").symbol().to_owned())
+            .collect::<String>()
+            .trim_end()
+            .to_owned();
+        let alt = if cfg!(target_os = "macos") {
+            "Opt+Enter"
+        } else {
+            "Alt+Enter"
+        };
+        assert!(
+            text.contains("Enter:send") && text.contains(&format!("{alt}:newline")),
+            "SSH/prefer-Alt footer must show Enter send and {alt} newline, got {text:?}"
+        );
+        assert!(
+            !text.contains("Shift+Enter:newline"),
+            "prefer-Alt footer must not advertise Shift+Enter as newline, got {text:?}"
         );
     }
     #[test]

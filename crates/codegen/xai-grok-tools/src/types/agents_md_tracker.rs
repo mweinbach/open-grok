@@ -1,10 +1,10 @@
-//! Tracks undiscovered AGENTS.md files during a session.
+//! Records startup AGENTS.md paths for a session.
 //!
-//! When the agent accesses files outside the initial CWD→root discovery
-//! chain, this tracker walks up from the target path to the git root,
-//! checking each directory for AGENTS.md files. Newly discovered files
-//! are reported once per session (or once per compaction cycle) as
-//! path-only reminders — the agent decides whether to read them.
+//! `seed` stores the cwd-to-git-root files discovered at agent build.
+//! `check_path` can walk from a later file toward the git root and return
+//! nested instruction files that were not in that set. No production
+//! caller invokes `check_path`. Nested files below cwd reach the model
+//! only through `read_file`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};

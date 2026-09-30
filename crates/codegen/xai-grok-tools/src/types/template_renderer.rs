@@ -31,6 +31,7 @@
 
 use std::collections::HashMap;
 
+use crate::types::context::WholeReadPolicy;
 use crate::types::description::make_desc_env;
 use crate::types::tool::ToolKind;
 
@@ -72,6 +73,8 @@ struct TemplateContext {
     system_reminders_enabled: bool,
     /// Absolute path to this session's drafts file, when known.
     feedback_drafts_path: String,
+    /// Which file classes `read_file` returns whole; read descriptions only promise it for classes that are on.
+    whole_read: WholeReadPolicy,
 }
 
 /// Shared render implementation: fast-path check + MiniJinja render.
@@ -221,8 +224,16 @@ impl TemplateRenderer {
                 has_unix_utilities: xai_grok_config::shell::has_unix_utilities(),
                 system_reminders_enabled: true,
                 feedback_drafts_path: String::new(),
+                whole_read: WholeReadPolicy::default(),
             },
         }
+    }
+
+    /// Set from the finalized `TruncationConfig`; every other construction site keeps the default (both on).
+    #[must_use]
+    pub fn with_whole_read(mut self, policy: WholeReadPolicy) -> Self {
+        self.ctx.whole_read = policy;
+        self
     }
 
     /// Set the absolute drafts-file path advertised in `send_feedback`.
@@ -617,6 +628,40 @@ mod tests {
             .render("${%- if tools.by_kind.search %}Use ${{ tools.by_kind.search }}.${%- endif %}")
             .unwrap();
         assert_eq!(result, "Use Grep.");
+    }
+
+    #[test]
+    fn read_description_whole_read_note_follows_policy_and_param_names() {
+        let base = make_renderer(
+            &[(ToolKind::Read, "read_file")],
+            &[(
+                ToolKind::Read,
+                &[("offset", "start_line"), ("limit", "num_lines")],
+            )],
+        );
+        let template = crate::implementations::grok_build::read_file::DESCRIPTION_FULL;
+
+        let on = base.clone().render(template).unwrap();
+        assert!(
+            on.contains("start_line and num_lines are ignored for them"),
+            "note must use the client-facing param names, got: {on}"
+        );
+
+        let off = base
+            .with_whole_read(WholeReadPolicy {
+                skill_markdown: false,
+                instruction_files: false,
+            })
+            .render(template)
+            .unwrap();
+        assert!(
+            !off.contains("returned whole"),
+            "note must vanish with both bits off, got: {off}"
+        );
+        assert!(
+            off.contains("beginning of the file\n"),
+            "bullet must end cleanly, got: {off}"
+        );
     }
 
     #[test]

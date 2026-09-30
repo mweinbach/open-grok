@@ -213,7 +213,6 @@ pub fn render_dropdown(
         buf.set_line_safe(area.x, y, line, row_w as u16);
     }
 
-    // ── Scrollbar ───────────────────────────────────────────────────────
     if needs_scrollbar {
         // Intersect with the frame buffer so a resize race cannot paint past
         // `buf.area` (same failure mode as item rows).

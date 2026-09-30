@@ -710,7 +710,7 @@ mod tests {
         )
         .unwrap();
         let base = crate::config::SubagentsConfig::resolve_base_with_sources(
-            false,
+            None,
             &toml::Value::Table(Default::default()),
             None,
             &root,

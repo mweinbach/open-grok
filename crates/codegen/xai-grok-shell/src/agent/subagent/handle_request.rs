@@ -10,25 +10,63 @@ use super::prompt_turn_receipt::{
 };
 use super::*;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_telemetry::events::{SubagentModelOverrideRejected, SubagentModelRejectionReason};
+use xai_grok_tools::implementations::grok_build::task::model_policy::{self, TaskModelSelection};
 use xai_grok_tools::implementations::{grok_build, opencode};
-pub(super) fn task_model_override_error(
-    requested: Option<&str>,
-    provenance: ModelOverrideProvenance,
+/// `None` on resume: the source model stays pinned.
+pub(super) fn explicit_tool_model(
+    overrides: &SubagentRuntimeOverrides,
     is_resume: bool,
+) -> Option<(String, TaskModelSelection)> {
+    let ModelOverrideProvenance::Tool { selection } = overrides.model_override_provenance else {
+        return None;
+    };
+    if is_resume {
+        return None;
+    }
+    overrides.model.clone().map(|model| (model, selection))
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum TaskModelAdmissionError {
+    HiddenSelection,
+    Unavailable(String),
+}
+/// The originating mode is enforced before availability, whatever the catalog says now.
+pub(super) fn admit_explicit_tool_model(
+    requested: &str,
+    selection: TaskModelSelection,
     available: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
     has_xai_session: bool,
     has_codex_session: bool,
-) -> Option<String> {
-    if provenance != ModelOverrideProvenance::Tool || is_resume {
-        return None;
+) -> Result<(), TaskModelAdmissionError> {
+    match selection {
+        TaskModelSelection::Inherited => Err(TaskModelAdmissionError::HiddenSelection),
+        TaskModelSelection::Selectable => {
+            crate::agent::models::task_model_error_for_catalog_with_provider_auth(
+                requested,
+                available,
+                has_xai_session,
+                has_codex_session,
+            )
+            .map_or(Ok(()), |message| {
+                Err(TaskModelAdmissionError::Unavailable(message))
+            })
+        }
     }
-    let requested = requested?;
-    crate::agent::models::task_model_error_for_catalog_with_provider_auth(
-        requested,
-        available,
-        has_xai_session,
-        has_codex_session,
-    )
+}
+/// Upstream `remote_config::task_model_policy::selection_telemetry_kind`,
+/// kept local until that presentation policy finds its fork `models/` home.
+fn selection_telemetry_kind(
+    selection: TaskModelSelection,
+) -> xai_grok_telemetry::events::SubagentModelSelectionKind {
+    match selection {
+        TaskModelSelection::Selectable => {
+            xai_grok_telemetry::events::SubagentModelSelectionKind::Selectable
+        }
+        TaskModelSelection::Inherited => {
+            xai_grok_telemetry::events::SubagentModelSelectionKind::Inherited
+        }
+    }
 }
 
 fn validate_subagent_reasoning_effort(
@@ -355,6 +393,12 @@ pub(crate) async fn run_shell_child(
         None
     };
     if let Some(ref source) = resume_source {
+        // Fork delta: report the resolved type, but do not overwrite
+        // `request.subagent_type` — that would void `validate_resume_identity`
+        // below. (Swarm resumes already adopt the source type pre-definition.)
+        let _ = reporter
+            .set_resolved_subagent_type(source.subagent_type.clone())
+            .await;
         if request.runtime_overrides.model.is_some() {
             tracing::debug!(
                 subagent_id = %request.id,
@@ -374,17 +418,30 @@ pub(crate) async fn run_shell_child(
             );
         }
     }
-    if let Some(error) = task_model_override_error(
-        request.runtime_overrides.model.as_deref(),
-        request.runtime_overrides.model_override_provenance,
-        resume_source.is_some(),
-        &ctx.available_models,
-        ctx.auth_manager
-            .current_or_expired()
-            .is_some_and(|auth| auth.is_session_auth()),
-        crate::codex_auth::is_logged_in(),
-    ) {
-        return child_run_output(failure_result(&request, &error), completion_data, None);
+    if let Some((requested, selection)) =
+        explicit_tool_model(&request.runtime_overrides, resume_source.is_some())
+        && let Err(error) = admit_explicit_tool_model(
+            &requested,
+            selection,
+            &ctx.available_models,
+            ctx.auth_manager
+                .current_or_expired()
+                .is_some_and(|auth| auth.is_session_auth()),
+            crate::codex_auth::is_logged_in(),
+        )
+    {
+        let message = match error {
+            TaskModelAdmissionError::HiddenSelection => {
+                xai_grok_telemetry::session_ctx::log_event(SubagentModelOverrideRejected {
+                    parent_session_id: request.parent_session_id.clone(),
+                    owner: telemetry_owner_kind(&request),
+                    reason: SubagentModelRejectionReason::HiddenSelection,
+                });
+                model_policy::hidden_selection_message(model_policy::MODEL_PARAM)
+            }
+            TaskModelAdmissionError::Unavailable(message) => message,
+        };
+        return child_run_output(failure_result(&request, &message), completion_data, None);
     }
     let worktree_path = if let Some(ref source) = resume_source {
         if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
@@ -460,12 +517,17 @@ pub(crate) async fn run_shell_child(
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
+        let (grove_enabled, grove_gate_source) =
+            crate::util::config::grove_worktree_gate(ctx.remote_settings.as_ref());
         match tokio::task::spawn_blocking(move || {
             let mut builder = xai_fast_worktree::WorktreeBuilder::new(&source_clone, &dest)
                 .working_tree_mode(xai_fast_worktree::WorkingTreeMode::PreserveWorkingTree)
                 .creation_mode(creation_mode)
                 .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
                 .session_id(subagent_id);
+            if let Some(opts) = crate::util::config::grove_worktree_opts_if_enabled(grove_enabled) {
+                builder = builder.grove_worktree(opts);
+            }
             if let Some(delegate) = btrfs_delegate {
                 builder = builder.btrfs_delegate(delegate);
             }
@@ -478,6 +540,8 @@ pub(crate) async fn run_shell_child(
                     subagent_id = %request.id,
                     worktree_path = %report.worktree_path.display(),
                     commit = %report.commit,
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
                     "Created isolated worktree for subagent"
                 );
                 Some(report.worktree_path)
@@ -486,7 +550,9 @@ pub(crate) async fn run_shell_child(
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Failed to create worktree, falling back to shared workspace"
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
+                    "Failed to create worktree (grove gate {grove_gate_source}), falling back to shared workspace"
                 );
                 None
             }
@@ -494,7 +560,9 @@ pub(crate) async fn run_shell_child(
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Worktree creation task panicked, falling back to shared workspace"
+                    grove_worktree = grove_enabled,
+                    grove_gate_source,
+                    "Worktree creation task panicked (grove gate {grove_gate_source}), falling back to shared workspace"
                 );
                 None
             }
@@ -1186,66 +1254,11 @@ pub(crate) async fn run_shell_child(
             }
         }
     }
-    let agent_mcp_servers: Vec<_> = if !agent_owned_mcp_servers_allowed(is_plugin_agent) {
-        if !definition.mcp_servers.is_empty() {
-            tracing::warn!(
-                agent = %definition.name,
-                plugin = ?definition.plugin_name,
-                "ignoring mcpServers on plugin agent (not supported for security)"
-            );
-        }
-        vec![]
-    } else {
-        definition
-                .mcp_servers
-                .iter()
-                .filter_map(|entry| match entry {
-                    xai_grok_agent::config::McpServerRef::Named(name) => {
-                        ctx.parent_mcp_configs
-                            .iter()
-                            .find(|s| {
-                                crate::session::mcp_servers::mcp_server_name(s) == name
-                            })
-                            .cloned()
-                            .or_else(|| {
-                                tracing::warn!(agent = %definition.name, server = name, "mcpServers: named ref not found in parent");
-                                None
-                            })
-                    }
-                    xai_grok_agent::config::McpServerRef::Inline { name, config } => {
-                        if let serde_json::Value::Object(obj) = config
-                            && obj.contains_key("type")
-                        {
-                            let mut flat = obj.clone();
-                            flat.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(name.clone()),
-                            );
-                            if let Ok(server) = serde_json::from_value::<
-                                agent_client_protocol::McpServer,
-                            >(serde_json::Value::Object(flat)) {
-                                return Some(server);
-                            }
-                            tracing::debug!(agent = %definition.name, server = name, "ACP wire format parse failed, trying map-keyed");
-                        }
-                        if let Some(inner_obj) = config.as_object() {
-                            let mut flat = inner_obj.clone();
-                            flat.insert(
-                                "name".to_string(),
-                                serde_json::Value::String(name.clone()),
-                            );
-                            if let Ok(server) = serde_json::from_value::<
-                                agent_client_protocol::McpServer,
-                            >(serde_json::Value::Object(flat)) {
-                                return Some(server);
-                            }
-                        }
-                        tracing::warn!(agent = %definition.name, server = name, "mcpServers: inline config could not be parsed");
-                        None
-                    }
-                })
-                .collect()
-    };
+    let agent_mcp_servers = crate::session::agent_mcp::materialize_agent_mcp_servers(
+        &definition,
+        &ctx.parent_mcp_configs,
+        &ctx.parent_cwd,
+    );
     let parent_mcp_pool =
         resolve_inherited_mcp_pool(ctx.parent_mcp_pool.take(), &definition.mcp_inheritance);
     let mcp_inherited_count = parent_mcp_pool
@@ -1294,6 +1307,12 @@ pub(crate) async fn run_shell_child(
         parent_session_id: request.parent_session_id.clone(),
         subagent_type: request.subagent_type.clone(),
         owner: telemetry_owner_kind(&request),
+        model_selection: match request.runtime_overrides.model_override_provenance {
+            ModelOverrideProvenance::Tool { selection } => {
+                Some(selection_telemetry_kind(selection))
+            }
+            ModelOverrideProvenance::Harness => None,
+        },
         workflow_run_id: request.owner.workflow_run_id().map(str::to_string),
         queued_ms: queued_for.map(|queued| u64::try_from(queued.as_millis()).unwrap_or(u64::MAX)),
         session_running: u32::try_from(session_running).unwrap_or(u32::MAX),
@@ -1312,7 +1331,7 @@ pub(crate) async fn run_shell_child(
         .send(crate::session::persistence::PersistenceMsg::CurrentModel {
             model_id: effective_model_id.clone(),
             provider: effective_sampling_config.provider,
-            agent_name: Some(definition.name.clone()),
+            agent: crate::session::persistence::PersistedAgent::from(&definition),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
             resolved_tool_policy: None,
         });
@@ -1373,6 +1392,7 @@ pub(crate) async fn run_shell_child(
             parent_session_id: Some(ctx.parent_session_id.clone()),
             subagent_type: Some(request.subagent_type.clone()),
             preserve_inherited_system: verbatim_mirror_fork,
+            parent_cwd: Some(ctx.parent_cwd.clone()),
             // Verbatim forks inherit the parent's cache identity. Resume
             // copies already wrote that key into the child's summary, so
             // restore it here instead of minting the new child session id.
@@ -1390,6 +1410,7 @@ pub(crate) async fn run_shell_child(
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
         xai_chat_state::CompactionMode::Summary,
         ctx.resolve_compaction_verbatim_input(),
+        ctx.resolve_long_reasoning_reminder(),
         ctx.resolve_compaction_tool_choice(),
         false,
         ctx.agent_config
@@ -1505,6 +1526,13 @@ pub(crate) async fn run_shell_child(
         },
         subagent_max_turns,
         forked_tool_override,
+        // Upstream passes `ctx.feature(Feature::SubagentModelInheritance)`;
+        // the fork-idiom resolver carries the same env > config > remote >
+        // default(false) tiers. `false` = not a chat-kind session.
+        // (Upstream's `spawn_ctx` spawn-timer arg is dropped: the fork has
+        // no spawn-phase telemetry infra to attach here.)
+        ctx.resolve_subagent_model_inheritance(),
+        false,
         ctx.sampling_gate.clone(),
     )
     .await;

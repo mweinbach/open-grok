@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use agent_client_protocol as acp;
 use xai_grok_tools::implementations::grok_build::LoopFireMode;
 use xai_grok_tools::implementations::skills::skill::format_skill_name;
-use xai_grok_tools::implementations::skills::types::SkillInfo;
+use xai_grok_tools::implementations::skills::types::{SkillInfo, SkillScope};
 
 /// A built-in slash command.
 pub(crate) struct BuiltinCommand {
@@ -18,6 +18,7 @@ pub(crate) struct BuiltinCommand {
     /// Filtered by `CommandAvailability::allows()` at advertising time;
     /// commands that map to `BuiltinGate::AlwaysOn` are never gated.
     pub gate: BuiltinGate,
+    pub(crate) workflow_projection: WorkflowProjection,
     pub(crate) model_authored_eligibility: ModelAuthoredEligibility,
     pub(super) resolve: fn(args: &str) -> BuiltinAction,
 }
@@ -26,6 +27,12 @@ pub(crate) struct BuiltinCommand {
 pub(crate) enum ModelAuthoredEligibility {
     Denied,
     ExactCanonical,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowProjection {
+    None,
+    ExactName,
 }
 
 /// Capability gate that decides whether a `BuiltinCommand` is advertised
@@ -64,6 +71,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("optional context about what to preserve"),
         aliases: &[],
         gate: BuiltinGate::AlwaysOn,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| BuiltinAction::Compact {
             user_context: if args.is_empty() {
                 None
@@ -79,6 +87,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("on|off"),
         aliases: &["yolo"],
         gate: BuiltinGate::AlwaysOn,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| BuiltinAction::SetYolo {
             enabled: !matches!(
                 args.to_lowercase().as_str(),
@@ -93,6 +102,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Memory,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::FlushMemory,
     },
     BuiltinCommand {
@@ -102,24 +112,18 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Memory,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::Dream,
     },
     BuiltinCommand {
         name: "memory",
         model_authored_eligibility: ModelAuthoredEligibility::Denied,
         description: "Browse, view, and manage your memories",
-        argument_hint: Some("on|off"),
+        argument_hint: None,
         aliases: &["mem"],
         gate: BuiltinGate::MemoryConfigured,
-        resolve: |args| {
-            let trimmed = args.trim().to_lowercase();
-            match trimmed.as_str() {
-                "on" | "enable" => BuiltinAction::MemoryToggle { enabled: true },
-                "off" | "disable" => BuiltinAction::MemoryToggle { enabled: false },
-                "status" => BuiltinAction::MemoryStatus,
-                _ => BuiltinAction::MemoryBrowse,
-            }
-        },
+        workflow_projection: WorkflowProjection::None,
+        resolve: |_args| BuiltinAction::MemoryBrowse,
     },
     BuiltinCommand {
         name: "context",
@@ -128,6 +132,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::AlwaysOn,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::ContextInfo,
     },
     BuiltinCommand {
@@ -137,6 +142,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Hooks,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::HooksTrust,
     },
     BuiltinCommand {
@@ -146,6 +152,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Hooks,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::HooksList,
     },
     BuiltinCommand {
@@ -155,6 +162,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("path to hook file or directory"),
         aliases: &[],
         gate: BuiltinGate::Hooks,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| BuiltinAction::HooksAdd {
             path: args.trim().to_string(),
         },
@@ -166,6 +174,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("path to hook file or directory"),
         aliases: &[],
         gate: BuiltinGate::Hooks,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| BuiltinAction::HooksRemove {
             path: args.trim().to_string(),
         },
@@ -177,6 +186,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Hooks,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::HooksUntrust,
     },
     BuiltinCommand {
@@ -186,6 +196,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("list | reload | trust <path> | add <path> | remove <path>"),
         aliases: &["plugin"],
         gate: BuiltinGate::Plugins,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| {
             let trimmed = args.trim();
             if trimmed.is_empty() || trimmed == "list" {
@@ -238,6 +249,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &[],
         gate: BuiltinGate::Plugins,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::PluginsReload,
     },
     BuiltinCommand {
@@ -247,6 +259,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: None,
         aliases: &["status", "info"],
         gate: BuiltinGate::AlwaysOn,
+        workflow_projection: WorkflowProjection::None,
         resolve: |_args| BuiltinAction::SessionInfo,
     },
     BuiltinCommand {
@@ -256,6 +269,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("feedback text"),
         aliases: &[],
         gate: BuiltinGate::Feedback,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| BuiltinAction::Feedback {
             text: args.trim().to_string(),
         },
@@ -267,6 +281,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("<query>"),
         aliases: &[],
         gate: BuiltinGate::WorkflowLaunches,
+        workflow_projection: WorkflowProjection::ExactName,
         resolve: |args| BuiltinAction::DeepResearch {
             query: args.trim().to_string(),
         },
@@ -280,6 +295,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         ),
         aliases: &[],
         gate: BuiltinGate::WorkflowManagement,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| {
             const OPS: [&str; 4] = ["pause", "resume", "stop", "save"];
             let trimmed = args.trim();
@@ -319,6 +335,7 @@ pub(super) const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         argument_hint: Some("<objective> [--budget <tokens>] | status | pause | resume | clear"),
         aliases: &[],
         gate: BuiltinGate::Goal,
+        workflow_projection: WorkflowProjection::None,
         resolve: |args| {
             let trimmed = args.trim();
             match trimmed.to_lowercase().as_str() {
@@ -371,6 +388,7 @@ const PROMPT_COMMANDS: &[BuiltinCommand] = &[BuiltinCommand {
     argument_hint: Some("[interval] <prompt>"),
     aliases: &[],
     gate: BuiltinGate::Scheduler,
+    workflow_projection: WorkflowProjection::None,
     // INVARIANT: resolve() short-circuits any prompt-only command via a
     // PROMPT_COMMANDS lookup before reaching this closure. If a future
     // refactor changes that ordering this `unreachable!` will surface
@@ -499,6 +517,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "delete",
     "docs",
     "doctor",
+    "dream",
     "edit-prompt",
     "effort",
     "exit",
@@ -507,6 +526,7 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "feedback",
     "fast",
     "find",
+    "flush",
     "fork",
     "full",
     "fullscreen",
@@ -533,6 +553,8 @@ pub const PAGER_COMMAND_KEYS: &[&str] = &[
     "m",
     "marketplace",
     "mcps",
+    "mem",
+    "memory",
     "minimal",
     "mission",
     "ml",
@@ -607,6 +629,11 @@ static RESERVED_SLASH_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| 
         taken.insert(builtin.name);
         taken.extend(builtin.aliases.iter().copied());
     }
+    // Fork: memory-gated shell builtins stay unreserved even though the pager
+    // lists the same keys for its shadowing builtins (memory_ops). A skill
+    // named `flush`/`dream` must advertise bare while the builtin is gated off.
+    taken.remove("flush");
+    taken.remove("dream");
     taken
 });
 /// Pager `CommandRegistry::apply_acp_commands` lowercases ACP names before
@@ -628,6 +655,32 @@ struct SkillCommand<'a> {
     name: String,
     skill: &'a SkillInfo,
 }
+fn exact_workflow_projection<'a>(
+    command: &BuiltinCommand,
+    workflows: &'a [crate::session::workflow::registry::WorkflowListing],
+) -> Option<&'a crate::session::workflow::registry::WorkflowListing> {
+    match command.workflow_projection {
+        WorkflowProjection::None => None,
+        WorkflowProjection::ExactName => {
+            let mut matches = workflows
+                .iter()
+                .filter(|workflow| workflow.name == command.name);
+            let workflow = matches.next()?;
+            matches.next().is_none().then_some(workflow)
+        }
+    }
+}
+fn workflow_meta(workflow: &crate::session::workflow::registry::WorkflowListing) -> acp::Meta {
+    let mut meta = acp::Meta::new();
+    meta.insert(
+        "workflowSource".to_string(),
+        serde_json::json!(workflow.source),
+    );
+    if let Some(path) = &workflow.path {
+        meta.insert("workflowPath".to_string(), serde_json::json!(path));
+    }
+    meta
+}
 
 struct EffectiveSkillCatalog<'a> {
     commands: Vec<SkillCommand<'a>>,
@@ -644,6 +697,24 @@ impl<'a> EffectiveSkillCatalog<'a> {
             .chain(PAGER_COMMAND_KEYS.iter().copied())
             .map(slash_key)
             .collect();
+        // Fork: the memory-gated builtins must not reserve their names while
+        // gated off — the pager's shadowing flush/dream builtins are
+        // themselves shell-gated (SHELL_GATED_COMMANDS), so a same-named
+        // skill advertises bare with no collision. Other gated builtins
+        // (hooks-*, login, …) stay taken: the pager owns those triggers
+        // unconditionally.
+        let active: HashSet<String> = builtins
+            .iter()
+            .flat_map(|builtin| {
+                std::iter::once(builtin.name).chain(builtin.aliases.iter().copied())
+            })
+            .map(slash_key)
+            .collect();
+        for key in ["flush", "dream"] {
+            if !active.contains(key) {
+                taken.remove(key);
+            }
+        }
 
         let candidates: Vec<_> = skills
             .iter()
@@ -780,13 +851,8 @@ pub(super) fn available_commands(
     let mut commands =
         Vec::with_capacity(catalog.builtins.len() + catalog.skills.len() + catalog.workflows.len());
     commands.extend(catalog.builtins.iter().map(|builtin| {
-        acp::AvailableCommand::new(builtin.name.to_string(), builtin.description.to_string()).input(
-            builtin.argument_hint.map(|hint| {
-                acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                    hint.to_string(),
-                ))
-            }),
-        )
+        available_command(builtin)
+            .meta(exact_workflow_projection(builtin, workflows).map(workflow_meta))
     }));
     commands.extend(catalog.skills.iter().map(|command| {
         let skill = command.skill;
@@ -859,16 +925,26 @@ pub(crate) fn builtin_commands(availability: CommandAvailability) -> Vec<acp::Av
     BUILTIN_COMMANDS
         .iter()
         .filter(|cmd| availability.allows(cmd.gate))
-        .map(|cmd| {
-            acp::AvailableCommand::new(cmd.name.to_string(), cmd.description.to_string()).input(
-                cmd.argument_hint.map(|hint| {
-                    acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
-                        hint.to_string(),
-                    ))
-                }),
-            )
-        })
+        .map(available_command)
         .collect()
+}
+
+/// One builtin by name, as `builtin_commands` would advertise it. For backends that serve a
+/// subset of the shell's commands and must describe them identically.
+pub fn builtin_command(name: &str) -> Option<acp::AvailableCommand> {
+    BUILTIN_COMMANDS
+        .iter()
+        .find(|cmd| cmd.name == name)
+        .map(available_command)
+}
+fn available_command(cmd: &BuiltinCommand) -> acp::AvailableCommand {
+    acp::AvailableCommand::new(cmd.name.to_string(), cmd.description.to_string()).input(
+        cmd.argument_hint.map(|hint| {
+            acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+                hint.to_string(),
+            ))
+        }),
+    )
 }
 
 // ── x.ai/commands/list ext method ────────────────────────────────
@@ -939,6 +1015,9 @@ pub(crate) struct ParsedSkillRef {
     pub qualified_name: String,
     /// Plugin name if this is a plugin skill.
     pub plugin_name: Option<String>,
+    pub scope: SkillScope,
+    /// Validated frontmatter `origin` slug, used for telemetry.
+    pub origin: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1009,10 +1088,6 @@ pub(super) enum BuiltinAction {
         text: String,
     },
     MemoryBrowse,
-    MemoryStatus,
-    MemoryToggle {
-        enabled: bool,
-    },
     GoalSet {
         objective: String,
         token_budget: Option<i64>,
@@ -1058,8 +1133,7 @@ impl BuiltinAction {
             BuiltinAction::PluginsUninstall { .. } => "plugins-uninstall",
             BuiltinAction::PluginsUpdate { .. } => "plugins-update",
             BuiltinAction::Feedback { .. } => "feedback",
-            BuiltinAction::MemoryBrowse | BuiltinAction::MemoryStatus => "memory",
-            BuiltinAction::MemoryToggle { .. } => "memory",
+            BuiltinAction::MemoryBrowse => "memory",
             BuiltinAction::GoalSet { .. }
             | BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1096,8 +1170,6 @@ impl BuiltinAction {
             BuiltinAction::PluginsUpdate { name } => name.is_some(),
             BuiltinAction::Feedback { text } => !text.is_empty(),
             BuiltinAction::MemoryBrowse => false,
-            BuiltinAction::MemoryStatus => true,
-            BuiltinAction::MemoryToggle { .. } => true,
             BuiltinAction::GoalSet { .. } => true,
             BuiltinAction::GoalStatus
             | BuiltinAction::GoalPause
@@ -1208,6 +1280,8 @@ fn parse_skill_references_with_catalog(
                     skill_path: hit.skill.path.clone(),
                     qualified_name: format_skill_name(hit.skill),
                     plugin_name: hit.skill.plugin_name.clone(),
+                    scope: hit.skill.scope,
+                    origin: hit.skill.origin.clone(),
                 }
             })
             .collect(),
@@ -1312,6 +1386,8 @@ pub(super) fn resolve_model_authored_skill(
             skill_path: skill.path.clone(),
             qualified_name: format_skill_name(skill),
             plugin_name: skill.plugin_name.clone(),
+            scope: skill.scope,
+            origin: skill.origin.clone(),
         }],
     })
 }
@@ -1637,6 +1713,7 @@ mod tests {
             when_to_use: None,
             short_description: Some(format!("Short: {name}")),
             author: None,
+            origin: None,
             argument_hint: None,
             path: format!("/path/to/{name}/SKILL.md"),
             scope: SkillScope::Local,
@@ -2531,6 +2608,7 @@ mod tests {
             when_to_use: None,
             short_description: Some(format!("Short: {name}")),
             author: None,
+            origin: None,
             argument_hint: None,
             path: format!("/path/to/{name}/{scope:?}/SKILL.md"),
             scope,
@@ -3061,7 +3139,7 @@ mod tests {
         ));
         assert!(matches!(
             resolve_builtin("memory", "status"),
-            Some(BuiltinAction::MemoryStatus)
+            Some(BuiltinAction::MemoryBrowse)
         ));
         // Any unrecognized arg also falls through to browse
         assert!(matches!(
@@ -3071,23 +3149,16 @@ mod tests {
     }
 
     #[test]
-    fn memory_on_off_resolves_to_toggle() {
-        for (arg, expected) in [
-            ("on", true),
-            ("enable", true),
-            ("ON", true),
-            ("Enable", true),
-            ("off", false),
-            ("disable", false),
-            ("OFF", false),
-            ("Disable", false),
+    fn memory_args_always_resolve_to_browse() {
+        for arg in [
+            "on", "enable", "ON", "Enable", "off", "disable", "OFF", "Disable", "status", "",
         ] {
             assert!(
                 matches!(
                     resolve_builtin("memory", arg),
-                    Some(BuiltinAction::MemoryToggle { enabled }) if enabled == expected
+                    Some(BuiltinAction::MemoryBrowse)
                 ),
-                "expected toggle({expected}) for {arg:?}",
+                "expected browse for {arg:?}",
             );
         }
     }
@@ -3109,7 +3180,7 @@ mod tests {
     }
 
     #[test]
-    fn mem_alias_resolves_toggle_with_args() {
+    fn mem_alias_resolves_browse_with_args() {
         let outcome = resolve(
             vec![text_block("/mem off")],
             &[],
@@ -3120,14 +3191,14 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             outcome,
-            SlashCommandOutcome::Builtin(BuiltinAction::MemoryToggle { enabled: false })
+            SlashCommandOutcome::Builtin(BuiltinAction::MemoryBrowse)
         ));
     }
 
     #[test]
     fn memory_resolves_when_disabled_but_configured() {
         // memory=false but memory_configured=true: /memory must still work
-        // so the user can re-enable via the toggle.
+        // so the user can still browse and manage memories.
         let availability = CommandAvailability {
             memory: false,
             ..CommandAvailability::all_enabled()

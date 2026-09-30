@@ -17,8 +17,13 @@ pub struct DiffLine {
 
 pub type DiffHunk = Vec<DiffLine>;
 
+/// Unchanged lines kept on each side of a change
+const MAX_CONTEXT: usize = 3;
+
+/// Whole-file diffs run on the render thread; past this `similar` returns a coarser but still correct diff
+const WHOLE_FILE_DIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub fn build_diff_hunks(details: &[SearchReplaceEditDetail]) -> Vec<DiffHunk> {
-    const MAX_CONTEXT: usize = 3;
     let mut hunks: Vec<DiffHunk> = Vec::new();
 
     for edit in details {
@@ -156,20 +161,42 @@ pub fn build_diff_hunks(details: &[SearchReplaceEditDetail]) -> Vec<DiffHunk> {
 
 /// Build diff hunks from full old/new text strings.
 ///
-/// Simpler alternative to `build_diff_hunks` when you don't have structured
-/// `SearchReplaceEditDetail` data — just the full before/after text.
-/// Used for ACP `ToolCallContent::Diff` fallback (pre-execution previews).
+/// Builds diff hunks from before/after text alone, with no structured `SearchReplaceEditDetail`.
+/// The ACP `ToolCallContent::Diff` fallback uses this for pre-execution previews and for backends that send whole files.
+/// Changes more than twice `MAX_CONTEXT` unchanged lines apart go into separate hunks, so a whole-file diff never shows the unchanged middle.
 pub fn diff_hunks_from_strings(old_text: &str, new_text: &str, start_line: usize) -> Vec<DiffHunk> {
-    let detail = SearchReplaceEditDetail {
-        old_string: old_text.to_owned(),
-        old_line: start_line,
-        new_string: new_text.to_owned(),
-        new_line: start_line,
-        context_before: String::new(),
-        context_after: String::new(),
-        line_prefix: String::new(),
-    };
-    build_diff_hunks(&[detail])
+    let diff = TextDiff::configure()
+        .timeout(WHOLE_FILE_DIFF_TIMEOUT)
+        .diff_lines(old_text, new_text);
+
+    diff.grouped_ops(MAX_CONTEXT)
+        .iter()
+        .map(|group| {
+            let mut hunk = DiffHunk::new();
+            for op in group {
+                let mut lo = op.old_range().start.saturating_add(start_line);
+                let mut ln = op.new_range().start.saturating_add(start_line);
+                for change in diff.iter_changes(op) {
+                    let tag = change.tag();
+                    hunk.push(DiffLine {
+                        text: change.value().to_owned(),
+                        lo,
+                        ln,
+                        tag,
+                    });
+                    match tag {
+                        ChangeTag::Equal => {
+                            lo = lo.saturating_add(1);
+                            ln = ln.saturating_add(1);
+                        }
+                        ChangeTag::Delete => lo = lo.saturating_add(1),
+                        ChangeTag::Insert => ln = ln.saturating_add(1),
+                    }
+                }
+            }
+            hunk
+        })
+        .collect()
 }
 
 /// Stitch overlapping/adjacent hunks from coalesced same-file edits into
@@ -753,6 +780,30 @@ mod tests {
     }
 
     #[test]
+    fn diff_hunks_from_strings_two_distant_changes_make_two_hunks() {
+        let old: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 2\n", "LINE 2\n").replace("line 18\n", "");
+
+        let hunks = diff_hunks_from_strings(&old, &new, 1);
+
+        let [first, second] = hunks.as_slice() else {
+            panic!("changes 16 lines apart must not share a hunk: {hunks:?}");
+        };
+        // The file start clips the context before line 2 to one line
+        assert_eq!(first.len(), 1 + 2 + 3);
+        assert_eq!(second.len(), 3 + 1 + 2);
+        // The second hunk numbers from its own op, and the delete shifts ln behind lo
+        assert_eq!(
+            second
+                .iter()
+                .find(|l| l.tag == ChangeTag::Delete)
+                .map(|l| (l.lo, l.ln)),
+            Some((18, 18))
+        );
+        assert_eq!(second.last().map(|l| (l.lo, l.ln)), Some((20, 19)));
+    }
+
+    #[test]
     fn blank_line_insert_produces_visible_hunk() {
         // Simulates hashline insert_after with content: "" — both old and new are empty.
         let details = vec![SearchReplaceEditDetail {
@@ -781,6 +832,14 @@ mod tests {
             1,
             "should have exactly one inserted blank line"
         );
+    }
+
+    #[test]
+    fn diff_hunks_from_strings_identical_text_produces_no_hunks() {
+        // A whole-file diff with no change must not leave a context-only hunk the header would count as an edit
+        let text = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        assert!(diff_hunks_from_strings(text, text, 1).is_empty());
+        assert!(diff_hunks_from_strings("one\n", "one\n", 1).is_empty());
     }
 
     #[test]

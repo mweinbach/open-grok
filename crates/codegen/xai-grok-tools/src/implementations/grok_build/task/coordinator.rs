@@ -22,22 +22,25 @@ use std::sync::Arc;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::{mpsc, oneshot};
+use xai_tool_types::HandedOffSubagentState;
 
 use super::active_message::ActiveMessageIngress;
 use super::admission::Admission;
 use super::coordinator_state::{
     ActiveChild, AgentMailboxWaiter, BlockingWaiter, BufferedCompletion, ChildRecord,
-    CompletedChild, InternalEvent, ListRequest, PendingChild, ProgressFuture, ProgressTarget,
-    ReplyFuture, TaggedFuture, active_summary, background_at_deadline, background_if_caller_gone,
-    completed_snapshot, completion_summary, sleep_until, workflow_outstanding,
+    CompletedChild, ForegroundChild, InternalEvent, ListRequest, PendingChild, ProgressFuture,
+    ProgressTarget, ReplyFuture, TaggedFuture, active_summary, background_at_deadline,
+    background_if_caller_gone, completed_snapshot, completion_summary, hand_off_to_background,
+    sleep_until, workflow_outstanding,
 };
 use super::types::ActiveAgentMessageOutcome;
 use super::types::{
     AgentMailboxIdentity, AgentMailboxMessage, AgentMessageDeliveryStatus, AgentMessageSendOutput,
-    AgentRosterEntry, ListAgentsOutput, SpawnedSubagentRef, SubagentCancelOutcome,
-    SubagentCancelTarget, SubagentDescribeOutcome, SubagentEvent, SubagentOutstandingReply,
-    SubagentRegistryCounts, SubagentRequest, SubagentResult, SubagentResumeLookup,
-    SubagentResumeSource, SubagentValidateTypeOutcome, WaitAgentMessagesOutput,
+    AgentRosterEntry, HandedOffForegroundSubagent, ListAgentsOutput, SpawnedSubagentRef,
+    SubagentCancelOutcome, SubagentCancelTarget, SubagentDescribeOutcome, SubagentEvent,
+    SubagentOutstandingReply, SubagentRegistryCounts, SubagentRequest, SubagentResult,
+    SubagentResumeLookup, SubagentResumeSource, SubagentValidateTypeOutcome,
+    WaitAgentMessagesOutput,
 };
 use active_message::{ActiveChildGeneration, ActiveMessageFuture, ActiveMessageLifecycle};
 
@@ -596,6 +599,11 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 refs.sort_by(|a, b| a.subagent_id.cmp(&b.subagent_id));
                 let _ = request.respond_to.send(refs);
             }
+            SubagentEvent::HandOffForeground(request) => {
+                let handed_off =
+                    self.hand_off_prompt_foreground(&request.parent_session_id, &request.prompt_id);
+                let _ = request.respond_to.send(handed_off);
+            }
             SubagentEvent::ValidateType(request) => {
                 self.validations.push(ReplyFuture {
                     future: Box::pin(
@@ -1000,6 +1008,29 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                 subagent_id,
                 respond_to,
             } => self.handle_active_message_finalizing(subagent_id, respond_to),
+            InternalEvent::ResolvedSubagentType {
+                subagent_id,
+                subagent_type,
+                respond_to,
+            } => {
+                let updated = if let Some(child) = self.pending.get_mut(&subagent_id) {
+                    child.request.subagent_type = subagent_type;
+                    true
+                } else if let Some(child) = self.active.get_mut(&subagent_id) {
+                    child.request.subagent_type = subagent_type;
+                    true
+                } else if let Some(queued) = self
+                    .queued
+                    .iter_mut()
+                    .find(|queued| queued.request.id == subagent_id)
+                {
+                    queued.request.subagent_type = subagent_type;
+                    true
+                } else {
+                    false
+                };
+                let _ = respond_to.send(updated);
+            }
             InternalEvent::ResumeSource {
                 source_id,
                 parent_session_id,
@@ -1258,7 +1289,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
         self.finish_child(id, output);
     }
 
-    fn finish_child(&mut self, id: &str, output: ChildRunOutput<R::CompletionData>) {
+    fn finish_child(&mut self, id: &str, mut output: ChildRunOutput<R::CompletionData>) {
         let record = if let Some(child) = self.active.remove(id) {
             ChildRecord::Active(child)
         } else if let Some(child) = self.pending.remove(id) {
@@ -1304,6 +1335,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             ),
         };
 
+        output.result.subagent_type = request.subagent_type.clone();
         let persisted_output_ref = self.runner.persisted_output_ref(&output.completion_data);
         let mut completed = CompletedChild {
             request: request.clone(),
@@ -1479,6 +1511,59 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
             request.parent_session_id == parent_session_id && !request.owner.is_workflow()
         });
         SubagentCancelOutcome::Cancelled
+    }
+
+    fn hand_off_prompt_foreground(
+        &mut self,
+        parent_session_id: &str,
+        prompt_id: &str,
+    ) -> Vec<HandedOffForegroundSubagent> {
+        fn hand_off_children<'a, C: ForegroundChild + 'a>(
+            children: impl Iterator<Item = &'a mut C>,
+            parent_session_id: &str,
+            prompt_id: &str,
+        ) -> Vec<HandedOffForegroundSubagent> {
+            children
+                .filter_map(|child| {
+                    let record = hand_off_record(
+                        child.request(),
+                        parent_session_id,
+                        prompt_id,
+                        HandedOffSubagentState::Running,
+                    )?;
+                    hand_off_to_background(child);
+                    Some(record)
+                })
+                .collect()
+        }
+        let mut handed_off =
+            hand_off_children(self.pending.values_mut(), parent_session_id, prompt_id);
+        handed_off.extend(hand_off_children(
+            self.active.values_mut(),
+            parent_session_id,
+            prompt_id,
+        ));
+        for queued in self.queued.iter_mut() {
+            if let Some(record) = hand_off_record(
+                &queued.request,
+                parent_session_id,
+                prompt_id,
+                HandedOffSubagentState::Queued,
+            ) {
+                queued.caller = QueuedCaller::Backgrounded;
+                handed_off.push(record);
+            }
+        }
+        handed_off.extend(self.completed.values().filter_map(|child| {
+            let state = if child.result.cancelled {
+                HandedOffSubagentState::Cancelled
+            } else {
+                HandedOffSubagentState::Finished
+            };
+            hand_off_record(&child.request, parent_session_id, prompt_id, state)
+        }));
+        handed_off.sort_by(|a, b| a.subagent_id.cmp(&b.subagent_id));
+        handed_off
     }
 
     fn teardown_session_children(&mut self, parent_session_id: &str) {
@@ -1755,6 +1840,24 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
 
 fn belongs_to_session(request: &SubagentRequest, parent_session_id: Option<&str>) -> bool {
     parent_session_id.is_none_or(|id| request.parent_session_id == id)
+}
+
+fn hand_off_record(
+    request: &SubagentRequest,
+    parent_session_id: &str,
+    prompt_id: &str,
+    state: HandedOffSubagentState,
+) -> Option<HandedOffForegroundSubagent> {
+    if request.run_in_background || !request_in_scope(request, parent_session_id, prompt_id) {
+        return None;
+    }
+    let tool_call_id = request.tool_call_id.clone()?;
+    Some(HandedOffForegroundSubagent {
+        subagent_id: request.id.clone(),
+        tool_call_id,
+        description: request.description.clone(),
+        state,
+    })
 }
 
 fn request_in_scope(request: &SubagentRequest, parent_session_id: &str, prompt_id: &str) -> bool {

@@ -6,10 +6,10 @@
 
 use super::*;
 use ratatui::style::Color;
+use xai_grok_pager::diff::DiffLine;
 use xai_grok_pager::scrollback::block::RenderBlock;
 use xai_grok_pager::scrollback::entry::ScrollbackEntry;
 use xai_grok_pager::scrollback::state::ScrollbackState;
-use xai_grok_pager_diff::DiffLine;
 
 fn test_cwd() -> &'static std::path::Path {
     std::path::Path::new("/test/session")
@@ -730,7 +730,7 @@ fn large_commit_is_capped_with_footer() {
     let cap = 12u16;
     let area = Rect::new(0, 0, width, cap);
     let mut buf = Buffer::empty(area);
-    paint_committed(&mut buf, renderer, width, full_h, theme.dim());
+    paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
 
     // The final row is the overflow footer naming the hidden line count and
     // pointing at /transcript; the buffer is exactly `cap` rows (bounded).
@@ -764,7 +764,7 @@ fn small_commit_is_not_capped() {
     // Buffer is exactly the block's height → no footer (uncapped path).
     let area = Rect::new(0, 0, width, full_h);
     let mut buf = Buffer::empty(area);
-    paint_committed(&mut buf, renderer, width, full_h, theme.dim());
+    paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
 
     let mut all = String::new();
     for y in 0..full_h {
@@ -783,6 +783,13 @@ fn committed_edit_keeps_diff_line_backgrounds() {
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use similar::ChangeTag;
+    use xai_grok_pager::theme::cache as theme_cache;
+
+    // EditToolCallBlock::rendered_output reads Theme::current(), not the renderer theme.
+    // pin_theme serializes against terminal_native_lock_paints_only_native_colors so this
+    // comparison cannot see Reset insert/delete bands from a concurrent native-lock flip.
+    let _pin = theme_cache::pin_theme();
+    theme_cache::set_terminal_native_lock(false);
 
     let hunk = vec![
         DiffLine {
@@ -813,6 +820,11 @@ fn committed_edit_keeps_diff_line_backgrounds() {
     let block = RenderBlock::edit_with_hunks("src/main.rs", vec![hunk]);
     let mut entry = ScrollbackEntry::new(block);
     let theme = Theme::current();
+    assert!(
+        !theme.diff_uses_line_fg(),
+        "this regression needs a banded theme; terminal-native is covered by \
+         terminal_native_lock_paints_only_native_colors"
+    );
     let appearance = committed_appearance(&AppearanceConfig::default());
     entry.set_display_mode(minimal_commit_display_mode(&entry.block, &appearance));
     let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
@@ -821,7 +833,7 @@ fn committed_edit_keeps_diff_line_backgrounds() {
     let h = renderer.desired_height(width);
     let area = Rect::new(0, 0, width, h);
     let mut buf = Buffer::empty(area);
-    renderer.render(area, &mut buf);
+    paint_committed(&mut buf, &renderer, width, h, theme.dim());
 
     // The committed edit uses a flat background (terminal transparency), but
     // must still paint the per-line diff backgrounds — otherwise an added /
@@ -844,6 +856,19 @@ fn committed_edit_keeps_diff_line_backgrounds() {
         saw_delete,
         "committed edit lost the delete (red) diff background"
     );
+
+    let wraps = commit_wrap_flags(&renderer, buf.area.height, h);
+    let rows = crate::full_view::buffer_to_semantic_rows(&buf, &wraps);
+    match theme.diff_insert_bg {
+        Color::Rgb(r, g, b) => {
+            let needle = format!("48;2;{r};{g};{b}");
+            assert!(
+                rows.iter().any(|(ansi, _, _)| ansi.contains(&needle)),
+                "committed ANSI must keep the insert band SGR {needle}: {rows:?}"
+            );
+        }
+        bg => panic!("pin_theme TrueColor groknight insert bg should be RGB, got {bg:?}"),
+    }
 }
 
 /// Asserted through `chrome_width` because that is what both `desired_height`
@@ -1137,6 +1162,220 @@ fn collapsed_thinking_commit_is_one_advertised_row() {
     // Too narrow for the hint: the header still wins, still one row.
     let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
     assert_eq!(renderer.desired_height(16), 1);
+}
+
+/// Unbreakable path token: slashed paths wrap at `/` before the last column and cannot prove wrap-join.
+const YAML_UNBREAKABLE: &str = "falcon_missions_nrol97_trajectory_nrol97.mat_unbreakable";
+
+fn yaml_commit_body() -> String {
+    format!(
+        "```yaml\n\
+nrol97:\n\
+  trajectory: {YAML_UNBREAKABLE}\n\
+  mission_number: 1667\n\
+  builds:\n\
+    - cgen_swrelease\n\
+```"
+    )
+}
+
+fn paint_yaml_agent(width: u16, trim: bool) -> (ratatui::buffer::Buffer, u16, Vec<bool>) {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let theme = Theme::current();
+    let appearance = committed_appearance(&AppearanceConfig::default());
+    let mut entry = ScrollbackEntry::new(RenderBlock::agent_message(yaml_commit_body()));
+    entry.set_display_mode(minimal_commit_display_mode(&entry.block, &appearance));
+    let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
+    let full_h = renderer.desired_height(width);
+    let area = Rect::new(0, 0, width, full_h);
+    let mut buf = Buffer::empty(area);
+    if trim {
+        paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
+    } else {
+        renderer.render(area, &mut buf);
+    }
+    let wraps = renderer.row_soft_wraps(buf.area.height);
+    (buf, full_h, wraps)
+}
+
+fn row_text(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+    (0..width)
+        .filter_map(|x| buf.cell((x, y)).map(|c| c.symbol().to_string()))
+        .collect()
+}
+
+#[test]
+fn dense_commit_grid_pads_short_yaml_rows() {
+    let width = 40u16;
+    let (buf, h, _wraps) = paint_yaml_agent(width, false);
+    let mut saw_short_key = false;
+    for y in 0..h {
+        let text = row_text(&buf, y, width);
+        if !text.contains("nrol97:") || text.contains("trajectory") {
+            continue;
+        }
+        saw_short_key = true;
+        let last = buf
+            .cell((width - 1, y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(
+            last, " ",
+            "untrimmed short YAML row must space-pad to the last column: {text:?}"
+        );
+    }
+    assert!(
+        saw_short_key,
+        "expected a short nrol97: row in {h} painted rows"
+    );
+}
+
+#[test]
+fn paint_committed_trims_pads_and_semantic_copy_keeps_yaml_intact() {
+    let width = 40u16;
+    let (buf, h, wraps) = paint_yaml_agent(width, true);
+    let mut saw_short_key = false;
+    for y in 0..h {
+        let text = row_text(&buf, y, width);
+        if !text.contains("nrol97:") || text.contains("trajectory") {
+            continue;
+        }
+        saw_short_key = true;
+        let last_vis =
+            crate::full_view::last_visible_column(&buf, y).expect("nrol97: row has glyphs");
+        assert!(
+            last_vis < width.saturating_sub(1),
+            "short YAML key must not serialize painted pads as full width: last_vis={last_vis} {text:?}"
+        );
+    }
+    assert!(saw_short_key, "expected a short nrol97: row after trim");
+
+    assert!(
+        wraps.iter().any(|w| *w),
+        "unbreakable YAML path must produce a wrap joiner"
+    );
+    let copy = crate::full_view::buffer_to_semantic_copy(&buf, &wraps);
+    assert!(
+        copy.contains(YAML_UNBREAKABLE),
+        "soft-wrapped path must join\n{copy}"
+    );
+    assert!(
+        !copy.contains("nrol97:\n\n"),
+        "trailing pads must not become blank lines between keys\n{copy}"
+    );
+    assert!(
+        copy.contains("mission_number: 1667"),
+        "short keys stay intact\n{copy}"
+    );
+}
+
+#[test]
+fn semantic_copy_exact_width_hard_break_code_lines_stay_separate() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let width = 40u16;
+    let line_a = "A".repeat(usize::from(width));
+    let line_b = "B".repeat(usize::from(width));
+    let body = format!("```\n{line_a}\n{line_b}\n```");
+    let theme = Theme::current();
+    let appearance = committed_appearance(&AppearanceConfig::default());
+    let mut entry = ScrollbackEntry::new(RenderBlock::agent_message(body));
+    entry.set_display_mode(minimal_commit_display_mode(&entry.block, &appearance));
+    let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
+    let full_h = renderer.desired_height(width);
+    let area = Rect::new(0, 0, width, full_h);
+    let mut buf = Buffer::empty(area);
+    paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
+    let wraps = renderer.row_soft_wraps(buf.area.height);
+    let copy = crate::full_view::buffer_to_semantic_copy(&buf, &wraps);
+    assert!(
+        copy.contains(&format!("{line_a}\n{line_b}")),
+        "exact-width hard breaks must stay separate lines\n{copy}"
+    );
+    assert!(
+        !copy.contains(&format!("{line_a}{line_b}")),
+        "native copy must not concatenate exact-width code lines\n{copy}"
+    );
+}
+
+#[test]
+fn capped_footer_does_not_join_wrapped_line() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let width = 20u16;
+    let body = YAML_UNBREAKABLE;
+    let theme = Theme::current();
+    let appearance = committed_appearance(&AppearanceConfig::default());
+    let mut entry = ScrollbackEntry::new(RenderBlock::agent_message(body));
+    entry.set_display_mode(minimal_commit_display_mode(&entry.block, &appearance));
+    let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
+    let full_h = renderer.desired_height(width);
+    assert!(full_h > 2, "unbreakable token must wrap, got {full_h}");
+
+    let cap = 2u16;
+    let area = Rect::new(0, 0, width, cap);
+    let mut buf = Buffer::empty(area);
+    paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
+
+    let raw = renderer.row_soft_wraps(cap);
+    assert!(
+        raw.first().copied().unwrap_or(false),
+        "precondition: first painted row wraps onto the overwritten continuation: {raw:?}"
+    );
+    let wraps = commit_wrap_flags(&renderer, cap, full_h);
+    assert!(
+        !wraps.iter().any(|w| *w),
+        "cap footer must not inherit a wrap joiner: {wraps:?}"
+    );
+
+    let copy = crate::full_view::buffer_to_semantic_copy(&buf, &wraps);
+    for line in copy.lines() {
+        if line.contains("more lines") {
+            assert!(
+                !line.contains("falcon") && !line.contains("nrol"),
+                "footer must not join the wrapped path\n{copy}"
+            );
+        }
+    }
+    assert!(copy.contains("more lines"), "footer present\n{copy}");
+}
+
+/// A full-width multiline command uses `joiner: Some("\n")`. That is not WRAPLINE.
+#[test]
+fn semantic_copy_multiline_command_keeps_newline_joiners() {
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+
+    let width = 40u16;
+    let line_a = "A".repeat(usize::from(width.saturating_sub(2)));
+    let line_b = "B".repeat(usize::from(width.saturating_sub(2)));
+    let theme = Theme::current();
+    let appearance = committed_appearance(&AppearanceConfig::default());
+    let mut entry = ScrollbackEntry::new(RenderBlock::execute(format!("{line_a}\n{line_b}")));
+    entry.set_display_mode(minimal_commit_display_mode(&entry.block, &appearance));
+    let renderer = minimal_renderer(&entry, &theme, appearance, test_cwd(), COMMITTED_TICK);
+    let full_h = renderer.desired_height(width);
+    let area = Rect::new(0, 0, width, full_h);
+    let mut buf = Buffer::empty(area);
+    paint_committed(&mut buf, &renderer, width, full_h, theme.dim());
+    let wraps = renderer.row_soft_wraps(buf.area.height);
+    assert!(
+        !wraps.iter().any(|w| *w),
+        "command `\\n` joiners must not set WRAPLINE: {wraps:?}"
+    );
+    let copy = crate::full_view::buffer_to_semantic_copy(&buf, &wraps);
+    assert!(
+        copy.contains('A') && copy.contains('B') && copy.contains("A\n"),
+        "native copy must keep the command separator\n{copy}"
+    );
+    assert!(
+        !copy.contains("A    B") && !copy.contains(&format!("{line_a}{line_b}")),
+        "native copy must not concatenate multiline commands\n{copy}"
+    );
 }
 
 /// K5 guard: reasoning committed collapsed must still fit its reserved

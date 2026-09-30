@@ -1181,9 +1181,10 @@ mod tests {
         })
     }
 
-    /// Build a realistic first-turn user message: metadata prefix + user query in tags.
+    /// Build a first-turn user message with a metadata prefix plus `<user_query>`.
     ///
-    /// This matches what `construct_user_message` + `user_query()` produce.
+    /// Includes a historical `<git_status>` block so extractors still work on
+    /// resumed transcripts that predate the prefix removal.
     fn make_synthetic_prefix_with_query(query: &str) -> ConversationItem {
         make_user(&format!(
             "<user_info>\nOS Version: macos\nShell: /bin/bash\n</user_info>\n\

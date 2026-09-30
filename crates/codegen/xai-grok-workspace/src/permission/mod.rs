@@ -1,5 +1,6 @@
 pub mod auto_mode;
 pub mod bash_command_splitting;
+mod bash_permission_script;
 pub mod claude_settings;
 mod exec_risk;
 mod gate_preflight;
@@ -77,8 +78,8 @@ pub(crate) fn init_metrics() {
 }
 pub use manager::{
     AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT, PermissionHandle,
-    always_allow_scope_persists, default_always_allow_scope, default_always_deny_scope,
-    minimum_always_allow_scope, reasons, spawn_permission_manager,
+    always_allow_scope_persists, broad_allow_floor_requires_prompt, default_always_allow_scope,
+    default_always_deny_scope, minimum_always_allow_scope, reasons, spawn_permission_manager,
     spawn_permission_manager_with_hub,
 };
 pub use policy::{

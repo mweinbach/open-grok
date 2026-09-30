@@ -1,4 +1,4 @@
-//! Agent spawning — creates the agent process and ACP channels.
+//! Agent spawning: creates the agent process and ACP channels.
 //!
 //! Simplified to only support GrokShell (in-process) mode.
 //! Subprocess and remote modes can be added later if needed.
@@ -31,15 +31,15 @@ const AGENT_JOIN_SLACK: Duration = Duration::from_secs(2);
 const JOIN_NOTICE_AFTER: Duration = Duration::from_millis(1500);
 
 /// Stderr notice after a slow join. Covers the whole SessionEnd pipeline
-/// (hooks, telemetry sync, upload drain, memory, optional dream) — not
+/// (hooks, telemetry sync, upload drain, memory, optional dream), not
 /// hooks alone, so the copy is intentionally not "session hooks".
 const JOIN_NOTICE: &str = "Finishing session…";
 
 /// Result of spawning a child agent.
 pub struct SpawnedAgent {
     /// Agent worker OS thread. Hand to [`AgentShutdownGuard`] so the worker is
-    /// cancelled and joined — letting session actors finish SessionEnd teardown
-    /// (hooks, telemetry, uploads, memory) — on every exit path.
+    /// cancelled and joined, letting session actors finish SessionEnd teardown
+    /// (hooks, telemetry, uploads, memory), on every exit path.
     pub thread_handle: thread::JoinHandle<Result<()>>,
     pub channel: AcpClientChannel,
     pub cancel: CancellationToken,
@@ -158,7 +158,7 @@ fn classify_join(result: thread::Result<Result<()>>) -> JoinOutcome {
     }
 }
 
-/// Render a panic payload as text — `panic!` payloads are `&str` or `String`,
+/// Render a panic payload as text. `panic!` payloads are `&str` or `String`,
 /// so the log shows the message instead of an opaque `Any`.
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
@@ -266,10 +266,13 @@ async fn spawn_agent_thread_direct(
     Ok(thread::Builder::new()
         .name("acp-agent-worker".into())
         .spawn(move || -> Result<()> {
+            // Declared before the `LocalSet` so an unwind also drops it last: tokio drops tasks in spawn order, so the gateway task would free the agent before its `LocalRef` tasks are dropped.
+            let mut keepalive: Option<Rc<MvpAgent>> = None;
             let local = tokio::task::LocalSet::new();
-            local.block_on(&rt, async move {
+            let result = local.block_on(&rt, async {
                 let client_tx = channel.tx.clone();
                 let agent_rc = spawn_agent(client_tx)?;
+                keepalive = Some(agent_rc.clone());
 
                 // Direct dispatch: RPC requests go straight to the agent
                 let gw_rx =
@@ -322,7 +325,11 @@ async fn spawn_agent_thread_direct(
                 cancel.cancelled().await;
                 agent_rc.flush_all_sessions(SESSION_FLUSH_GRACE).await;
                 anyhow::Result::Ok(())
-            })
+            });
+            // LocalSet before runtime, as an implicit scope-end drop would do; the agent last.
+            drop(local);
+            drop(keepalive);
+            result
         })?)
 }
 

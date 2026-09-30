@@ -468,6 +468,14 @@ message ExecutionOptions {
   optional uint32 stream_chunk_size = 7;
 }
 
+/// Which files `read_file` returns whole (offset/limit ignored) under the token cap. Unset bits mean on.
+message WholeReadPolicy {
+  /// `SKILL.md` and `.md` under a `skills/` path segment.
+  optional bool skill_markdown = 1;
+  /// Project-instruction files (`AGENTS.md` family) by exact file name.
+  optional bool instruction_files = 2;
+}
+
 /// Client-configurable truncation settings.
 /// All fields are optional — omitted fields mean "use the tool's built-in default".
 message TruncationConfig {
@@ -486,6 +494,9 @@ message TruncationConfig {
 
   /// Max lines to read for read_file. Default: 1000.
   optional uint32 max_lines_read = 4;
+
+  /// Whole-read exemptions for read_file. Unset = both on.
+  WholeReadPolicy whole_read = 5;
 }
 
 /// Output format preference - affects output_json structure.

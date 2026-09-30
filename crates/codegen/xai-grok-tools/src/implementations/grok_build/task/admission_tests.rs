@@ -23,6 +23,7 @@ fn request(parent_session_id: &str) -> SubagentRequest {
         context: SubagentContextRequest::FRESH,
         owner: SubagentOwner::Task,
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        tool_call_id: None,
     }
 }
 

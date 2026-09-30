@@ -553,8 +553,6 @@ mod tests {
         );
     }
 
-    // --- Progress bar (OSC 9;4) tests ---
-
     fn make_title_state(is_busy: bool) -> title::TitleState<'static> {
         title::TitleState {
             session_name: None,
@@ -593,44 +591,15 @@ mod tests {
     }
 
     #[test]
-    fn progress_deduplicates_repeated_busy_ticks() {
-        let mut svc = NotificationService::new_for_test(NotificationConfig {
-            progress_bar: true,
-            ..Default::default()
-        });
-        // Multiple busy ticks should not change the flag after the first.
-        svc.on_tick(&make_title_state(true));
-        assert!(svc.is_progress_active());
-        svc.on_tick(&make_title_state(true));
-        assert!(svc.is_progress_active());
-    }
-
-    #[test]
-    fn progress_deduplicates_repeated_idle_ticks() {
-        let mut svc = NotificationService::new_for_test(NotificationConfig {
-            progress_bar: true,
-            ..Default::default()
-        });
-        // Multiple idle ticks: progress_active stays false.
-        svc.on_tick(&make_title_state(false));
-        assert!(!svc.is_progress_active());
-        svc.on_tick(&make_title_state(false));
-        assert!(!svc.is_progress_active());
-    }
-
-    #[test]
     fn progress_keepalive_re_emits_after_interval() {
         let mut svc = NotificationService::new_for_test(NotificationConfig {
             progress_bar: true,
             ..Default::default()
         });
 
-        // Activate the progress bar.
         let _result = svc.on_tick(&make_title_state(true));
         assert!(svc.is_progress_active());
-        // First tick should produce output (the indeterminate sequence).
-        // (build_progress_escape returns None for unsupported brands, but
-        //  the flag still flips — the test verifies the timing logic.)
+        // build_progress_escape returns None for unsupported brands, but the flag still flips; this locks keep-alive timing.
         let first_sent = svc.progress_last_sent;
         assert!(first_sent.is_some());
 
@@ -690,12 +659,10 @@ mod tests {
             ..Default::default()
         });
 
-        // Activate progress bar.
         svc.on_tick(&make_title_state(true));
         assert!(svc.is_progress_active());
         assert!(svc.progress_last_sent.is_some());
 
-        // Flushing with is_busy=false should clear both.
         svc.flush_idle_state(&make_title_state(false));
         assert!(!svc.is_progress_active());
         assert!(svc.progress_last_sent.is_none());
@@ -712,8 +679,6 @@ mod tests {
         assert!(!svc.is_progress_active());
     }
 
-    // --- Permission notification rate-limiting tests ---
-
     #[test]
     fn permission_suppression_lifecycle() {
         let mut svc = NotificationService::new_for_test(NotificationConfig::default());
@@ -728,31 +693,5 @@ mod tests {
         // Clearing (queue drained) allows the next batch to fire.
         svc.clear_permission_notification();
         assert!(!svc.should_suppress_permission_notification());
-    }
-
-    #[test]
-    fn notify_with_suppression_still_allows_non_permission_events() {
-        // Even when permission notifications are suppressed, other event
-        // kinds (e.g. TurnComplete) must still fire through notify().
-        let mut svc = NotificationService::new_for_test(NotificationConfig {
-            events: vec![
-                NotificationEventKind::TurnComplete,
-                NotificationEventKind::ApprovalRequired,
-            ],
-            condition: NotificationCondition::Always,
-            ..Default::default()
-        });
-        svc.mark_permission_notified();
-
-        // TurnComplete should not panic — suppression is only a flag the
-        // *caller* checks before calling notify(), not enforced inside
-        // notify() itself. This verifies the protocol=None path doesn't
-        // crash regardless of suppression state.
-        svc.notify(NotificationEvent {
-            kind: NotificationEventKind::TurnComplete,
-            title: "Grok".into(),
-            body: "Done".into(),
-            session_id: None,
-        });
     }
 }

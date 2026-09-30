@@ -29,7 +29,7 @@ pub(crate) struct LocationParts {
     /// The checked-out branch, `detached` for a detached HEAD, `None` outside a git repo.
     pub branch: Option<String>,
     pub is_worktree: bool,
-    /// The abbreviated, middle-shortened cwd. Linked worktrees use [`worktree_badge`], not a path suffix.
+    /// The abbreviated, middle-shortened cwd.
     pub cwd_display: String,
 }
 
@@ -118,6 +118,7 @@ mod tests {
         let detached = location_parts_from(cwd, Some(probe(Some(""), true)));
         assert_eq!(detached.branch.as_deref(), Some("detached"));
         assert!(detached.is_worktree);
+        assert_eq!(detached.cwd_display, "/w/wt/feature");
 
         let no_head = location_parts_from(cwd, Some(probe(None, false)));
         assert_eq!(no_head.branch, None);

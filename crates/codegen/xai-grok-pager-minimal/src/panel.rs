@@ -568,6 +568,7 @@ mod tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".to_string(),
             wire_source: McpWireSource::Local,
             plugin_name: None,
@@ -590,6 +591,8 @@ mod tests {
 
     fn session_entry(id: &str) -> xai_grok_pager::app::app_view::SessionPickerEntry {
         xai_grok_pager::app::app_view::SessionPickerEntry {
+            session_kind: None,
+            last_recap: None,
             id: id.into(),
             summary: id.into(),
             updated_at: chrono::Utc::now(),
@@ -616,6 +619,8 @@ mod tests {
             loading: false,
             lanes: Default::default(),
             previous_palette: None,
+            detail_seq: 0,
+            generation: 0,
             window: xai_grok_pager::views::modal_window::ModalWindowState::new(),
             content_results: None,
             content_loading: false,

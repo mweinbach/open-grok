@@ -34,6 +34,7 @@ pub use crate::inference_override::{
 use crate::scripted::TerminalWait;
 pub use crate::scripted::{ScriptedBody, ScriptedResponse, SseEvent};
 use crate::sse;
+use crate::telemetry_events::TelemetryEventsState;
 
 #[derive(Debug, Clone)]
 pub struct LogEntry {
@@ -268,6 +269,35 @@ struct StorageState {
     uploads: std::sync::Mutex<Vec<StorageUpload>>,
 }
 
+/// `teamId`, `teamName`, and `teamRole` on `GET /v1/user`.
+#[derive(Debug, Clone)]
+pub struct MockUserTeam {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+}
+
+/// `canAdministerTeam` on `GET /v1/user`. `Omitted` leaves the key out; `Unresolved` is `null`,
+/// the proxy's answer when it could not resolve the caller's team-administration capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MockCanAdministerTeam {
+    Omitted,
+    Unresolved,
+    Allowed,
+    Denied,
+}
+
+impl MockCanAdministerTeam {
+    pub fn wire_value(self) -> Option<Value> {
+        match self {
+            Self::Omitted => None,
+            Self::Unresolved => Some(Value::Null),
+            Self::Allowed => Some(Value::Bool(true)),
+            Self::Denied => Some(Value::Bool(false)),
+        }
+    }
+}
+
 /// Mock `/v1/chat/completions` + `/v1/responses` + `/v1/messages` +
 /// `/v1/models` + `/v1/settings` + `/v1/storage` +
 /// `/v1/privacy/coding-data-retention` server.
@@ -300,6 +330,12 @@ pub struct MockInferenceServer {
     hang: Arc<std::sync::atomic::AtomicBool>,
     /// See [`Self::set_user_subscription_tier`].
     user_tier: Arc<std::sync::RwLock<Option<String>>>,
+    /// See [`Self::set_user_team`].
+    user_team: Arc<std::sync::RwLock<Option<MockUserTeam>>>,
+    /// See [`Self::set_user_can_administer_team`].
+    user_can_administer_team: Arc<std::sync::RwLock<MockCanAdministerTeam>>,
+    /// Product-telemetry batches posted to `/v1/events`, flattened in arrival order.
+    telemetry: Arc<TelemetryEventsState>,
 }
 
 impl MockInferenceServer {
@@ -341,6 +377,10 @@ impl MockInferenceServer {
         let storage = Arc::new(StorageState::default());
         let hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let user_tier = Arc::new(std::sync::RwLock::new(None::<String>));
+        let user_team = Arc::new(std::sync::RwLock::new(None::<MockUserTeam>));
+        let user_can_administer_team =
+            Arc::new(std::sync::RwLock::new(MockCanAdministerTeam::Omitted));
+        let telemetry = Arc::new(TelemetryEventsState::default());
         let app = Self::build_router(
             log.clone(),
             shared_models.clone(),
@@ -354,6 +394,9 @@ impl MockInferenceServer {
             storage.clone(),
             hang.clone(),
             user_tier.clone(),
+            user_team.clone(),
+            user_can_administer_team.clone(),
+            telemetry.clone(),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -395,6 +438,9 @@ impl MockInferenceServer {
             storage,
             hang,
             user_tier,
+            user_team,
+            user_can_administer_team,
+            telemetry,
         })
     }
 
@@ -494,6 +540,17 @@ impl MockInferenceServer {
         *self.user_tier.write().unwrap() = tier.map(str::to_owned);
     }
 
+    /// Set the `teamId`/`teamName`/`teamRole` served by `GET /v1/user`.
+    pub fn set_user_team(&self, team: MockUserTeam) {
+        *self.user_team.write().unwrap() = Some(team);
+    }
+
+    /// Set the `canAdministerTeam` served by `GET /v1/user`
+    /// (default [`MockCanAdministerTeam::Omitted`]).
+    pub fn set_user_can_administer_team(&self, can_administer: MockCanAdministerTeam) {
+        *self.user_can_administer_team.write().unwrap() = can_administer;
+    }
+
     /// Set the `stop_reason` emitted by the `/v1/messages` terminal
     /// `message_delta` (default `"end_turn"`).
     pub fn set_messages_stop_reason(&self, stop_reason: impl Into<String>) {
@@ -545,6 +602,11 @@ impl MockInferenceServer {
 
     pub fn requests(&self) -> Vec<LogEntry> {
         self.log.entries.lock().unwrap().clone()
+    }
+
+    /// Every product-telemetry event posted to `/v1/events` so far, flattened out of its batch, in arrival order.
+    pub fn telemetry_events(&self) -> Vec<Value> {
+        self.telemetry.events()
     }
 
     pub fn received_requests(&self) -> Vec<LogEntry> {
@@ -759,6 +821,9 @@ impl MockInferenceServer {
         storage: Arc<StorageState>,
         hang: Arc<std::sync::atomic::AtomicBool>,
         user_tier: Arc<std::sync::RwLock<Option<String>>>,
+        user_team: Arc<std::sync::RwLock<Option<MockUserTeam>>>,
+        user_can_administer_team: Arc<std::sync::RwLock<MockCanAdministerTeam>>,
+        telemetry: Arc<TelemetryEventsState>,
     ) -> Router {
         let hang_models = hang.clone();
         let hang_settings = hang;
@@ -776,6 +841,7 @@ impl MockInferenceServer {
         let overrides_rs = overrides.clone();
         let overrides_settings = overrides.clone();
         let overrides_msg = overrides;
+        let overrides_privacy = overrides_msg.clone();
         let scripted_agent_turns_cc = scripted_agent_turns.clone();
         let scripted_agent_turns_rs = scripted_agent_turns.clone();
         let scripted_agent_turns_msg = scripted_agent_turns;
@@ -1100,22 +1166,28 @@ impl MockInferenceServer {
                     let log = log.clone();
                     move |headers: HeaderMap, Json(body): Json<Value>| {
                         let log = log.clone();
+                        let overrides = overrides_privacy.clone();
                         async move {
                             let auth = Self::extract_auth(&headers);
+                            let path = "/v1/privacy/coding-data-retention";
                             log.record(
                                 "PUT",
-                                "/v1/privacy/coding-data-retention",
+                                path,
                                 Some(&body),
                                 auth.as_deref(),
                                 Self::headers_vec(&headers),
                             );
+                            // Lets a test refuse the write
+                            if let Some(s) = overrides.pop_scripted(path) {
+                                return s.into_response_paced(None, None).await;
+                            }
                             // Echo the received flag back like the real
                             // cli-chat-proxy does on success.
                             let opt_out = body
                                 .get("codingDataRetentionOptOut")
                                 .cloned()
                                 .unwrap_or(Value::Bool(false));
-                            Json(json!({ "codingDataRetentionOptOut": opt_out }))
+                            Json(json!({ "codingDataRetentionOptOut": opt_out })).into_response()
                         }
                     }
                 }),
@@ -1126,6 +1198,8 @@ impl MockInferenceServer {
                     move |axum::extract::RawQuery(query): axum::extract::RawQuery| {
                         let log = log.clone();
                         let user_tier = user_tier.clone();
+                        let user_team = user_team.clone();
+                        let user_can_administer_team = user_can_administer_team.clone();
                         async move {
                             // Keep the query string in the log so tests can
                             // count `?include=subscription` checks separately
@@ -1136,12 +1210,25 @@ impl MockInferenceServer {
                             };
                             log.record("GET", &path, None, None, Vec::new());
                             let tier = user_tier.read().unwrap().clone();
+                            let team = user_team.read().unwrap().clone();
+                            let can_administer =
+                                user_can_administer_team.read().unwrap().wire_value();
                             let mut body = json!({
                                 "userId": "mock-user",
                                 "email": "mock-user@test.invalid",
                             });
-                            if let Some(t) = tier {
-                                body["subscriptionTier"] = json!(t);
+                            if let Some(obj) = body.as_object_mut() {
+                                if let Some(t) = tier {
+                                    obj.insert("subscriptionTier".into(), json!(t));
+                                }
+                                if let Some(team) = team {
+                                    obj.insert("teamId".into(), json!(team.id));
+                                    obj.insert("teamName".into(), json!(team.name));
+                                    obj.insert("teamRole".into(), json!(team.role));
+                                }
+                                if let Some(can_administer) = can_administer {
+                                    obj.insert("canAdministerTeam".into(), can_administer);
+                                }
                             }
                             Json(body).into_response()
                         }
@@ -1213,6 +1300,17 @@ impl MockInferenceServer {
                 }),
             )
             // The shell probes these before/alongside per-file uploads. Answer
+            // Product telemetry POSTs `GROK_TELEMETRY_EVENTS_URL` verbatim; tests point it at `{url()}/events`
+            .route(
+                "/v1/events",
+                post({
+                    let telemetry = telemetry.clone();
+                    move |body: axum::body::Bytes| {
+                        let telemetry = telemetry.clone();
+                        async move { telemetry.handle(&body) }
+                    }
+                }),
+            )
             // 404 ("old proxy") so it falls back to plain `POST /v1/storage`,
             // which is the path the park-on-401 e2e exercises.
             .route(
@@ -1939,6 +2037,116 @@ mod tests {
             puts[1].body,
             Some(json!({ "codingDataRetentionOptOut": true }))
         );
+    }
+
+    type UserRouteStep = (&'static str, fn(&MockInferenceServer), Value);
+
+    /// Whole bodies, so an absent key cannot pass as `null`; one server, so each state is reversible.
+    #[tokio::test]
+    async fn user_route_serves_exactly_the_fields_set() {
+        use MockCanAdministerTeam::{Allowed, Denied, Omitted, Unresolved};
+        let server = MockInferenceServer::start().await.unwrap();
+        let url = format!("{}/user", server.url());
+
+        let default = json!({ "userId": "mock-user", "email": "mock-user@test.invalid" });
+        let with_tier = json!({
+            "userId": "mock-user",
+            "email": "mock-user@test.invalid",
+            "subscriptionTier": "grok_pro",
+        });
+        let with_team = json!({
+            "userId": "mock-user",
+            "email": "mock-user@test.invalid",
+            "teamId": "team-1",
+            "teamName": "Mock Team",
+            "teamRole": "MEMBER",
+        });
+        let capability = |value: Value| {
+            let mut body = with_team.clone();
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("canAdministerTeam".into(), value);
+            }
+            body
+        };
+
+        let steps: [UserRouteStep; 7] = [
+            ("default", |_| {}, default),
+            (
+                "tier",
+                |s| s.set_user_subscription_tier(Some("grok_pro")),
+                with_tier,
+            ),
+            (
+                "team",
+                |s| {
+                    s.set_user_subscription_tier(None);
+                    s.set_user_team(MockUserTeam {
+                        id: "team-1".into(),
+                        name: "Mock Team".into(),
+                        role: "MEMBER".into(),
+                    });
+                },
+                with_team.clone(),
+            ),
+            (
+                "unresolved",
+                |s| s.set_user_can_administer_team(Unresolved),
+                capability(Value::Null),
+            ),
+            (
+                "allowed",
+                |s| s.set_user_can_administer_team(Allowed),
+                capability(json!(true)),
+            ),
+            (
+                "denied",
+                |s| s.set_user_can_administer_team(Denied),
+                capability(json!(false)),
+            ),
+            (
+                "omitted again",
+                |s| s.set_user_can_administer_team(Omitted),
+                with_team.clone(),
+            ),
+        ];
+        for (label, apply, expected) in steps {
+            apply(&server);
+            let body: Value = reqwest::get(&url).await.unwrap().json().await.unwrap();
+            assert_eq!(expected, body, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn privacy_coding_data_retention_serves_scripted_denial_then_echoes() {
+        let server = MockInferenceServer::start().await.unwrap();
+        let url = format!("{}/privacy/coding-data-retention", server.url());
+        server.enqueue_response(
+            "/v1/privacy/coding-data-retention",
+            ScriptedResponse::json(403, json!({ "error": "team policy" })),
+        );
+        let put = || {
+            reqwest::Client::new()
+                .put(&url)
+                .json(&json!({ "codingDataRetentionOptOut": true }))
+                .send()
+        };
+
+        let resp = put().await.unwrap();
+        assert_eq!(403, resp.status());
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(json!({ "error": "team policy" }), body);
+
+        let resp = put().await.unwrap();
+        assert_eq!(200, resp.status(), "an empty queue falls back to the echo");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(json!({ "codingDataRetentionOptOut": true }), body);
+
+        let puts: Vec<_> = server
+            .requests()
+            .into_iter()
+            .filter(|e| e.method == "PUT" && e.path == "/v1/privacy/coding-data-retention")
+            .collect();
+        assert_eq!(2, puts.len(), "the refused write is logged too");
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 static STDERR_OUTPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -20,7 +21,20 @@ pub fn stderr_lock() -> MutexGuard<'static, ()> {
 /// `/dev/null` redirect on fd 2). Otherwise falls back to normal stderr.
 pub fn with_locked_stderr<T>(f: impl FnOnce(&mut std::fs::File) -> T) -> T {
     let _guard = stderr_lock();
-    let mut file = xai_tty_utils::dup_tui_stderr().unwrap_or_else(|_| {
+    f(&mut tui_stderr_file())
+}
+
+/// [`with_locked_stderr`] that gives up after `timeout` (a holder may be wedged in a tty write); `None` means `f` never ran.
+pub fn try_with_locked_stderr_for<T>(
+    timeout: Duration,
+    f: impl FnOnce(&mut std::fs::File) -> T,
+) -> Option<T> {
+    let _guard = stderr_output_lock().try_lock_for(timeout)?;
+    Some(f(&mut tui_stderr_file()))
+}
+
+fn tui_stderr_file() -> std::fs::File {
+    xai_tty_utils::dup_tui_stderr().unwrap_or_else(|_| {
         // Fallback: try_clone stderr to get an independently-owned
         // File. This path is hit if redirect_native_stderr was never
         // called or fd dup fails.
@@ -45,6 +59,9 @@ pub fn with_locked_stderr<T>(f: impl FnOnce(&mut std::fs::File) -> T) -> T {
             std::mem::forget(temp);
         }
         stderr_file
-    });
-    f(&mut file)
+    })
 }
+
+#[cfg(test)]
+#[path = "stderr_tests.rs"]
+mod tests;

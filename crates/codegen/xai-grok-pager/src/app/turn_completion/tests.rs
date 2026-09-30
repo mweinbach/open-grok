@@ -901,15 +901,15 @@ fn unknown_card_index_never_discards() {
 fn cancelled_turn_event_picks_marker_by_category() {
     let d = std::time::Duration::from_millis(700);
     assert!(matches!(
-        cancelled_turn_event(None, Some(HOOK_DENIED_CATEGORY), d),
+        cancelled_turn_event(None, Some(HOOK_DENIED_CATEGORY), Some(d)),
         SessionEvent::TurnBlockedByHook { .. }
     ));
     assert!(matches!(
-        cancelled_turn_event(None, None, d),
+        cancelled_turn_event(None, None, Some(d)),
         SessionEvent::TurnCancelled { .. }
     ));
     assert_eq!(
-        cancelled_turn_event(None, Some(HOOK_DENIED_CATEGORY), d).message(),
+        cancelled_turn_event(None, Some(HOOK_DENIED_CATEGORY), Some(d)).message(),
         "Turn blocked by a hook in 0.7s."
     );
 }
@@ -918,7 +918,7 @@ fn cancelled_turn_event_picks_marker_by_category() {
 fn cancelled_turn_event_names_passive_causes() {
     let d = std::time::Duration::from_secs(10);
     let banner = |trigger: Option<&str>, category: Option<&str>| {
-        cancelled_turn_event(trigger, category, d).message()
+        cancelled_turn_event(trigger, category, Some(d)).message()
     };
     assert_eq!(
         banner(Some("ctrl_c"), None),
@@ -1536,6 +1536,10 @@ fn turn_stop_reason_parses_exact_tokens() {
         TurnStopReason::from("max_turn_requests"),
         TurnStopReason::MaxTurnRequests
     );
+    assert_eq!(
+        TurnStopReason::from("interrupted"),
+        TurnStopReason::Interrupted
+    );
     assert_eq!(TurnStopReason::from("nope"), TurnStopReason::Unknown);
 }
 
@@ -1616,14 +1620,15 @@ fn classifier_cancelled_uses_cancel_trigger() {
 }
 
 #[test]
-fn classifier_cancelled_missing_elapsed_is_zero() {
+fn classifier_cancelled_missing_elapsed_is_unset() {
     let mut input = base_input(TurnStopReason::Cancelled);
     input.elapsed_ms = None;
     match terminal_marker(input) {
-        Some(SessionEvent::TurnCancelled { elapsed, .. }) => {
-            assert_eq!(elapsed, std::time::Duration::ZERO);
+        Some(ev @ SessionEvent::TurnCancelled { elapsed: None, .. }) => {
+            assert_eq!(ev.message(), "Turn cancelled.");
+            assert!(!ev.message().contains("0.0s"));
         }
-        other => panic!("expected cancelled, got {other:?}"),
+        other => panic!("expected cancelled without a fake duration, got {other:?}"),
     }
 }
 

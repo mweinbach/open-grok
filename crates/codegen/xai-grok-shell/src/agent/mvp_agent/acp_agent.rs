@@ -1408,6 +1408,7 @@ impl acp::Agent for MvpAgent {
             });
         let model = model_rx
             .await
+            .map(|current| current.id)
             .unwrap_or_else(|_| self.sampling_config.borrow().model.clone());
         let mut parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>> = None;
         let verbatim = arguments
@@ -3107,7 +3108,12 @@ impl acp::Agent for MvpAgent {
             }
             "x.ai/session/usage" => crate::extensions::usage::handle(self, &args).await,
             "x.ai/session/cache" => crate::extensions::cache::handle(self, &args).await,
-            "x.ai/memory/flush" | "x.ai/memory/rewrite" => {
+            crate::extensions::memory::MEMORY_FLUSH_METHOD
+            | crate::extensions::memory::MEMORY_DREAM_METHOD
+            | crate::extensions::memory::MEMORY_REWRITE_METHOD
+            | crate::extensions::memory::MEMORY_LIST_METHOD
+            | crate::extensions::memory::MEMORY_TOGGLE_METHOD
+            | crate::extensions::memory::MEMORY_FORGET_METHOD => {
                 crate::extensions::memory::handle(self, &args).await
             }
             "x.ai/skills/refresh-baseline" => {

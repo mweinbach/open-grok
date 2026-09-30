@@ -4,6 +4,7 @@ use agent_client_protocol as acp;
 use xai_acp_lib::AcpAgentGatewaySender as GatewaySender;
 
 use crate::agent::mvp_agent::MvpAgent;
+use crate::extensions::worktree_seed;
 use crate::session::ExtMethodResult;
 use crate::session::persistence::LocalSessionResolutionKind;
 use crate::session::worktree::{
@@ -16,7 +17,7 @@ use crate::session::worktree::{
 
 type ExtResult = Result<acp::ExtResponse, acp::Error>;
 
-const WORKTREE_EXT_LOG: &str = "xai_worktree";
+pub(super) const WORKTREE_EXT_LOG: &str = "xai_worktree";
 
 /// Wrapper to send worktree progress notifications via gateway.
 #[derive(Clone)]
@@ -47,10 +48,15 @@ fn to_response<T: serde::Serialize>(result: anyhow::Result<T>) -> ExtResult {
         .map_err(|e| acp::Error::internal_error().data(e.to_string()))
 }
 
-/// Extract the worktree path from a `Creating` response for pinning.
-fn extract_creating_path(resp: &anyhow::Result<CreateWorktreeResponse>) -> Option<String> {
-    if let Ok(CreateWorktreeResponse::Creating { worktree_path, .. }) = resp {
-        Some(worktree_path.clone())
+/// `resolved_source_git_root` is `serde(skip)`; copy it in-process from Creating.
+fn extract_creating(resp: &CreateWorktreeResponse) -> Option<(String, Option<String>)> {
+    if let CreateWorktreeResponse::Creating {
+        worktree_path,
+        source_git_root,
+        ..
+    } = resp
+    {
+        Some((worktree_path.clone(), source_git_root.clone()))
     } else {
         None
     }
@@ -91,6 +97,16 @@ pub(crate) struct GcWorktreeRequest {
 #[serde(rename_all = "camelCase")]
 pub struct WorktreeDbPathResponse {
     pub path: String,
+}
+
+/// `create_from_worktree_sync` response plus the optional branch step.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SeededForkResponse {
+    #[serde(flatten)]
+    pub created: xai_grok_workspace::worktree::CreateWorktreeFromWorktreeResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<worktree_seed::BranchOutcome>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -175,9 +191,10 @@ pub async fn handle(
                 .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
             // Post-dispatch: spawn async task for Creating variant.
             if let Ok(resp) = serde_json::from_value::<CreateWorktreeResponse>(result.clone())
-                && matches!(&resp, CreateWorktreeResponse::Creating { .. })
+                && let Some((path, source_git_root)) = extract_creating(&resp)
             {
-                req.worktree_path = extract_creating_path(&Ok(resp));
+                req.worktree_path = Some(path);
+                req.resolved_source_git_root = source_git_root;
                 let notifier = GatewayWorktreeNotifier {
                     gateway: agent.gateway.clone(),
                 };
@@ -243,9 +260,10 @@ pub async fn handle(
                 })?;
 
             if result.spawn_task {
-                // Pin the resolved path so the async task reuses it instead of
-                // generating a new UUID via auto_label().
-                req.resolved_dest_path = extract_creating_path(&Ok(response.clone()));
+                if let Some((path, source_git_root)) = extract_creating(&response) {
+                    req.resolved_dest_path = Some(path);
+                    req.resolved_source_git_root = source_git_root;
+                }
                 let notifier = GatewayWorktreeNotifier {
                     gateway: agent.gateway.clone(),
                 };
@@ -260,48 +278,40 @@ pub async fn handle(
         "x.ai/git/worktree/create_from_worktree_sync" => {
             let mut req =
                 serde_json::from_str::<CreateWorktreeFromWorktreeRequest>(args.params.get())?;
-
-            // For jj repos, use jj workspace add instead of git worktree
-            let source_path = std::path::Path::new(&req.source_worktree_path);
-            let resolved_root = ops
-                .dispatch(
-                    &xai_grok_workspace::workspace_ops::GitResolveRootReq {
-                        cwd: source_path.to_path_buf(),
-                    },
-                    None,
-                )
-                .await
-                .ok()
-                .flatten();
-            if let Some(git_root) = resolved_root {
-                let vcs_kind = ops
-                    .dispatch(
-                        &xai_grok_workspace::workspace_ops::DetectVcsKindReq {
-                            path: git_root.clone(),
-                        },
-                        None,
-                    )
-                    .await
-                    .unwrap_or(xai_grok_workspace::session::git::VcsKind::Git);
-                if vcs_kind.is_jj() {
-                    tracing::info!("using jj workspace for subagent isolation");
-                    return to_response(create_jj_workspace(&req).await);
-                }
-            }
+            let seed = serde_json::from_str::<worktree_seed::SeedOptions>(args.params.get())?;
+            seed.validate()
+                .map_err(|e| acp::Error::invalid_params().data(e))?;
 
             let request_worktree_type = req.worktree_type;
-            // Apply default if not explicitly set in request
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            req.grove_gate_source =
+                Some(apply_grove_worktree_flag(agent, &mut req.grove_worktree).into());
+
+            // Nested clones keep libgit2; Grove dest is the fallback on partialclone.
+            let source_path = std::path::Path::new(&req.source_worktree_path);
+            if xai_grok_workspace::worktree::git_or_grove_is_jj_async(
+                source_path,
+                req.grove_worktree == Some(true),
+            )
+            .await
+            {
+                tracing::info!("using jj workspace for subagent isolation");
+                return to_response(create_jj_workspace(&req).await);
+            }
+
             log_effective_worktree_type(
                 "x.ai/git/worktree/create_from_worktree_sync",
                 request_worktree_type,
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
-            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
-            let result = ops
+            // Fetch in the source so linked and standalone copies both see the ref.
+            if let Some(base_ref) = seed.base_ref.as_deref() {
+                worktree_seed::fetch_base_ref(source_path, base_ref).await;
+            }
+            let mut result = ops
                 .dispatch(
                     &xai_grok_workspace::workspace_ops::CreateWorktreeFromWorktreeSyncReq {
                         inner: req.into_wire(),
@@ -310,7 +320,35 @@ pub async fn handle(
                 )
                 .await
                 .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-            to_response(Ok(result))
+            // `checkout -B` on a `status: exists` tree would reset work already there.
+            let branch = match seed.branch.as_deref() {
+                Some(branch) if result.status == "created" => {
+                    worktree_seed::checkout_branch(
+                        std::path::Path::new(&result.worktree_path),
+                        branch,
+                        seed.base_ref.as_deref(),
+                    )
+                    .await
+                }
+                Some(branch) => {
+                    tracing::info!(
+                        target: WORKTREE_EXT_LOG,
+                        branch,
+                        status = %result.status,
+                        worktree = %result.worktree_path,
+                        "worktree seed: branch step skipped, worktree was not created by this call"
+                    );
+                    None
+                }
+                None => None,
+            };
+            if let Some(branch) = &branch {
+                result.commit = Some(branch.commit.clone());
+            }
+            to_response(Ok(SeededForkResponse {
+                created: result,
+                branch,
+            }))
         }
         // Resume a session in a fresh worktree.
         "x.ai/git/worktree/resume_session" => {
@@ -368,8 +406,21 @@ pub async fn handle(
         "x.ai/session/rehydrate" => {
             let req = serde_json::from_str::<RehydrateSessionRequest>(args.params.get())?;
             let registry_client = agent.session_registry_client();
+            let (grove_worktree, grove_gate_source) = {
+                let config = agent.cfg.borrow();
+                crate::util::config::grove_worktree_gate(config.remote_settings.as_ref())
+            };
 
-            to_response(rehydrate_session_in_worktree(&req, ops, registry_client.as_ref()).await)
+            to_response(
+                rehydrate_session_in_worktree(
+                    &req,
+                    ops,
+                    registry_client.as_ref(),
+                    grove_worktree,
+                    grove_gate_source,
+                )
+                .await,
+            )
         }
         // ── Worktree management methods ──────────────────────────────────
         "x.ai/git/worktree/list" => {
@@ -441,18 +492,19 @@ pub async fn handle(
     }
 }
 
-fn apply_grove_worktree_flag(agent: &MvpAgent, slot: &mut Option<bool>) {
+fn apply_grove_worktree_flag(agent: &MvpAgent, slot: &mut Option<bool>) -> &'static str {
     let root = crate::config::load_effective_config()
         .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
     let config = agent.cfg.borrow();
-    apply_grove_worktree_gate(slot, &root, config.remote_settings.as_ref());
+    apply_grove_worktree_gate(slot, &root, config.remote_settings.as_ref())
 }
 
+/// Always run the grove gate, even when `slot` is already `Some`; the kill switch applies last.
 pub(crate) fn apply_grove_worktree_gate(
     slot: &mut Option<bool>,
     root: &toml::Value,
     remote: Option<&crate::util::config::RemoteSettings>,
-) {
+) -> &'static str {
     let (enabled, source) = crate::util::config::gate_grove_worktree(*slot, root, remote);
     tracing::info!(
         target: WORKTREE_EXT_LOG,
@@ -461,11 +513,13 @@ pub(crate) fn apply_grove_worktree_gate(
         "WORKTREE_REQUEST_SHELL: resolved grove materialize strategy"
     );
     *slot = Some(enabled);
+    source
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn apply_grove_worktree_gate_does_not_bypass_remote_kill_or_unavailability() {
@@ -532,6 +586,65 @@ mod tests {
         assert!(req.dry_run);
         assert_eq!(req.max_age.as_deref(), Some("7d"));
         assert!(req.force);
+    }
+
+    fn clear_grove_env() {
+        // SAFETY: callers are `#[serial]`; no concurrent env mutation.
+        // Fork reads grove intent from `OPENGROK_WORKTREE_TYPE` only (no `ENV_GROVE`).
+        unsafe {
+            std::env::remove_var(crate::util::config::ENV_WORKTREE_TYPE);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn inherit_grove_gate_attaches_opts_when_local_toml_is_on() {
+        clear_grove_env();
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings::default();
+        let mut slot = None;
+        // Fork gate is fail-closed on missing remote settings; pass an
+        // explicit default so the local layer is exercised.
+        let src = apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(src, "local");
+        assert_eq!(slot, Some(true));
+        assert!(
+            crate::util::config::grove_worktree_opts_if_enabled(slot.unwrap_or(false))
+                .is_some_and(|opts| opts.enabled)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn inherit_grove_gate_skips_opts_when_default_off() {
+        clear_grove_env();
+        let root = toml::Value::Table(toml::map::Map::new());
+        let remote = crate::util::config::RemoteSettings::default();
+        let mut slot = None;
+        let src = apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(src, "default");
+        assert_eq!(slot, Some(false));
+        assert!(
+            crate::util::config::grove_worktree_opts_if_enabled(slot.unwrap_or(false)).is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn inherit_grove_gate_skips_opts_on_remote_kill() {
+        clear_grove_env();
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            grove_worktree: Some(false),
+            ..crate::util::config::RemoteSettings::default()
+        };
+        let mut slot = None;
+        let src = apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(src, "remote_kill");
+        assert_eq!(slot, Some(false));
+        assert!(
+            crate::util::config::grove_worktree_opts_if_enabled(slot.unwrap_or(false)).is_none()
+        );
     }
 
     #[test]

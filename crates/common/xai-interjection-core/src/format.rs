@@ -4,9 +4,9 @@ pub const LARGE_PROMPT_THRESHOLD: usize = 25_000;
 pub const INTERJECTION_NOTE: &str = "The user sent a message while you were working:";
 pub const INTERRUPT_NOTE: &str = "The user interrupted the previous turn:";
 
-/// Trailing reminder so a mid-turn steer or post-cancel follow-up does not drop in-flight work.
-const UNFINISHED_TASKS_REMINDER: &str =
-    "Make sure to complete any unfinished tasks from previous turns.";
+/// Trailing reminder so a mid-turn steer or post-cancel follow-up answers the user before
+/// resuming in-flight work.
+pub const UNFINISHED_TASKS_REMINDER: &str = "If the user is asking for a response, address the user first. After replying, complete any unfinished tasks from previous turns.";
 
 /// Wrap a user message in the canonical `<user_query>` envelope.
 pub fn user_query(user_message: &str) -> String {
@@ -81,7 +81,8 @@ mod tests {
         let s = "é".repeat(LARGE_PROMPT_THRESHOLD);
         let out = format_interjection(s);
         assert!(out.contains("... [truncated]"));
-        assert!(out.len() < LARGE_PROMPT_THRESHOLD + 200);
+        let envelope = format_interjection(String::new()).len();
+        assert!(out.len() <= LARGE_PROMPT_THRESHOLD + envelope + "... [truncated]".len());
     }
 
     #[test]

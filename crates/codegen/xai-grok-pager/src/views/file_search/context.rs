@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(ctx.path_range(), 7..10);
     }
 
-    // ── Drill-aware detection (whitespace inside a drilled dir name) ─────
+    // Drill-aware: whitespace inside a drilled dir name.
 
     #[test]
     fn drill_prefix_allows_internal_space() {

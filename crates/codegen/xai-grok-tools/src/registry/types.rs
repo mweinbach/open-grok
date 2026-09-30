@@ -355,6 +355,22 @@ fn stream_no_terminal_error() -> xai_tool_runtime::ToolError {
         "dispatch stream ended without a terminal item",
     )
 }
+fn context_for_call(
+    tool_call_id: &str,
+    cwd_override: Option<std::path::PathBuf>,
+    cancellation: Option<tokio_util::sync::CancellationToken>,
+) -> xai_tool_runtime::ToolCallContext {
+    let call_id = xai_tool_protocol::ToolCallId::new(tool_call_id)
+        .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7());
+    let mut ctx = xai_tool_runtime::ToolCallContext::new(call_id);
+    if let Some(cwd) = cwd_override {
+        ctx.insert(xai_tool_runtime::Cwd(cwd));
+    }
+    if let Some(cancellation) = cancellation {
+        ctx.insert(xai_tool_runtime::Cancellation(cancellation));
+    }
+    ctx
+}
 /// Converts a dispatch's `serde_json::Value` back into a `ToolOutput`.
 type OutputConverter =
     Arc<dyn Fn(serde_json::Value) -> Result<ToolOutput, serde_json::Error> + Send + Sync>;
@@ -430,6 +446,8 @@ struct FinalizedTool {
     output_converter:
         Arc<dyn Fn(serde_json::Value) -> Result<ToolOutput, serde_json::Error> + Send + Sync>,
     definition: ToolDefinition,
+    /// `use_tool` re-exported without the MCP file forms, for sampling backends that must not see them. `None` elsewhere.
+    inline_mcp_definition: Option<ToolDefinition>,
     /// Effective params (defaults merged with client overrides).
     /// Kept for building `ProposedTool` during reminder evaluation and for
     /// params-aware finalized definition construction.
@@ -449,6 +467,11 @@ struct FinalizedTool {
     /// `"legacy-0.4.10"`). `None` for unmanaged tools and dynamically
     /// registered (MCP) tools.
     contract_version: Option<String>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredToolIdentity {
+    pub tool_id: String,
+    pub version: Option<String>,
 }
 /// Toolset produced by `ToolRegistryBuilder::finalize()`.
 ///
@@ -541,6 +564,7 @@ pub struct ToolRegistryBuilder {
     /// behavior); the tools server sets it from
     /// `FinalizeToolServerConfigRequest.system_reminders_enabled`.
     system_reminders_enabled: bool,
+    mcp_file_input_preparation: bool,
 }
 impl Default for ToolRegistryBuilder {
     fn default() -> Self {
@@ -613,7 +637,13 @@ impl ToolRegistryBuilder {
                 kind,
                 requires,
                 default_params: serde_json::to_value(P::default()).unwrap_or_default(),
-                input_schema: generate_schema_cached::<T::Args>(),
+                input_schema: if kind == ToolKind::UseTool {
+                    serde_json::json!(
+                        crate::implementations::use_tool::UseToolInput::input_schema(true)
+                    )
+                } else {
+                    generate_schema_cached::<T::Args>()
+                },
                 metadata: Box::new(tool),
                 output_converter: Box::new(|value| {
                     let typed: T::Output = serde_json::from_value(value)?;
@@ -681,6 +711,7 @@ impl ToolRegistryBuilder {
             reminders: Vec::new(),
             shared_local_registry: None,
             system_reminders_enabled: true,
+            mcp_file_input_preparation: false,
         };
         b.register_with_params::<grok_build::BashTool, grok_build::bash::BashParams>();
         b.register_with_params::<grok_build::ReadFileTool, grok_build::read_file::ReadFileParams>();
@@ -704,7 +735,7 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::TaskOutputTool>();
         b.register::<grok_build::GetTerminalCommandOutputTool>();
         b.register::<grok_build::WaitTasksTool>();
-        b.register::<grok_build::TaskTool>();
+        b.register_with_params::<grok_build::TaskTool, grok_build::task::TaskParams>();
         b.register::<grok_build::SendSubagentMessageTool>();
         b.register::<grok_build::AgentSwarmTool>();
         b.register::<grok_build::SwarmWaitTool>();
@@ -815,19 +846,21 @@ impl ToolRegistryBuilder {
         let out: HashMap<&str, serde_json::Value> = self
             .tools
             .iter()
-            .map(|(name, e)| {
-                (
-                    name.as_str(),
-                    serde_json::json!({
+            .map(|(name, e)| (
+                name.as_str(),
+                serde_json::json!({
                         "namespace": e.namespace,
                         "id": e.id,
                         "kind": e.kind,
                         "default_params": e.default_params,
-                        "input_schema": e.input_schema,
+                        "input_schema": if e.kind == ToolKind::UseTool {
+                            serde_json::json!(crate::implementations::use_tool::UseToolInput::input_schema(false))
+                        } else {
+                            e.input_schema.clone()
+                        },
                         "requires": e.requires,
                     }),
-                )
-            })
+            ))
             .collect();
         serde_json::to_value(&out).expect("tool_config_raw_to_not_fail")
     }
@@ -878,6 +911,30 @@ impl ToolRegistryBuilder {
                         .with_category("behavior_version"),
                 );
                 continue;
+            }
+            if entry.metadata.kind() == ToolKind::UseTool
+                && let Some(mapping) = &tool_config.params_name_overrides
+            {
+                let fields = ["tool_name", "tool_input", "tool_input_file", "file"];
+                let mut destinations = std::collections::HashSet::new();
+                let has_collision = mapping.iter().any(|(canonical, client)| {
+                    !destinations.insert(client.as_str())
+                        || (canonical != client && fields.contains(&client.as_str()))
+                }) || fields
+                    .iter()
+                    .filter(|field| !mapping.contains_key(**field))
+                    .any(|field| !destinations.insert(*field));
+                if has_collision {
+                    errors.push(
+                        RequirementError::new(
+                            tool_config.id.clone(),
+                            "ambiguous MCP wrapper parameter mapping",
+                        )
+                        .with_field_path("params_name_overrides")
+                        .with_category("parameter_mapping"),
+                    );
+                    continue;
+                }
             }
             let effective = match compute_effective_params(entry, tool_config) {
                 Ok(effective) => effective,
@@ -984,6 +1041,11 @@ impl ToolRegistryBuilder {
     pub fn set_system_reminders_enabled(&mut self, enabled: bool) {
         self.system_reminders_enabled = enabled;
     }
+    /// Opt in only when the host prepares file-backed MCP calls before tool dispatch.
+    pub fn with_mcp_file_input_preparation(mut self) -> Self {
+        self.mcp_file_input_preparation = true;
+        self
+    }
     pub fn finalize(
         self,
         config: ToolServerConfig,
@@ -1010,6 +1072,8 @@ impl ToolRegistryBuilder {
         if !errors.is_empty() {
             return Err(errors);
         }
+        let mcp_file_input_supported =
+            self.mcp_file_input_preparation && ctx.fs.supports_bounded_read();
         let mut kind_to_name: HashMap<ToolKind, String> = HashMap::new();
         for tool_config in &config.tools {
             let entry = &self.tools[&tool_config.id];
@@ -1038,7 +1102,8 @@ impl ToolRegistryBuilder {
             crate::implementations::grok_build::send_feedback::drafts_file_path(&session_folder.0);
         let renderer = TemplateRenderer::new(kind_to_name.clone(), kind_params.clone())
             .with_system_reminders_enabled(self.system_reminders_enabled)
-            .with_feedback_drafts_path(feedback_drafts_path);
+            .with_feedback_drafts_path(feedback_drafts_path)
+            .with_whole_read(truncation_config.whole_read);
         let mut tools = Vec::new();
         let mut resources = Resources::new();
         resources.insert(crate::types::resources::Terminal(ctx.backend));
@@ -1206,32 +1271,51 @@ impl ToolRegistryBuilder {
                 .iter()
                 .map(|(canonical, client)| (client.clone(), canonical.clone()))
                 .collect();
-            let effective_params = compute_effective_params(&entry, tool_config)
+            let mut effective_params = compute_effective_params(&entry, tool_config)
                 .map_err(|e| vec![requirement_error_from_param_error(&tool_config.id, e)])?;
-            let mut definition = entry.metadata.versioned_definition(
-                contract_version.as_deref(),
-                &client_name,
-                tool_config.description_override.as_deref(),
-                &renderer,
-                &param_map,
-                &entry.input_schema,
-                &effective_params,
-            );
-            if let Some(desc) = &definition.function.description {
-                definition.function.description = Some(truncation_config.interpolate_description(
-                    desc,
+            if entry.kind == ToolKind::UseTool {
+                effective_params = merge_json(
+                    &effective_params,
+                    &serde_json::json!({crate::implementations::use_tool::FILE_INPUT_SUPPORTED: mcp_file_input_supported}),
+                );
+            }
+            let build_definition = |effective_params: &serde_json::Value| {
+                let mut definition = entry.metadata.versioned_definition(
+                    contract_version.as_deref(),
+                    &client_name,
+                    tool_config.description_override.as_deref(),
+                    &renderer,
+                    &param_map,
+                    &entry.input_schema,
+                    effective_params,
+                );
+                if let Some(desc) = &definition.function.description {
+                    definition.function.description =
+                        Some(truncation_config.interpolate_description(
+                            desc,
+                            &client_name,
+                            crate::DEFAULT_TOOL_OUTPUT_BYTES,
+                            xai_tool_types::max_wait_block_ms(),
+                        ));
+                }
+                renderer.render_schema_descriptions(&mut definition.function.parameters);
+                truncation_config.apply_to_schema(
+                    &mut definition.function.parameters,
                     &client_name,
                     crate::DEFAULT_TOOL_OUTPUT_BYTES,
                     xai_tool_types::max_wait_block_ms(),
+                );
+                definition
+            };
+            let definition = build_definition(&effective_params);
+            let inline_mcp_definition = (entry.kind == ToolKind::UseTool
+                && mcp_file_input_supported)
+                .then(|| build_definition(
+                    &merge_json(
+                        &effective_params,
+                        &serde_json::json!({crate::implementations::use_tool::FILE_INPUT_SUPPORTED: false}),
+                    ),
                 ));
-            }
-            renderer.render_schema_descriptions(&mut definition.function.parameters);
-            truncation_config.apply_to_schema(
-                &mut definition.function.parameters,
-                &client_name,
-                crate::DEFAULT_TOOL_OUTPUT_BYTES,
-                xai_tool_types::max_wait_block_ms(),
-            );
             (entry.apply_params)(&effective_params, &mut resources);
             tools.push(FinalizedTool {
                 namespace: entry.namespace,
@@ -1241,6 +1325,7 @@ impl ToolRegistryBuilder {
                 metadata: Arc::from(entry.metadata),
                 output_converter: Arc::from(entry.output_converter),
                 definition,
+                inline_mcp_definition,
                 effective_params,
                 input_schema: entry.input_schema,
                 reverse_params,
@@ -1416,6 +1501,20 @@ impl FinalizedToolset {
     pub fn tool_name_for_kind(&self, kind: ToolKind) -> Option<String> {
         self.renderer.tool_for_kind(kind).map(str::to_owned)
     }
+    /// Qualified registration id (`GrokBuild:read_file`) and managed behavior version.
+    /// Lookup is by the finalized client-facing name. Unknown, custom, and dynamic
+    /// registrations return `None`; callers use one opaque class instead of the alias.
+    pub fn registered_identity(&self, client_name: &str) -> Option<RegisteredToolIdentity> {
+        let tools = self.tools.read();
+        let tool = tools.iter().find(|tool| tool.client_name == client_name)?;
+        if tool.namespace == ToolNamespace::MCP.to_string() {
+            return None;
+        }
+        Some(RegisteredToolIdentity {
+            tool_id: format!("{}:{}", tool.namespace, tool.id),
+            version: tool.contract_version.clone(),
+        })
+    }
     pub fn tool_name_for_registry_id(&self, registry_id: &str) -> Option<String> {
         self.tools
             .read()
@@ -1473,6 +1572,20 @@ impl FinalizedToolset {
             .map(|t| t.definition.clone())
             .collect()
     }
+    /// Built-in definitions with `use_tool` advertised inline-only. The Anthropic Messages API rejects the file-form
+    /// schema's root-level union, and Messages-backed models must not see the file forms at all.
+    pub fn tool_definitions_builtins_only_inline_mcp(&self) -> Vec<ToolDefinition> {
+        self.tools
+            .read()
+            .iter()
+            .filter(|t| !t.client_name.contains("__"))
+            .map(|t| {
+                t.inline_mcp_definition
+                    .clone()
+                    .unwrap_or_else(|| t.definition.clone())
+            })
+            .collect()
+    }
     /// Get the resolved contract version for a tool by its client-facing name.
     ///
     /// Returns `None` if the tool is not found or is not version-managed.
@@ -1514,20 +1627,80 @@ impl FinalizedToolset {
             ),
         )
     }
+    /// Whether a registered target is an MCP tool; absence permits a managed-catalog lookup.
+    pub fn is_mcp_target(&self, tool_name: &str) -> Option<bool> {
+        self.tools
+            .read()
+            .iter()
+            .find(|tool| tool.client_name == tool_name)
+            .map(|tool| tool.metadata.tool_namespace() == ToolNamespace::MCP)
+    }
+    /// Parse an MCP wrapper from original JSON before key remapping loses duplicates.
+    pub fn parse_mcp_wrapper_json(
+        &self,
+        tool_name: &str,
+        arguments: &str,
+    ) -> Result<crate::implementations::UseToolInput, xai_tool_runtime::ToolError> {
+        let tools = self.tools.read();
+        let tool = tools
+            .iter()
+            .find(|t| t.client_name == tool_name)
+            .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
+        crate::implementations::UseToolInput::from_model_json(arguments, &tool.reverse_params)
+            .map_err(|error| xai_tool_runtime::ToolError::invalid_arguments(error.to_string()))
+    }
+    /// Convert only this finalized wrapper's canonical keys into its model-facing keys.
+    pub fn model_mcp_arguments(
+        &self,
+        tool_name: &str,
+        input: &crate::implementations::UseToolInput,
+    ) -> Result<serde_json::Value, xai_tool_runtime::ToolError> {
+        let value = serde_json::to_value(input)
+            .map_err(|e| xai_tool_runtime::ToolError::invalid_arguments(e.to_string()))?;
+        self.model_facing_arguments(tool_name, value)
+    }
+    /// Project canonical argument keys onto this tool's model-facing names.
+    ///
+    /// Same reverse map as [`Self::model_mcp_arguments`].
+    pub fn model_facing_arguments(
+        &self,
+        tool_name: &str,
+        canonical: serde_json::Value,
+    ) -> Result<serde_json::Value, xai_tool_runtime::ToolError> {
+        let tools = self.tools.read();
+        let tool = tools
+            .iter()
+            .find(|t| t.client_name == tool_name)
+            .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
+        let forward: HashMap<_, _> = tool
+            .reverse_params
+            .iter()
+            .map(|(client, name)| (name.clone(), client.clone()))
+            .collect();
+        crate::util::remap::remap_json_keys_checked(canonical, &forward)
+            .map_err(xai_tool_runtime::ToolError::invalid_arguments)
+    }
     pub async fn try_parse(
         &self,
         tool_name: &str,
         tool_params: &serde_json::Value,
     ) -> Result<ToolInput, xai_tool_runtime::ToolError> {
-        let (reverse_params, parse_input) = {
+        let (reverse_params, parse_input, is_mcp_wrapper) = {
             let tools = self.tools.read();
             let tool = tools
                 .iter()
                 .find(|t| t.client_name == tool_name)
                 .ok_or_else(|| Self::tool_not_found_error(tool_name))?;
-            (tool.reverse_params.clone(), tool.parse_input.clone())
+            (
+                tool.reverse_params.clone(),
+                tool.parse_input.clone(),
+                tool.metadata.kind() == ToolKind::UseTool,
+            )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let canonical_params = if is_mcp_wrapper {
+            crate::util::remap::remap_json_keys_checked(tool_params.clone(), &reverse_params)
+                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
+        } else if reverse_params.is_empty() {
             tool_params.clone()
         } else {
             remap_json_keys(tool_params.clone(), &reverse_params)
@@ -1588,6 +1761,7 @@ impl FinalizedToolset {
         if let Some(cwd) = parent_ctx.extensions.get::<xai_tool_runtime::Cwd>() {
             ctx.extensions.insert((*cwd).clone());
         }
+        crate::types::source_summary::copy_call_facts(&parent_ctx, &mut ctx);
         let tool_id = xai_tool_protocol::ToolId::new(&registry_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
         let lr_handle = self.local_registry.find(&tool_id).ok_or_else(|| {
@@ -1626,14 +1800,22 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
-        use futures::StreamExt;
-        let mut stream = self.call_streaming_with_cancellation(
+        self.call_with_context(
             tool_name,
             tool_args,
-            tool_call_id,
-            cwd_override,
-            cancellation,
-        );
+            context_for_call(tool_call_id, cwd_override, cancellation),
+        )
+        .await
+    }
+    /// Dispatch with a caller-built context. Host resources replace anything the caller supplied.
+    pub async fn call_with_context(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        ctx: xai_tool_runtime::ToolCallContext,
+    ) -> Result<ToolRunResult, xai_tool_runtime::ToolError> {
+        use futures::StreamExt;
+        let mut stream = self.call_streaming_with_context(tool_name, tool_args, ctx);
         while let Some(item) = stream.next().await {
             match item {
                 xai_tool_runtime::ToolStreamItem::Progress(_) => continue,
@@ -1680,14 +1862,61 @@ impl FinalizedToolset {
         cwd_override: Option<std::path::PathBuf>,
         cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
-        self.call_streaming_with_cancellation_and_viewer_context(
+        self.call_streaming_with_context(
             tool_name,
             tool_args,
-            tool_call_id,
-            cwd_override,
-            cancellation,
-            None,
+            context_for_call(tool_call_id, cwd_override, cancellation),
         )
+    }
+    pub fn call_streaming_with_context(
+        self: &Arc<Self>,
+        tool_name: &str,
+        tool_args: serde_json::Value,
+        ctx: xai_tool_runtime::ToolCallContext,
+    ) -> xai_tool_runtime::ToolStream<ToolRunResult> {
+        use futures::StreamExt;
+        let this = Arc::clone(self);
+        let tool_name = tool_name.to_owned();
+        Box::pin(async_stream::stream! {
+            let parts = match this.prepare_dispatch(
+                &tool_name,
+                tool_args,
+                ctx,
+            ) {
+                Ok(parts) => parts,
+                Err(e) => {
+                    yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                    return;
+                }
+            };
+            let DispatchParts {
+                lr_handle,
+                ctx,
+                canonical_params,
+                output_converter,
+                effective_tool_name,
+            } = parts;
+            let mut inner = lr_handle.execute(ctx, canonical_params).await;
+            while let Some(item) = inner.next().await {
+                match item {
+                    xai_tool_runtime::ToolStreamItem::Progress(p) => {
+                        yield xai_tool_runtime::ToolStreamItem::Progress(p);
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Err(e)) => {
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(Err(e));
+                        return;
+                    }
+                    xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
+                        let run_result = this
+                            .finalize_output(typed.value, &output_converter, effective_tool_name)
+                            .await;
+                        yield xai_tool_runtime::ToolStreamItem::Terminal(run_result);
+                        return;
+                    }
+                }
+            }
+            yield xai_tool_runtime::ToolStreamItem::Terminal(Err(stream_no_terminal_error()));
+        })
     }
     /// Streaming dispatch with an optional call-scoped viewer-context override.
     pub fn call_streaming_with_cancellation_and_viewer_context(
@@ -1731,9 +1960,7 @@ impl FinalizedToolset {
             let parts = match this.prepare_dispatch(
                 &tool_name,
                 tool_args,
-                &tool_call_id,
-                cwd_override,
-                cancellation,
+                context_for_call(&tool_call_id, cwd_override, cancellation),
             ) {
                 Ok(parts) => parts,
                 Err(e) => {
@@ -1784,11 +2011,9 @@ impl FinalizedToolset {
         self: &Arc<Self>,
         tool_name: &str,
         tool_args: serde_json::Value,
-        tool_call_id: &str,
-        cwd_override: Option<std::path::PathBuf>,
-        cancellation: Option<tokio_util::sync::CancellationToken>,
+        mut ctx: xai_tool_runtime::ToolCallContext,
     ) -> Result<DispatchParts, xai_tool_runtime::ToolError> {
-        let (registry_id, output_converter, reverse_params) = {
+        let (registry_id, output_converter, reverse_params, is_mcp_wrapper) = {
             let tools = self.tools.read();
             let entry = tools
                 .iter()
@@ -1798,37 +2023,43 @@ impl FinalizedToolset {
                 entry.registry_id.clone(),
                 entry.output_converter.clone(),
                 entry.reverse_params.clone(),
+                entry.metadata.kind() == ToolKind::UseTool,
             )
         };
-        let canonical_params = if reverse_params.is_empty() {
+        let canonical_params = if is_mcp_wrapper {
+            crate::util::remap::remap_json_keys_checked(tool_args, &reverse_params)
+                .map_err(xai_tool_runtime::ToolError::invalid_arguments)?
+        } else if reverse_params.is_empty() {
             tool_args
         } else {
             remap_json_keys(tool_args, &reverse_params)
         };
-        let effective_tool_name = if tool_name == "use_tool" {
+        let effective_tool_name = if is_mcp_wrapper {
             serde_json::from_value::<crate::implementations::use_tool::UseToolInput>(
                 canonical_params.clone(),
             )
             .ok()
-            .map(|input| input.tool_name)
+            .and_then(|input| input.target_name().map(str::to_owned))
         } else {
             None
         };
         let contract_version = self.get_contract_version(tool_name);
+        let incoming_call_id = ctx.call_id.as_str().to_owned();
         let native_metadata =
-            crate::implementations::codex::multi_agent_wire::decode_function_call_id(tool_call_id);
+            crate::implementations::codex::multi_agent_wire::decode_function_call_id(
+                &incoming_call_id,
+            );
         let runtime_call_id = native_metadata
             .as_ref()
             .map(|(call_id, _)| *call_id)
-            .unwrap_or(tool_call_id);
-        let rt_call_id = xai_tool_protocol::ToolCallId::new(runtime_call_id)
+            .unwrap_or(&incoming_call_id);
+        ctx.call_id = xai_tool_protocol::ToolCallId::new(runtime_call_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolCallId::new_v7());
-        let mut ctx = xai_tool_runtime::ToolCallContext::new(rt_call_id);
         if native_metadata.is_some() {
             ctx.insert(
                 crate::implementations::codex::multi_agent_wire::NativeMessageEncryption(
                     crate::implementations::codex::multi_agent_wire::codex_message_is_encrypted(
-                        tool_call_id,
+                        &incoming_call_id,
                     ),
                 ),
             );
@@ -1838,16 +2069,10 @@ impl FinalizedToolset {
         ctx.extensions.insert(
             crate::types::resources::InvokingToolParamNames::from_reverse_params(&reverse_params),
         );
-        if let Some(cwd) = cwd_override {
-            ctx.extensions.insert(xai_tool_runtime::Cwd(cwd));
-        }
-        if let Some(cancellation) = cancellation {
+        ctx.extensions.remove::<xai_tool_runtime::BehaviorVersion>();
+        if let Some(version) = contract_version {
             ctx.extensions
-                .insert(xai_tool_runtime::Cancellation(cancellation));
-        }
-        if let Some(ref version) = contract_version {
-            ctx.extensions
-                .insert(xai_tool_runtime::BehaviorVersion(version.clone()));
+                .insert(xai_tool_runtime::BehaviorVersion(version));
         }
         ctx.extensions.insert(InnerDispatch(std::sync::Arc::new(
             InnerDispatchForToolset {
@@ -1856,6 +2081,9 @@ impl FinalizedToolset {
         )));
         if let Some(wvc) = self.workspace_viewer_ctx.as_ref() {
             ctx.extensions.insert(wvc.clone());
+        } else {
+            ctx.extensions
+                .remove::<xai_tool_runtime::WorkspaceViewerContext>();
         }
         let tool_id = xai_tool_protocol::ToolId::new(&registry_id)
             .unwrap_or_else(|_| xai_tool_protocol::ToolId::new("unknown").expect("valid"));
@@ -1967,6 +2195,7 @@ impl FinalizedToolset {
             id: name.clone(),
             registry_id,
             client_name: name.clone(),
+            inline_mcp_definition: None,
             metadata: Arc::new(DefaultToolMetadata {
                 kind,
                 description: description.clone(),
@@ -3542,6 +3771,45 @@ mod tests {
             "finalize error should mention duplicate client_name: {errors:?}",
         );
     }
+    #[tokio::test]
+    async fn mcp_mapping_collisions_fail_validation_and_finalization() {
+        let tmp = TempDir::new().unwrap();
+        for pairs in [
+            vec![("file", "source"), ("unused", "source")],
+            vec![("file", "source"), ("tool_input_file", "source")],
+            vec![("unused", "file")],
+            vec![("unused", "source"), ("another", "source")],
+        ] {
+            for pairs in [pairs.clone(), pairs.into_iter().rev().collect()] {
+                let builder = ToolRegistryBuilder::new();
+                let mut tool = ToolConfig::for_tool::<crate::implementations::UseTool>();
+                tool.params_name_overrides = Some(
+                    pairs
+                        .into_iter()
+                        .map(|(canonical, client)| (canonical.to_owned(), client.to_owned()))
+                        .collect(),
+                );
+                let config = ToolServerConfig {
+                    tools: vec![tool],
+                    behavior_preset: None,
+                };
+                let validated = builder.validate_config(&config);
+                assert_eq!(1, validated.len());
+                assert_eq!(
+                    "ambiguous MCP wrapper parameter mapping",
+                    validated.first().unwrap().message
+                );
+                let finalized = match builder.finalize(config, test_session_context(&tmp)) {
+                    Ok(_) => panic!("ambiguous mappings must not finalize"),
+                    Err(errors) => errors,
+                };
+                assert_eq!(
+                    serde_json::to_value(validated).unwrap(),
+                    serde_json::to_value(finalized).unwrap()
+                );
+            }
+        }
+    }
     #[derive(Debug)]
     struct FakeMcpTool {
         description: String,
@@ -3576,6 +3844,42 @@ mod tests {
         ) -> Result<String, xai_tool_runtime::ToolError> {
             Ok("ok".into())
         }
+    }
+    #[tokio::test]
+    async fn registered_identity_uses_the_qualified_id_not_the_alias() {
+        let tmp = TempDir::new().unwrap();
+        let toolset = ToolRegistryBuilder::new()
+            .finalize(
+                ToolServerConfig {
+                    tools: vec![
+                        ToolConfig::for_tool::<crate::implementations::grok_build::grep::GrepTool>(
+                        )
+                        .with_name("search_code"),
+                    ],
+                    behavior_preset: None,
+                },
+                test_session_context(&tmp),
+            )
+            .expect("grep should finalize");
+        assert_eq!(
+            toolset.registered_identity("search_code"),
+            Some(RegisteredToolIdentity {
+                tool_id: "GrokBuild:grep".into(),
+                version: Some("current".into()),
+            })
+        );
+        assert_eq!(toolset.registered_identity("grep"), None);
+        assert_eq!(toolset.registered_identity("not_a_tool"), None);
+        toolset
+            .register_tool(
+                "docs__search".into(),
+                FakeMcpTool {
+                    description: "d".into(),
+                },
+                None,
+            )
+            .expect("dynamic tool should register");
+        assert_eq!(toolset.registered_identity("docs__search"), None);
     }
     #[tokio::test]
     async fn call_sets_effective_tool_name_for_use_tool_dispatch() {
@@ -5338,9 +5642,7 @@ mod tests {
                 .prepare_dispatch(
                     "send_message",
                     serde_json::json!({"target":"/root/worker", "message":"test"}),
-                    call["call_id"].as_str().unwrap(),
-                    None,
-                    None,
+                    context_for_call(call["call_id"].as_str().unwrap(), None, None),
                 )
                 .unwrap();
             assert_eq!(parts.ctx.call_id.as_str(), "call_native");
@@ -5361,9 +5663,7 @@ mod tests {
             .prepare_dispatch(
                 "read_file",
                 serde_json::json!({"target_file": "noop"}),
-                "test-call",
-                None,
-                None,
+                context_for_call("test-call", None, None),
             )
             .expect("prepare_dispatch succeeds");
         let wvc = parts
@@ -5380,9 +5680,7 @@ mod tests {
             .prepare_dispatch(
                 "read_file",
                 serde_json::json!({"target_file": "noop"}),
-                "test-call",
-                None,
-                None,
+                context_for_call("test-call", None, None),
             )
             .expect("prepare_dispatch succeeds");
         assert!(
@@ -5393,6 +5691,39 @@ mod tests {
                 .is_none(),
             "no extension must be stamped when workspace_viewer_ctx is None",
         );
+    }
+    #[tokio::test]
+    async fn prepare_dispatch_keeps_the_source_slot_and_replaces_resources() {
+        let (toolset, _tmp) = toolset_with_viewer_ctx(None);
+        let slot = crate::types::source_summary::SourceSummarySlot::new();
+        let incoming = crate::types::resources::Resources::new().into_shared();
+        let mut ctx = context_for_call("test-call", None, None);
+        ctx.insert(slot.clone());
+        ctx.insert(incoming.clone());
+        let parts = toolset
+            .prepare_dispatch("read_file", serde_json::json!({"target_file": "noop"}), ctx)
+            .expect("prepare_dispatch succeeds");
+        let kept = parts
+            .ctx
+            .get::<crate::types::source_summary::SourceSummarySlot>()
+            .expect("slot");
+        let mut detail = crate::types::source_summary::ReadDetail::unknown();
+        detail.role = crate::types::source_summary::ReadRole::SkillEntry;
+        slot.record(crate::types::source_summary::ToolSourceSummary {
+            result: crate::types::source_summary::ToolSourceResult::Failed(None),
+            output_limit: crate::types::source_summary::ToolOutputLimit::Unobserved,
+            detail: crate::types::source_summary::ToolSourceDetail::Read(detail),
+        });
+        assert_eq!(
+            kept.snapshot().read().map(|read| read.role),
+            Some(crate::types::source_summary::ReadRole::SkillEntry)
+        );
+        let host = parts
+            .ctx
+            .get::<crate::types::resources::SharedResources>()
+            .expect("resources");
+        assert!(std::sync::Arc::ptr_eq(host.as_ref(), &toolset.resources));
+        assert!(!std::sync::Arc::ptr_eq(host.as_ref(), &incoming));
     }
     #[tokio::test]
     async fn streaming_dispatch_override_enables_progress_without_workspace_viewer_context() {

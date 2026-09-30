@@ -18,7 +18,7 @@ use crate::v2::{
 const MAX_PREVIOUS_CONTENT_BYTES: u64 = 8 * 1024 * 1024;
 /// Largest topic a write may produce. Dream's `read_topics` and forget both
 /// refuse larger files, so accepting one here would make every later Dream fail.
-const MAX_TOPIC_FILE_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_TOPIC_FILE_BYTES: u64 = 256 * 1024;
 /// Largest inbox observation a write may produce. Mirrors the private
 /// `MAX_OBSERVATION_FILE_BYTES` in `v2_capture.rs`, which is the source of
 /// truth for what capture recovery and Dream are willing to read back.

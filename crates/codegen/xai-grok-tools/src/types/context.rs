@@ -3,12 +3,12 @@ use std::collections::HashMap;
 const MAX_LINES_READ_DEFAULT: usize = 1_000;
 
 /// Client-configurable truncation settings.
-/// All fields are optional — `None` means "use the tool's built-in default".
+/// Scalar fields are optional — `None` means "use the tool's built-in default".
 ///
 /// There is deliberately no per-line cap: clipping long lines silently
 /// corrupts single-line files (minified JSON, data dumps) with no way for
 /// the model to recover the clipped bytes. Non-skill reads are bounded by
-/// the whole-read `MAX_NUM_TOKENS` cap instead (skill files are exempt from
+/// the whole-read `READ_FILE_MAX_TOKENS` cap instead (skill files are exempt from
 /// all read limits by design). Other agent CLIs likewise apply no
 /// per-line cap. The wire field (`TruncationConfig.max_chars_per_line` in
 /// grok-tools.proto) is deprecated and ignored.
@@ -27,6 +27,23 @@ pub struct TruncationConfig {
     /// `[mcp] max_output_bytes`) never changes non-MCP readers like the
     /// opencode bash cap.
     pub mcp_max_output_bytes: Option<usize>,
+    pub whole_read: WholeReadPolicy,
+}
+
+/// Which files `read_file` returns whole under the token cap; a bit that is off makes its class a regular file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct WholeReadPolicy {
+    pub skill_markdown: bool,
+    pub instruction_files: bool,
+}
+
+impl Default for WholeReadPolicy {
+    fn default() -> WholeReadPolicy {
+        WholeReadPolicy {
+            skill_markdown: true,
+            instruction_files: true,
+        }
+    }
 }
 
 impl TruncationConfig {

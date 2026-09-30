@@ -12,6 +12,7 @@ pub const BOT_RELAY_CAPABILITIES: &[&str] = &[
     Method::BotSubscribe.as_wire_str(),
     Method::BotUnsubscribe.as_wire_str(),
     Method::BotBindConversation.as_wire_str(),
+    Method::BotPresence.as_wire_str(),
     Method::BotEvent.as_wire_str(),
 ];
 pub const BOT_EVENT_ENVELOPE_V: u32 = 1;
@@ -30,6 +31,8 @@ pub const COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE: &str = "attachment_wrong_sou
 pub const COMMAND_REJECTED_ATTACHMENT_TOO_LARGE: &str = "attachment_too_large";
 pub const COMMAND_REJECTED_ATTACHMENT_NOT_READY: &str = "attachment_not_ready";
 pub const COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: &str = "gateway/unknown-method";
+pub const COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: &str = "voice_call_unavailable";
+pub const COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED: &str = "main_agent_not_enabled";
 pub const COMMAND_REJECTED_REASONS: &[&str] = &[
     COMMAND_REJECTED_AGENT_ID_MISMATCH,
     COMMAND_REJECTED_ARGS_INVALID,
@@ -42,8 +45,10 @@ pub const COMMAND_REJECTED_REASONS: &[&str] = &[
     COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE,
     COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD,
     COMMAND_REJECTED_HARNESS_REFUSED,
+    COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED,
     COMMAND_REJECTED_NOT_SUPPORTED_IN_LIVE,
     COMMAND_REJECTED_NOT_YET_ENABLED,
+    COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE,
 ];
 pub fn is_gateway_method_unsupported(err: &BotRelayError) -> bool {
     err.code == BotRelayErrorCode::CommandRejected
@@ -163,6 +168,13 @@ pub struct BotTranscriptOffboxResult {
     pub next_cursor: Option<String>,
 }
 #[typeshare]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotTranscriptEntryStamp {
+    #[typeshare(serialized_as = "I54")]
+    pub entry_version: u64,
+}
+#[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BotSubscribeParams {
@@ -186,6 +198,15 @@ pub struct BotBindConversationParams {
 }
 #[typeshare]
 pub type BotBindConversationResult = BotEmptyResult;
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BotPresenceParams {
+    pub agent_id: String,
+    pub viewing: bool,
+}
+#[typeshare]
+pub type BotPresenceResult = BotEmptyResult;
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -355,11 +376,17 @@ impl<'de> Deserialize<'de> for BotRelayErrorCode {
         Ok(Self::from_wire(&text))
     }
 }
+/// Cap on [`BotRelayErrorDetail::upstream_message`], in chars.
+pub const UPSTREAM_MESSAGE_MAX_CHARS: usize = 240;
 #[typeshare]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BotRelayErrorDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
+    /// The upstream's own user-facing sentence for a refusal, trimmed and
+    /// capped at [`UPSTREAM_MESSAGE_MAX_CHARS`] chars. Never the raw body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_message: Option<String>,
 }
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,21 +419,25 @@ impl From<BotRelayError> for JsonRpcError {
 #[typeshare]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum HubChannel {
+    #[serde(rename = "hub:turn_started")]
+    TurnStarted,
     #[serde(rename = "hub:turn_finished")]
     TurnFinished,
     #[serde(rename = "hub:resync_required")]
     ResyncRequired,
 }
 impl HubChannel {
-    pub const ALL: &'static [Self] = &[Self::TurnFinished, Self::ResyncRequired];
+    pub const ALL: &'static [Self] = &[Self::TurnStarted, Self::TurnFinished, Self::ResyncRequired];
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::TurnStarted => "hub:turn_started",
             Self::TurnFinished => "hub:turn_finished",
             Self::ResyncRequired => "hub:resync_required",
         }
     }
     pub fn from_wire(text: &str) -> Option<Self> {
         match text {
+            "hub:turn_started" => Some(Self::TurnStarted),
             "hub:turn_finished" => Some(Self::TurnFinished),
             "hub:resync_required" => Some(Self::ResyncRequired),
             _ => None,
@@ -492,10 +523,19 @@ impl<'de> Deserialize<'de> for BotEventChannel {
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct HubTurnStartedEvent {
+    pub agent_id: String,
+    pub turn_id: String,
+}
+#[typeshare]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HubTurnFinishedEvent {
     pub agent_id: String,
     pub conversation_ids: Vec<String>,
     pub preview: String,
+    #[serde(default)]
+    pub turn_id: String,
 }
 #[typeshare]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -568,6 +608,7 @@ mod tests {
             "bot.subscribe",
             "bot.unsubscribe",
             "bot.bindConversation",
+            "bot.presence",
             "bot.event",
         ];
         assert_eq!(BOT_RELAY_CAPABILITIES, expected);
@@ -840,6 +881,17 @@ mod tests {
         assert_eq!(roundtrip(&empty_bind), empty_bind_wire);
         let parsed: BotBindConversationParams = serde_json::from_value(empty_bind_wire).unwrap();
         assert!(parsed.agent_ids.is_empty());
+
+        let presence = BotPresenceParams {
+            agent_id: "agt_a".to_owned(),
+            viewing: true,
+        };
+        assert_eq!(
+            json!({"agentId": "agt_a", "viewing": true}),
+            roundtrip(&presence)
+        );
+        assert_rejects::<BotPresenceParams>(json!({"agentId": "agt_a"}));
+        assert_rejects::<BotPresenceParams>(json!({"agent_id": "agt_a", "viewing": true}));
     }
     #[test]
     fn error_codes_round_trip_and_unknown_becomes_upstream_error() {
@@ -883,6 +935,7 @@ mod tests {
             retryable: false,
             detail: BotRelayErrorDetail {
                 upstream: Some("...".to_owned()),
+                upstream_message: None,
             },
             reason: None,
         };
@@ -1173,10 +1226,19 @@ mod tests {
     }
     #[test]
     fn hub_owned_event_bodies_round_trip() {
+        let started = HubTurnStartedEvent {
+            agent_id: "agt_1".to_owned(),
+            turn_id: "turn_7".to_owned(),
+        };
+        assert_eq!(
+            roundtrip(&started),
+            json!({"agentId": "agt_1", "turnId": "turn_7"})
+        );
         let finished = HubTurnFinishedEvent {
             agent_id: "agt_1".to_owned(),
             conversation_ids: vec!["conv_1".to_owned()],
             preview: "done".to_owned(),
+            turn_id: "turn_7".to_owned(),
         };
         assert_eq!(
             roundtrip(&finished),
@@ -1184,6 +1246,7 @@ mod tests {
                 "agentId": "agt_1",
                 "conversationIds": ["conv_1"],
                 "preview": "done",
+                "turnId": "turn_7",
             })
         );
         let resync = HubResyncRequiredEvent {
@@ -1191,6 +1254,13 @@ mod tests {
         };
         assert_eq!(roundtrip(&resync), json!({"agentId": "agt_1"}));
         assert_rejects::<HubResyncRequiredEvent>(json!({"agent_id": "agt_1"}));
+        let legacy: HubTurnFinishedEvent = serde_json::from_value(json!({
+            "agentId": "agt_1",
+            "conversationIds": [],
+            "preview": "",
+        }))
+        .unwrap();
+        assert_eq!("", legacy.turn_id);
     }
     #[test]
     fn event_envelope_composes_hub_owned_bodies() {
@@ -1198,6 +1268,7 @@ mod tests {
             agent_id: "agt_1".to_owned(),
             conversation_ids: vec!["conv_1".to_owned()],
             preview: "done".to_owned(),
+            turn_id: "turn_7".to_owned(),
         };
         let finished_env = BotEventEnvelope::new(
             "agt_1",
@@ -1214,6 +1285,7 @@ mod tests {
                 "agentId": "agt_1",
                 "conversationIds": ["conv_1"],
                 "preview": "done",
+                "turnId": "turn_7",
             },
         });
         assert_eq!(roundtrip(&finished_env), finished_wire);

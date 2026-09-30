@@ -910,17 +910,25 @@ async fn handle_add_source(url: &str) -> xai_hooks_plugins_types::ActionOutcome 
         }
     };
 
-    // Run the write under SAVE_LOCK + flock, off the reactor.
+    // Run the write under the config write guard (SAVE_LOCK + init flock), off the reactor; an
+    // unguarded add is exactly the read-modify-write race the guard prevents.
     let config_path = xai_grok_config::grok_home().join("config.toml");
-    let grok_home = xai_grok_config::grok_home();
-    let _save_guard = crate::util::config::lock_config_writes().await;
+    let save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return ActionOutcome {
+                status: OutcomeStatus::InternalError,
+                message: format!("Another config write is in progress: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
     let write = {
         let name = name.clone();
-        tokio::task::spawn_blocking(move || {
-            let _flock = acquire_init_lock(&grok_home).ok();
-            add_marketplace_source(&config_path, &name, &input, is_official)
-        })
-        .await
+        save_guard
+            .run_blocking(move || add_marketplace_source(&config_path, &name, &input, is_official))
+            .await
     };
     match write {
         Ok(Ok(())) => {}
@@ -1037,9 +1045,23 @@ fn add_marketplace_source(
 /// plugins that were installed from it.
 async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     let src = source_url_or_path.to_string();
-    // Lock + run the blocking FS work off the reactor.
-    let _save_guard = crate::util::config::lock_config_writes().await;
-    match tokio::task::spawn_blocking(move || remove_source_locked(&src)).await {
+    // Guard (SAVE_LOCK + init flock) held across the whole blocking read-modify-write so a
+    // concurrent auto-register can't re-add the source mid-removal.
+    let save_guard = match crate::util::config::lock_config_writes().await {
+        Ok(guard) => guard,
+        Err(e) => {
+            return xai_hooks_plugins_types::ActionOutcome {
+                status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
+                message: format!("Another config write is in progress: {e}"),
+                requires_reload: false,
+                requires_restart: false,
+            };
+        }
+    };
+    match save_guard
+        .run_blocking(move || remove_source_locked(&src))
+        .await
+    {
         Ok(outcome) => outcome,
         Err(e) => xai_hooks_plugins_types::ActionOutcome {
             status: xai_hooks_plugins_types::OutcomeStatus::InternalError,
@@ -1050,15 +1072,13 @@ async fn handle_remove_source(source_url_or_path: &str) -> xai_hooks_plugins_typ
     }
 }
 
-/// Sync body of [`handle_remove_source`], run on a blocking thread under the
-/// flock for the whole read-modify-write so a concurrent auto-register can't
-/// re-add the source mid-removal.
+/// Sync body of [`handle_remove_source`]; the caller holds the config write
+/// guard across this whole read-modify-write.
 fn remove_source_locked(source_url_or_path: &str) -> xai_hooks_plugins_types::ActionOutcome {
     use crate::plugin;
     use xai_hooks_plugins_types::{ActionOutcome, OutcomeStatus};
 
     let grok_home = xai_grok_config::grok_home();
-    let _flock = acquire_init_lock(&grok_home).ok();
 
     let uninstalled = plugin::uninstall_marketplace_source_plugins(source_url_or_path);
 

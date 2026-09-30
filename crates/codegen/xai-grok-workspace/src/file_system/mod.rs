@@ -26,7 +26,7 @@ pub mod adapter;
 pub use adapter::AcpFsAdapter;
 
 mod codebase_index;
-pub use codebase_index::CodebaseIndexManager;
+pub use codebase_index::{CodebaseIndexManager, get_index_cache_path};
 
 mod fs;
 pub use fs::{AsyncFileSystem, AsyncFsWrapper, FsError, bytes_to_string};

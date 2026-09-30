@@ -329,6 +329,16 @@ impl Default for VendorCompat {
     }
 }
 
+/// Bare file names, no path separators: read_file matches them against `Path::file_name()`; `agent_filenames()` prepends them to the vendor-gated `.claude/` paths.
+pub(crate) const INSTRUCTION_FILENAMES: &[&str] = &[
+    "Agents.md",
+    "Claude.md",
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENT.md",
+    "AGENTS.md",
+];
+
 /// Resolved `[compat]` configuration threaded into compatibility consumers.
 ///
 /// Every cell defaults on. Codex's non-session cells are reserved and are not
@@ -399,14 +409,7 @@ impl CompatConfig {
     /// Replaces the hard-coded `AGENT_FILENAMES` constant. When `claude.agents`
     /// is on, the returned list is identical (same order).
     pub fn agent_filenames(&self) -> Vec<&'static str> {
-        let mut names = vec![
-            "Agents.md",
-            "Claude.md",
-            "CLAUDE.md",
-            "CLAUDE.local.md",
-            "AGENT.md",
-            "AGENTS.md",
-        ];
+        let mut names = INSTRUCTION_FILENAMES.to_vec();
         if self.claude.agents {
             names.push(".claude/CLAUDE.md");
             names.push(".claude/CLAUDE.local.md");

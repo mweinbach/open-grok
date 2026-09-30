@@ -149,19 +149,51 @@ impl SummaryGenerator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTitleNotificationKind {
+    Automatic,
+    Manual,
+    Reset,
+}
+
+/// Builds the canonical extension and ACP title notifications with matching manual-pin metadata.
+pub fn session_title_notifications(
+    session_id: acp::SessionId,
+    title: &str,
+    kind: SessionTitleNotificationKind,
+) -> (SessionNotification, acp::SessionNotification) {
+    let meta = match kind {
+        SessionTitleNotificationKind::Automatic => None,
+        SessionTitleNotificationKind::Manual => {
+            Some(crate::extensions::notification::title_is_manual_meta())
+        }
+        SessionTitleNotificationKind::Reset => {
+            Some(crate::extensions::notification::title_is_unpinned_meta())
+        }
+    };
+    let summary = SessionNotification {
+        session_id: session_id.clone(),
+        update: XaiSessionUpdate::SessionSummaryGenerated {
+            session_summary: title.to_owned(),
+        },
+        meta: meta.clone(),
+    };
+    let info = session_info_update(session_id, title)
+        .meta(meta.and_then(|meta| meta.as_object().cloned()));
+    (summary, info)
+}
+
 /// Notify the client that a session summary is available.
 pub(crate) fn notify_client(gateway: &Option<GatewaySender>, info: &Info, title: &str) {
     let Some(gateway) = gateway else {
         return;
     };
 
-    let notification = SessionNotification {
-        session_id: info.id.clone(),
-        update: XaiSessionUpdate::SessionSummaryGenerated {
-            session_summary: title.to_owned(),
-        },
-        meta: None,
-    };
+    let (notification, info_update) = session_title_notifications(
+        info.id.clone(),
+        title,
+        SessionTitleNotificationKind::Automatic,
+    );
     if let Ok(params) = serde_json::value::to_raw_value(&notification) {
         gateway.forward_fire_and_forget(acp::ExtNotification::new(
             "x.ai/session_notification",
@@ -169,7 +201,7 @@ pub(crate) fn notify_client(gateway: &Option<GatewaySender>, info: &Info, title:
         ));
     }
 
-    gateway.forward_fire_and_forget(session_info_update(info.id.clone(), title));
+    gateway.forward_fire_and_forget(info_update);
 }
 
 pub(crate) fn session_info_update(
@@ -186,21 +218,7 @@ pub(crate) fn session_info_update(
     )
 }
 
-/// Manual-rename fan-out: same payload as [`session_info_update`] plus
-/// `_meta.x.ai/titleIsManual`. Old clients ignore the unknown key.
-pub(crate) fn session_info_update_manual(
-    session_id: acp::SessionId,
-    title: &str,
-) -> acp::SessionNotification {
-    session_info_update(session_id, title).meta(
-        crate::extensions::notification::title_is_manual_meta()
-            .as_object()
-            .cloned(),
-    )
-}
-
-/// Unpin fan-out: no title (avoid blanking list-driven clients) +
-/// `_meta.x.ai/titleIsManual: false`.
+/// Unpin fan-out: no title (avoid blanking list-driven clients) plus `_meta.x.ai/titleIsManual: false`.
 pub(crate) fn session_info_update_unpinned(session_id: acp::SessionId) -> acp::SessionNotification {
     acp::SessionNotification::new(
         session_id,
@@ -218,18 +236,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_info_update_manual_carries_meta_and_raw_title() {
-        let n = session_info_update_manual(acp::SessionId::new("s"), "a &amp; b");
-        let v = serde_json::to_value(&n).unwrap();
-        assert_eq!(
-            v["_meta"][crate::extensions::notification::TITLE_IS_MANUAL_META_KEY],
-            true
+    fn manual_title_notifications_stamp_the_pin_meta_on_both_forms() {
+        let (summary, info) = session_title_notifications(
+            acp::SessionId::new("s"),
+            "a &amp; b",
+            SessionTitleNotificationKind::Manual,
         );
-        let title = v
+        let key = crate::extensions::notification::TITLE_IS_MANUAL_META_KEY;
+
+        assert_eq!(
+            summary.meta.as_ref().and_then(|m| m.get(key)),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let info = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            info.get("_meta").and_then(|m| m.get(key)),
+            Some(&serde_json::Value::Bool(true))
+        );
+        let title = info
             .pointer("/update/title")
-            .or_else(|| v.pointer("/update/sessionInfoUpdate/title"))
+            .or_else(|| info.pointer("/update/sessionInfoUpdate/title"))
             .cloned();
-        assert_eq!(title, Some(serde_json::json!("a &amp; b")), "{v}");
+        assert_eq!(title, Some(serde_json::json!("a &amp; b")), "{info}");
     }
 
     #[test]

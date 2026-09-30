@@ -334,10 +334,14 @@ fn persistent_agent_thread(
         return Ok(());
     }
 
+    // Declared before the `LocalSet` so it is dropped after the `LocalRef` tasks on it, on unwind too; see `LocalRef`.
+    let mut keepalive: Option<Rc<MvpAgent>> = None;
     let local_set = tokio::task::LocalSet::new();
-    local_set.block_on(&rt, async move {
-        run_persistent_agent(agent_config, conn_rx, prefetched_models).await
+    local_set.block_on(&rt, async {
+        run_persistent_agent(agent_config, conn_rx, prefetched_models, &mut keepalive).await
     });
+    drop(local_set);
+    drop(keepalive);
 
     warn!("Persistent agent thread exiting");
     Ok(())
@@ -478,6 +482,7 @@ async fn run_persistent_agent(
     agent_config: AgentConfig,
     mut connection_rx: mpsc::UnboundedReceiver<NewConnectionChannels>,
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
+    keepalive: &mut Option<Rc<MvpAgent>>,
 ) {
     // Persistent gateway channel — the MvpAgent and all session actors hold
     // clones of `gw_tx`. This channel survives across reconnections.
@@ -496,6 +501,8 @@ async fn run_persistent_agent(
         MvpAgent::new(gateway, &agent_config, auth_manager, prefetched_models)
             .unwrap_or_else(crate::agent::init::exit_on_config_error),
     );
+    // Published before any `LocalRef` task can be spawned, so a panic below cannot free the agent first.
+    *keepalive = Some(Rc::clone(&agent));
     agent.models_manager.spawn_background_refresh();
 
     let relay_dest: RelayDest = Rc::new(RefCell::new(None));

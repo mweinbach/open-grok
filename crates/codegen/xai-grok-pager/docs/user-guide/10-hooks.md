@@ -70,7 +70,7 @@ Hooks are discovered from several places (all are merged):
 | Project | `<project>/.cursor/hooks.json` | Requires trust | Cursor compatibility (configurable) |
 | Config | `~/.opengrok/config.toml` | Always | Your hooks alongside the rest of your config |
 | Config | `managed_config.toml` (`$OPENGROK_HOME` and `/etc/opengrok`) | Always | Organization-distributed hooks (server-synced and on-device) |
-| Config | `requirements.toml` (user and system) | Always | Organization-distributed hooks in the requirements layer |
+| Config | `requirements.toml` (signed cache, and `/etc/opengrok`) | Always | Organization-enforced hooks; see [Enforced hooks](#enforced-hooks) |
 | Plugin | Bundled inside installed plugins | Per-plugin | Shared team hooks |
 
 Config-file hooks live in the same TOML your organization already controls; see [Hooks in Config Files](#hooks-in-config-files) for the format. The compatible vendor hook sources are scanned by default. To disable scanning for a specific vendor, set `[compat.<vendor>] hooks = false` in `~/.opengrok/config.toml` or the corresponding environment variable. See [Configuration](05-configuration.md#harness-compatibility) for details.
@@ -193,7 +193,7 @@ Hooks can also live directly in your Open Grok config, so a team can distribute 
 |------|------|-------------|
 | `~/.opengrok/config.toml` | User | You |
 | `managed_config.toml` (`$OPENGROK_HOME`, `/etc/opengrok`) | Managed / system | Your organization |
-| `requirements.toml` (user and system) | Requirements | Your organization |
+| `requirements.toml` (`$OPENGROK_HOME` signed cache, `/etc/opengrok`) | Requirements | Your organization |
 
 The TOML is structurally identical to the JSON hook object, so an existing hook transliterates directly:
 
@@ -221,8 +221,35 @@ timeout = 10
 Prefer the inline form to avoid repeating the `[[hooks.<Event>.hooks]]` header for each handler.
 
 - **Additive across layers.** Every layer's hooks run; a lower-priority layer adds hooks but never replaces another layer's block. A hook defined identically in more than one layer is deduplicated, keeping the highest-authority copy.
-- **Provenance labels.** Config hooks appear in `/hooks` tagged by origin (`managed:`, `requirements/user:`, `user:`, and so on) so you can see which layer contributed each one.
+- **Provenance labels.** Config hooks appear in `/hooks` tagged by origin (`managed:`, `requirements/signed:`, `requirements/user:`, `user:`, and so on) so you can see which layer contributed each one.
 - **No read-time expansion.** A literal `${VAR}` in a `command` or `url` reaches the hook runner unchanged, matching JSON hook-file semantics; the runner performs the single expansion.
+
+### Enforced hooks
+
+Hooks from the config layers your organization controls are enforced: they carry a `[policy]` badge in `/hooks`, `Space` refuses to disable them, an entry in `~/.opengrok/disabled-hooks` does not skip them, and their source cannot be removed. Two layers qualify:
+
+- The root-owned system files `/etc/opengrok/requirements.toml` and `/etc/opengrok/managed_config.toml` (`requirements/system:` and `system_managed:` names).
+- The `~/.opengrok/requirements.toml` that the deployment sync writes, while its bytes match the signed policy the server sent (`requirements/signed:` names). If the file is edited or its signature file is missing or unreadable, its hooks load as your own (`requirements/user:` names) and can be disabled again; an unreadable `requirements.toml` contributes no hooks. Organizations that need the file to stay intact set `fail_closed = true` in the same requirements, which refuses to start on an edited copy or a missing signature (an unreadable file is a read error and still starts). See [Configuration](05-configuration.md) for the config layers.
+
+Hooks in `~/.opengrok/managed_config.toml` and `~/.opengrok/config.toml` are distribution, not enforcement: you can disable them.
+
+### Allow only managed hooks
+
+An organization can restrict a machine to the hooks it enforces:
+
+```toml
+# /etc/opengrok/requirements.toml
+allow_managed_hooks_only = true
+```
+
+With this set:
+
+- **What runs.** Only [enforced hooks](#enforced-hooks): the ones from the root-owned `/etc/opengrok/requirements.toml` and `/etc/opengrok/managed_config.toml`, and the ones in the synced `~/.opengrok/requirements.toml` while it matches its signature. An edited synced file loads as your own hooks, which the pin skips.
+- **What is skipped.** Every other hook, at dispatch: `~/.opengrok/hooks`, every `~/.opengrok/*.toml` file, project hooks, plugin hooks, agent frontmatter hooks, and the Claude and Cursor compatibility files. In `/hooks` they show `[disabled]`, and enabling them is refused ("Hooks outside managed policy are disabled by your organization."); `open-grok inspect` names the file that set the pin.
+- **What still runs.** Hooks the embedding client registers over ACP (an IDE or the desktop app), as under Claude Code's `allowManagedHooksOnly`. The pager's `[[ui.notifications.hooks]]` commands are a separate mechanism.
+- **Windows.** There is no root-owned layer (no `/etc/opengrok`), so only the signed synced `requirements.toml` hooks and ACP client hooks still run.
+
+The key is a tighten-only policy pin: any native policy layer (`requirements.toml` or `managed_config.toml` in `$OPENGROK_HOME` or `/etc/opengrok`, or macOS MDM) or Claude's `managed-settings.json` can set it, the camelCase `allowManagedHooksOnly` is accepted everywhere, no layer can release it, and a non-boolean value engages it. Like the other policy pins it is read once at startup, so a pin added mid-session applies at the next start, not on `/hooks` Reload. `open-grok inspect` lists it under **Enforced by policy** as "Hooks outside managed policy disabled" with the file that set it.
 
 ---
 

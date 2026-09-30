@@ -194,7 +194,7 @@ This shows:
 - API backend and sandbox profile (when set)
 - Context window usage (used and total tokens, with the percentage used)
 
-On the Session info tab, click a value to copy it, or drag to select a range (same highlight as the tool viewer). `c` copies the session ID and `y` copies the whole block. Copy uses the same clipboard route as the rest of Grok, including `grok wrap`.
+On the Session info tab, click a value to copy it, or drag to select a range (same highlight as the tool viewer). `c` copies the session ID and `y` copies the whole block. Copy uses the same clipboard route as the rest of Grok, including `open-grok wrap`.
 
 ---
 
@@ -292,6 +292,31 @@ Worktree sessions are managed internally through the `x.ai/git/worktree/*` exten
 
 Resume a session in a fresh worktree with `open-grok -w -r <session-id>`.
 
+### Manage Grove redirections
+
+A Grove worktree can redirect ignored artifact directories such as `target` and `node_modules` to storage outside the projected tree. The redirect commands take the mount path as their first argument.
+
+```bash
+grok worktree redirect list /path/to/worktree
+grok worktree redirect list /path/to/worktree --json
+grok worktree redirect add /path/to/worktree target bind
+grok worktree redirect del /path/to/worktree target
+grok worktree redirect fixup /path/to/worktree
+grok worktree redirect unmount /path/to/worktree target
+```
+
+`list` prints `repo_path`, `type`, `mechanism`, `target`, `source`, and `state`. Run `unmount` without a repo-relative path to take down every redirect on the mount. Use `fixup --force` to replace Grove-owned residue. Use `fixup --strict` to refuse a populated plain directory.
+
+
+```bash
+grok clone https://example.com/org/repo.git --redirect-ignored
+grok clone https://example.com/org/repo.git \
+  --redirect-ignored --redirect-dir build --redirect-dir '**/node_modules'
+grok clone https://example.com/org/repo.git --no-redirects
+```
+
+`GROVE_REDIRECTS=0` remains a runtime kill switch. Grok does not save the kill switch as the clone's redirect choice.
+
 ### Checking Disk Usage
 
 `open-grok du` (alias: `open-grok disk-usage`) reports what the Open Grok home (`~/.opengrok`) uses on disk. It lists each top-level directory, largest first, then each worktree with its size, type, age, label, and path. Worktrees the registry does not track appear as `untracked`. Pass `--json` for the same report as machine-readable output.
@@ -312,6 +337,8 @@ Worktrees
 To reclaim space, run `open-grok worktree gc --max-age 7d --dry-run`, then the same command without `--dry-run`. Without `--max-age`, gc expires nothing.
 Untracked rows are not in the registry, so gc never visits them. Remove one with `open-grok worktree rm --dry-run <path>`, then without `--dry-run`.
 ```
+
+After the Open Grok home table, `open-grok du` may print **Redirections**, **Orphaned redirections**, and **Unattributed redirect directories**. Those bytes live in Grove escape jails, not in the home total. An empty scan prints nothing. Reclaim a live jail with `open-grok worktree clean-artifacts`. Purge live jails plus proven orphans with `open-grok du --clean --yes`. Delete only proven orphans with `open-grok du --clean-orphaned --yes`.
 
 `AGE` is the value `open-grok worktree gc` measures: time since the worktree was last accessed, or since it was created when that is more recent. Session and agent activity update it; a shell or editor left open in the directory does not. An untracked worktree has no registry entry, so its age comes from the newest file underneath it.
 
@@ -350,6 +377,8 @@ The smaller state files -- `summary.json`, `plan.json`, and `signals.json` -- ar
 - `current_model_id` -- the model in use
 - `parent_session_id` -- the source session for a fork or restore
 - `agent_name` -- the agent definition active when the session was last saved
+- `last_turn_summary` -- an ultra-short summary of the most recent turn
+- `last_recap` -- a bounded preview of the latest session recap
 
 ### Disk Usage
 

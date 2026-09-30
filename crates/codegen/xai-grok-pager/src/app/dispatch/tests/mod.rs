@@ -5,6 +5,7 @@ mod cta_e2e;
 mod custom_provider;
 mod dashboard;
 mod jump;
+mod mid_text_goal;
 mod modes;
 mod notes;
 mod permissions;
@@ -52,6 +53,7 @@ use super::session::fork::build_child_fork_marker;
 use super::session::lifecycle::{dispatch_new_session_inner, drain_startup_actions, finish_trust};
 use super::session::load::{dispatch_load_session_with_restore, reanchor_grouped_selection};
 use super::session::modal::{dispatch_rename_session, dispatch_sessions_confirm_close};
+use super::settings::handle_feature_override_persisted;
 use super::settings::setters::set_default_model_inner;
 use super::settings::ui::{action_for_reset, apply_setting_rollback};
 use super::status::scrub_error_for_toast;
@@ -66,8 +68,8 @@ use crate::app::actions::{
 use crate::app::agent::{AgentId, AgentSession, AgentState};
 use crate::app::agent_view::{ActivePane, AgentView, PromptMode};
 use crate::app::app_view::{
-    ActiveView, AppView, AuthMode, AuthState, PrimaryProvider, TrustState, VoiceState, VoiceTarget,
-    WelcomeAnnouncementState,
+    ActiveView, AppView, AuthMode, AuthState, PendingCodingDataWrite, PrimaryProvider, TrustState,
+    VoiceState, VoiceTarget, WelcomeAnnouncementState,
 };
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::{SessionEvent, ToolCallBlock};
@@ -227,11 +229,14 @@ fn test_app() -> AppView {
         privacy_notice_rollout: false,
         privacy_banner_reshow_days: None,
         privacy_banner_acked: None,
-        privacy_banner_opt_in_inflight: false,
+        coding_data_pending_write: None,
         coding_data_write_seq: 0,
         show_tips: None,
         auto_update: None,
         ask_user_question_timeout_enabled: None,
+        subagent_model_inheritance: crate::settings::FeatureOverrideState::new(
+            xai_grok_shell::agent::config::Feature::SubagentModelInheritance,
+        ),
         zdr_access_enabled: false,
         usage_billing_redirect_url: None,
         access_gate_shown_logged: false,
@@ -279,6 +284,8 @@ fn test_app() -> AppView {
         #[cfg(feature = "local-workspace")]
         welcome_on_workspace_mode: false,
         welcome_toast: None,
+        dispatch_depth: 0,
+        pending_image_notices: Vec::new(),
         welcome_on_privacy_banner: false,
         welcome_on_upgrade_cta: false,
         auth_show_raw_url: false,
@@ -414,6 +421,12 @@ fn make_test_agent_session(app: &AppView, id: AgentId, sid: &str) -> AgentSessio
         created_via_new: false,
     }
 }
+pub(super) fn test_agent_mut(app: &mut AppView, id: AgentId) -> &mut AgentView {
+    let Some(agent) = app.agents.get_mut(&id) else {
+        panic!("agent {id:?} is not registered");
+    };
+    agent
+}
 pub(super) fn test_app_with_agent() -> AppView {
     let mut app = test_app();
     let id = AgentId(0);
@@ -424,6 +437,12 @@ pub(super) fn test_app_with_agent() -> AppView {
     app.next_agent_id = 1;
     switch_to_agent(&mut app, id, SwitchCause::New);
     app
+}
+pub(super) fn test_agent(app: &AppView, id: AgentId) -> &AgentView {
+    match app.agents.get(&id) {
+        Some(agent) => agent,
+        None => panic!("missing agent {id:?}"),
+    }
 }
 /// Give a test agent a generated title so the dashboard renders it.
 ///
@@ -542,6 +561,7 @@ fn cta_mcp_server(
         setup_values: std::collections::HashMap::new(),
         tools: vec![],
         enabled: true,
+        blocked_reason: None,
         source: plugin
             .map(|p| format!("plugin: {p}"))
             .unwrap_or_else(|| "local".into()),

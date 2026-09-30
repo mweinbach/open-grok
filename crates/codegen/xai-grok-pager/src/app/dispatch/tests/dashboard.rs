@@ -2,6 +2,7 @@
 use super::*;
 use crate::app::app_view::InputOutcome;
 use crate::app::dispatch::queue::maybe_drain_queue;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use xai_grok_shell::session::unified_list::ListScope;
 
 #[test]
@@ -1271,7 +1272,9 @@ fn dashboard_image_dispatch_cancel_rewind_resends_attachment() {
         agent.session.session_id = Some(acp::SessionId::new("dashboard-image"));
         agent.session.state = AgentState::Idle;
         assert!(matches!(
-            maybe_drain_queue(agent).effects.as_slice(),
+            maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects
+                .as_slice(),
             [Effect::SendPromptBlocks { .. }]
         ));
     }
@@ -5397,6 +5400,117 @@ fn dashboard_close_shortcuts_help_clears_modal() {
     assert!(app.dashboard.as_ref().unwrap().shortcuts_modal.is_some());
     let _ = dispatch(Action::DashboardCloseShortcutsHelp, &mut app);
     assert!(app.dashboard.as_ref().unwrap().shortcuts_modal.is_none());
+}
+/// A dashboard send leaves `+ New Agent` focused over an empty input.
+/// The dashboard must ignore the repeated Enter from a held key.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_double_enter_after_dispatch_does_not_create_second_session() {
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    assert!(
+        app.dashboard
+            .as_ref()
+            .expect("dashboard is open")
+            .new_agent_button_focused
+    );
+    send_dashboard_draft(&mut app, "fix the bug");
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.dashboard
+            .as_ref()
+            .expect("dashboard is open")
+            .dispatch
+            .text()
+            .is_empty()
+    );
+    assert!(
+        matches!(app.handle_input(&enter), InputOutcome::Unchanged),
+        "the echoed Enter must not act on the focused `+ New Agent`"
+    );
+    let tab = Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let _ = app.handle_input(&tab);
+    assert!(matches!(
+        app.handle_input(&enter),
+        InputOutcome::Action(Action::DashboardCreateNewAgentWithDetail)
+    ));
+}
+/// Types `text` into the dashboard input and sends it with Enter.
+fn send_dashboard_draft(app: &mut AppView, text: &str) {
+    for ch in text.chars() {
+        app.handle_input(&Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let InputOutcome::Action(send @ Action::DashboardDispatch { .. }) = app.handle_input(&enter)
+    else {
+        panic!("Enter with a draft must send");
+    };
+    let _ = dispatch(send, app);
+}
+/// A send such as `/usage` can open a modal that takes the next keys.
+/// The Esc that closes the modal must end the send echo guard.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_modal_esc_after_send_ends_echo_guard() {
+    let mut app = test_app();
+    open_dashboard(&mut app);
+    send_dashboard_draft(&mut app, "fix the bug");
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let _ = dispatch(Action::DashboardOpenShortcutsHelp, &mut app);
+    assert!(
+        app.dashboard
+            .as_ref()
+            .expect("dashboard is open")
+            .shortcuts_modal
+            .is_some()
+    );
+    let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let InputOutcome::Action(close @ Action::DashboardCloseShortcutsHelp) = app.handle_input(&esc)
+    else {
+        panic!("Esc must close the modal");
+    };
+    let _ = dispatch(close, &mut app);
+    assert!(
+        matches!(
+            app.handle_input(&enter),
+            InputOutcome::Action(Action::DashboardCreateNewAgentWithDetail)
+        ),
+        "Enter after a modal-consumed Esc is deliberate and must create"
+    );
+}
+/// `AppView` handles the `/resume` picker's Esc before it reaches the dashboard.
+/// That Esc must still end the send echo guard.
+#[serial_test::serial(GROK_AGENT_DASHBOARD)]
+#[test]
+fn dashboard_session_picker_esc_after_send_ends_echo_guard() {
+    let mut app = test_app();
+    app.workspace_dashboard_enabled = true;
+    open_dashboard(&mut app);
+    send_dashboard_draft(&mut app, "fix the bug");
+    let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let _ = dispatch(
+        Action::DashboardDispatchSlash {
+            text: "/resume".to_owned(),
+        },
+        &mut app,
+    );
+    assert!(app.dashboard_session_picker.is_some());
+    let esc = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    let InputOutcome::Action(close @ Action::DashboardCloseSessionPicker) = app.handle_input(&esc)
+    else {
+        panic!("Esc must close the picker");
+    };
+    let _ = dispatch(close, &mut app);
+    assert!(
+        matches!(
+            app.handle_input(&enter),
+            InputOutcome::Action(Action::DashboardCreateNewAgentWithDetail)
+        ),
+        "Enter after a picker-consumed Esc is deliberate and must create"
+    );
 }
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]

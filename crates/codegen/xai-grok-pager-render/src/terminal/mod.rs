@@ -15,6 +15,7 @@ pub mod image;
 pub mod keyboard;
 pub mod kitty_keyboard;
 pub mod overlay;
+pub mod pop_fence;
 pub(crate) mod probe;
 pub mod term_version;
 pub mod tmux;
@@ -36,6 +37,7 @@ pub use kitty_keyboard::{
     kitty_event_types_withheld, kitty_flags_pushed, kitty_releases_reported,
     negotiated_kitty_flags, pushed_kitty_flags, set_pushed_kitty_flags, take_kitty_flags_pushed,
 };
+pub use pop_fence::{PopFence, PopFenceOutcome};
 pub use term_version::{TermVersion, TermVersionSource};
 
 #[cfg(test)]
@@ -353,7 +355,6 @@ impl TerminalContext {
     /// precedence over multiplexer reasons so the user is pointed at the
     /// deeper cause.
     pub fn kitty_skip_reason(&self) -> Option<&'static str> {
-        let is_tmux_3_3_later = self.is_tmux_version_or_later(3, 3);
         if matches!(
             self.brand,
             TerminalName::VsCode
@@ -376,6 +377,25 @@ impl TerminalContext {
         if self.brand == TerminalName::JetBrains {
             return Some("jetbrains");
         }
+        if let Some(reason) = self.kitty_multiplexer_skip_reason() {
+            return Some(reason);
+        }
+        // No positive evidence of KKP support, so skip: xterm.js mis-encodes shifted keys (https://github.com/xtermjs/xterm.js/issues/5823)
+        // Probing an unresponsive terminal blocks startup.
+        if self.brand.is_capability_unclassified()
+            && self.multiplexer == MultiplexerKind::Undetected
+        {
+            return Some("unknown_no_multiplexer");
+        }
+        None
+    }
+
+    /// Multiplexer layers that drop Kitty keyboard / extended Enter, independent of brand.
+    ///
+    /// [`Self::kitty_skip_reason`] may hide these behind a brand/VTE reason; footer and
+    /// newline-preference decisions must still see them.
+    fn kitty_multiplexer_skip_reason(&self) -> Option<&'static str> {
+        let is_tmux_3_3_later = self.is_tmux_version_or_later(3, 3);
         if self.multiplexer == MultiplexerKind::Screen {
             return Some("screen");
         }
@@ -490,15 +510,16 @@ impl TerminalContext {
         false
     }
 
-    /// True when `Ctrl+.` cannot be delivered reliably as a shortcuts primary.
-    ///
-    /// Without KKP (or an equivalent extended-key path), `Ctrl+.` is not a
-    /// classic C0 control and collapses to `.` / an ambiguous byte — so we
-    /// follow [`Self::kitty_skip_reason`] rather than a hard-coded brand
-    /// list. That keeps iTerm2+tmux with `extended-keys off` (and other
-    /// multiplexer skips) aligned with VS Code / VTE / Apple Terminal.
-    /// The pager folds in host-OS signals (Windows, WSL) via
-    /// `ctrl_dot_unreliable()`.
+    /// Broader than [`Self::shift_enter_unavailable`]: SSH and multiplexers that drop
+    /// extended Enter (old tmux, `extended-keys off`, GNU screen) collapse Shift+Enter
+    /// even when the brand-first [`Self::kitty_skip_reason`] reports a terminal reason.
+    pub fn prefer_alt_enter_newline(&self) -> bool {
+        self.shift_enter_unavailable()
+            || self.is_ssh
+            || self.kitty_multiplexer_skip_reason().is_some()
+    }
+
+    /// Without KKP, Ctrl+. is not a C0 control and collapses to `.`. Follows [`Self::kitty_skip_reason`] so mux skips stay aligned.
     pub fn ctrl_dot_unreliable(&self) -> bool {
         self.kitty_skip_reason().is_some()
     }
@@ -1043,7 +1064,7 @@ fn terminal_name_from_term_program(value: &str) -> Option<TerminalName> {
 
 /// User-configured alt-screen (fullscreen) mode.
 ///
-/// Parsed from `[terminal] alt_screen` in `~/.grok/pager.toml` and
+/// Parsed from `[terminal] alt_screen` in `~/.opengrok/pager.toml` and
 /// overridden by the `--no-alt-screen` CLI flag.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AltScreenMode {

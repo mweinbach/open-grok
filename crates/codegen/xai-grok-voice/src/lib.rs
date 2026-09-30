@@ -18,7 +18,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod stt;
 
-pub use auth::{SharedVoiceAuth, StaticVoiceAuth, VoiceAuthProvider};
+pub use auth::{SharedVoiceAuth, StaticVoiceAuth, VoiceAuthError, VoiceAuthProvider};
 pub use config::VoiceConfig;
 pub use error::VoiceError;
 pub use event::VoiceEvent;

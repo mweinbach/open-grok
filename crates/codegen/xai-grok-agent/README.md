@@ -95,7 +95,7 @@ actionable feedback organized by severity.
 ```
 
 With `promptMode: extend` (the default), the body is appended to the
-base template which includes tool calling conventions, formatting
+base template which includes work policy, formatting
 rules, and user info. The author only writes persona-specific content.
 
 ### Full prompt override
@@ -113,11 +113,11 @@ tools:
 
 You are a custom agent.
 
-Use ${{ tools.read_file }} to read files.
-Use ${{ tools.search_replace }} to edit files.
+Use ${{ tools.by_kind.read }} to read files.
+Use ${{ tools.by_kind.edit }} to edit files.
 
-${%- if tools.run_terminal_cmd %}
-Use ${{ tools.run_terminal_cmd }} for shell commands.
+${%- if tools.by_kind.execute %}
+Use ${{ tools.by_kind.execute }} for shell commands.
 ${%- endif %}
 
 <user_info>
@@ -195,7 +195,7 @@ All frontmatter keys use **camelCase**.
 promptMode: extend                     promptMode: full
 ──────────────────                     ─────────────────
 1. Base template (MiniJinja)           1. Markdown body (MiniJinja, ${{ }}/${% %})
-   (tool conventions, formatting,      2. AGENTS.md section (if agentsMd: true)
+   (work policy, formatting,           2. AGENTS.md section (if agentsMd: true)
     user_info, background tasks)       3. Skills section
 2. Markdown body (appended raw)
 3. AGENTS.md section (if agentsMd: true)
@@ -206,23 +206,22 @@ promptMode: extend                     promptMode: full
 
 | Variable | Description |
 |---|---|
-| `${{ tools.read_file }}` | Resolved name for `read_file` (or empty if disabled) |
-| `${{ tools.search_replace }}` | Resolved name for `search_replace` |
-| `${{ tools.run_terminal_cmd }}` | Resolved name for `run_terminal_cmd` |
-| `${{ tools.grep }}` | Resolved name for `grep` |
-| `${{ tools.list_dir }}` | Resolved name for `list_dir` |
-| `${{ tools.todo_write }}` | Resolved name for `todo_write` |
-| `${{ tools.skill }}` | Resolved name for `skill` |
-| `${{ tools.get_task_output }}` | Resolved name for `get_task_output` |
-| `${{ tools.kill_task }}` | Resolved name for `kill_task` |
-| `${{ tools.web_search }}` | Resolved name for `web_search` |
+| `${{ tools.by_kind.read }}` | Model-facing name for the Read kind (empty if disabled) |
+| `${{ tools.by_kind.edit }}` | Model-facing name for the Edit kind |
+| `${{ tools.by_kind.execute }}` | Model-facing name for the Execute kind |
+| `${{ tools.by_kind.search }}` | Model-facing name for the Search kind |
+| `${{ tools.by_kind.list }}` | Model-facing name for the List kind |
+| `${{ tools.by_kind.plan }}` | Model-facing name for the Plan kind |
+| `${{ tools.by_kind.skill }}` | Model-facing name for the Skill kind |
+| `${{ tools.by_kind.web_search }}` | Model-facing name for the WebSearch kind |
 | `${{ os_name }}` | Operating system (e.g. `"macos"`, `"linux"`) |
 | `${{ shell_path }}` | Shell path (e.g. `"/bin/zsh"`) |
 | `${{ working_directory }}` | Workspace path |
 | `${{ current_date }}` | Current date in the user's local timezone (`YYYY-MM-DD`) |
 
-Conditionals: `${%- if tools.todo_write %}...${%- endif %}` — block
-is omitted when the tool is disabled.
+Conditionals: `${%- if tools.by_kind.plan %}...${%- endif %}`.
+The block is omitted when that kind is disabled. Canonical keys such as
+`${{ tools.read_file }}` are not in the render context.
 
 ## Discovery Rules
 
@@ -242,34 +241,13 @@ user-level definition with the same name.
 
 ## Crate Relationships
 
-```
-┌──────────────────┐
-│  xai-grok-agent  │  ← This crate
-│  (Agent, Builder, │
-│   Definition)     │
-└────────┬─────────┘
-         │ depends on
-         ▼
-┌──────────────────┐
-│  xai-grok-tools  │
-│  (ToolBridge,    │
-│   ToolRegistry,  │
-│   ToolState)     │
-└────────▲─────────┘
-         │ depends on
-┌────────┴─────────┐
-│  xai-grok-shell  │  uses AgentBuilder to create
-│  (session host)  │  Agent during session setup
-└──────────────────┘
-```
+This crate uses `xai-grok-tools`.
+`xai-grok-tools` provides `ToolBridge` and `Resources`.
+Session tool state is in `Resources`.
+There is no `ToolState`.
 
-- **`xai-grok-tools`**: Provides `ToolBridge`, `ToolRegistry`,
-  `ToolState`, `SystemReminderLayer`, and tool implementations.
-  `xai-grok-agent` depends on it for tool setup.
-- **`xai-grok-shell`**: The application shell. Uses `AgentBuilder`
-  to construct an `Agent` during session creation. The shell
-  re-exports some modules from `xai-grok-agent` (AGENTS.md
-  discovery, skills discovery, base prompt rendering).
+`xai-grok-shell` is the session host.
+It uses `AgentBuilder` to construct an `Agent` at session setup.
 
 ## Built-in Agents
 

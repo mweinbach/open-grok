@@ -1130,19 +1130,19 @@ impl ScrollbackState {
 
         let mut changes = Vec::new();
 
-        // Collect (id, idx) pairs first to avoid borrow issues
-        let dirty_entries: Vec<(EntryId, usize)> = self
+        // Collect indices first: the height update mutably borrows the cache while `dirty_heights` is still live
+        let dirty_entries: Vec<usize> = self
             .dirty_heights
             .iter()
-            .filter_map(|&id| self.entries.get_index_of(&id).map(|idx| (id, idx)))
+            .filter_map(|id| self.entries.get_index_of(id))
             .collect();
 
-        for (id, idx) in dirty_entries {
+        for idx in dirty_entries {
             if idx >= cache.entries.len() {
                 continue; // Entry added after cache was built
             }
 
-            let Some((_, entry)) = self.entries.get_index(idx) else {
+            let Some((id, entry)) = self.entries.get_index(idx) else {
                 continue;
             };
             let info = cache.entries[idx];
@@ -1150,7 +1150,7 @@ impl ScrollbackState {
                 .with_appearance_ref(&self.appearance)
                 .with_cwd(cwd);
             let member_height = match inline_edit_height {
-                Some((edit_id, h)) if edit_id == id => h,
+                Some((edit_id, h)) if edit_id == *id => h,
                 _ => renderer.desired_height(entry_area_width),
             };
             let new_height = info.with_verb_header_row(member_height);

@@ -174,6 +174,23 @@ impl SessionActor {
                 .combine_queued_prompts
                 .unwrap_or(false);
 
+        // A `/memory` toggle during the previous turn could not swap the prompt; do it before this
+        // turn samples. Takes `state` briefly on its own, so it stays outside the lock below.
+        if self
+            .memory
+            .prompt_sync_pending
+            .load(std::sync::atomic::Ordering::Relaxed)
+            && self.sync_v2_memory_prompt().await
+                == super::memory_control::MemoryPromptSync::RenderFailed
+        {
+            tracing::warn!(
+                target: xai_grok_telemetry::memory_log::TARGET,
+                session_id = %self.session_info.id.0,
+                "memory prompt sync failed again at turn promotion; this turn samples with the \
+                 previous memory section"
+            );
+        }
+
         let mut state = self.state.lock().await;
         // Re-check after the await gap.
         if state.running_task.is_some()

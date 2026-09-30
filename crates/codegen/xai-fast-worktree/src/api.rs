@@ -96,7 +96,7 @@ pub trait BtrfsDelegate: Send + Sync {
 }
 
 /// How to treat the source working tree when creating the destination worktree.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WorkingTreeMode {
     /// Replicate the working tree exactly as-is (including local modifications and untracked files).
     #[default]
@@ -220,6 +220,9 @@ pub struct WorktreeReport {
     pub resolved_strategy: &'static str,
     /// Arm-specific metadata persisted into worktrees.db.
     pub strategy_metadata: Option<serde_json::Value>,
+    /// Arms that declined before the one that ran. Always empty: the fork's
+    /// dispatch does not record typed declines.
+    pub skipped: Vec<crate::ArmSkip>,
 }
 
 /// High-level builder API for creating fast git worktrees.
@@ -495,6 +498,7 @@ impl WorktreeBuilder {
             ignored_copy: result.ignored_stats.map(Into::into),
             resolved_strategy: result.resolved_strategy,
             strategy_metadata: result.strategy_metadata,
+            skipped: Vec::new(),
         })
     }
 

@@ -2743,8 +2743,6 @@ fn available_commands_refreshed_empty_is_noop() {
     );
 }
 
-// -- Session deletion from the /resume picker -----------------------
-
 #[test]
 fn delete_session_complete_removes_only_matching_source_and_id() {
     use crate::views::modal::ActiveModal;
@@ -3066,8 +3064,6 @@ fn rename_session_failed_keeps_local_display_name_and_pushes_system_block() {
     );
 }
 
-// ── GateRefreshed subscription flow ─────────────────────────────
-
 /// Regression: when the 30s gate poll detects the subscription gate has
 /// been lifted, it must emit `CheckSubscription` so the shell refreshes
 /// the JWT. Without this the auth token still lacks the subscription
@@ -3186,8 +3182,6 @@ fn gate_refreshed_newly_blocked_defers_gate_for_verification() {
         "must arm the verification timeout; got: {effects:?}"
     );
 }
-
-// ── Stale-gate verification resolution ──────────────────────────
 
 fn test_gate() -> xai_grok_shell::auth::GateInfo {
     xai_grok_shell::auth::GateInfo {
@@ -3657,8 +3651,6 @@ fn rollback_to_always_approve_blocked_by_policy_pin() {
     );
     assert!(!app.default_yolo);
 }
-
-// -- Degraded conversations lane (SessionListLoaded.partial) ----------
 
 /// A degraded conversations lane surfaces an actionable notice instead of
 /// the misleading "No sessions found" toast.

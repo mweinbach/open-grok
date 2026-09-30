@@ -546,6 +546,7 @@ fn rehydrate_worktree_from_ref_inner(
         ignored_copy: None,
         resolved_strategy: crate::worktree::STRATEGY_GIT,
         strategy_metadata: None,
+        skipped: Vec::new(),
     })
 }
 

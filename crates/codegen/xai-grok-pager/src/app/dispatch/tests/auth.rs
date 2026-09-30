@@ -1420,8 +1420,6 @@ fn cta_mcps_loaded_later_needs_auth_opens_handoff() {
     );
 }
 
-// ── agent-bound kinds (bash) ─────────
-
 /// A bash command typed while a turn is RUNNING takes the
 /// server-authoritative immediate path (Effect + optimistic echo, no local
 /// queue entry).

@@ -940,6 +940,7 @@ pub fn map_tool_result(ev: &events::ToolCallCompleted) -> Option<ExternalRecord>
         )
         .attr(ExternalKey::HookRewrote, ev.hook_rewrote)
         .attr(ExternalKey::DurationMs, ev.duration_ms)
+        .attr(ExternalKey::Model, ev.external_model_id.as_str())
         .gated(
             ExternalKey::ToolName,
             Gate::ToolDetails,

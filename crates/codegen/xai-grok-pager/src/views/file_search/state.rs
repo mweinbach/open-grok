@@ -154,8 +154,6 @@ impl FileSearchState {
         self.scroll_offset = 0;
     }
 
-    // ── Visibility ──────────────────────────────────────────────────────
-
     /// Whether the dropdown should be visible.
     pub fn is_visible(&self) -> bool {
         self.context.is_some() && !self.results.topk.is_empty()
@@ -198,8 +196,6 @@ impl FileSearchState {
     pub fn is_dir_mode(&self) -> bool {
         self.context.as_ref().is_some_and(|c| c.is_dir_mode())
     }
-
-    // ── Context updates ─────────────────────────────────────────────────
 
     /// Anchor (or clear) the drilled directory for whitespace-aware detection.
     pub fn set_drill_prefix(&mut self, prefix: Option<String>) {
@@ -269,8 +265,6 @@ impl FileSearchState {
         self.results = FuzzyMatcherDaemonResults::default();
     }
 
-    // ── Tick / polling ──────────────────────────────────────────────────
-
     /// Poll the daemon for new results. Returns `true` if results changed.
     ///
     /// Should be called on every tick (~4ms) while the dropdown is potentially visible.
@@ -305,9 +299,7 @@ impl FileSearchState {
         false
     }
 
-    // ── Navigation ──────────────────────────────────────────────────────
-
-    /// Move selection by `delta` items (negative = up, positive = down).
+    /// Move selection by `delta` items (negative is up, positive is down).
     pub fn move_selection(&mut self, delta: isize) {
         let len = self.results.topk.len();
         if len == 0 {
@@ -335,8 +327,6 @@ impl FileSearchState {
             self.scroll_offset = self.selected + 1 - visible_rows;
         }
     }
-
-    // ── Selection / replacement ─────────────────────────────────────────
 
     /// Select the hovered item (for click-to-accept).
     /// Returns `true` if there was a valid hovered item to select.

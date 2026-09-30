@@ -245,6 +245,7 @@ fn product_skill_info(
         description,
         has_user_specified_description: true,
         paths: None,
+        origin: None,
         when_to_use: None,
         short_description: None,
         author: None,

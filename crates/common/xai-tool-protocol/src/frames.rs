@@ -334,6 +334,30 @@ pub struct ServerInfo {
     pub status: ToolServerLifecycleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_kind: Option<HostKind>,
+}
+
+/// What hosts a tool server, resolved by the hub from the *minter* of its
+/// serve credential at upgrade — never from the client-declared `host_kind`
+/// in registration `metadata`. Bind-time policy keys on it, and
+/// `servers.list` carries it as [`ServerInfo::host_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostKind {
+    Desktop,
+    Container,
+    Sandbox,
+}
+
+impl std::fmt::Display for HostKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Desktop => "desktop",
+            Self::Container => "container",
+            Self::Sandbox => "sandbox",
+        })
+    }
 }
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerIdentityMetadata {
@@ -940,8 +964,9 @@ pub struct ToolsChanged {
 /// Lifecycle status of a tool server connection.
 ///
 /// `starting` → `ready` → `busy` ↔ `ready` → `draining` → `shutting_down`.
-/// `disconnected` is hub-only: set during disconnect cleanup, never sent
-/// by the tool server itself.
+/// `disconnected` is set by the hub during disconnect cleanup, and sent by a
+/// tool server tearing down gracefully (`push_disconnect_status`) — the hub
+/// accepts it only for the sender's own connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolServerLifecycleStatus {

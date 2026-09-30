@@ -185,6 +185,14 @@ impl PersistedRowId {
 /// Also reused by the dashboard-overlay stop for its double-press close confirm.
 pub const CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long after a send an empty Enter still counts as an echo of that send.
+/// One second covers the default key auto-repeat delay on macOS (375 ms), Windows (500 ms), and GNOME (500 ms).
+const SEND_ECHO_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) fn send_echo_window_open(since_send: std::time::Duration) -> bool {
+    since_send < SEND_ECHO_WINDOW
+}
+
 /// Coarse state used for the dashboard grouping.
 ///
 /// See [`super::row::classify_top_level`] / [`super::row::classify_subagent`] for the mapping rules.
@@ -423,6 +431,9 @@ pub struct DashboardState {
     pub(crate) deferred_dispatch_send: Option<DeferredDispatchSend>,
     /// A peek-reply send deferred the same way; per-surface slots so stashing one surface can never overwrite the other's pending send.
     pub(crate) deferred_peek_send: Option<DeferredPeekSend>,
+    /// When the dispatch input last sent its text.
+    /// `AppView` clears it on any key other than Enter.
+    pub(crate) last_send_at: Option<Instant>,
     /// Peek panel state (Space toggles).
     pub peek: Option<PeekPanelState>,
     /// Session-scoped guest viewport for the live-tail peek (capture once on select; sticky while the same row is peeked; restore on leave).
@@ -629,6 +640,10 @@ pub struct DashboardState {
     /// Surface-local compose mode for dispatch and peek (not persisted; not shared with agent sessions).
     /// `/multiline` or Ctrl+M.
     pub multiline_mode: bool,
+    pub(crate) preview_enabled: bool,
+    /// `/usage` modal, hosted here because the dashboard has no agent to hang it on (session-less: no session id).
+    /// Owns input while open; cleared on dashboard-open and on every overlay exit back to the list.
+    pub usage_modal: Option<Box<crate::views::usage_modal::UsageInfoModalState>>,
 }
 
 /// Mode staged for the next agent the dashboard spawns.
@@ -1205,6 +1220,7 @@ impl DashboardState {
             paste_probe_in_flight: 0,
             deferred_dispatch_send: None,
             deferred_peek_send: None,
+            last_send_at: None,
             peek: None,
             peek_viewport: None,
             peek_reply,
@@ -1259,7 +1275,11 @@ impl DashboardState {
             voice_interim: None,
             multiline_mode: false,
 
+            // Fresh dashboard with no rows seeded, so the `+ New Agent` button is the default cursor target.
             new_agent_button_focused: true,
+            preview_enabled: xai_grok_shell::agent::config::UiConfig::default()
+                .dashboard_preview_enabled(),
+            usage_modal: None,
         }
     }
 
@@ -1683,6 +1703,7 @@ impl DashboardState {
         let row_changed = peek.as_ref().map(|p| &p.row) != self.peek.as_ref().map(|p| &p.row);
         if row_changed {
             self.clear_peek_reply();
+            self.deferred_peek_send = None;
         }
         self.peek = peek;
     }
@@ -2593,7 +2614,6 @@ impl DashboardState {
                     .as_ref()
                     .is_some_and(|p| p.reject_option == selected);
             match (key.code, selected) {
-                // ── No option selected → navigate agents / open ──
                 (KeyCode::Up, None) => {
                     return Some(InputOutcome::Action(Action::DashboardSelectPrev));
                 }
@@ -2618,7 +2638,6 @@ impl DashboardState {
                             .unwrap_or(InputOutcome::Unchanged),
                     );
                 }
-                // ── Option selected → move within options (spill at edges) ──
                 (KeyCode::Up, Some(0)) => {
                     return Some(InputOutcome::Action(Action::DashboardSelectPrev));
                 }
@@ -2739,8 +2758,9 @@ impl DashboardState {
             {
                 return Some(InputOutcome::Changed);
             }
-            let enter_is_newline =
-                focused && compose_enter_is_newline(self.multiline_mode, mod_enter);
+            let enter_is_newline = focused
+                && (compose_enter_is_newline(self.multiline_mode, mod_enter)
+                    || crate::input::is_delivered_super_enter(key));
             if !enter_is_newline {
                 let Some(row) = self.peek.as_ref().map(|p| p.row.clone()) else {
                     return Some(InputOutcome::Unchanged);
@@ -2816,7 +2836,7 @@ impl DashboardState {
     /// "send and open" chord (`attach == true`, walk into the detail view).
     /// Empty-prompt fallbacks mirror the old Enter handler: open the selected row, or create from the `[+ New Agent]` button.
     /// A `/command` always routes to the slash dispatcher (there's no session to "open"), so `attach` only affects the plain-dispatch path.
-    fn dispatch_send_action(&self, attach: bool) -> InputOutcome {
+    fn dispatch_send_action(&mut self, attach: bool) -> InputOutcome {
         let text = self.dispatch.text().to_string();
         let trimmed = text.trim();
         if trimmed.is_empty() {
@@ -2828,6 +2848,7 @@ impl DashboardState {
             }
             return InputOutcome::Unchanged;
         }
+        self.last_send_at = Some(Instant::now());
         if trimmed.starts_with('/') {
             return InputOutcome::Action(Action::DashboardDispatchSlash { text });
         }
@@ -2859,6 +2880,15 @@ impl DashboardState {
                 None
             }
         }
+    }
+
+    /// Whether an empty Enter now is an echo of the last send.
+    /// Key auto-repeat in older terminals, a bouncing key switch, and a double tap all produce this echo.
+    fn empty_enter_echoes_send(&self) -> bool {
+        self.dispatch.text().trim().is_empty()
+            && self
+                .last_send_at
+                .is_some_and(|sent| send_echo_window_open(sent.elapsed()))
     }
 
     fn handle_key(&mut self, key: &KeyEvent, registry: &ActionRegistry) -> InputOutcome {
@@ -3153,6 +3183,9 @@ impl DashboardState {
 
         if matches!(key.code, KeyCode::Enter) {
             if self.list_focused && key.modifiers.is_empty() {
+                if self.empty_enter_echoes_send() {
+                    return InputOutcome::Unchanged;
+                }
                 if let Some(id) = self.selected.clone() {
                     return InputOutcome::Action(Action::DashboardAttach(id));
                 }
@@ -3172,8 +3205,11 @@ impl DashboardState {
                 return InputOutcome::Changed;
             }
             // slash_accepted_send: no-arg slash accept must submit, not newline.
-            let enter_is_newline =
-                !slash_accepted_send && compose_enter_is_newline(self.multiline_mode, mod_enter);
+            // PromptWidget inserts a newline for a delivered SUPER+Enter (Kitty).
+            // Apple Terminal rescue makes `is_mod_enter` true for a bare Enter that must send or insert a newline.
+            let enter_is_newline = !slash_accepted_send
+                && (compose_enter_is_newline(self.multiline_mode, mod_enter)
+                    || crate::input::is_delivered_super_enter(key));
             // Expand paste/file chips only for real bare Enter
 
             if !mod_enter
@@ -3187,6 +3223,8 @@ impl DashboardState {
             }
             if enter_is_newline {
                 // fall through for newline
+            } else if self.empty_enter_echoes_send() {
+                return InputOutcome::Unchanged;
             } else {
                 return self.dispatch_send_action(false);
             }
@@ -4098,8 +4136,10 @@ fn rename_edit_outcome(outcome: LineEditOutcome) -> InputOutcome {
 /// Rules:
 /// - `a:` (empty) clears the filter (no-op).
 /// - `a:<name>` matches by agent label (case-insensitive substring).
-/// - `s:` (empty) is a substring match.
-/// - `s:<state>` matches by row state; accepts synonyms `needs-input`/`needs_input`/`needsinput`/`blocked`/`completed`/ `failed`/`idle`/`working`.
+/// - `s:` (empty) clears the filter (no-op).
+/// - `s:<state>` matches by row state; accepts synonyms `needs-input`/`needs_input`/`needsinput`/`needs`/`input`,
+///   `working`/`busy`/`running`, `idle`, `inactive`/`dormant`, `completed`/`done`,
+///   `failed`/`errored`/`cancelled`/`canceled`.
 ///   Unknown values fall back to substring.
 /// - `#<n>` is treated as a substring filter (PR filtering is not implemented; matching against label and cwd keeps the typed text useful).
 /// - Anything else is a substring match on label and cwd.
@@ -4151,10 +4191,6 @@ pub fn parse_row_state_token(s: &str) -> Option<RowState> {
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Persistence I/O
-// ---------------------------------------------------------------------------
 
 /// Read the persisted `[dashboard].enabled` flag (defaults to `true`).
 ///
@@ -4697,6 +4733,7 @@ mod tests {
         state.selected = Some(id1.clone());
         let rows = vec![super::super::row::DashboardRow {
             id: id1.clone(),
+            session_id: None,
             label: "r1".to_string(),
             subtitle: None,
             state: RowState::Idle,
@@ -4731,6 +4768,7 @@ mod tests {
         let id1 = DashboardRowId::TopLevel(AgentId(1));
         let rows = vec![super::super::row::DashboardRow {
             id: id1.clone(),
+            session_id: None,
             label: "r1".to_string(),
             subtitle: None,
             state: RowState::Idle,
@@ -9477,6 +9515,7 @@ mod tests {
     fn reanchor_test_row(id: usize, state: RowState) -> super::super::row::DashboardRow {
         super::super::row::DashboardRow {
             id: DashboardRowId::TopLevel(AgentId(id)),
+            session_id: None,
             label: format!("r{id}"),
             subtitle: None,
             state,

@@ -284,6 +284,59 @@
     }
 
     #[test]
+    fn finished_child_footer_skips_trailing_turn_cancelled() {
+        use crate::app::subagent::finalize_finished_child_view;
+
+        for event in [
+            SessionEvent::TurnCancelled {
+                elapsed: Some(std::time::Duration::from_secs(1)),
+                cause: crate::scrollback::blocks::CancelledBy::User,
+            },
+            SessionEvent::TurnFailed {
+                error: "boom".into(),
+                elapsed: None,
+            },
+            SessionEvent::TurnBlockedByHook {
+                elapsed: Some(std::time::Duration::from_secs(1)),
+            },
+        ] {
+            let mut child = make_agent(Some("child-footer"));
+            child
+                .scrollback
+                .push_block(RenderBlock::session_event(event));
+            let len = child.scrollback.len();
+            finalize_finished_child_view(&mut child, std::time::Duration::from_secs(2));
+            assert_eq!(
+                child.scrollback.len(),
+                len,
+                "a trailing turn-terminal marker must not grow a second TurnCompleted"
+            );
+            assert!(
+                !matches!(
+                    last_session_event(&child.scrollback),
+                    Some(SessionEvent::TurnCompleted { .. })
+                ),
+                "trailing marker must stay, got {:?}",
+                last_session_event(&child.scrollback)
+            );
+        }
+
+        let mut child = make_agent(Some("child-footer"));
+        child
+            .scrollback
+            .push_block(RenderBlock::session_event(SessionEvent::TurnCancelled {
+                elapsed: Some(std::time::Duration::from_secs(1)),
+                cause: crate::scrollback::blocks::CancelledBy::User,
+            }));
+        child.scrollback.push_block(RenderBlock::system("later turn"));
+        finalize_finished_child_view(&mut child, std::time::Duration::from_secs(4));
+        assert!(matches!(
+            last_session_event(&child.scrollback),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
     fn spawning_many_subagents_starts_no_history_search_threads() {
         const SUBAGENTS: usize = 50;
 

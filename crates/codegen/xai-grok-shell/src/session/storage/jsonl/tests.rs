@@ -1289,7 +1289,7 @@ fn write_test_summary(
         generated_title: None,
         title_is_manual: false,
         worktree_label: None,
-        agent_name: None,
+        agent: Default::default(),
         sandbox_profile: None,
         reasoning_effort: None,
         last_turn_summary: None,
@@ -2357,6 +2357,7 @@ async fn retry_after_lost_ack_converges_memory_and_disk_to_authoritative_item() 
     let chat = xai_chat_state::ChatStateActor::spawn(
         vec![],
         xai_grok_sampling_types::SamplingConfig {
+            max_request_bytes: None,
             base_url: String::new(),
             model: String::new(),
             max_completion_tokens: None,

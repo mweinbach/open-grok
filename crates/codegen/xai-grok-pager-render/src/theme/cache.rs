@@ -338,6 +338,10 @@ pub fn test_lock() -> &'static Mutex<()> {
 pub fn pin_theme() -> std::sync::MutexGuard<'static, ()> {
     let guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     set(ThemeKind::GrokNight);
+    // A predecessor may have left the terminal-native lock engaged (minimal
+    // startup paths set it without resetting); clear it so the pinned theme
+    // actually resolves to GrokNight instead of the terminal palette.
+    set_terminal_native_lock(false);
     // Color level is a write-once `OnceLock`; tests run without a TTY so it
     // resolves to `TrueColor` anyway. Pin it explicitly (best-effort: ignore the
     // already-initialized `Err`) so the measure path that reads it stays fixed.

@@ -1438,9 +1438,21 @@ async fn writer_exits_when_control_channel_closes() {
 /// Socket-less `HubConnection` for tests: observe the sent frame and
 /// resolve the response waiter without a live server or actor task.
 fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>) {
+    test_connection_with(
+        Arc::new(AuthCredential::bearer("test-token")),
+        Vec::new(),
+        AUTH_REFRESH_POLL,
+    )
+}
+/// [`test_connection`] with the provider the socket dials with, the
+/// capabilities its `hello_ack` advertised, and the `auth.refresh` cadence.
+fn test_connection_with(
+    credential: Arc<dyn AuthProvider>,
+    hello_capabilities: Vec<String>,
+    auth_refresh_poll: Duration,
+) -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>) {
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(8);
     let demux = Arc::new(Demux::with_outbound(outbound_tx.clone()));
-    let credential: Arc<dyn AuthProvider> = Arc::new(AuthCredential::bearer("test-token"));
     let (stop_tx, _stop_rx) = mpsc::channel::<()>(1);
     let (reconnect_tx, _reconnect_rx) = mpsc::channel::<()>(1);
     let inner = Arc::new(HubConnectionInner {
@@ -1463,12 +1475,14 @@ fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>)
         reconnect_jitter_seed: 1,
         attempt_reset_after: resolve_attempt_reset_after(None),
         reconnect_after_terminal_close_codes: Vec::new(),
+        auth_refresh_poll,
         outage_seq: AtomicU32::new(0),
         outbound_tx,
         demux: demux.clone(),
         bound_sessions: Arc::new(RefCountedSet::new()),
+        last_binds: dashmap::DashMap::new(),
         connection_id: Arc::new(Mutex::new(None)),
-        hello_capabilities: parking_lot::RwLock::new(Vec::new()),
+        hello_capabilities: parking_lot::RwLock::new(hello_capabilities),
         next_request_id: std::sync::atomic::AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         stop_tx,
@@ -1478,6 +1492,290 @@ fn test_connection() -> (Arc<HubConnection>, Arc<Demux>, mpsc::Receiver<String>)
         writer_error: Arc::new(parking_lot::Mutex::new(None)),
     });
     (Arc::new(HubConnection { inner }), demux, outbound_rx)
+}
+mod auth_refresh_driver {
+    use super::*;
+    use serde_json::json;
+    /// A bearer provider whose token the test rotates.
+    #[derive(Debug)]
+    struct RotatingBearer(parking_lot::Mutex<String>);
+    impl RotatingBearer {
+        fn new(token: &str) -> Arc<Self> {
+            Arc::new(Self(parking_lot::Mutex::new(token.to_owned())))
+        }
+        fn rotate(&self, token: &str) {
+            *self.0.lock() = token.to_owned();
+        }
+    }
+    impl AuthProvider for RotatingBearer {
+        fn current(&self) -> AuthCredential {
+            AuthCredential::bearer(self.0.lock().clone())
+        }
+    }
+    const POLL: Duration = Duration::from_millis(20);
+    const QUIET: Duration = Duration::from_millis(150);
+    fn refresh_capability() -> Vec<String> {
+        vec![Method::AuthRefresh.as_wire_str().to_owned()]
+    }
+    /// A socket-less tool-server connection offered `auth.refresh`, dialed
+    /// with `provider`, plus its driver seeded from `provider.current()`.
+    fn connection_with_driver(
+        provider: &Arc<RotatingBearer>,
+        poll: Duration,
+    ) -> (
+        Arc<HubConnection>,
+        Arc<Demux>,
+        mpsc::Receiver<String>,
+        AuthRefreshDriver,
+    ) {
+        let (conn, demux, outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), poll);
+        let driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &provider.current(),
+            Some(true),
+        )
+        .expect("a bearer tool server with the capability");
+        (conn, demux, outbound_rx, driver)
+    }
+    async fn no_frame_for(outbound_rx: &mut mpsc::Receiver<String>, window: Duration) -> bool {
+        tokio::time::timeout(window, outbound_rx.recv())
+            .await
+            .is_err()
+    }
+    /// The `auth.refresh` frame the driver sent: its id and the bearer.
+    async fn next_refresh(outbound_rx: &mut mpsc::Receiver<String>) -> (Value, String) {
+        let text = tokio::time::timeout(Duration::from_secs(2), outbound_rx.recv())
+            .await
+            .expect("a frame within 2 s")
+            .expect("outbound open");
+        let frame: Value = serde_json::from_str(&text).expect("json frame");
+        assert_eq!(
+            frame["method"],
+            Method::AuthRefresh.as_wire_str(),
+            "{frame}"
+        );
+        let token = frame["params"]["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_owned();
+        (frame["id"].clone(), token)
+    }
+    fn accept(demux: &Demux, id: Value) {
+        demux.route(json!({ "jsonrpc": "2.0", "id": id, "result": { "exp": 1_800_000_000 } }));
+    }
+    fn refuse(demux: &Demux, id: Value, reason: &str) {
+        demux.route(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32003, "message": "refused", "data": { "reason": reason } },
+        }));
+    }
+    fn refusal(reason: &str) -> Result<i64, AuthRefreshError> {
+        Err(AuthRefreshError::Refused {
+            reason: reason.to_owned(),
+            message: "refused".to_owned(),
+        })
+    }
+    #[test]
+    fn runs_only_for_a_bearer_tool_server_offered_the_capability() {
+        let bearer = AuthCredential::bearer("t1");
+        let headers = AuthCredential::headers([("authorization", "Bearer t1")]).expect("valid");
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, Some(true)).is_some()
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::Harness, &bearer, Some(true)).is_none(),
+            "a harness is never token-bound"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &headers, Some(true))
+                .is_none(),
+            "a header bundle is not a bearer the hub can re-verify"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, Some(false))
+                .is_none(),
+            "the hub did not offer it to this socket"
+        );
+        assert!(
+            AuthRefreshDriver::for_phase(ConnectionKind::ToolServer, &bearer, None).is_none(),
+            "a hub predating capabilities closes at exp; nothing to send it"
+        );
+    }
+    #[tokio::test]
+    async fn sends_once_per_changed_bearer_and_never_two_at_once() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx, driver) = connection_with_driver(&provider, POLL);
+        let task = tokio::spawn(run_auth_refresh(conn.inner.clone(), driver, POLL));
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "an unchanged bearer is never re-presented"
+        );
+        provider.rotate("t2");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "no second request while the first is unanswered"
+        );
+        accept(&demux, id);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "an acknowledged bearer is not re-presented"
+        );
+        provider.rotate("t3");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token);
+        refuse(&demux, id, "unavailable");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token, "a refused bearer is retried on the next tick");
+        task.abort();
+    }
+    /// The hub bound to a bearer whose accept reply was lost refuses it
+    /// `not_later` forever; the driver takes that as the acknowledgement it
+    /// missed instead of re-presenting it every tick.
+    #[tokio::test]
+    async fn a_not_later_refusal_acknowledges_the_bearer_and_others_do_not() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx, driver) = connection_with_driver(&provider, POLL);
+        let task = tokio::spawn(run_auth_refresh(conn.inner.clone(), driver, POLL));
+        provider.rotate("t2");
+        let (id, _) = next_refresh(&mut outbound_rx).await;
+        refuse(&demux, id, AUTH_REFRESH_NOT_LATER);
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "a not_later bearer is one the hub already holds"
+        );
+        provider.rotate("t3");
+        let (id, _) = next_refresh(&mut outbound_rx).await;
+        refuse(&demux, id, "too_soon");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token, "any other refusal is retried");
+        task.abort();
+    }
+    #[test]
+    fn unaccepted_answers_are_counted_until_an_acknowledgement() {
+        let mut driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &AuthCredential::bearer("t1"),
+            Some(true),
+        )
+        .expect("driver");
+        for expected in 1..=AUTH_REFRESH_WARN_AFTER + 1 {
+            driver.settle("t2".to_owned(), refusal("unverified"));
+            assert_eq!(expected, driver.unaccepted_in_a_row);
+            assert_eq!("t1", driver.acknowledged);
+        }
+        driver.settle(
+            "t2".to_owned(),
+            Err(AuthRefreshError::Failed(ClientError::NetworkError(
+                "timed out".to_owned(),
+            ))),
+        );
+        assert_eq!(AUTH_REFRESH_WARN_AFTER + 2, driver.unaccepted_in_a_row);
+        driver.settle("t2".to_owned(), refusal(AUTH_REFRESH_NOT_LATER));
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert_eq!("t2", driver.acknowledged);
+        driver.settle("t3".to_owned(), refusal("too_soon"));
+        driver.settle("t3".to_owned(), Ok(1_800_000_000));
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert_eq!("t3", driver.acknowledged);
+    }
+    /// A provider stuck on a bearer the hub already holds is acknowledged
+    /// each time and still shows up on the counter.
+    #[cfg(feature = "metrics")]
+    #[test]
+    fn not_later_is_counted_although_acknowledged() {
+        let mut driver = AuthRefreshDriver::for_phase(
+            ConnectionKind::ToolServer,
+            &AuthCredential::bearer("t1"),
+            Some(true),
+        )
+        .expect("driver");
+        let before = crate::metrics::auth_refresh_refused_count(AUTH_REFRESH_NOT_LATER);
+        for _ in 0..5 {
+            driver.settle("t2".to_owned(), refusal(AUTH_REFRESH_NOT_LATER));
+        }
+        assert_eq!("t2", driver.acknowledged);
+        assert_eq!(0, driver.unaccepted_in_a_row);
+        assert!(
+            crate::metrics::auth_refresh_refused_count(AUTH_REFRESH_NOT_LATER) >= before + 5,
+            "each not_later answer is counted (other tests may add to the same label)"
+        );
+    }
+    /// The metric label is one of a fixed set whatever the hub sends.
+    #[test]
+    fn refusal_reason_label_is_bounded() {
+        let known = refusal("unverified").expect_err("refusal");
+        assert_eq!("unverified", known.reason());
+        let unknown = refusal("some-future-reason").expect_err("refusal");
+        assert_eq!("other", unknown.reason());
+        let failed = AuthRefreshError::Failed(ClientError::NetworkError("x".to_owned()));
+        assert_eq!("failed", failed.reason());
+    }
+    /// A reconnect that dialed with a bearer the provider has since rotated
+    /// past must not wait a whole poll interval to present the fresh one.
+    #[tokio::test]
+    async fn the_first_check_runs_at_phase_start() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, _demux, mut outbound_rx, driver) =
+            connection_with_driver(&provider, Duration::from_secs(60));
+        provider.rotate("t2");
+        let task = tokio::spawn(run_auth_refresh(
+            conn.inner.clone(),
+            driver,
+            Duration::from_secs(60),
+        ));
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn dropping_the_phase_task_ends_a_pending_rotation() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), POLL);
+        let task = spawn_auth_refresh(&conn.inner, &provider.current()).expect("driver spawned");
+        provider.rotate("t2");
+        let (id, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t2", token);
+        drop(task);
+        refuse(&demux, id, "unavailable");
+        provider.rotate("t3");
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "neither the retry nor the next rotation is presented after the phase ended"
+        );
+    }
+    /// On reconnect the new driver is seeded with the bearer the reconnect
+    /// presented, so a rotation that happened during the outage is not
+    /// presented a second time.
+    #[tokio::test]
+    async fn a_driver_seeded_from_a_rotated_presented_stays_silent_until_the_next_rotation() {
+        let provider = RotatingBearer::new("t1");
+        provider.rotate("t2");
+        let (conn, _demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), refresh_capability(), POLL);
+        let task = spawn_auth_refresh(&conn.inner, &provider.current()).expect("driver spawned");
+        assert!(
+            no_frame_for(&mut outbound_rx, QUIET).await,
+            "the presented bearer is what the hub already holds"
+        );
+        provider.rotate("t3");
+        let (_, token) = next_refresh(&mut outbound_rx).await;
+        assert_eq!("t3", token);
+        drop(task);
+    }
+    #[tokio::test]
+    async fn nothing_is_sent_without_the_capability() {
+        let provider = RotatingBearer::new("t1");
+        let (conn, _demux, mut outbound_rx) =
+            test_connection_with(provider.clone(), Vec::new(), POLL);
+        assert!(spawn_auth_refresh(&conn.inner, &provider.current()).is_none());
+        provider.rotate("t2");
+        assert!(no_frame_for(&mut outbound_rx, QUIET).await);
+    }
 }
 #[test]
 fn classify_stream_end_prefers_recorded_write_error() {
@@ -1505,6 +1803,80 @@ fn classify_stream_end_prefers_recorded_write_error() {
         classify_stream_end(inner, Some("reset".to_owned())),
         DisconnectCause::WriteError(_)
     ));
+}
+/// One replay entry per tool server; unbinding one keeps the rest, unbinding
+/// the last drops the key, and a close drops them all.
+#[test]
+fn recorded_binds_follow_bind_unbind_and_close() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds").expect("valid");
+    let bind = |server: &str, cwd: Option<&str>| SessionBindServerParams {
+        server_id: ServerId::new(server).expect("valid"),
+        cwd: cwd.map(str::to_owned),
+        metadata: None,
+    };
+    let recorded = |conn: &HubConnection| {
+        conn.inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.clone())
+            .unwrap_or_default()
+    };
+    conn.record_session_bind(&session, bind("a", None));
+    conn.record_session_bind(&session, bind("b", None));
+    conn.record_session_bind(&session, bind("a", Some("/re-bound")));
+    assert_eq!(
+        vec![bind("b", None), bind("a", Some("/re-bound"))],
+        recorded(&conn)
+    );
+    conn.forget_session_bind(&session, Some(&ServerId::new("b").expect("valid")));
+    assert_eq!(vec![bind("a", Some("/re-bound"))], recorded(&conn));
+    conn.forget_session_bind(&session, Some(&ServerId::new("a").expect("valid")));
+    assert!(!conn.inner.last_binds.contains_key(&session));
+    conn.record_session_bind(&session, bind("a", None));
+    conn.forget_session_bind(&session, None);
+    assert!(!conn.inner.last_binds.contains_key(&session));
+}
+/// Forgetting the last server of a session must not take a bind recorded
+/// concurrently down with it: the key is removed only if the entry is still
+/// empty at removal time. Correct code cannot fail this; an unconditional
+/// remove loses `b` on some interleaving.
+#[test]
+fn forgetting_the_last_server_keeps_a_concurrently_recorded_bind() {
+    let (conn, _demux, _outbound_rx) = test_connection();
+    let session = SessionId::new("binds-race").expect("valid");
+    let server = |name: &str| ServerId::new(name).expect("valid");
+    for _ in 0..2_000 {
+        conn.record_session_bind(
+            &session,
+            SessionBindServerParams {
+                server_id: server("a"),
+                cwd: None,
+                metadata: None,
+            },
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| conn.forget_session_bind(&session, Some(&server("a"))));
+            scope.spawn(|| {
+                conn.record_session_bind(
+                    &session,
+                    SessionBindServerParams {
+                        server_id: server("b"),
+                        cwd: None,
+                        metadata: None,
+                    },
+                )
+            });
+        });
+        let remaining: Vec<ServerId> = conn
+            .inner
+            .last_binds
+            .get(&session)
+            .map(|binds| binds.iter().map(|b| b.server_id.clone()).collect())
+            .unwrap_or_default();
+        assert_eq!(vec![server("b")], remaining);
+        conn.forget_session_bind(&session, None);
+    }
 }
 #[test]
 fn supports_is_unknown_until_capabilities_advertised() {

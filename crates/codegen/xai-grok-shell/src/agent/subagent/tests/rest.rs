@@ -2775,13 +2775,20 @@ fn resolve_inherited_pool_missing_parent_returns_none() {
 /// mcpServers, but they do inherit already-connected parent servers.
 #[test]
 fn plugin_agents_inherit_parent_mcp_pool_by_default() {
+    let mut plugin_def = xai_grok_agent::config::AgentDefinition::general_purpose();
+    plugin_def.plugin_name = Some("test-plugin".into());
+    plugin_def.mcp_servers = vec![xai_grok_agent::config::McpServerRef::Inline {
+        name: "owned".into(),
+        config: serde_json::json!({"command": "owned-server"}),
+    }];
     assert!(
-        !super::agent_owned_mcp_servers_allowed(true),
+        crate::session::agent_mcp::materialize_agent_mcp_servers(
+            &plugin_def,
+            &[],
+            std::path::Path::new("/tmp"),
+        )
+        .is_empty(),
         "plugin agents must not declare agent-owned mcpServers"
-    );
-    assert!(
-        super::agent_owned_mcp_servers_allowed(false),
-        "non-plugin agents may declare agent-owned mcpServers"
     );
     let pool = make_pool(&["atlassian", "github"]);
     let inherited = super::resolve_inherited_mcp_pool(
@@ -2833,6 +2840,7 @@ fn make_test_skill(
         disable_model_invocation: false,
         has_user_specified_description: false,
         paths: None,
+        origin: None,
         body: None,
     }
 }

@@ -23,6 +23,25 @@ use crate::types::output::{ToolOutput, ToolRunResult};
 use crate::types::resources::{OwnerSessionId, State, Terminal};
 use crate::types::template_renderer::TemplateRenderer;
 use crate::types::tool::ToolKind;
+use xai_tool_types::BackgroundNoticeNaming;
+
+#[derive(Debug, Clone)]
+pub struct BackgroundNoticeNames {
+    pub task_output_tool: String,
+    pub task_ids_param: String,
+    pub timeout_ms_param: String,
+    pub notified_on_completion: bool,
+}
+
+impl BackgroundNoticeNames {
+    pub fn naming(&self) -> BackgroundNoticeNaming<'_> {
+        BackgroundNoticeNaming {
+            task_output_tool: &self.task_output_tool,
+            task_ids_param: &self.task_ids_param,
+            timeout_ms_param: &self.timeout_ms_param,
+        }
+    }
+}
 
 /// Result of executing a tool through the bridge.
 ///
@@ -117,6 +136,20 @@ impl ToolBridge {
             .and_then(|r| r.tool_for_kind(kind).map(str::to_string))
     }
 
+    pub async fn background_notice_naming(&self) -> BackgroundNoticeNames {
+        use crate::implementations::grok_build::task;
+        let resources = &self.registry.resources;
+        let (task_output_tool, task_ids_param, timeout_ms_param) =
+            task::resolve_background_notice_names(resources).await;
+        let notified_on_completion = task::notified_on_completion(resources).await;
+        BackgroundNoticeNames {
+            task_output_tool,
+            task_ids_param,
+            timeout_ms_param,
+            notified_on_completion,
+        }
+    }
+
     pub fn tool_for_registry_id(&self, registry_id: &str) -> Option<String> {
         self.registry.tool_name_for_registry_id(registry_id)
     }
@@ -131,6 +164,11 @@ impl ToolBridge {
     /// Get only built-in tool definitions (exclude MCP tools).
     pub async fn tool_definitions_builtins_only(&self) -> Vec<ToolDefinition> {
         self.registry.tool_definitions_builtins_only()
+    }
+
+    /// Built-in tool definitions with `use_tool` advertised inline-only (no MCP file forms).
+    pub async fn tool_definitions_builtins_only_inline_mcp(&self) -> Vec<ToolDefinition> {
+        self.registry.tool_definitions_builtins_only_inline_mcp()
     }
 
     /// Render a prompt template through [`TemplateRenderer`] with extra

@@ -374,6 +374,7 @@ impl<R: ChildRunner> SubagentCoordinator<R> {
                         id: target.clone(),
                         parent_session_id: identity.team_scope_id.clone(),
                         parent_prompt_id: None,
+                        tool_call_id: None,
                         prompt: String::new(),
                         description: record.task_name.clone(),
                         subagent_type: record.agent_type.clone(),

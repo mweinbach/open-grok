@@ -165,6 +165,20 @@ fn default_system_prompt_label() -> String {
 fn is_template_override_none(t: &TemplateOverride) -> bool {
     matches!(t, TemplateOverride::None)
 }
+/// Trailing-separator temp directory for the `<scratch_files>` section; a literal path so the model never expands a shell variable.
+fn scratch_dir() -> String {
+    if cfg!(windows) {
+        let dir = std::env::temp_dir();
+        let text = dir.display().to_string();
+        if text.ends_with(std::path::MAIN_SEPARATOR) {
+            text
+        } else {
+            format!("{text}{}", std::path::MAIN_SEPARATOR)
+        }
+    } else {
+        "/tmp/".to_string()
+    }
+}
 impl PromptContext {
     /// Normalize this context for persistence based on audience.
     ///
@@ -262,6 +276,7 @@ impl PromptContext {
             "is_non_interactive": self.is_non_interactive,
             "system_prompt_label": self.system_prompt_label.as_str(),
             "include_browser_verification": self.include_browser_verification,
+            "scratch_dir": scratch_dir(),
         })
     }
     /// Render the full system prompt via `ToolBridge`.
@@ -276,6 +291,14 @@ impl PromptContext {
     pub async fn render(&self, tool_bridge: &ToolBridge) -> Option<String> {
         let renderer = tool_bridge.template_renderer_snapshot().await?;
         self.render_with_renderer(&renderer)
+    }
+    /// [`render`](Self::render), keeping the context the prompt came from so the pair cannot drift apart.
+    pub async fn render_paired(self, tool_bridge: &ToolBridge) -> Option<RenderedPrompt> {
+        let system_prompt = self.render(tool_bridge).await?;
+        Some(RenderedPrompt {
+            prompt_context: self,
+            system_prompt,
+        })
     }
     /// Render the full system prompt from a finalized tool-name renderer.
     ///
@@ -312,6 +335,16 @@ impl PromptContext {
             PromptMode::Full => render(self.prompt_body.as_deref().unwrap_or(""))?,
         };
         Some(prompt)
+    }
+}
+/// A system prompt with the [`PromptContext`] it was rendered from; only [`PromptContext::render_paired`] produces one.
+pub struct RenderedPrompt {
+    prompt_context: PromptContext,
+    system_prompt: String,
+}
+impl RenderedPrompt {
+    pub(crate) fn into_parts(self) -> (PromptContext, String) {
+        (self.prompt_context, self.system_prompt)
     }
 }
 #[cfg(test)]
@@ -1190,9 +1223,15 @@ mod tests {
             "should not mention system commands"
         );
         assert!(!rendered.contains("Reserve"), "should not mention Reserve");
+        // Upstream 1.0.41 dropped the "Prefer specialized tools" line; the
+        // tool_calling section now only carries the parallelize guidance.
         assert!(
-            rendered.contains("`read_file` for reading."),
-            "tool_calling line should end cleanly after read reference"
+            rendered.contains("<tool_calling>"),
+            "tool_calling section should still render"
+        );
+        assert!(
+            rendered.contains("Parallelize independent tool calls"),
+            "tool_calling section should keep the parallelize guidance"
         );
     }
     #[test]

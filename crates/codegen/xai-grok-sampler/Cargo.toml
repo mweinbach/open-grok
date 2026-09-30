@@ -44,5 +44,11 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 
+[features]
+# Cargo release builds omit the mock constructor. Bazel enables this via
+# `default-bazel` so shell tests link the same rlib.
+test-support = []
+default-bazel = ["test-support"]
+
 [lints]
 workspace = true

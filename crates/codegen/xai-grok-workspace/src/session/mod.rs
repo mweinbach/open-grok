@@ -46,6 +46,12 @@ pub mod result {
         pub error: Option<serde_json::Value>,
     }
 }
+/// How one of a session's MCP servers fared once its start settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpServerOutcome {
+    Connected,
+    Failed,
+}
 /// Per-session state held in [`WorkspaceShared::sessions`].
 ///
 /// The `effective_tool_config` baseline and the resolved `toolset` are
@@ -136,6 +142,8 @@ pub struct WorkspaceSession {
     system_notify_producers: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
     path_virtualization: OnceLock<crate::path_virtualization::PathVirtualization>,
     cwd_override: OnceLock<PathBuf>,
+    /// In-progress `workspace.client_fs_write_file` uploads bound to this session.
+    staged_uploads: crate::file_system::client_fs::StagedUploads,
 }
 struct WorkspaceSessionInner {
     effective_tool_config: Arc<ToolServerConfig>,
@@ -266,7 +274,12 @@ impl WorkspaceSession {
             system_notify_producers: std::sync::Mutex::new(Vec::new()),
             path_virtualization: OnceLock::new(),
             cwd_override: OnceLock::new(),
+            staged_uploads: Default::default(),
         }
+    }
+    /// Staged `client_fs_write_file` uploads owned by this session.
+    pub(crate) fn staged_uploads(&self) -> &crate::file_system::client_fs::StagedUploads {
+        &self.staged_uploads
     }
     pub(crate) fn set_path_virtualization(
         &self,
@@ -373,6 +386,32 @@ impl WorkspaceSession {
     }
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+    /// The server's settled start outcome, or `None` while it is still starting. Never waits: a
+    /// status probe reads past a start that holds the lock and reports it as unsettled.
+    pub fn mcp_server_outcome(&self, name: &str) -> Option<McpServerOutcome> {
+        let state = self.mcp_state.try_lock().ok()?;
+        if state.owned_clients.contains_key(name) {
+            Some(McpServerOutcome::Connected)
+        } else if state.init_failed.contains_key(name) {
+            Some(McpServerOutcome::Failed)
+        } else {
+            None
+        }
+    }
+    /// Settles `name` as a start would, for host-crate tests that read the outcome without a server.
+    #[doc(hidden)]
+    pub async fn settle_mcp_server_for_test(&self, name: &str, outcome: McpServerOutcome) {
+        let mut state = self.mcp_state.lock().await;
+        match outcome {
+            McpServerOutcome::Connected => {
+                state.owned_clients.insert(
+                    name.to_owned(),
+                    Arc::new(xai_grok_mcp::servers::McpClient::stub(name)),
+                );
+            }
+            McpServerOutcome::Failed => state.record_init_failure(name, false, None),
+        }
     }
     pub fn cwd(&self) -> &Path {
         self.cwd_override.get().map_or(&self.cwd, PathBuf::as_path)
@@ -610,6 +649,8 @@ pub struct WorkspaceShared {
     /// Uses `tokio::sync::Mutex` so the guard can be held across the
     /// async `HubHandle::connect()` call, preventing TOCTOU races.
     pub(crate) hub_handle: tokio::sync::Mutex<Option<HubHandle>>,
+    pub(crate) queue_stats_sampler:
+        parking_lot::Mutex<Option<crate::upload::QueueStatsSamplerGuard>>,
     /// Remote-origin tool configs (consumer direction), updated by the
     /// notification listener.
     pub(crate) hub_tools_snapshot: arc_swap::ArcSwap<Vec<ToolConfig>>,

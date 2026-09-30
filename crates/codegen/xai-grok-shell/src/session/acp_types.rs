@@ -679,6 +679,9 @@ pub struct FeedbackContext {
     pub context_tokens_used: u64,
     pub context_window_tokens: u64,
     pub session_cwd: String,
+    pub reasoning_effort: Option<crate::sampling::ReasoningEffort>,
+    pub model_id: Option<String>,
+    pub model_fingerprint: Option<String>,
 }
 
 // ── Startup hints ───────────────────────────────────────────────────────
@@ -697,9 +700,8 @@ pub struct StartupHints {
     pub non_interactive: bool,
     #[serde(default)]
     pub skip_git_status: bool,
-    /// Leading conversation items to preserve verbatim across compaction (the
-    /// immutable head): spawn-injected items for a fresh subagent, or just the
-    /// System head for a `resume_from` subagent so the resumed body stays compactable.
+    /// Leading conversation items to preserve verbatim across compaction (the immutable head).
+    /// A fresh subagent's head is its spawn-injected items; a `resume_from` subagent's is just the System head so the resumed body stays compactable.
     #[serde(default)]
     pub inherited_prefix_len: Option<usize>,
     /// When true, this session is a subagent child and its prompts should
@@ -745,6 +747,9 @@ pub struct StartupHints {
             xai_grok_tools::implementations::grok_build::task::types::SubagentStatusEvent,
         >,
     >,
+    /// Parent project cwd for child/worktree overlay kill-switch. Not on the wire.
+    #[serde(skip)]
+    pub parent_cwd: Option<PathBuf>,
     /// Runtime-only gate for Codex v2's multi-agent policy injection. Flat
     /// children set this false so per-turn config reconstruction cannot
     /// re-enable delegation instructions after spawn.

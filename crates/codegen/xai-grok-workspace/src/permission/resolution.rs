@@ -787,6 +787,22 @@ pub struct ManagedSettings {
     default_mode: Option<DefaultPermissionMode>,
     pub mcp_allowlist: McpServerAllowlist,
     pub marketplace_allowlist: MarketplaceAllowlist,
+    /// `allow_managed_hooks_only = true`: hooks that are not managed policy
+    /// are pinned off. Default off (hooks fail open).
+    pub non_managed_hooks: NonManagedHooksPin,
+}
+
+/// Tighten-only pin for non-managed hooks.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NonManagedHooksPin {
+    engaged: bool,
+}
+
+impl NonManagedHooksPin {
+    /// True when the managed layer disables hooks outside managed policy.
+    pub fn is_disabled(&self) -> bool {
+        self.engaged
+    }
 }
 
 static MANAGED_SETTINGS: OnceLock<ManagedSettings> = OnceLock::new();
@@ -883,6 +899,12 @@ fn parse_managed_settings_json(json: &serde_json::Value, path: &Path) -> Managed
         marketplace_allowlist: MarketplaceAllowlist {
             allowed_urls: marketplace_urls,
             source_path: Some(path.to_path_buf()),
+        },
+        non_managed_hooks: NonManagedHooksPin {
+            engaged: json
+                .get("allow_managed_hooks_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         },
     }
 }

@@ -10,6 +10,7 @@ use crate::session::signals::TurnDeltaSnapshot;
 use agent_client_protocol as acp;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
+use xai_grok_tools::types::skill_discovery_tracker::SkillUpdateKind;
 
 /// Result of an add/remove working-directory mutation: whether the set
 /// changed and the full canonical list afterwards (newest last).
@@ -323,6 +324,68 @@ pub struct CancelOptions {
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
 }
+/// Why the catalog is being (re-)advertised; labels the `slash.advertise` unified-log line.
+#[derive(Debug, Clone, Copy)]
+pub enum AdvertiseTrigger {
+    /// A new session pushed its first catalog.
+    SessionStart,
+    /// A loaded session re-pushed its catalog to the reconnecting client.
+    SessionLoad,
+    /// The skill baseline was replaced (disk reload, plugins, bundle sync, `/clear`).
+    SkillsReload,
+    /// A tool call surfaced new skills mid-turn.
+    SkillDiscovery,
+    /// A workflow watcher or an explicit workflow reload saw a change.
+    WorkflowsChanged,
+    /// `set_session_model` swapped in a harness with a different toolset.
+    HarnessRebuild,
+    /// Per-response token-usage meta refresh; the catalog itself is unchanged.
+    UsageMeta,
+}
+impl AdvertiseTrigger {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::SessionStart => "session_start",
+            Self::SessionLoad => "session_load",
+            Self::SkillsReload => "skills_reload",
+            Self::SkillDiscovery => "skill_discovery",
+            Self::WorkflowsChanged => "workflows_changed",
+            Self::HarnessRebuild => "harness_rebuild",
+            Self::UsageMeta => "usage_meta",
+        }
+    }
+}
+impl From<SkillUpdateKind> for AdvertiseTrigger {
+    fn from(kind: SkillUpdateKind) -> Self {
+        match kind {
+            SkillUpdateKind::Discovery => Self::SkillDiscovery,
+            SkillUpdateKind::BaselineChange => Self::SkillsReload,
+        }
+    }
+}
+pub struct SessionModelSwitch {
+    pub sampling_config: xai_grok_sampler::SamplerConfig,
+    pub use_concise: bool,
+    /// The two models declare differing `model_family`s, so a lossy compaction runs at switch end.
+    pub is_family_switch: bool,
+    /// When `false`, skip the system prompt rewrite (concise/default swap).
+    /// Set to `false` for forked sessions so mid-session model switches cannot contaminate the inherited prompt configuration.
+    pub apply_prompt_override: bool,
+    /// When `true`, suppress the system prompt rewrite even though `apply_prompt_override` may be `true`.
+    /// Set by the model-switch orchestrator immediately after a successful `RebuildAgentForDefinition`.
+    /// The rebuild handler already installed the fresh harness's prompt; the concise/default swap must not clobber it.
+    pub skip_prompt_rewrite: bool,
+    /// Computed by `MvpAgent` against the new model id.
+    /// Per-model remote settings and per-model user TOML overrides then target the right model after a `/model` switch.
+    /// The session actor stores this on `compaction.threshold_percent` (which is `Cell<u8>` so it can update without `&mut self`).
+    pub auto_compact_threshold_percent: u8,
+    pub system_prompt_label: String,
+}
+#[derive(Debug, Clone, Default)]
+pub struct CurrentModel {
+    pub id: String,
+    pub reasoning_effort: Option<xai_grok_sampling_types::ReasoningEffort>,
+}
 pub enum SessionCommand {
     #[expect(
         private_interfaces,
@@ -468,7 +531,7 @@ pub enum SessionCommand {
         context_window: Option<std::num::NonZeroU64>,
     },
     GetCurrentModel {
-        responds_to: oneshot::Sender<String>,
+        responds_to: oneshot::Sender<CurrentModel>,
     },
     GetCurrentPromptMode {
         responds_to: oneshot::Sender<PromptMode>,
@@ -501,11 +564,22 @@ pub enum SessionCommand {
     /// Trigger an on-demand memory flush for this session.
     ///
     /// Calls `run_memory_flush("user_requested", None)` on the session actor.
-    /// Returns an error if memory is not enabled for this session, or
-    /// `Ok(true/false)` indicating whether a flush actually ran (false if
-    /// another flush was already in progress).
+    /// Capture every completed turn now for `x.ai/memory/flush`.
     FlushMemory {
-        respond_to: oneshot::Sender<acp::Result<bool>>,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryFlushResponse>,
+    },
+    /// Consolidate memory now for `x.ai/memory/dream`, bypassing the automatic gates.
+    MemoryDream {
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryDreamResponse>,
+    },
+    /// List memory files and state for `x.ai/memory/list`.
+    MemoryList {
+        respond_to: oneshot::Sender<Result<crate::extensions::memory::MemoryListing, String>>,
+    },
+    /// Turn memory on or off for `x.ai/memory/toggle`.
+    MemoryToggle {
+        enabled: bool,
+        respond_to: oneshot::Sender<crate::extensions::memory::MemoryToggleResponse>,
     },
     /// Delete one memory note from the `/memory` modal.
     MemoryForget {
@@ -615,6 +689,10 @@ pub enum SessionCommand {
         next_trace_turn: u64,
         request_id: Option<String>,
     },
+    /// Tell the model, at its next prompt, that the turn a previous process was running never finished.
+    NoteInterruptedTurn {
+        turn: crate::session::interrupted_turn::InterruptedTurn,
+    },
     /// Flush pending writes and copy the current session directory contents to memory.
     /// The caller can then tar.gz + upload to GCS (or similar).
     CopyFile {
@@ -633,6 +711,9 @@ pub enum SessionCommand {
     /// completes (or immediately if configs are unchanged).
     UpdateMcpServers {
         mcp_servers: Vec<acp::McpServer>,
+        /// Admitted client list. `Some` replaces the actor seed; `None` leaves it
+        /// (disk/plugin rematerialize).
+        client_seed: Option<Vec<acp::McpServer>>,
         respond_to: oneshot::Sender<Result<(), acp::Error>>,
     },
     /// Re-apply per-attachment policy (MCP init strategy, delivery tools)

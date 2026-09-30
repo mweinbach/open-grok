@@ -448,6 +448,10 @@ mod permission_analytics_tests {
     #[test]
     fn security_finding_enum_matches_manager_tokens() {
         use std::collections::BTreeSet;
+        assert_eq!(
+            Some(vec![PermissionSecurityFinding::UnresolvedArgument]),
+            convert_findings(&["unresolved_argument".to_owned()]),
+        );
         let manager: BTreeSet<&str> = ClassifierSecurityFinding::ALL
             .iter()
             .map(|f| f.token())

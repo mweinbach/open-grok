@@ -26,6 +26,7 @@ use crate::{
     implementations::grok_build::task::{
         MAX_SUBAGENT_DEPTH,
         backend::{SubagentBackend, SubagentBackendResource},
+        model_policy::TaskModelSelection,
         types::{
             CurrentPromptIdResource, ForegroundWaitKind, ModelOverrideProvenance,
             OrchestrationSteerSignal, SWARM_RATE_LIMIT_RETRY_BASE_MS, SessionIdResource,
@@ -858,6 +859,7 @@ fn build_member_request(
         subagent_type: context.subagent_type,
         parent_session_id: context.parent_session_id,
         parent_prompt_id: context.parent_prompt_id,
+        tool_call_id: None,
         swarm: Some(SwarmMemberMeta {
             swarm_id: context.swarm_id,
             description: context.description,
@@ -874,7 +876,9 @@ fn build_member_request(
                 .is_none()
                 .then(|| context.model.clone())
                 .flatten(),
-            model_override_provenance: ModelOverrideProvenance::Tool,
+            model_override_provenance: ModelOverrideProvenance::Tool {
+                selection: TaskModelSelection::default(),
+            },
             reasoning_effort: context.reasoning_effort,
             persona: None,
             capability_mode: None,

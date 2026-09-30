@@ -1489,35 +1489,57 @@ pub fn load_for_send(img: &PastedImage) -> Option<(Vec<u8>, String)> {
 // ACP content block construction
 // -------------------------------------------------------------------------
 
-/// Build ACP `ContentBlock` values from prompt text and attached images,
-/// with an optional fallback that re-loads orphan
-/// `[Image #N: <path>]` placeholders from disk.
-///
-/// Behaviour for each placeholder in `text`:
-/// - If a [`PastedImage`] with the matching `display_number` is present
-///   in `images`, the placeholder is left untouched and the
-///   `PastedImage` provides the bytes.
-/// - Otherwise, if `workspace_cwd` is `Some`, attempt to load the
-///   placeholder's path via the shared
-///   [`xai_grok_shell::session::placeholder_images::load_placeholder_image`]
-///   helper. On success: attach a `ContentBlock::Image` and leave the
-///   placeholder text in place. On failure: strip the placeholder from
-///   the forwarded text and emit a `tracing::warn!` (no UI alert
-///   surface exists today — the warn log is the established pattern,
-///   see `load_for_send` for prior art).
-/// - When `workspace_cwd` is `None`, the orphan placeholder is left in
-///   the text unchanged (legacy behaviour, used by unit tests).
-///
-/// Path validation, extension allowlist, and the 50-MB size cap come
-/// from the shared helper so the TUI and the server use the same rules.
+/// Wire blocks plus the display numbers of attached images whose bytes could not be loaded
+/// (`load_for_send` returned `None`). Their `[Image #N]` text stays in the text block.
+#[derive(Debug, Default)]
+pub struct ContentBlocksBuild {
+    pub blocks: Vec<agent_client_protocol::ContentBlock>,
+    pub skipped_display_numbers: Vec<usize>,
+}
+
+/// Matching chips supply bytes. Orphans load via the shared helper (same path rules as the server) when `workspace_cwd` is set.
+/// Load failure strips the placeholder (warn only). `None` cwd leaves orphans unchanged.
 pub fn build_content_blocks_with_workspace(
     text: String,
     images: Vec<PastedImage>,
     workspace_cwd: Option<&std::path::Path>,
 ) -> Vec<agent_client_protocol::ContentBlock> {
+    build_content_blocks_with_workspace_report(text, images, workspace_cwd).blocks
+}
+
+/// [`build_content_blocks_with_workspace`] that also reports the attached images it could not load,
+/// so the caller can tell the user instead of sending silently without them.
+pub fn build_content_blocks_with_workspace_report(
+    text: String,
+    images: Vec<PastedImage>,
+    workspace_cwd: Option<&std::path::Path>,
+) -> ContentBlocksBuild {
+    build_content_blocks_with_workspace_report_ref(text, &images, workspace_cwd)
+}
+
+/// Caller keeps the [`PastedImage`] records and must unlink staged files after the bytes are copied.
+pub fn build_content_blocks_with_workspace_ref(
+    text: String,
+    images: &[PastedImage],
+    workspace_cwd: Option<&std::path::Path>,
+) -> Vec<agent_client_protocol::ContentBlock> {
+    build_content_blocks_with_workspace_report_ref(text, images, workspace_cwd).blocks
+}
+
+/// Borrowing form of [`build_content_blocks_with_workspace_report`].
+pub fn build_content_blocks_with_workspace_report_ref(
+    text: String,
+    images: &[PastedImage],
+    workspace_cwd: Option<&std::path::Path>,
+) -> ContentBlocksBuild {
     let allowed: Option<Vec<std::path::PathBuf>> =
         workspace_cwd.map(xai_grok_shared::placeholder_images::default_allowed_prefixes);
-    build_content_blocks_with_prefixes(text, images, allowed.as_deref())
+    build_content_blocks_with_prefixes_and_caps_ref(
+        text,
+        images,
+        allowed.as_deref(),
+        xai_grok_shared::placeholder_images::MAX_PLACEHOLDER_AGGREGATE_BYTES,
+    )
 }
 
 /// Test-injectable variant of [`build_content_blocks_with_workspace`].
@@ -1531,28 +1553,32 @@ pub fn build_content_blocks_with_prefixes(
     images: Vec<PastedImage>,
     allowed_prefixes: Option<&[std::path::PathBuf]>,
 ) -> Vec<agent_client_protocol::ContentBlock> {
-    build_content_blocks_with_prefixes_and_caps(
+    build_content_blocks_with_prefixes_and_caps_ref(
         text,
-        images,
+        &images,
         allowed_prefixes,
         xai_grok_shared::placeholder_images::MAX_PLACEHOLDER_AGGREGATE_BYTES,
     )
+    .blocks
 }
 
-/// Test-injectable variant of [`build_content_blocks_with_prefixes`]
-/// that takes an explicit aggregate-bytes cap.
-///
-/// Mirrors the server-side
-/// [`xai_grok_shell::session::placeholder_images::recover_orphan_placeholders_with_prefixes_and_caps`].
-/// Aggregate-cap semantics match: `aggregate + image.len() > cap`
-/// triggers the loop break (inclusive boundary — a running total
-/// exactly equal to the cap is admitted).
+/// Cap check matches the server: `aggregate + len > cap` breaks, so a total exactly equal to the cap is admitted.
 pub fn build_content_blocks_with_prefixes_and_caps(
     text: String,
     images: Vec<PastedImage>,
     allowed_prefixes: Option<&[std::path::PathBuf]>,
     aggregate_max: usize,
 ) -> Vec<agent_client_protocol::ContentBlock> {
+    build_content_blocks_with_prefixes_and_caps_ref(text, &images, allowed_prefixes, aggregate_max)
+        .blocks
+}
+
+fn build_content_blocks_with_prefixes_and_caps_ref(
+    text: String,
+    images: &[PastedImage],
+    allowed_prefixes: Option<&[std::path::PathBuf]>,
+    aggregate_max: usize,
+) -> ContentBlocksBuild {
     use agent_client_protocol::{ContentBlock, ImageContent, TextContent};
     use base64::Engine as _;
 
@@ -1560,7 +1586,7 @@ pub fn build_content_blocks_with_prefixes_and_caps(
     // collect successfully-loaded orphan images. PastedImage-backed
     // placeholders (display_number present in `images`) are left alone.
     let (rewritten_text, orphan_images) =
-        resolve_orphan_placeholders(text, &images, allowed_prefixes, aggregate_max);
+        resolve_orphan_placeholders(text, images, allowed_prefixes, aggregate_max);
 
     // Phase 2: drop `[Image #N: <path>]` → `[Image #N]`. The path
     // tempts the model into a redundant `Read` on its own
@@ -1570,11 +1596,15 @@ pub fn build_content_blocks_with_prefixes_and_caps(
 
     let mut blocks = Vec::with_capacity(1 + images.len() + orphan_images.len());
     blocks.push(ContentBlock::Text(TextContent::new(rewritten_text)));
+    let mut skipped_display_numbers = Vec::new();
 
-    for img in &images {
+    for img in images {
         let (bytes, mime_type) = match load_for_send(img) {
             Some(loaded) => loaded,
-            None => continue,
+            None => {
+                skipped_display_numbers.push(img.display_number);
+                continue;
+            }
         };
 
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1604,7 +1634,10 @@ pub fn build_content_blocks_with_prefixes_and_caps(
         blocks.push(ContentBlock::Image(orphan));
     }
 
-    blocks
+    ContentBlocksBuild {
+        blocks,
+        skipped_display_numbers,
+    }
 }
 
 /// Scan `text` for `[Image #N: <path>]` placeholders that lack a
@@ -1974,6 +2007,13 @@ pub fn extract_video_refs(text: &str) -> Vec<ScrollbackVideoRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn nth<T>(xs: &[T], i: usize) -> &T {
+        let Some(x) = xs.get(i) else {
+            panic!("expected item {i}, got {} items", xs.len());
+        };
+        x
+    }
 
     /// The image dir is keyed off the session's cwd — the glue the cross-cwd
     /// resume fix relies on: with `AgentSession.cwd` anchored to the origin cwd,
@@ -4338,6 +4378,32 @@ mod tests {
         // before + space after the placeholder) collapses to a
         // single space.
         assert_eq!(t.text, "before after");
+    }
+
+    #[test]
+    fn build_blocks_report_lists_unloadable_display_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let loadable = make_real_image(40, 40);
+        let mut unloadable = make_image(2, 2);
+        unloadable.session_image_path = Some(dir.path().join("gone.png"));
+
+        let build = build_content_blocks_with_workspace_report(
+            "see [Image #1] and [Image #2]".to_owned(),
+            vec![loadable, unloadable],
+            None,
+        );
+
+        assert_eq!(build.skipped_display_numbers, vec![2]);
+        // Text plus the one loadable image; the unloadable one contributes no block
+        assert_eq!(build.blocks.len(), 2);
+        let agent_client_protocol::ContentBlock::Text(t) = &nth(&build.blocks, 0) else {
+            panic!("first block must be text");
+        };
+        assert_eq!(t.text, "see [Image #1] and [Image #2]");
+        assert!(matches!(
+            nth(&build.blocks, 1),
+            agent_client_protocol::ContentBlock::Image(_)
+        ));
     }
 
     #[test]

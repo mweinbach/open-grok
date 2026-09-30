@@ -219,13 +219,31 @@ fn resolve_dismissable_campaigns() -> Vec<CampaignEntry> {
 /// Effective config with remote/override-aware campaign overlay
 /// (base → resolve [override/kill/merge/dismiss] → apply), one `ConfigLayers::load`.
 pub fn load_effective_config() -> std::io::Result<toml::Value> {
+    load_effective_config_with_layers().map(|(_, effective)| effective)
+}
+
+/// What [`load_effective_config`] merged: the layers and the campaign patches it applied, highest priority first.
+pub struct EffectiveConfigLayers {
+    pub layers: ConfigLayers,
+    pub active_campaigns: Vec<CampaignEntry>,
+}
+
+/// [`load_effective_config`] plus its inputs, for a caller that also reads the layers one by one.
+pub fn load_effective_config_with_layers() -> std::io::Result<(EffectiveConfigLayers, toml::Value)>
+{
     let layers = ConfigLayers::load()?;
     let dismissed = load_dismissed_ids();
     let remote = cached_remote_campaigns();
     let mut effective = layers.effective_config_base();
     let active = resolve_active_campaigns_from_layers(&layers, &effective, &remote, &dismissed);
     layers.apply_campaign_overrides(&mut effective, &active);
-    Ok(effective)
+    Ok((
+        EffectiveConfigLayers {
+            layers,
+            active_campaigns: active,
+        },
+        effective,
+    ))
 }
 
 /// Effective config with **disk campaigns only** — no remote cache, no

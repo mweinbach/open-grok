@@ -2,7 +2,7 @@
 //! `tests/common/` because that compiles into every integration binary and
 //! would pull the transport stack into all of them.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use agent_client_protocol::{self as acp, Agent as _};
@@ -101,8 +101,6 @@ where
                     json!({
                         "startupHints": {
                             "nonInteractive": true,
-                            "skipGitStatus": true,
-                            "skipProjectLayout": true,
                         },
                         "clientType": client_type,
                         "clientVersion": "0.0-test",
@@ -243,4 +241,55 @@ where
         workdir.path().to_path_buf(),
         std::rc::Rc::clone(&server),
     )));
+}
+
+fn hold_global_env() -> MutexGuard<'static, ()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Runs one session under `GROK_INSTRUMENTATION=log` and asserts each `probe` name reaches the log file.
+/// `name` labels the temp log file and the client. The instrumentation mode is read once per process, so a
+/// caller must own its own test binary.
+#[allow(dead_code)]
+pub fn assert_probes_emitted(name: &str, probes: &[&str]) {
+    use tracing_subscriber::prelude::*;
+
+    let log_path = std::env::temp_dir().join(format!("{name}-{}.jsonl", std::process::id()));
+    // SAFETY: set before any agent code; mode is read once on first use.
+    unsafe {
+        std::env::set_var("GROK_INSTRUMENTATION", "log");
+        std::env::set_var("GROK_INSTRUMENTATION_LOG", &log_path);
+    }
+    let _ = tracing_subscriber::registry()
+        .with(xai_grok_shell::instrumentation::layer::<
+            tracing_subscriber::Registry,
+        >())
+        .try_init();
+
+    let session_name = name.to_owned();
+    run_agent_test(move |cwd, _server| async move {
+        let (conn, _init) = connect_and_auth(AutoApproveClient, &session_name).await;
+        let _session_id = new_session(&conn, &cwd).await;
+    });
+    let _ = xai_grok_shell::instrumentation::finalize();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let log = loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if probes.iter().all(|probe| log.contains(probe)) || std::time::Instant::now() >= deadline {
+            break log;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    for probe in probes {
+        assert!(
+            log.contains(probe),
+            "must emit the {probe} probe; log:\n{log}"
+        );
+    }
+    let _ = std::fs::remove_file(&log_path);
 }

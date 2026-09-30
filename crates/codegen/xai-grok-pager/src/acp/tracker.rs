@@ -29,6 +29,7 @@ use tracing::debug;
 use xai_grok_tools::types::output::{BashOutput, ToolOutput};
 use xai_grok_tools::types::output::{ReadFileOutput, SearchToolOutput, WebFetchOutput};
 use xai_grok_tools::util::strip_redundant_session_cd;
+use xai_tool_types::ReadLineCounts;
 /// Convert a UTC millisecond timestamp to local time.
 fn utc_ms_to_local(ms: i64) -> DateTime<Local> {
     chrono::Utc
@@ -2023,11 +2024,12 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 .or_else(|| extract_raw_field(tc, "path"))
                 .unwrap_or_else(|| tc.title.clone());
             let mut block = ReadToolCallBlock::new(&path);
-            if let Some(ref raw) = tc.raw_output
-                && let Ok(ToolOutput::ReadFile(read_output)) =
-                    serde_json::from_value::<ToolOutput>(raw.clone())
-            {
-                match read_output {
+            let structured = tc
+                .raw_output
+                .as_ref()
+                .map(|raw| serde_json::from_value::<ToolOutput>(raw.clone()));
+            match structured {
+                Some(Ok(ToolOutput::ReadFile(read_output))) => match read_output {
                     ReadFileOutput::FileContent(fc) => {
                         if fc.offset.is_some() || fc.limit.is_some() {
                             let off = fc.offset.unwrap_or(0);
@@ -2057,14 +2059,33 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                             pages: pdf.total_pages,
                         });
                     }
+                },
+                _ if !success => {
+                    let text = content_text(tc);
+                    block = block.with_error(if text.is_empty() {
+                        "Read failed".to_string()
+                    } else {
+                        text
+                    });
                 }
-            } else if !success {
-                let text = content_text(tc);
-                block = block.with_error(if text.is_empty() {
-                    "Read failed".to_string()
-                } else {
-                    text
-                });
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => {
+                    let counts = tc
+                        .raw_output
+                        .as_ref()
+                        .and_then(|raw| serde_json::from_value::<ReadLineCounts>(raw.clone()).ok())
+                        .unwrap_or_default();
+                    if let Some(range) = counts.range {
+                        block = block.with_line_range(LineRange::new(range.start, range.end));
+                    }
+                    block.total_lines = counts.total_lines;
+                    if has_text_content(tc) {
+                        let text = content_text(tc);
+                        let total_lines =
+                            counts.total_lines.unwrap_or_else(|| text.lines().count());
+                        block = block.with_content(text, total_lines);
+                    }
+                }
             }
             RenderBlock::ToolCall(ToolCallBlock::Read(block))
         }
@@ -2113,6 +2134,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
             let query = extract_raw_field(tc, "query")
+                .or_else(|| extract_raw_field(tc, "search_term"))
                 .or_else(|| {
                     tc.title
                         .strip_prefix("Web search: ")
@@ -2223,7 +2245,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                     }
                     block.citations = ws.citations;
                 }
-                if block.content.is_none() {
+                if success && block.content.is_none() {
                     let text = content_text(tc);
                     if !text.is_empty() {
                         block.content = Some(text);
@@ -2231,7 +2253,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 }
             }
             if !success {
-                block = block.with_error("Web search failed");
+                block = block.with_error(failure_reason(tc, "Web search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::WebSearch(block))
         }
@@ -2247,7 +2269,7 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
             block.file_matches = grep.file_matches;
             block.file_paths = grep.file_paths;
             if !success {
-                block.error = Some("Search failed".into());
+                block.error = Some(failure_reason(tc, "Search failed"));
             }
             RenderBlock::ToolCall(ToolCallBlock::Search(block))
         }
@@ -2304,7 +2326,12 @@ fn tool_call_to_block(tc: &acp::ToolCall, session_cwd: Option<&Path>) -> RenderB
                 block.content = Some(content);
             }
             if !success {
-                block = block.with_error("Search failed");
+                let error = block
+                    .content
+                    .take()
+                    .filter(|_| block.results.is_empty())
+                    .unwrap_or_else(|| "Search failed".to_owned());
+                block = block.with_error(error);
             }
             RenderBlock::ToolCall(ToolCallBlock::IntegrationSearch(block))
         }
@@ -2498,6 +2525,27 @@ fn content_text(tc: &acp::ToolCall) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+/// A search streams nothing, so a failed one's content is the reason; `default` covers an empty one
+fn failure_reason(tc: &acp::ToolCall, default: &str) -> String {
+    let reason = content_text(tc);
+    if reason.is_empty() {
+        default.to_owned()
+    } else {
+        reason
+    }
+}
+/// True when at least one content block is text, even empty text (an empty file read)
+fn has_text_content(tc: &acp::ToolCall) -> bool {
+    tc.content.iter().any(|c| {
+        matches!(
+            c,
+            acp::ToolCallContent::Content(acp::Content {
+                content: acp::ContentBlock::Text(_),
+                ..
+            })
+        )
+    })
 }
 /// Check if a tool call is bg-task internal plumbing.
 /// That covers get_command_or_subagent_output, kill_command_or_subagent, wait_commands_or_subagents, and the external background-await tool.
@@ -2695,7 +2743,7 @@ fn extract_raw_field(tc: &acp::ToolCall, field: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
-/// Extract a short, user-friendly error label from a failed Edit tool call.
+/// The error shown on a failed Edit block: a short label for a structured search_replace output, else the text content
 fn extract_edit_error(tc: &acp::ToolCall) -> String {
     use xai_grok_tools::types::output::SearchReplaceOutput;
     if let Some(ref raw) = tc.raw_output
@@ -2711,7 +2759,10 @@ fn extract_edit_error(tc: &acp::ToolCall) -> String {
             SearchReplaceOutput::EditsApplied(_) => "Edit failed".to_owned(),
         };
     }
-    "Edit failed".to_owned()
+    match content_text(tc) {
+        text if text.is_empty() => "Edit failed".to_owned(),
+        text => text,
+    }
 }
 /// Extract search input metadata from a tool call's rawInput.
 fn extract_search_meta(tc: &acp::ToolCall) -> SearchInputMeta {

@@ -67,7 +67,7 @@ xai-fuzzy-file-search = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 smallvec = { workspace = true }
 chrono = { workspace = true }
-tree-sitter = "0.25.10"
+tree-sitter = { workspace = true }
 tree-sitter-bash = "0.25"
 url = { workspace = true }
 xai-grok-env = { workspace = true }

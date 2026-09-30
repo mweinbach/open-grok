@@ -198,6 +198,7 @@ mod tests {
         let chat_state = xai_chat_state::ChatStateActor::spawn(
             conversation,
             xai_grok_sampling_types::SamplingConfig {
+                max_request_bytes: None,
                 base_url: "https://example.test/v1".to_string(),
                 model: "gpt-test".to_string(),
                 max_completion_tokens: None,

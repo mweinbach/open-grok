@@ -16,6 +16,9 @@ use crate::scrollback::types::{AccentStyle, BlockContext, BlockOutput, DisplayMo
 use crate::theme::Theme;
 use crate::util::format_duration;
 
+/// The signal recorded on a task the user stopped.
+pub(crate) const KILLED_SIGNAL: &str = "killed";
+
 /// What kind of bg task lifecycle event this block represents.
 #[derive(Debug, Clone)]
 pub enum BgTaskKind {
@@ -150,7 +153,7 @@ impl BlockContent for BgTaskBlock {
                 // Detect kill signals to show "killed" instead of "failed"
                 let is_killed = signal
                     .as_deref()
-                    .is_some_and(|s| matches!(s, "killed" | "SIGTERM" | "SIGKILL" | "oom"));
+                    .is_some_and(|s| matches!(s, KILLED_SIGNAL | "SIGTERM" | "SIGKILL" | "oom"));
                 let verb = if is_killed { "killed" } else { "failed" };
                 let detail = if is_killed {
                     String::new()

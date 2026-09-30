@@ -4454,6 +4454,7 @@ mod tests {
 
     fn minimal_config() -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: Some("test-key".to_string()),
             base_url: "https://example.test".to_string(),
             model: "test-model".to_string(),

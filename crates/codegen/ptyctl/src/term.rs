@@ -343,6 +343,51 @@ impl Terminal {
         let styled = self.screen_styled(opts);
         styled::render_html(&styled, &self.cursor_position(), &self.size())
     }
+
+    /// Native select→copy: join on `WRAPLINE` or a leading wide-char wrap spacer, not last-column occupancy.
+    pub fn native_copy_text(&self) -> String {
+        let grid = self.term.grid();
+        let history = grid.history_size();
+        let screen = grid.screen_lines();
+        let num_cols = grid.columns();
+        let mut out = String::new();
+        if num_cols == 0 {
+            return out;
+        }
+
+        let start = -(history as i32);
+        let end = screen as i32;
+        for line_idx in start..end {
+            let row = &grid[Line(line_idx)];
+            let mut text = String::new();
+            for col_idx in 0..num_cols {
+                let cell = &row[Column(col_idx)];
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(cell.c);
+                if let Some(zw) = cell.zerowidth() {
+                    for &c in zw {
+                        text.push(c);
+                    }
+                }
+            }
+            out.push_str(text.trim_end());
+
+            let last = &row[Column(num_cols - 1)];
+            // `WIDE_CHAR_SPACER` is occupancy (CJK/emoji occupying the last column). Only
+            // `WRAPLINE` or `LEADING_WIDE_CHAR_SPACER` (wide glyph that wrapped) is a soft wrap.
+            let wraps = last.flags.contains(Flags::WRAPLINE)
+                || last.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER);
+            if !wraps {
+                out.push('\n');
+            }
+        }
+        out
+    }
 }
 
 /// Resolve an optional 1-indexed range to 0-indexed (start, end).
@@ -354,5 +399,90 @@ fn resolve_range(range: &Option<Range<usize>>, max: usize) -> (usize, usize) {
             (start, end)
         }
         None => (0, max),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_copy_joins_wrapped_rows() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = Terminal::new(4, 3, SessionListener::new(tx));
+        term.feed(b"abcde\r\nxy");
+        let copy = term.native_copy_text();
+        assert!(copy.contains("abcde"), "WRAPLINE rows must join: {copy:?}");
+        assert!(
+            !copy.contains("abcd\ne"),
+            "soft wrap must not become a hard break: {copy:?}"
+        );
+        assert!(copy.contains("xy"), "hard break after wrap stays: {copy:?}");
+    }
+
+    #[test]
+    fn native_copy_full_width_hard_break_does_not_join() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = Terminal::new(4, 3, SessionListener::new(tx));
+        term.feed(b"abcd\r\nxy");
+        let copy = term.native_copy_text();
+        assert!(
+            copy.contains("abcd\nxy"),
+            "full-width hard break must stay a line: {copy:?}"
+        );
+        assert!(
+            !copy.contains("abcdxy"),
+            "occupied last column is not WRAPLINE: {copy:?}"
+        );
+    }
+
+    #[test]
+    fn native_copy_wide_glyph_hard_break_does_not_join() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = Terminal::new(4, 3, SessionListener::new(tx));
+        // Each CJK cell is two columns; two of them fill width 4. The last cell is
+        // WIDE_CHAR_SPACER without WRAPLINE when the line hard-breaks.
+        term.feed("中中\r\nxy".as_bytes());
+        let copy = term.native_copy_text();
+        assert!(
+            copy.contains("中中\nxy"),
+            "wide-glyph hard break must stay a line: {copy:?}"
+        );
+        assert!(
+            !copy.contains("中中xy"),
+            "last-column WIDE_CHAR_SPACER is not WRAPLINE: {copy:?}"
+        );
+    }
+
+    #[test]
+    fn native_copy_wide_glyph_wrap_still_joins() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = Terminal::new(4, 3, SessionListener::new(tx));
+        term.feed("中中中".as_bytes());
+        let copy = term.native_copy_text();
+        assert!(
+            copy.contains("中中中"),
+            "WRAPLINE after a wide-glyph wrap must still join: {copy:?}"
+        );
+        assert!(
+            !copy.contains("中中\n中"),
+            "soft-wrapped CJK must not become a hard break: {copy:?}"
+        );
+    }
+
+    #[test]
+    fn native_copy_emoji_hard_break_does_not_join() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut term = Terminal::new(4, 3, SessionListener::new(tx));
+        term.feed("😀😀\r\nxy".as_bytes());
+        let copy = term.native_copy_text();
+        assert!(
+            copy.contains("😀😀\nxy"),
+            "emoji exact-width hard break must stay a line: {copy:?}"
+        );
+        assert!(
+            !copy.contains("😀😀xy"),
+            "last-column WIDE_CHAR_SPACER is not a wrap: {copy:?}"
+        );
     }
 }

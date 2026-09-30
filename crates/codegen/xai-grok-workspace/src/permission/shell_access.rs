@@ -720,7 +720,7 @@ fn cwd_poison_positions(root: Node<'_>, src: &str) -> Vec<CwdPoison> {
                 scope: execution_scope(node),
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -808,7 +808,7 @@ fn unwrap_invocation_checked(invocation: &ShellInvocation) -> CheckedInvocationP
     }
 }
 
-enum ArgText {
+pub(crate) enum ArgText {
     /// Literal path/word, no runtime expansion.
     Literal(String),
     /// Runtime expansion; unpinnable, so callers prompt.
@@ -820,7 +820,7 @@ enum ArgText {
 fn node_has_expansion(node: Node<'_>) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
-        for i in 0..n.child_count() {
+        for i in 0..n.child_count() as u32 {
             let Some(child) = n.child(i) else { continue };
             if matches!(
                 child.kind(),
@@ -892,7 +892,7 @@ fn decode_double_quoted_content(content: &str) -> Option<String> {
     Some(out)
 }
 
-fn shell_node_arg(node: Node<'_>, src: &str) -> Option<ArgText> {
+pub(crate) fn shell_node_arg(node: Node<'_>, src: &str) -> Option<ArgText> {
     let text = || node.utf8_text(src.as_bytes()).ok().map(str::to_owned);
     match node.kind() {
         "variable_assignment" => None,
@@ -942,7 +942,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
     while let Some(node) = stack.pop() {
         if node.kind() == "command" {
             let mut words = Vec::new();
-            for i in 0..node.named_child_count() {
+            for i in 0..node.named_child_count() as u32 {
                 let Some(child) = node.named_child(i) else {
                     continue;
                 };
@@ -974,7 +974,7 @@ fn shell_command_invocations(root: Node<'_>, src: &str) -> Vec<ShellInvocation> 
                 wrapper_words,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -1022,7 +1022,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
                 ambiguous,
             });
         }
-        for i in 0..node.child_count() {
+        for i in 0..node.child_count() as u32 {
             if let Some(child) = node.child(i) {
                 stack.push(child);
             }
@@ -1033,7 +1033,7 @@ fn shell_redirect_targets(root: Node<'_>, src: &str) -> Vec<ShellRedirectTarget>
 
 fn shell_redirect_one(node: Node<'_>, src: &str) -> Option<(Option<String>, ShellFileMode, bool)> {
     let mut redirect = None;
-    for i in 0..node.child_count() {
+    for i in 0..node.child_count() as u32 {
         let kind = node.child(i)?.kind();
         // `<<`/`<<<` read from inline text, not a file.
         if kind.contains("<<") {

@@ -782,12 +782,20 @@ pub fn delete_persona_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 /// Load `[agent]` from effective config (merged shell + pager config layers).
-fn load_agent_selection_config() -> AgentSelectionConfig {
+pub(crate) fn load_agent_selection_config() -> AgentSelectionConfig {
     xai_grok_shell::config::load_effective_config()
         .ok()
         .and_then(|root| xai_grok_shell::agent::config::Config::new_from_toml_cfg(&root).ok())
         .map(|cfg| cfg.agent)
         .unwrap_or_default()
+}
+pub(crate) fn config_agent_is_explicit() -> bool {
+    let agent = load_agent_selection_config();
+    agent
+        .name
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty())
+        || agent.definition.is_some()
 }
 /// Explicit `[agent] name` in config.toml (not env/CLI overrides).
 fn load_config_agent_name() -> Option<String> {

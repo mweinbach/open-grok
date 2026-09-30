@@ -13,7 +13,6 @@ pub struct PromptTiming {
     turn_start: Instant,
     mcp_wait_ms: u64,
     tool_collection_ms: u64,
-    repo_status_wait_ms: Option<u64>,
     ttft_ms: Option<u64>,
     ttlb_ms: u64,
     attempts: u32,
@@ -26,7 +25,6 @@ impl PromptTiming {
             turn_start: Instant::now(),
             mcp_wait_ms: 0,
             tool_collection_ms: 0,
-            repo_status_wait_ms: None,
             ttft_ms: None,
             ttlb_ms: 0,
             attempts: 1,
@@ -37,10 +35,6 @@ impl PromptTiming {
     pub fn record_tool_prep(&mut self, mcp_wait_ms: u64, total_prep_ms: u64) {
         self.mcp_wait_ms = mcp_wait_ms;
         self.tool_collection_ms = total_prep_ms.saturating_sub(mcp_wait_ms);
-    }
-
-    pub fn record_repo_status_wait(&mut self, wait_ms: u64) {
-        self.repo_status_wait_ms = Some(wait_ms);
     }
 
     pub fn record_stream_latency(&mut self, ttft_ms: Option<u64>, ttlb_ms: u64) {
@@ -89,7 +83,6 @@ impl PromptTiming {
             total_ms,
             mcp_wait_ms: self.mcp_wait_ms,
             tool_collection_ms: self.tool_collection_ms,
-            repo_status_wait_ms: self.repo_status_wait_ms,
             model_call_ms,
             pre_model_ms,
             mcp_server_count,
@@ -112,13 +105,11 @@ mod tests {
     fn recorded_stream_and_model_fields_reach_the_event() {
         let mut timing = PromptTiming::start();
         timing.record_tool_prep(12, 40);
-        timing.record_repo_status_wait(7);
         timing.record_stream_latency(Some(35), 60);
         timing.record_model_result(3, Some(18));
         let event = timing.into_event(80, 1, 2, 4, McpInitStrategy::Blocking, "model".into());
         assert_eq!(event.mcp_wait_ms, 12);
         assert_eq!(event.tool_collection_ms, 28);
-        assert_eq!(event.repo_status_wait_ms, Some(7));
         assert_eq!(event.ttft_ms, Some(35));
         assert_eq!(event.ttlb_ms, 60);
         assert_eq!(event.attempts, 3);
@@ -133,7 +124,6 @@ mod tests {
             total_ms: 5200,
             mcp_wait_ms: 120,
             tool_collection_ms: 45,
-            repo_status_wait_ms: None,
             model_call_ms: 4800,
             pre_model_ms: 400,
             mcp_server_count: 6,

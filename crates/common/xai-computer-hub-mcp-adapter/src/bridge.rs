@@ -3,14 +3,14 @@
 //! [`McpBridge`] discovers tools from an [`McpTransport`] and registers
 //! them with a hub `ToolServer` via one `ToolServerHandler` per
 //! tool. Incoming hub calls are translated to MCP `tools/call` and the
-//! response is mapped back to [`ToolOutputWire`].
+//! response is handed back in the MCP `CallToolResult` shape.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tracing::{debug, info, warn};
-use xai_tool_protocol::{McpBlock, SessionId, ToolId, ToolOutputWire};
+use xai_tool_protocol::{SessionId, ToolId};
 use xai_tool_runtime::{ToolCallContext, ToolError, ToolStream, TypedToolOutput, terminal_only};
 use xai_tool_types::ToolDescription;
 
@@ -193,7 +193,7 @@ impl Drop for McpBridge {
 /// Hub-facing handler for a single MCP tool.
 ///
 /// Translates hub `tool_call_request` frames into MCP `tools/call`
-/// invocations and maps the result back to [`ToolOutputWire`].
+/// invocations and hands the result back in the MCP `CallToolResult` shape.
 pub struct McpToolHandler {
     tool_id: ToolId,
     definition: McpToolDefinition,
@@ -240,15 +240,12 @@ impl xai_computer_hub_sdk::ToolServerHandler for McpToolHandler {
         crate::metrics::mcp_call_duration_observe(_start.elapsed().as_secs_f64());
 
         let terminal = match result {
-            Ok(call_result) => {
-                let output = translate_mcp_result(&call_result);
-                serde_json::to_value(output)
-                    .map(|value| TypedToolOutput::from_value(tool_id, value))
-                    .map_err(|e| {
-                        crate::metrics::mcp_error();
-                        ToolError::execution(self.tool_id.clone(), e.to_string()).with_source(e)
-                    })
-            }
+            Ok(call_result) => translate_mcp_result(call_result)
+                .map(|value| TypedToolOutput::from_value(tool_id, value))
+                .map_err(|e| {
+                    crate::metrics::mcp_error();
+                    ToolError::execution(self.tool_id.clone(), e.to_string()).with_source(e)
+                }),
             Err(mcp_err) => {
                 crate::metrics::mcp_error();
                 Err(ToolError::execution(
@@ -262,77 +259,31 @@ impl xai_computer_hub_sdk::ToolServerHandler for McpToolHandler {
     }
 }
 
-/// Convert an [`McpCallResult`] into the wire output format.
+/// Project an [`McpCallResult`] into the value handed to the hub.
 ///
-/// - **Error responses** (`is_error: true`): concatenates text-only blocks
-///   into a single [`ToolOutputWire::Text`], discarding non-text content
-///   (with a warning when content is dropped).
-/// - **Empty content**: returns `ToolOutputWire::Text("")` regardless of
-///   `is_error` — matches side-effect-only MCP tools.
-/// - **Single text block**: returns [`ToolOutputWire::Text`] directly.
-/// - **Multi-block / non-text**: returns [`ToolOutputWire::Mcp`] with
-///   structured blocks.
-fn translate_mcp_result(result: &McpCallResult) -> ToolOutputWire {
+/// The gateway renders the MCP `CallToolResult` shape one block per content
+/// entry (a `ToolOutputWire` serialised here gets wrapped again by the SDK
+/// and lands as one JSON text block). It needs a non-empty `content` array,
+/// so a side-effect-only result gets one empty text block.
+fn translate_mcp_result(mut result: McpCallResult) -> Result<Value, serde_json::Error> {
     if result.content.is_empty() {
-        return ToolOutputWire::Text(String::new());
+        result.content.push(McpContent::Text {
+            text: String::new(),
+        });
     }
-
-    if result.is_error {
-        let error_text = result
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                McpContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if error_text.is_empty() {
-            warn!(
-                content_count = result.content.len(),
-                "MCP error response contained only non-text blocks; content dropped"
-            );
-        }
-        return ToolOutputWire::Text(error_text);
-    }
-
-    // Single text block → flat text output.
-    if result.content.len() == 1
-        && let Some(McpContent::Text { text }) = result.content.first()
-    {
-        return ToolOutputWire::Text(text.clone());
-    }
-
-    let blocks: Vec<McpBlock> = result
-        .content
-        .iter()
-        .map(|c| match c {
-            McpContent::Text { text } => McpBlock::Text { text: text.clone() },
-            McpContent::Image { mime_type, data } => McpBlock::Image {
-                mime_type: mime_type.clone(),
-                data: data.clone(),
-            },
-            McpContent::Resource {
-                uri,
-                mime_type,
-                text,
-            } => McpBlock::Resource {
-                uri: uri.clone(),
-                mime_type: mime_type.clone(),
-                text: text.clone(),
-            },
-        })
-        .collect();
-
-    ToolOutputWire::Mcp { blocks }
+    serde_json::to_value(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{McpCallResult, McpContent, McpServerInfo, McpToolDefinition};
+    use futures::StreamExt;
+    use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::Mutex;
+    use xai_computer_hub_sdk::ToolServerHandler;
+    use xai_tool_runtime::{ContentBlock, ToolStreamItem};
 
     struct MockTransport {
         server_info: McpServerInfo,
@@ -340,7 +291,6 @@ mod tests {
         call_response: Mutex<Option<McpCallResult>>,
         call_error: Mutex<Option<McpError>>,
         closed: AtomicBool,
-        last_call: Mutex<Option<(String, Value)>>,
     }
 
     impl MockTransport {
@@ -351,7 +301,6 @@ mod tests {
                 call_response: Mutex::new(None),
                 call_error: Mutex::new(None),
                 closed: AtomicBool::new(false),
-                last_call: Mutex::new(None),
             }
         }
 
@@ -380,9 +329,11 @@ mod tests {
             Ok(self.tools.clone())
         }
 
-        async fn call_tool(&self, name: &str, arguments: Value) -> Result<McpCallResult, McpError> {
-            *self.last_call.lock().await = Some((name.to_string(), arguments));
-
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+        ) -> Result<McpCallResult, McpError> {
             if let Some(err) = self.call_error.lock().await.take() {
                 return Err(err);
             }
@@ -467,7 +418,6 @@ mod tests {
             .find(|h| h.tool_id.as_str() == "search")
             .unwrap();
 
-        use xai_computer_hub_sdk::ToolServerHandler;
         let desc = handler.description();
         assert_eq!(desc.name, "search");
         assert_eq!(desc.description, "Search for items");
@@ -475,139 +425,111 @@ mod tests {
         assert!(handler.input_schema().is_some());
     }
 
+    /// 1x1 transparent PNG.
+    const PNG_BASE64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+    /// Connect a bridge whose transport answers every call with
+    /// `response`, run the first handler as the daemon does, and return
+    /// its terminal output. `model_output` is what the model sees: the
+    /// SDK server forwards `value` verbatim and the gateway re-derives
+    /// the blocks from it the same way `from_value` does here.
+    async fn call_with_response(response: McpCallResult) -> TypedToolOutput {
+        let transport = make_transport(
+            MockTransport::new(sample_server_info(), sample_tools()).with_call_response(response),
+        );
+        let config = McpBridgeConfig {
+            session_id: SessionId::new("test-session").unwrap(),
+            namespace: None,
+        };
+        let handle = McpBridge::connect(transport, &config).await.unwrap();
+        let handler = &handle.bridge.handlers()[0];
+        let mut stream = handler
+            .handle_call(ToolCallContext::default(), Value::Null)
+            .await;
+        match stream.next().await.unwrap() {
+            ToolStreamItem::Terminal(Ok(typed)) => typed,
+            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
+        }
+    }
+
+    fn text_block(text: &str) -> ContentBlock {
+        ContentBlock::Text { text: text.into() }
+    }
+
+    fn png_content() -> McpContent {
+        McpContent::Image {
+            mime_type: "image/png".into(),
+            data: PNG_BASE64.into(),
+        }
+    }
+
+    fn png_block() -> ContentBlock {
+        ContentBlock::Image {
+            mime_type: "image/png".into(),
+            data: PNG_BASE64.into(),
+            media_id: None,
+            filename: None,
+            path: None,
+            metadata: Default::default(),
+        }
+    }
+
     #[tokio::test]
     async fn bridge_forwards_call_text_response() {
-        let call_result = McpCallResult {
+        let typed = call_with_response(McpCallResult {
             content: vec![McpContent::Text {
                 text: "found 3 results".into(),
             }],
             is_error: false,
-        };
-        let transport = make_transport(
-            MockTransport::new(sample_server_info(), sample_tools())
-                .with_call_response(call_result),
+        })
+        .await;
+
+        assert_eq!(
+            typed.value,
+            json!({"content": [{"type": "text", "text": "found 3 results"}], "isError": false})
         );
-        let config = McpBridgeConfig {
-            session_id: SessionId::new("test-session").unwrap(),
-            namespace: None,
-        };
-
-        let handle = McpBridge::connect(Arc::clone(&transport), &config)
-            .await
-            .unwrap();
-        let handler = handle
-            .bridge
-            .handlers()
-            .iter()
-            .find(|h| h.tool_id.as_str() == "search")
-            .unwrap();
-
-        use futures::StreamExt;
-        use xai_computer_hub_sdk::ToolServerHandler;
-
-        let ctx = ToolCallContext::default();
-        let args = serde_json::json!({"query": "test"});
-        let mut stream = handler.handle_call(ctx, args).await;
-
-        let item = stream.next().await.unwrap();
-        match item {
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
-                let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
-                assert_eq!(output, ToolOutputWire::Text("found 3 results".into()));
-            }
-            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
-        }
+        assert_eq!(typed.model_output, vec![text_block("found 3 results")]);
     }
 
     #[tokio::test]
-    async fn bridge_forwards_call_mcp_blocks_response() {
-        let call_result = McpCallResult {
+    async fn bridge_forwards_call_image_response() {
+        let typed = call_with_response(McpCallResult {
             content: vec![
                 McpContent::Text {
                     text: "result text".into(),
                 },
-                McpContent::Image {
-                    mime_type: "image/png".into(),
-                    data: "base64data".into(),
-                },
+                png_content(),
             ],
             is_error: false,
-        };
-        let transport = make_transport(
-            MockTransport::new(sample_server_info(), sample_tools())
-                .with_call_response(call_result),
+        })
+        .await;
+
+        assert_eq!(
+            typed.model_output,
+            vec![text_block("result text"), png_block()]
         );
-        let config = McpBridgeConfig {
-            session_id: SessionId::new("test-session").unwrap(),
-            namespace: None,
-        };
-
-        let handle = McpBridge::connect(transport, &config).await.unwrap();
-        let handler = &handle.bridge.handlers()[0];
-
-        use futures::StreamExt;
-        use xai_computer_hub_sdk::ToolServerHandler;
-
-        let ctx = ToolCallContext::default();
-        let mut stream = handler
-            .handle_call(ctx, Value::Object(Default::default()))
-            .await;
-
-        let item = stream.next().await.unwrap();
-        match item {
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
-                let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
-                match output {
-                    ToolOutputWire::Mcp { blocks } => {
-                        assert_eq!(blocks.len(), 2);
-                        assert!(
-                            matches!(&blocks[0], McpBlock::Text { text } if text == "result text")
-                        );
-                        assert!(
-                            matches!(&blocks[1], McpBlock::Image { mime_type, .. } if mime_type == "image/png")
-                        );
-                    }
-                    other => panic!("expected Mcp blocks, got {other:?}"),
-                }
-            }
-            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
-        }
     }
 
+    /// An error result keeps every block: a failed browser action's
+    /// screenshot is what lets the model self-correct.
     #[tokio::test]
     async fn bridge_handles_mcp_error_response() {
-        let call_result = McpCallResult {
-            content: vec![McpContent::Text {
-                text: "permission denied".into(),
-            }],
+        let typed = call_with_response(McpCallResult {
+            content: vec![
+                McpContent::Text {
+                    text: "permission denied".into(),
+                },
+                png_content(),
+            ],
             is_error: true,
-        };
-        let transport = make_transport(
-            MockTransport::new(sample_server_info(), sample_tools())
-                .with_call_response(call_result),
+        })
+        .await;
+
+        assert_eq!(typed.value["isError"], json!(true));
+        assert_eq!(
+            typed.model_output,
+            vec![text_block("permission denied"), png_block()]
         );
-        let config = McpBridgeConfig {
-            session_id: SessionId::new("test-session").unwrap(),
-            namespace: None,
-        };
-
-        let handle = McpBridge::connect(transport, &config).await.unwrap();
-        let handler = &handle.bridge.handlers()[0];
-
-        use futures::StreamExt;
-        use xai_computer_hub_sdk::ToolServerHandler;
-
-        let ctx = ToolCallContext::default();
-        let mut stream = handler.handle_call(ctx, Value::Null).await;
-
-        let item = stream.next().await.unwrap();
-        match item {
-            xai_tool_runtime::ToolStreamItem::Terminal(Ok(typed)) => {
-                let output: ToolOutputWire = serde_json::from_value(typed.value).unwrap();
-                assert_eq!(output, ToolOutputWire::Text("permission denied".into()));
-            }
-            other => panic!("expected Terminal(Ok(_)), got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -624,15 +546,12 @@ mod tests {
         let handle = McpBridge::connect(transport, &config).await.unwrap();
         let handler = &handle.bridge.handlers()[0];
 
-        use futures::StreamExt;
-        use xai_computer_hub_sdk::ToolServerHandler;
-
         let ctx = ToolCallContext::default();
         let mut stream = handler.handle_call(ctx, Value::Null).await;
 
         let item = stream.next().await.unwrap();
         match item {
-            xai_tool_runtime::ToolStreamItem::Terminal(Err(ref e))
+            ToolStreamItem::Terminal(Err(ref e))
                 if e.kind == xai_tool_runtime::ToolErrorKind::Execution =>
             {
                 assert!(
@@ -687,44 +606,15 @@ mod tests {
     }
 
     #[test]
-    fn translate_mcp_result_single_text() {
-        let result = McpCallResult {
-            content: vec![McpContent::Text {
-                text: "hello".into(),
-            }],
-            is_error: false,
-        };
-        assert_eq!(
-            translate_mcp_result(&result),
-            ToolOutputWire::Text("hello".into())
-        );
-    }
-
-    #[test]
-    fn translate_mcp_result_error_concatenates_text() {
-        let result = McpCallResult {
-            content: vec![
-                McpContent::Text {
-                    text: "line 1".into(),
-                },
-                McpContent::Text {
-                    text: "line 2".into(),
-                },
-            ],
-            is_error: true,
-        };
-        assert_eq!(
-            translate_mcp_result(&result),
-            ToolOutputWire::Text("line 1\nline 2".into())
-        );
-    }
-
-    #[test]
-    fn translate_mcp_result_mixed_content_uses_blocks() {
-        let result = McpCallResult {
+    fn translate_mcp_result_keeps_call_tool_result_shape() {
+        let value = translate_mcp_result(McpCallResult {
             content: vec![
                 McpContent::Text {
                     text: "hello".into(),
+                },
+                McpContent::Image {
+                    mime_type: "image/png".into(),
+                    data: "AAAA".into(),
                 },
                 McpContent::Resource {
                     uri: "file:///test".into(),
@@ -733,49 +623,37 @@ mod tests {
                 },
             ],
             is_error: false,
-        };
-        match translate_mcp_result(&result) {
-            ToolOutputWire::Mcp { blocks } => assert_eq!(blocks.len(), 2),
-            other => panic!("expected Mcp, got {other:?}"),
+        })
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "image", "mimeType": "image/png", "data": "AAAA"},
+                    {"type": "resource", "uri": "file:///test", "mimeType": "text/plain", "text": "content"},
+                ],
+                "isError": false,
+            })
+        );
+    }
+
+    #[test]
+    fn translate_mcp_result_empty_content_reaches_model_as_empty_text() {
+        for is_error in [false, true] {
+            let value = translate_mcp_result(McpCallResult {
+                content: vec![],
+                is_error,
+            })
+            .unwrap();
+            assert_eq!(
+                value,
+                json!({"content": [{"type": "text", "text": ""}], "isError": is_error})
+            );
+
+            let typed = TypedToolOutput::from_value(ToolId::new("search").unwrap(), value);
+            assert_eq!(typed.model_output, vec![text_block("")]);
         }
-    }
-
-    #[test]
-    fn translate_mcp_result_empty_content_returns_empty_text() {
-        let result = McpCallResult {
-            content: vec![],
-            is_error: false,
-        };
-        assert_eq!(
-            translate_mcp_result(&result),
-            ToolOutputWire::Text(String::new())
-        );
-    }
-
-    #[test]
-    fn translate_mcp_result_empty_error_content_returns_empty_text() {
-        let result = McpCallResult {
-            content: vec![],
-            is_error: true,
-        };
-        assert_eq!(
-            translate_mcp_result(&result),
-            ToolOutputWire::Text(String::new())
-        );
-    }
-
-    #[test]
-    fn translate_mcp_result_error_with_only_image_drops_content() {
-        let result = McpCallResult {
-            content: vec![McpContent::Image {
-                mime_type: "image/png".into(),
-                data: "base64data".into(),
-            }],
-            is_error: true,
-        };
-        assert_eq!(
-            translate_mcp_result(&result),
-            ToolOutputWire::Text(String::new())
-        );
     }
 }

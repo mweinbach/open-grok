@@ -139,3 +139,30 @@ pub fn error(msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
 pub fn debug(msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
     push_entry(LogLevel::Debug, msg, sid, ctx);
 }
+
+fn direct_entry(lvl: LogLevel, msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
+    xai_grok_telemetry::unified_log::ingest_client_entries(
+        LogSource::GrokPager,
+        &[ClientLogEntry {
+            ts: now_ts(),
+            pid: Some(std::process::id()),
+            ver: Some(xai_grok_version::version().to_owned()),
+            lvl,
+            sid: sid.map(Into::into),
+            msg: msg.into(),
+            ctx,
+        }],
+    );
+}
+
+/// Write an info entry straight to `unified.jsonl`, bypassing the ACP forwarder. The forwarder only gets a sender
+/// after a successful connect, and a flush during a failed startup destroys buffered entries. Entries logged before
+/// the connect that must survive a failed startup go through here.
+pub fn write_direct_info(msg: &str, ctx: Option<serde_json::Value>) {
+    direct_entry(LogLevel::Info, msg, None, ctx);
+}
+
+/// [`write_direct_info`] at warn level, for failure reports that must land even when the ACP forwarder is wedged.
+pub fn write_direct_warn(msg: &str, sid: Option<&str>, ctx: Option<serde_json::Value>) {
+    direct_entry(LogLevel::Warn, msg, sid, ctx);
+}

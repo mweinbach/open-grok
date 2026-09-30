@@ -2200,6 +2200,41 @@ impl ModelsManager {
             .await;
     }
 
+    /// One lock read, so ids, families, and the fetch state come from one catalog generation.
+    pub(crate) fn task_model_catalog_snapshot(
+        &self,
+        remote_fetch_enabled: bool,
+    ) -> task_model_policy::TaskModelCatalogSnapshot {
+        use task_model_policy::{CatalogAuthority, EligibleTaskModel};
+        let is_session_auth = self.is_session_auth();
+        let cat = self.inner.catalog.read();
+        task_model_policy::TaskModelCatalogSnapshot {
+            eligible: cat
+                .models
+                .iter()
+                .filter(|(_, e)| e.info.is_picker_eligible(is_session_auth))
+                .map(|(id, e)| EligibleTaskModel {
+                    id: id.clone(),
+                    // Provider identity comes from model metadata, never from a
+                    // server-reported family string: xAI-minted entries are the
+                    // first-party family, everything else is third-party.
+                    model_family: Some(
+                        if e.info.provider == xai_grok_sampling_types::ModelProvider::Xai {
+                            "xai".to_string()
+                        } else {
+                            "third_party".to_string()
+                        },
+                    ),
+                })
+                .collect(),
+            authority: if cat.has_fetched_real_catalog || !remote_fetch_enabled {
+                CatalogAuthority::Complete
+            } else {
+                CatalogAuthority::Provisional
+            },
+        }
+    }
+
     async fn wait_for_first_catalog_inner(&self, remote_fetch_enabled: bool) -> bool {
         const BUDGET: std::time::Duration = crate::http::STARTUP_AUTH_REFRESH_TIMEOUT
             .saturating_add(crate::http::STARTUP_FETCH_TIMEOUT);
@@ -3135,6 +3170,7 @@ mod fetch;
 mod resolution;
 mod settings_cache;
 pub mod startup_prefetch;
+pub(crate) mod task_model_policy;
 
 pub(crate) use cache::*;
 pub(crate) use endpoint::*;

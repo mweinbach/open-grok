@@ -30,9 +30,21 @@ fn test_home() -> &'static PathBuf {
 
 /// Clean up config files between tests.
 fn reset_config_files(home: &std::path::Path) {
-    let _ = fs::remove_file(home.join("config.toml"));
-    let _ = fs::remove_file(home.join("requirements.toml"));
-    let _ = fs::remove_file(home.join("managed_config.toml"));
+    for name in ["config.toml", "requirements.toml", "managed_config.toml"] {
+        let path = home.join(name);
+        // `remove_file` cannot clear a directory squat left by
+        // `update_config_refuses_unreadable_config_toml`; later `fs::write`
+        // then fails with EISDIR.
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {
+                let _ = fs::remove_dir_all(&path);
+            }
+            Ok(_) => {
+                let _ = fs::remove_file(&path);
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 #[tokio::test]
@@ -169,4 +181,118 @@ async fn update_config_does_not_leak_managed_config_values() {
         user_cfg.cli.channel, None,
         "channel from managed_config.toml leaked into user config. Raw:\n{raw}"
     );
+}
+
+/// Settings save must not replace a user `config.toml` symlink with a regular file.
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn update_config_preserves_config_toml_symlink() {
+    let home = test_home();
+    reset_config_files(home);
+
+    let repo = home.join("dotfiles");
+    fs::create_dir_all(&repo).unwrap();
+    let target = repo.join("config.toml");
+    fs::write(&target, "[ui]\nsimple_mode = false\n").unwrap();
+    let link = home.join("config.toml");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    xai_grok_shell::util::config::update_config(|cfg| {
+        cfg.ui.simple_mode = Some(true);
+    })
+    .await
+    .expect("update_config should succeed");
+
+    let meta = fs::symlink_metadata(&link).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "config.toml must remain a symlink after save_config; got {:?}",
+        meta.file_type()
+    );
+    assert_eq!(target, fs::read_link(&link).unwrap());
+    let raw = fs::read_to_string(&target).unwrap();
+    assert!(
+        raw.contains("simple_mode = true"),
+        "symlink target must receive the settings save:\n{raw}"
+    );
+}
+
+/// A present-but-unreadable `config.toml` (directory squat) must not be treated
+/// as empty and rewritten — same class as an `ELOOP` symlink chain the kernel
+/// cannot `open`.
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn update_config_refuses_unreadable_config_toml() {
+    let home = test_home();
+    reset_config_files(home);
+
+    let squat = home.join("config.toml");
+    fs::create_dir(&squat).unwrap();
+
+    let err = xai_grok_shell::util::config::update_config(|cfg| {
+        cfg.ui.simple_mode = Some(true);
+    })
+    .await
+    .expect_err("unreadable config.toml must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unreadable") || msg.contains("Is a directory") || msg.contains("directory"),
+        "expected unreadable refusal, got {msg}"
+    );
+    assert!(
+        squat.is_dir(),
+        "directory squat must not be replaced by a regular file"
+    );
+}
+
+/// Bind dest before the typed load. A retarget inside `f` (after load, before
+/// save) must refuse — not merge A's modeled fields onto B.
+#[tokio::test]
+#[serial]
+#[cfg(unix)]
+async fn update_config_refuses_retarget_between_load_and_save() {
+    let home = test_home();
+    reset_config_files(home);
+
+    let a = home.join("a.toml");
+    let b = home.join("b.toml");
+    fs::write(&a, "[ui]\nsimple_mode = false\nfrom_a = true\n").unwrap();
+    fs::write(&b, "[ui]\nsimple_mode = false\nfrom_b = true\n").unwrap();
+    let link = home.join("config.toml");
+    std::os::unix::fs::symlink(&a, &link).unwrap();
+
+    let err = xai_grok_shell::util::config::update_config(|cfg| {
+        cfg.ui.simple_mode = Some(true);
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+    })
+    .await
+    .expect_err("retarget between load and save must fail closed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed") || msg.contains("follow destination"),
+        "expected retarget refusal, got {msg}"
+    );
+
+    let raw_a = fs::read_to_string(&a).unwrap();
+    let raw_b = fs::read_to_string(&b).unwrap();
+    assert!(
+        raw_a.contains("from_a = true"),
+        "referent A must stay unmerged:\n{raw_a}"
+    );
+    assert!(
+        !raw_a.contains("simple_mode = true"),
+        "must not publish onto A after retarget:\n{raw_a}"
+    );
+    assert!(
+        raw_b.contains("from_b = true"),
+        "referent B must stay unmerged:\n{raw_b}"
+    );
+    assert!(
+        !raw_b.contains("simple_mode = true"),
+        "must not merge A's snapshot onto B:\n{raw_b}"
+    );
+    assert_eq!(b, fs::read_link(&link).unwrap());
 }

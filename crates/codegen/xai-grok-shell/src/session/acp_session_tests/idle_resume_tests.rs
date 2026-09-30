@@ -151,6 +151,7 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             let chat_state_handle = xai_chat_state::ChatStateActor::spawn(
                 vec![],
                 xai_grok_sampling_types::SamplingConfig {
+                    max_request_bytes: None,
                     base_url: mock_url.clone(),
                     model: "test-model".to_string(),
                     max_completion_tokens: Some(8192),
@@ -178,6 +179,15 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             let actor = SessionActor {
+                hook_disabled: Default::default(),
+                is_chat_kind: false,
+                vcs_kind: xai_grok_workspace::session::git::VcsKind::None,
+                vcs_root: None,
+                transient_retry_enabled: true,
+                transient_retries_prompt_total: std::cell::Cell::new(0),
+                transient_episode_start: std::cell::Cell::new(None),
+                status_wake: Default::default(),
+                active_work: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 session_info: SessionInfo {
                     id: acp::SessionId::new("test-idle-resume"),
                     cwd: cwd.as_str().to_string(),
@@ -250,6 +260,13 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                     prefix_released: std::sync::atomic::AtomicBool::new(false),
                     cancel: Default::default(),
                 },
+                long_reasoning_reminder:
+                    crate::session::long_reasoning_reminder::LongReasoningReminder {
+                        enabled: false,
+                        tokens: crate::session::long_reasoning_reminder::DEFAULT_TOKENS,
+                        delay: crate::session::long_reasoning_reminder::DEFAULT_DELAY,
+                    },
+                long_reasoning_turn_state: Default::default(),
                 memory: crate::session::memory_state::SessionMemory::empty(),
                 session_start: std::time::Instant::now(),
                 inference_idle_timeout: Duration::from_secs(300),
@@ -319,14 +336,10 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 ),
                 goal_classifier_in_flight: std::sync::atomic::AtomicBool::new(false),
                 managed_mcp_handle: Default::default(),
-                initial_client_mcp_servers: vec![],
+                initial_client_mcp_servers: Default::default(),
                 tool_metadata_snapshot: Arc::new(std::sync::Mutex::new(Default::default())),
                 mcp_announcements: Default::default(),
-                status_wake: Default::default(),
                 status_line_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                transient_turn_retries: false,
-                transient_retries_prompt_total: Default::default(),
-                transient_episode_start: Default::default(),
                 rate_limit_waits: Default::default(),
                 code_mode_hook_followups: Default::default(),
                 sampling_gate: None,
@@ -354,7 +367,6 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
                 turn_end_tx: Default::default(),
                 client_hooks: Default::default(),
                 hook_resolved_workspace_root: String::new(),
-                vcs_kind: xai_grok_workspace::session::git::VcsKind::Git,
                 hook_load_errors: std::cell::RefCell::new(Vec::new()),
                 plugin_registry: std::cell::RefCell::new(None),
                 plugin_registry_handle: None,

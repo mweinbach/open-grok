@@ -51,6 +51,8 @@ pub(crate) enum TurnStopReason {
     Error,
     MaxTokens,
     MaxTurnRequests,
+    /// The agent process died or was restarted mid-turn; the shell closes the turn on the next load.
+    Interrupted,
     Unknown,
 }
 
@@ -64,6 +66,7 @@ impl From<&str> for TurnStopReason {
             "error" => Self::Error,
             "max_tokens" => Self::MaxTokens,
             "max_turn_requests" => Self::MaxTurnRequests,
+            xai_grok_shell::session::interrupted_turn::INTERRUPTED_STOP_REASON => Self::Interrupted,
             _ => Self::Unknown,
         }
     }
@@ -94,11 +97,6 @@ pub(crate) fn duration_to_elapsed_ms(elapsed: Option<std::time::Duration>) -> Op
     elapsed.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn required_elapsed(ms: Option<u64>) -> std::time::Duration {
-    ms.map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::ZERO)
-}
-
 pub(crate) fn terminal_marker(input: TerminalMarkerInput<'_>) -> Option<SessionEvent> {
     let elapsed = input.elapsed_ms.map(std::time::Duration::from_millis);
     match input.stop {
@@ -111,7 +109,7 @@ pub(crate) fn terminal_marker(input: TerminalMarkerInput<'_>) -> Option<SessionE
         TurnStopReason::Cancelled => Some(cancelled_turn_event(
             input.cancel_trigger,
             input.cancellation_category,
-            required_elapsed(input.elapsed_ms),
+            elapsed,
         )),
         TurnStopReason::RateLimit => None,
         TurnStopReason::Error if input.error_banner_present => None,
@@ -120,11 +118,19 @@ pub(crate) fn terminal_marker(input: TerminalMarkerInput<'_>) -> Option<SessionE
             input.agent_result,
             elapsed,
         )),
+        // The shell's text names the cause; the request-failure formatter would relabel it "Request failed"
+        TurnStopReason::Interrupted => Some(SessionEvent::TurnFailed {
+            error: input
+                .agent_result
+                .unwrap_or(xai_grok_shell::session::interrupted_turn::INTERRUPTED_MESSAGE)
+                .to_string(),
+            elapsed,
+        }),
     }
 }
 
 /// The turn-failed terminal marker: formats `agent_result` with the typed kind.
-/// One builder for all rails (classifier, wake failure, busy-wake pierce) so the failure copy can't drift between them.
+/// One builder for every rail that paints a failure so the copy can't drift between them.
 pub(super) fn failed_turn_event(
     error_kind: Option<WireErrorType>,
     agent_result: Option<&str>,
@@ -146,7 +152,7 @@ pub(super) fn failed_turn_event(
 pub(super) fn cancelled_turn_event(
     cancel_trigger: Option<&str>,
     cancellation_category: Option<&str>,
-    elapsed: std::time::Duration,
+    elapsed: Option<std::time::Duration>,
 ) -> SessionEvent {
     if cancellation_category == Some(HOOK_DENIED_CATEGORY) {
         SessionEvent::TurnBlockedByHook { elapsed }
@@ -599,6 +605,126 @@ pub(super) fn finalize_turn_from_terminal(
     agent.mark_turn_finished(TurnEnd::Completed);
 
     TerminalApply::ViewerFinalized
+}
+
+/// Must not arm lost-RPC reconcile. A different prompt's terminal marks without `finish_turn`.
+pub(super) fn finalize_child_view_turn(
+    child: &mut AgentView,
+    signal: TerminalSignal<'_>,
+    wire_elapsed_ms: Option<u64>,
+) -> bool {
+    if child.session.loading_replay {
+        return false;
+    }
+    if child.session.state.command_in_flight().is_some() {
+        return false;
+    }
+    let signal_pid = signal.prompt_id.filter(|pid| !pid.is_empty());
+    // Nameless terminals still finish a TurnCancelling turn whose id a chunk adopted.
+    // A named follow-up that is already running is a stale duplicate and must not end.
+    if signal_pid.is_none()
+        && child.session.current_prompt_id.is_some()
+        && !child.session.state.is_cancelling()
+    {
+        return false;
+    }
+    let mut other_prompt = false;
+    if let Some(pid) = signal_pid.filter(|pid| {
+        let current = child.session.current_prompt_id.as_deref();
+        let differs = current.is_some_and(|cur| cur != *pid);
+        let left_behind = child.superseded_child_prompt_ids.contains(*pid) && current != Some(*pid);
+        differs || left_behind
+    }) {
+        if !child.ended_child_prompt_ids.insert(pid.to_string()) {
+            return false;
+        }
+        other_prompt = true;
+    } else if signal_pid.is_some_and(|pid| {
+        child.ended_child_prompt_ids.contains(pid)
+            && child.session.current_prompt_id.as_deref() != Some(pid)
+    }) {
+        return false;
+    }
+    if !other_prompt && !child.session.state.is_busy() && child.session.current_prompt_id.is_none()
+    {
+        return false;
+    }
+
+    let TerminalSignal {
+        prompt_id,
+        stop_reason,
+        agent_result,
+        cancel_trigger,
+        cancellation_category,
+        error_kind,
+        ..
+    } = signal;
+
+    let elapsed_ms = if other_prompt {
+        wire_elapsed_ms
+    } else {
+        duration_to_elapsed_ms(child.turn_elapsed()).or(wire_elapsed_ms)
+    };
+    let ending_prompt_id = if other_prompt {
+        signal_pid.map(str::to_string)
+    } else {
+        child
+            .session
+            .current_prompt_id
+            .clone()
+            .or_else(|| prompt_id.filter(|pid| !pid.is_empty()).map(str::to_string))
+    };
+
+    if !other_prompt {
+        child.session.finish_turn(&mut child.scrollback);
+        // `finish_turn` only reaches rows the tracker saw. A resumed transcript's running tools would otherwise spin under an idle footer.
+        child.scrollback.finish_all_running();
+    }
+
+    let expected_send_now = if other_prompt {
+        None
+    } else {
+        child.expect_send_now_cancel.take()
+    };
+    let send_now_cancel = match cancel_trigger {
+        Some(trigger) => trigger == "send_now",
+        None => expected_send_now.is_some(),
+    };
+    let event = terminal_marker(TerminalMarkerInput {
+        stop: TurnStopReason::from(stop_reason),
+        elapsed_ms,
+        agent_result,
+        send_now_cancel,
+        cancel_trigger,
+        cancellation_category,
+        error_kind,
+        error_banner_present: super::dispatch::scrollback_has_recent_error_banner(
+            &child.scrollback,
+        ),
+    });
+    if other_prompt {
+        push_turn_terminal_marker(child, event, ending_prompt_id.as_deref());
+        return true;
+    }
+    push_turn_terminal_marker(child, event, ending_prompt_id.as_deref());
+    // `mark_turn_finished` clears the stamp; the bound has to outlive that.
+    let closed_start = child.turn_start_ms;
+    let closed_prompt = child.turn_start_ms_prompt.clone();
+    child.mark_turn_finished(TurnEnd::Completed);
+    if let Some(pid) = ending_prompt_id {
+        // Only this prompt's own bound. A follow-up end must not drop an earlier nameless close.
+        let clears_bound =
+            child.unidentified_child_turn_closed_prompt.as_deref() == Some(pid.as_str());
+        child.ended_child_prompt_ids.insert(pid);
+        if clears_bound {
+            child.unidentified_child_turn_closed_ms = None;
+            child.unidentified_child_turn_closed_prompt = None;
+        }
+    } else {
+        child.unidentified_child_turn_closed_ms = closed_start;
+        child.unidentified_child_turn_closed_prompt = closed_start.and(closed_prompt);
+    }
+    true
 }
 
 /// Map a [`finalize_turn_from_terminal`] outcome to the redraw/tick bool that BOTH terminal rails RETURN DIRECTLY.

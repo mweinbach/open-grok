@@ -54,11 +54,11 @@ pub(crate) use prompt::dispatch_initial_prompt;
 pub(in crate::app) use prompt::{show_small_screen_tip, show_ssh_wrap_tip};
 pub(crate) use queue::maybe_drain_queue;
 pub(super) use queue::{
-    apply_turn_start_shim, arm_send_now_and_paint, maybe_drain_queue_and_note_peek,
-    note_peek_page_flip, shim_renders_own_user_block,
+    apply_turn_start_shim, arm_send_now_and_paint, flush_held_local_queue_into_wait,
+    maybe_drain_queue_and_note_peek, note_peek_page_flip, shim_renders_own_user_block,
 };
-pub(in crate::app) use rewind::{find_user_prompt_entry_for_shell_index, shell_prompt_index_at};
-pub(crate) use router::dispatch;
+pub(in crate::app) use rewind::find_user_prompt_entry_for_shell_index;
+pub(crate) use router::{dispatch, flush_image_notices};
 pub(crate) use settings::ui::refresh_open_settings_modals;
 pub(crate) use status::commit_minimal_update_notice;
 pub(crate) use turn::{reconcile_overdue_cancels, reconcile_overdue_turn_ends};

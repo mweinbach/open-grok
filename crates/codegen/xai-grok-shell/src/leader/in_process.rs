@@ -1,10 +1,12 @@
 //! A real agent behind a leader server, in this process rather than a child.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader, simplex};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 use xai_acp_lib::{
@@ -17,22 +19,45 @@ use crate::agent::mvp_agent::MvpAgent;
 
 const SIMPLEX_BUF: usize = 8 * 1024 * 1024;
 
-/// Spawns an agent on the current `LocalSet`, reading requests from `to_agent`
-/// and writing responses to `from_agent`. Returns the task handles so a caller
-/// can end the agent. Panics if the ambient configuration cannot build one.
-pub fn spawn_agent(
+/// An in-process agent: the tasks that pump its I/O, and the handle that keeps it allocated.
+///
+/// `MvpAgent` spawns background tasks on the ambient `LocalSet` that hold raw `LocalRef` self-pointers, so the agent
+/// must outlive every task on that `LocalSet`. Aborting `tasks` ends the ACP connection (which owns its own clone of
+/// the agent) but leaves those background tasks queued; a caller that lets the agent die while they are still queued
+/// frees the memory they keep reading, and their teardown writes through the dangling pointer.
+/// Hold `keepalive` past the `LocalSet`: `drop(local_set)` first, then `drop(keepalive)`.
+pub struct InProcessAgent {
+    /// The ACP connection, the request pump and the response pump. Abort and await them to end the agent's I/O.
+    pub tasks: Vec<JoinHandle<()>>,
+    /// Drop only after the `LocalSet` the agent was spawned on.
+    pub keepalive: Rc<MvpAgent>,
+}
+
+/// Spawns an agent on the current `LocalSet`, reading requests from `to_agent` and writing responses to `from_agent`.
+/// Resolves once the agent is built, with the task handles so a caller can end its I/O and the keepalive the caller
+/// must hold past the `LocalSet`. Panics if the ambient configuration cannot build one.
+pub async fn spawn_agent(
     mut to_agent: UnboundedReceiver<String>,
     from_agent: UnboundedSender<String>,
-) -> Vec<JoinHandle<()>> {
+) -> InProcessAgent {
     let (agent_in_read, mut agent_in_write) = simplex(SIMPLEX_BUF);
     let (agent_out_read, agent_out_write) = simplex(SIMPLEX_BUF);
+    let (keepalive_tx, keepalive_rx) = oneshot::channel();
 
-    let agent = tokio::task::spawn_local(async move {
+    // Built inside the task so the agent's bootstrap state lives on the task's heap-boxed future, not on the caller's
+    // stack (a debug-build `MvpAgent` boot would otherwise deepen every test that awaits this)
+    let connection = tokio::task::spawn_local(async move {
         let config = AgentConfig::default();
         let auth_manager = Arc::new(config.create_auth_manager());
         let (gateway_tx, gateway_rx) = tokio::sync::mpsc::unbounded_channel();
-        let agent = MvpAgent::new(GatewaySender::new(gateway_tx), &config, auth_manager, None)
-            .expect("valid agent config");
+        let agent = Rc::new(
+            MvpAgent::new(GatewaySender::new(gateway_tx), &config, auth_manager, None)
+                .expect("valid agent config"),
+        );
+        // A caller that stopped waiting has no way to hold the agent past the `LocalSet`, so do not start one
+        if keepalive_tx.send(Rc::clone(&agent)).is_err() {
+            return;
+        }
         let incoming = LineBufferedRead::spawn_local(agent_in_read.compat());
         let (conn, handle_io) =
             acp::AgentSideConnection::new(agent, agent_out_write.compat_write(), incoming, |fut| {
@@ -73,5 +98,11 @@ pub fn spawn_agent(
         }
     });
 
-    vec![agent, requests, responses]
+    let keepalive = keepalive_rx
+        .await
+        .expect("in-process agent task ended before it built an agent");
+    InProcessAgent {
+        tasks: vec![connection, requests, responses],
+        keepalive,
+    }
 }

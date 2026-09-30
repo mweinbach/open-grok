@@ -789,7 +789,12 @@ mod tests {
         let placement = tool_media_placement(path.clone());
         assert!(agent.build_inline_media_escapes(&placement).is_none());
         assert!(agent.inline_media_load_failed.contains_key(&path));
-        std::fs::write(&path, &png).unwrap();
+        // Rewrite via rename so the retry key differs even on coarse-clock
+        // filesystems (a same-length same-mtime in-place rewrite can share
+        // ctime with the failed load and be correctly skipped).
+        let staged = directory.path().join("slow-write.png.new");
+        std::fs::write(&staged, &png).unwrap();
+        std::fs::rename(&staged, &path).unwrap();
         pin_modified(&path);
         assert!(agent.build_inline_media_escapes(&placement).is_some());
         assert!(!agent.inline_media_load_failed.contains_key(&path));

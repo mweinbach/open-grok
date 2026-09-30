@@ -56,6 +56,43 @@ pub struct CreateWorktreeResult {
     pub strategy_metadata: Option<serde_json::Value>,
 }
 
+/// One dispatch arm that did not serve the worktree, and why.
+///
+/// The fork's dispatch does not track typed declines, so reports carry an
+/// empty list; the type exists so callers can render whatever a future
+/// dispatch records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArmSkip {
+    pub arm: String,
+    /// One line describing why the arm declined.
+    pub detail: String,
+}
+
+impl ArmSkip {
+    pub fn new(arm: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            arm: arm.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ArmSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.arm, self.detail)
+    }
+}
+
+/// Skip lines joined for a log field or a fallback message.
+#[must_use]
+pub fn render_arm_skips(skips: &[ArmSkip]) -> String {
+    skips
+        .iter()
+        .map(ArmSkip::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Execute worktree creation plan. This is a blocking operation.
 pub(crate) fn execute_plan(plan: WorktreePlan) -> Result<CreateWorktreeResult> {
     execute::execute_create_worktree(plan)

@@ -162,6 +162,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     let recap_model_from_app = app.recap_model.clone();
     let memory_model_from_app = app.memory_model.clone();
@@ -258,6 +259,7 @@ pub(crate) fn refresh_open_settings_modals(app: &mut AppView) {
                 auto_mode_gate: auto_mode_gate_from_app,
                 ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
                 voice_stt_language: voice_stt_language_from_app.clone(),
+                subagent_model_inheritance: subagent_model_inheritance_from_app,
                 local_feature_flags: local_feature_flags.clone(),
                 scheduler_background_loops: agent
                     .scheduler_background_loops
@@ -374,6 +376,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
     let auto_mode_gate_from_app = app.auto_mode_gate;
     let ask_user_question_timeout_enabled_from_app = app.ask_user_question_timeout_enabled;
     let voice_stt_language_from_app = app.voice_config.language.clone();
+    let subagent_model_inheritance_from_app = app.subagent_model_inheritance;
     let scheduler_background_loops_seed = app.scheduler_background_loops_seed;
     let recap_model_from_app = app.recap_model.clone();
     let memory_model_from_app = app.memory_model.clone();
@@ -485,6 +488,7 @@ pub(in crate::app::dispatch) fn dispatch_open_settings(
         auto_mode_gate: auto_mode_gate_from_app,
         ask_user_question_timeout_enabled: ask_user_question_timeout_enabled_from_app,
         voice_stt_language: voice_stt_language_from_app,
+        subagent_model_inheritance: subagent_model_inheritance_from_app,
         local_feature_flags: xai_grok_shell::util::config::load_local_feature_flags_sync(),
         scheduler_background_loops: agent
             .scheduler_background_loops
@@ -956,12 +960,28 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 return vec![];
             };
             let default_value = crate::settings::default_value_for(meta);
+            let Some(action) = action_for_reset(key, &default_value) else {
+                tracing::error!(
+                    target: "settings",
+                    key,
+                    ?default_value,
+                    "reset has no action_for_reset arm — registry/dispatch skew",
+                );
+                return vec![];
+            };
 
             // Gate idempotent reset: already-at-default → toast only.
+            // Not for the coding-data setter, which owns that decision: its local "opt-out" may be the unconfirmed fail-safe, so it writes anyway
+            // Nor for a `[features]` override, where reset deletes the key: a saved value equal to the default is still an override
             let pager_snapshot = build_pager_snapshot(app);
             let current_value =
                 crate::settings::current_value_for(key, &app.current_ui, &pager_snapshot);
-            if current_value.as_ref() == Some(&default_value) {
+            if current_value.as_ref() == Some(&default_value)
+                && !matches!(
+                    action,
+                    Action::SetCodingDataSharing { .. } | Action::ClearSubagentModelInheritance
+                )
+            {
                 tracing::debug!(
                     target: "settings",
                     key,
@@ -973,16 +993,6 @@ pub(in crate::app::dispatch) fn dispatch_confirm_reset_setting(
                 });
                 return vec![];
             }
-
-            let Some(action) = action_for_reset(key, &default_value) else {
-                tracing::error!(
-                    target: "settings",
-                    key,
-                    ?default_value,
-                    "reset has no action_for_reset arm — registry/dispatch skew",
-                );
-                return vec![];
-            };
             tracing::info!(
                 target: "settings",
                 key,
@@ -1325,6 +1335,7 @@ pub(crate) fn build_pager_snapshot(app: &AppView) -> crate::settings::PagerLocal
         auto_mode_gate: app.auto_mode_gate,
         ask_user_question_timeout_enabled: app.ask_user_question_timeout_enabled,
         voice_stt_language: app.voice_config.language.clone(),
+        subagent_model_inheritance: app.subagent_model_inheritance,
         local_feature_flags: xai_grok_shell::util::config::load_local_feature_flags_sync(),
         scheduler_background_loops: agent_scheduler_background_loops(app),
     }
@@ -1474,6 +1485,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         ("show_timestamps", SettingValue::Bool(b)) => Some(Action::SetTimestamps(*b)),
         ("show_timeline", SettingValue::Bool(b)) => Some(Action::SetTimeline(*b)),
         ("page_flip_on_send", SettingValue::Bool(b)) => Some(Action::SetPageFlipOnSend(*b)),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            Some(Action::SetDashboardPreview(*enabled))
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             Some(Action::SetConfirmBeforeRewind(*b))
         }
@@ -1527,6 +1541,9 @@ pub(in crate::app::dispatch) fn action_for_reset(
         }
         ("toolset.ask_user_question.timeout_enabled", SettingValue::Bool(b)) => {
             Some(Action::SetAskUserQuestionTimeoutEnabled(*b))
+        }
+        ("subagent_model_inheritance", SettingValue::Bool(_)) => {
+            Some(Action::ClearSubagentModelInheritance)
         }
         ("toolset.perplexity_web_search.enabled", SettingValue::Bool(b)) => {
             Some(Action::SetPerplexityWebSearch(*b))
@@ -1792,6 +1809,9 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
         ("show_timestamps", SettingValue::Bool(b)) => set_timestamps_inner(app, *b),
         ("show_timeline", SettingValue::Bool(b)) => set_timeline_inner(app, *b),
         ("page_flip_on_send", SettingValue::Bool(b)) => set_page_flip_on_send_inner(app, *b),
+        ("dashboard_preview", SettingValue::Bool(enabled)) => {
+            app.current_ui.dashboard_preview = Some(*enabled);
+        }
         ("confirm_before_rewind", SettingValue::Bool(b)) => {
             set_confirm_before_rewind_inner(app, *b)
         }
@@ -1888,6 +1908,13 @@ pub(in crate::app::dispatch) fn apply_setting_rollback(
             set_yolo_mode_inner(app, kind.is_always_approve());
             // Restore canonical (meaningful for `Default`).
             app.current_ui.permission_mode = Some(kind.as_canonical().to_string());
+            // The staged word has to roll back too, or SessionCreated replays the value that failed to save
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get_mut(&id)
+                && (agent.session.session_id.is_none() || agent.deferred_permission_mode.is_some())
+            {
+                agent.deferred_permission_mode = Some(kind.as_canonical());
+            }
             // Sync the per-session auto flag ONLY for a permission_mode rollback;
             // other rollback arms must not clobber it from the global canonical.
             sync_active_auto_flag(app);

@@ -1,6 +1,6 @@
 //! Commands sent to the ChatStateActor.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use tokio::sync::oneshot;
 use xai_grok_sampling_types::{
@@ -253,9 +253,11 @@ pub enum ChatStateCommand {
     /// after each verifier panel). No-op when nothing was recorded.
     FlushHarnessTraceTurn,
 
-    /// Repair dangling tool calls after a harness-initiated halt.
+    /// Repair dangling tool calls after a harness-initiated halt. `answers` are
+    /// written only for ids still dangling; the rest are dropped.
     RepairDanglingAfterHarnessHalt {
         class: &'static str,
+        answers: HashMap<String, String>,
     },
 
     PopStrandedContinueReminder,
@@ -490,6 +492,7 @@ mod tests {
         let _ = ChatStateCommand::PruneForFreshInput { reply: tx };
         let _ = ChatStateCommand::UpdateSamplingConfig {
             config: SamplingConfig {
+                max_request_bytes: None,
                 base_url: String::new(),
                 model: String::new(),
                 max_completion_tokens: None,

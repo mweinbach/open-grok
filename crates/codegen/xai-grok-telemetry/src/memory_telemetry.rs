@@ -157,6 +157,34 @@ pub struct MemoryV2DreamLifecycle {
     pub usage: MemoryV2ModelUsage,
 }
 
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2CarryoverOutcome {
+    #[default]
+    Imported,
+    Failed,
+}
+
+/// One legacy `MEMORY.md` carried into a v2 scope at session start. Counts
+/// only; no-op starts (no source, unchanged source) emit nothing.
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryV2CarryoverCompleted {
+    pub scope: MemoryV2Scope,
+    pub outcome: MemoryV2CarryoverOutcome,
+    pub topics_created: u32,
+    pub topics_appended: u32,
+    pub sections_skipped: u32,
+    pub bytes_written: u64,
+}
+
+#[derive(Debug, Default, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryV2Scope {
+    #[default]
+    Global,
+    Workspace,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct MemoryV2GcCompleted {
     pub archived_observations_removed: u64,

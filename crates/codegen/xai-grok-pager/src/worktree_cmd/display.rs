@@ -92,8 +92,11 @@ pub fn print_json(records: &[WorktreeRecord], out: &mut impl Write) -> std::io::
     let json = serde_json::to_string_pretty(records).unwrap_or_else(|_| "[]".to_string());
     writeln!(out, "{json}")
 }
-
-pub fn print_show(rec: &WorktreeRecord, out: &mut impl Write) -> std::io::Result<()> {
+pub fn print_show(
+    rec: &WorktreeRecord,
+    redirections_bytes: Option<u64>,
+    out: &mut impl Write,
+) -> std::io::Result<()> {
     writeln!(out, "  Path:           {}", rec.path.display())?;
     writeln!(out, "  ID:             {}", rec.id)?;
     writeln!(out, "  Type:           {}", rec.kind.as_str())?;
@@ -142,6 +145,7 @@ pub fn print_show(rec: &WorktreeRecord, out: &mut impl Write) -> std::io::Result
         }
         writeln!(out)?;
     }
+    let _ = redirections_bytes;
     Ok(())
 }
 
@@ -212,7 +216,15 @@ mod tests {
             label,
         )
     }
-
+    #[test]
+    fn print_show_non_nfs_omits_nfs_block() {
+        let rec = make_record("wt-copy", "c");
+        let mut out = Vec::new();
+        print_show(&rec, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("Strategy:       nfs"), "{text}");
+        assert!(!text.contains("clean-artifacts"), "{text}");
+    }
     #[test]
     fn print_table_pads_cjk_labels_by_display_width() {
         let records = vec![

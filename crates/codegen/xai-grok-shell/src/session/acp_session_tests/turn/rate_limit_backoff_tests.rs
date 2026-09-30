@@ -108,7 +108,7 @@ pub(super) async fn actor_under_test(
     let mut actor = create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await;
     actor.sampler_handle = sampler_handle;
     actor.startup_hints.is_subagent = matches!(session, SessionKind::Subagent);
-    actor.transient_turn_retries = transient_retry_enabled;
+    actor.transient_retry_enabled = transient_retry_enabled;
     actor.max_retries = sampler_max_retries;
 
     let mut cfg = actor

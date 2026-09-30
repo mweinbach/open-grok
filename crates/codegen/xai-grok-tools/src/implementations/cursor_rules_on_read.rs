@@ -478,6 +478,7 @@ mod tests {
         ));
         resources.insert(Params(ReadFileParams {
             cursor_rules_on_read: true,
+            ..Default::default()
         }));
         resources.into_shared()
     }

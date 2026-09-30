@@ -43,6 +43,7 @@ xai-grok-pager-diff = { path = "../xai-grok-pager-diff" }
 # Misc used by the commit/live/full-view paths.
 chrono = { workspace = true }
 similar = { workspace = true }
+unicode-width = { workspace = true }
 xai-grok-shell = { workspace = true }
 xai-grok-version = { workspace = true }
 xai-token-estimation = { workspace = true }

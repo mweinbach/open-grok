@@ -325,10 +325,15 @@ impl AgentView {
                 ) {
                     return None;
                 }
+                let image_notice = self.unbound_image_placeholder_notice();
                 let images = self.prompt.drain_images();
                 self.prompt.set_text("");
                 self.note_draft_consumed();
-                Some(Action::SendPromptNow { text, images })
+                Some(Action::SendPromptNow {
+                    text,
+                    images,
+                    image_notice,
+                })
             }
             AgentDeferredSend::Stash => {
                 self.handle_stash_prompt_key();

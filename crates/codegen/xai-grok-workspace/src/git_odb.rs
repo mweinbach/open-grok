@@ -2,7 +2,7 @@
 //!
 //! libgit2 walks serialize on an in-process mutex and this permit. CLI status
 //! is only in the cap to bound pack I/O when uncontended. Prompt CLI may run
-//! without a permit under contention so `<git_status>` is not dropped behind a
+//! without a permit under contention so status is not dropped behind a
 //! long acquire wait.
 
 use std::sync::{Arc, LazyLock};

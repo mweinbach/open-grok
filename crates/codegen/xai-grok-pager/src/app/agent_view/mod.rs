@@ -166,6 +166,7 @@ mod links;
 mod media;
 mod modals;
 mod notices;
+pub(crate) use notices::ImagesDroppedBy;
 mod panes;
 mod paste;
 mod plan;
@@ -181,6 +182,7 @@ mod header_tests;
 mod rewind;
 mod selection;
 mod session;
+mod session_mode;
 mod shell_completion;
 mod viewer;
 mod workflows_overlay;
@@ -288,7 +290,7 @@ pub struct PrivacyBannerState {
     pub(crate) active: bool,
     /// `[Opt in]` (opt in; ack only after ACP success).
     pub(crate) hit_opt_in: HitArea,
-    /// `[Opt out]` (ack now; record the decline).
+    /// `[Opt out]` (write the decline; ack only after ACP success).
     pub(crate) hit_opt_out: HitArea,
     /// "Terms" link (opens the terms of service).
     pub(crate) hit_terms: HitArea,
@@ -905,6 +907,14 @@ pub struct AgentView {
     /// at replay-window entry; a queue broadcast naming one as running again
     /// removes that entry.
     pub(crate) finished_wake_prompts: std::collections::HashSet<String>,
+    /// Child prompt ids whose terminal marker was already applied.
+    pub(crate) ended_child_prompt_ids: std::collections::HashSet<String>,
+    /// Child prompt ids left for a newer turn. Not yet marked: the terminal still pushes a marker.
+    pub(crate) superseded_child_prompt_ids: std::collections::HashSet<String>,
+    /// `turnStartMs` of a child turn that ended with no prompt id. `None` if that turn had no start.
+    pub(crate) unidentified_child_turn_closed_ms: Option<i64>,
+    /// Prompt id that start belonged to. `None` when the closed turn had no id.
+    pub(crate) unidentified_child_turn_closed_prompt: Option<String>,
     /// The wake turn currently streaming, if any. See [`RunningWakeTurn`].
     pub(crate) running_wake_turn: Option<RunningWakeTurn>,
     pub active_pane: AgentPane,
@@ -1046,6 +1056,12 @@ pub struct AgentView {
     /// queue's optimistic-echo + reconcile-by-id pattern, applied so the
     /// originator gets instant feedback AND viewers stay in sync.
     pub self_interjection_ids: std::collections::HashSet<String>,
+    /// Optimistic interjection scrollback rows, keyed by `interjection_id`.
+    /// Failed sends remove these entries by id so retry cannot drop the wrong identical follow-up.
+    pub interjection_painted_blocks: std::collections::HashMap<String, crate::scrollback::EntryId>,
+    /// Original images for a painted interjection, restored if the send fails.
+    pub interjection_retry_images:
+        std::collections::HashMap<String, Vec<crate::prompt_images::PastedImage>>,
     /// Local wall-clock time when the most recent turn finished
     /// (success, failure, or cancellation). Used by the dashboard
     /// modal to display "Nm ago" idle markers. Initialised to the
@@ -1421,12 +1437,22 @@ pub struct AgentView {
     /// The cycle logic uses `plan_mode_pending.unwrap_or(plan_mode_active)`
     /// so rapid Shift+Tab presses advance correctly without waiting for ACP.
     pub(crate) plan_mode_pending: Option<bool>,
+    /// Modes from the session response, in ring order. Empty means Shift+Tab stays on the plan/permission cycle.
+    pub(crate) available_modes: Vec<agent_client_protocol::SessionMode>,
+    /// Last confirmed mode. Plan surfaces still read `plan_mode_active`; this covers the rest.
+    pub(crate) session_mode: xai_grok_tools::types::SessionMode,
+    /// Optimistic Shift+Tab pick over `available_modes`, cleared like `plan_mode_pending`.
+    pub(crate) session_mode_pending: Option<xai_grok_tools::types::SessionMode>,
     /// Session mode to apply once this agent's ACP session exists. Set when
     /// the agent is spawned from the dashboard with `/plan` active (the
     /// session does not exist yet, so the mode can't be sent immediately).
     /// Consumed in the `SessionCreated` / `WorktreeSessionCreated` handlers,
     /// mirroring `AgentSession.deferred_model_switch`.
     pub(crate) deferred_session_mode: Option<xai_grok_tools::types::SessionMode>,
+    /// Permission mode chosen on Welcome before the ACP session exists.
+    /// `PersistPermissionMode` with no session id cannot notify the shell, so `SessionCreated` replays this against the bound id.
+    /// `SessionCreated` replays this against the bound id.
+    pub(crate) deferred_permission_mode: Option<&'static str>,
     pub(crate) pending_extensions_fetch: bool,
     /// Whether this view was last rendered inside the dashboard's session
     /// overlay. Updated every frame by `draw`; read when building the
@@ -1443,6 +1469,13 @@ pub struct AgentView {
     /// MCP servers, cleared when `x.ai/mcp_initialized` arrives.
     /// Shown in the turn status line while the agent is idle.
     pub(crate) mcp_init_progress: Option<McpInitProgress>,
+    /// Set when a session create or fork is dispatched. Cleared when the id binds or the create fails.
+    /// Renders "Starting session…" in the turn-status row.
+    pub(crate) session_starting_since: Option<Instant>,
+    /// Latest `session/new` setup step from `x.ai/session/setup`; names the stuck step on a timeout. Cleared on bind/fail.
+    pub(crate) session_new_phase: Option<xai_grok_shell::agent::SessionSetupPhase>,
+    /// The create's `_meta.sessionId`, held until `SessionCreated` binds it, so setup phases route here. Cleared on bind/fail.
+    pub(crate) pending_session_id: Option<agent_client_protocol::SessionId>,
     /// Last synced ACP command generation. When this differs from
     /// `session.available_commands_generation`, `sync_acp_commands()`
     /// is called on the prompt. Starts at 0 so bootstrap (generation 1)
@@ -1504,12 +1537,6 @@ pub struct AgentView {
     pub(crate) cancel_trigger_hint: Option<crate::app::actions::CancelTrigger>,
     pub(crate) rewind_state: Option<crate::views::rewind::RewindState>,
     pub(crate) rewind_points: Option<Vec<crate::views::rewind::RewindPointInfo>>,
-    /// In-place edit of a previous user prompt. See `inline_edit.rs`.
-    pub(crate) inline_edit: Option<crate::app::inline_edit::InlineEditState>,
-    /// Edited text awaiting its rewind; `dispatch_rewind_success` resubmits it.
-    /// Set only when the rewind flow emits `Effect::RewindExecute` while the
-    /// inline editor is open (see `stash_inline_resubmit_if_editing`).
-    pub(crate) pending_inline_resubmit: Option<String>,
     /// `/jump` picker overlay (pure client-side turn navigation).
     pub(crate) jump_state: Option<crate::views::jump::JumpState>,
     /// Timeline sidebar rail geometry for the current frame (`None` =

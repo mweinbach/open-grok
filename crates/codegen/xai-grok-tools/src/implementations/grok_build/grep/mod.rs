@@ -311,6 +311,7 @@ impl xai_tool_runtime::Tool for GrepTool {
             wall_ms = tracing::field::Empty,
             early_kill = tracing::field::Empty,
             effective_head_limit = tracing::field::Empty,
+            grep_reason = tracing::field::Empty,
         );
 
         grep_progress_stream(ctx, input, spec, span)
@@ -324,6 +325,7 @@ impl xai_tool_runtime::Tool for GrepTool {
             wall_ms = tracing::field::Empty,
             early_kill = tracing::field::Empty,
             effective_head_limit = tracing::field::Empty,
+            grep_reason = tracing::field::Empty,
         )
     )]
     async fn run(
@@ -342,6 +344,10 @@ impl xai_tool_runtime::Tool for GrepTool {
             GrepStep::Early(out) => {
                 tracing::Span::current().record("wall_ms", started.elapsed().as_millis() as u64);
                 tracing::Span::current().record("early_kill", false);
+                // Negative Early exit is the spawn-failure arm, not an unclassified -1.
+                if out.exit_code < 0 {
+                    tracing::Span::current().record("grep_reason", "spawn_failure");
+                }
                 return Ok(out);
             }
         };
@@ -390,6 +396,7 @@ impl xai_tool_runtime::Tool for GrepTool {
             Err(_elapsed) => {
                 tracing::Span::current().record("timed_out", true);
                 tracing::Span::current().record("early_kill", true);
+                tracing::Span::current().record("grep_reason", "timeout");
                 tracing::Span::current().record("wall_ms", started.elapsed().as_millis() as u64);
                 tracing::warn!(timeout_secs = timeout.as_secs(), "grep timed out");
                 let _ = child.start_kill();
@@ -409,6 +416,9 @@ impl xai_tool_runtime::Tool for GrepTool {
         };
 
         tracing::Span::current().record("early_kill", stdout_truncated);
+        if stdout_truncated {
+            tracing::Span::current().record("grep_reason", "early_stop");
+        }
         tracing::Span::current().record("wall_ms", started.elapsed().as_millis() as u64);
         tracing::info!(
             wall_ms = started.elapsed().as_millis() as u64,
@@ -450,6 +460,9 @@ fn grep_progress_stream(
                 // still populate the `tool.grep` span in the streaming (prod) path.
                 span.record("wall_ms", stream_started.elapsed().as_millis() as u64);
                 span.record("early_kill", false);
+                if out.exit_code < 0 {
+                    span.record("grep_reason", "spawn_failure");
+                }
                 yield xai_tool_runtime::ToolStreamItem::Terminal(Ok(out));
                 return;
             }
@@ -567,6 +580,7 @@ fn grep_progress_stream(
         if timed_out {
             span.record("timed_out", true);
             span.record("early_kill", true);
+            span.record("grep_reason", "timeout");
             span.record("wall_ms", stream_started.elapsed().as_millis() as u64);
             let secs = timeout.as_secs();
             span.in_scope(|| {
@@ -636,6 +650,9 @@ fn grep_progress_stream(
 
         let wall_ms = stream_started.elapsed().as_millis() as u64;
         span.record("early_kill", stdout_truncated);
+        if stdout_truncated {
+            span.record("grep_reason", "early_stop");
+        }
         span.record("wall_ms", wall_ms);
         span.in_scope(|| {
             tracing::info!(

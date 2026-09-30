@@ -4,6 +4,7 @@ use crate::hub::HubConfig;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+pub use xai_grok_hooks::discovery::HookSourceConfig;
 use xai_grok_tools::registry::types::{SessionContext, ToolRegistryBuilder, ToolServerConfig};
 /// Default capacity for the workspace event broadcast channel.
 pub const DEFAULT_EVENT_BUFFER_CAPACITY: usize = 64;
@@ -898,16 +899,6 @@ impl std::fmt::Debug for AgentSessionConfig {
             .field("parent_session_id", &self.parent_session_id)
             .finish()
     }
-}
-/// A single hook source: either a JSON settings file or a directory of
-/// `*.json` hook files. Maps 1:1 to [`xai_grok_hooks::discovery::HookSource`]
-/// but uses owned `PathBuf` so the config struct is `'static`.
-#[derive(Debug, Clone)]
-pub enum HookSourceConfig {
-    /// A single JSON settings file (e.g. `~/.claude/settings.json`).
-    SettingsFile(PathBuf),
-    /// A directory of `*.json` hook files (e.g. `~/.opengrok/hooks/`).
-    Directory(PathBuf),
 }
 /// Filesystem isolation strategy for a forked session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

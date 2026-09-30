@@ -428,6 +428,7 @@ pub(crate) struct RegistryConfig {
 pub mod acp_conversion;
 pub(crate) mod acp_mcp;
 pub(crate) mod acp_session;
+pub(crate) mod agent_mcp;
 pub(crate) mod agent_rebuild;
 pub(crate) mod chat_persistence;
 pub(crate) mod code_mode;
@@ -452,8 +453,10 @@ pub mod helpers;
 pub(crate) mod image_describe;
 pub(crate) mod image_normalize;
 pub(crate) mod inference_metrics;
+pub(crate) mod long_reasoning_reminder;
 pub mod tool_surface;
 pub use xai_grok_shared::session::info;
+pub mod interrupted_turn;
 pub mod managed_mcp;
 pub(crate) mod mcp_descriptors;
 pub(crate) mod mcp_dispatcher;
@@ -478,11 +481,13 @@ pub mod result;
 pub mod signals;
 pub(crate) mod slash_authority;
 pub(crate) mod slash_commands;
-pub use slash_commands::PAGER_COMMAND_KEYS;
+pub use slash_commands::{PAGER_COMMAND_KEYS, builtin_command};
 pub mod storage;
 pub(crate) mod streaming_capture;
-pub(crate) mod summary;
+pub mod summary;
 pub(crate) mod telemetry;
+#[cfg(feature = "test-support")]
+pub use telemetry::{complete_projected_call, grep_output, tool_execution_span};
 #[cfg(feature = "test-support")]
 pub mod testkit;
 pub mod tool_index;

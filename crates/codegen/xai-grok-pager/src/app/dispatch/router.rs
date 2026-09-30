@@ -58,9 +58,9 @@ use super::prompt::{
 use super::queue;
 use super::queue::dispatch_drain_queue;
 use super::rewind::{
-    dispatch_inline_edit_submit, dispatch_rewind, dispatch_rewind_cancel_offer,
-    dispatch_rewind_confirm, dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss,
-    dispatch_rewind_dismiss_error, dispatch_rewind_picker_select, dispatch_rewind_show_picker,
+    dispatch_rewind, dispatch_rewind_cancel_offer, dispatch_rewind_confirm,
+    dispatch_rewind_confirm_never_ask, dispatch_rewind_dismiss, dispatch_rewind_dismiss_error,
+    dispatch_rewind_picker_select, dispatch_rewind_show_picker,
 };
 use super::session::foreign::dispatch_fetch_session_list;
 use super::session::fork::{
@@ -85,31 +85,32 @@ use super::settings::setters::{
     clear_deepseek_api_key, clear_default_model, clear_fireworks_api_key,
     clear_fork_secondary_model, clear_gemini_api_key, clear_kimi_api_key, clear_memory_model,
     clear_meta_api_key, clear_opencode_go_api_key, clear_openrouter_api_key,
-    clear_perplexity_api_key, clear_recap_model, clear_runinfra_api_key, clear_wafer_api_key,
-    clear_zai_api_key, delete_custom_model, preview_auto_dark_theme, preview_auto_light_theme,
-    preview_theme, refresh_custom_models, refresh_opencode_go_models, refresh_openrouter_models,
-    set_ask_user_question_timeout_enabled, set_auto_dark_theme, set_auto_light_theme,
-    set_auto_update, set_code_mode, set_collapsed_edit_blocks, set_combine_queued_prompts,
-    set_compact_mode, set_confirm_before_rewind, set_contextual_hint_image_input,
-    set_contextual_hint_plan_mode, set_contextual_hint_send_now, set_contextual_hint_small_screen,
-    set_contextual_hint_ssh_wrap, set_contextual_hint_undo, set_contextual_hint_word_select,
-    set_custom_model_backend, set_custom_model_base_url, set_custom_model_context_window,
-    set_custom_model_env_key, set_custom_model_id, set_custom_model_name,
-    set_custom_model_provider, set_custom_model_save, set_custom_model_slug, set_deepseek_api_key,
-    set_default_model, set_default_selected_permission, set_display_refresh_auto_cadence,
-    set_enter_steers, set_fireworks_api_key, set_follow_up_behavior, set_fork_secondary_model,
-    set_gemini_api_key, set_group_tool_verbs, set_hunk_tracker_mode, set_image_generation_provider,
-    set_invert_scroll, set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key,
-    set_local_feature_flag, set_max_thoughts_width, set_memory_model, set_meta_api_key,
-    set_multiline_mode, set_opencode_go_api_key, set_opencode_go_enabled_models,
-    set_openrouter_api_key, set_openrouter_enabled_models, set_page_flip_on_send,
-    set_perplexity_api_key, set_perplexity_web_search, set_prompt_suggestions, set_recap_model,
+    clear_perplexity_api_key, clear_recap_model, clear_runinfra_api_key,
+    clear_subagent_model_inheritance, clear_wafer_api_key, clear_zai_api_key, delete_custom_model,
+    preview_auto_dark_theme, preview_auto_light_theme, preview_theme, refresh_custom_models,
+    refresh_opencode_go_models, refresh_openrouter_models, set_ask_user_question_timeout_enabled,
+    set_auto_dark_theme, set_auto_light_theme, set_auto_update, set_code_mode,
+    set_collapsed_edit_blocks, set_combine_queued_prompts, set_compact_mode,
+    set_confirm_before_rewind, set_contextual_hint_image_input, set_contextual_hint_plan_mode,
+    set_contextual_hint_send_now, set_contextual_hint_small_screen, set_contextual_hint_ssh_wrap,
+    set_contextual_hint_undo, set_contextual_hint_word_select, set_custom_model_backend,
+    set_custom_model_base_url, set_custom_model_context_window, set_custom_model_env_key,
+    set_custom_model_id, set_custom_model_name, set_custom_model_provider, set_custom_model_save,
+    set_custom_model_slug, set_deepseek_api_key, set_default_model,
+    set_default_selected_permission, set_display_refresh_auto_cadence, set_enter_steers,
+    set_fireworks_api_key, set_follow_up_behavior, set_fork_secondary_model, set_gemini_api_key,
+    set_group_tool_verbs, set_hunk_tracker_mode, set_image_generation_provider, set_invert_scroll,
+    set_keep_text_selection, set_kimi_api_endpoint, set_kimi_api_key, set_local_feature_flag,
+    set_max_thoughts_width, set_memory_model, set_meta_api_key, set_multiline_mode,
+    set_opencode_go_api_key, set_opencode_go_enabled_models, set_openrouter_api_key,
+    set_openrouter_enabled_models, set_page_flip_on_send, set_perplexity_api_key,
+    set_perplexity_web_search, set_prompt_suggestions, set_recap_model,
     set_remember_tool_approvals, set_render_mermaid, set_respect_manual_folds,
     set_runinfra_api_key, set_screen_mode, set_scroll_lines, set_scroll_mode, set_scroll_speed,
-    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_stream_tool_calls, set_theme,
-    set_timeline, set_timestamps, set_vim_mode, set_voice_capture_mode, set_voice_keybind_enabled,
-    set_voice_stt_language, set_wafer_api_key, set_web_search_source, set_x_search_enabled,
-    set_zai_api_key,
+    set_show_thinking_blocks, set_show_tips, set_simple_mode, set_stream_tool_calls,
+    set_subagent_model_inheritance, set_theme, set_timeline, set_timestamps, set_vim_mode,
+    set_voice_capture_mode, set_voice_keybind_enabled, set_voice_stt_language, set_wafer_api_key,
+    set_web_search_source, set_x_search_enabled, set_zai_api_key,
 };
 use super::settings::ui::{
     dispatch_confirm_reset_setting, dispatch_open_command_palette,
@@ -176,7 +177,20 @@ pub(super) fn dispatch_copy_auth_url(
 /// arm into a handler: as a delegation its `return`s become plain arm values
 /// and start flowing through the tail. The fat inline arms stayed inline for
 /// this reason; audit an arm's `return`s before moving it.
+/// Every action enters here, including the nested dispatches a slash command or task result issues.
+/// Only the outermost call shows the image notices the whole tree queued, so a nested action's own
+/// toast cannot bury them and one submission yields one message.
 pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
+    app.dispatch_depth = app.dispatch_depth.saturating_add(1);
+    let effects = dispatch_inner(action, app);
+    app.dispatch_depth = app.dispatch_depth.saturating_sub(1);
+    if app.dispatch_depth == 0 {
+        flush_image_notices(app);
+    }
+    effects
+}
+
+fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
     app.reconcile_foreign_resume_launch();
     let effects = match action {
         Action::Quit | Action::QuitConfirmed => {
@@ -433,10 +447,14 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SendSlashCommandPreservingDraft(text) => {
             dispatch_send_prompt_inner(app, text, false, false, false)
         }
-        Action::Interject { text, images } => dispatch_interject(app, text, images),
-        Action::SendPromptNow { text, images } => {
-            super::interject::dispatch_send_prompt_now(app, text, images)
+        Action::Interject { text, images } => {
+            super::queue::with_held_queue_flush(app, |app| dispatch_interject(app, text, images))
         }
+        Action::SendPromptNow {
+            text,
+            images,
+            image_notice,
+        } => super::interject::dispatch_send_prompt_now(app, text, images, image_notice),
         Action::EnableVoiceMode => dispatch_enable_voice_mode(app, true),
         Action::VoiceToggle => dispatch_voice_toggle(app),
         Action::VoiceStop => dispatch_voice_stop(app),
@@ -1187,6 +1205,8 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetAskUserQuestionTimeoutEnabled(v) => {
             set_ask_user_question_timeout_enabled(app, v)
         }
+        Action::SetSubagentModelInheritance(v) => set_subagent_model_inheritance(app, v),
+        Action::ClearSubagentModelInheritance => clear_subagent_model_inheritance(app),
         Action::SetKeepTextSelection(v) => set_keep_text_selection(app, v),
         Action::SetScrollSpeed(v) => set_scroll_speed(app, v),
         Action::SetScrollMode(v) => set_scroll_mode(app, v),
@@ -1219,6 +1239,9 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::SetTimestamps(v) => set_timestamps(app, v),
         Action::SetTimeline(v) => set_timeline(app, v),
         Action::SetPageFlipOnSend(v) => set_page_flip_on_send(app, v),
+        Action::SetDashboardPreview(enabled) => {
+            crate::app::dispatch::settings::dashboard::set_dashboard_preview(app, enabled)
+        }
         Action::SetConfirmBeforeRewind(v) => set_confirm_before_rewind(app, v),
         Action::SetCombineQueuedPrompts(v) => set_combine_queued_prompts(app, v),
         Action::SetFollowUpBehavior(v) => set_follow_up_behavior(app, v),
@@ -1502,19 +1525,57 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::PersistMemoryFullscreen(fs) => {
             vec![Effect::PersistMemoryFullscreen { fullscreen: fs }]
         }
+        Action::MemoryForget {
+            path,
+            expected_content_hash,
+        } => {
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get(&id)
+                && let Some(session_id) = agent.session.session_id.clone()
+            {
+                return vec![Effect::MemoryForget {
+                    agent_id: id,
+                    session_id,
+                    path,
+                    expected_content_hash,
+                }];
+            }
+            vec![]
+        }
         Action::OpenMemoryModal => {
             if let ActiveView::Agent(id) = app.active_view
                 && let Some(agent) = app.agents.get(&id)
                 && let Some(session_id) = agent.session.session_id.clone()
             {
-                return vec![Effect::SendPrompt {
+                return vec![Effect::FetchMemoryList {
                     agent_id: id,
                     session_id,
-                    text: "/memory".to_string(),
-                    prompt_id: uuid::Uuid::new_v4().to_string(),
-                    skill_token_ranges: Vec::new(),
                 }];
             }
+            vec![]
+        }
+        Action::MemoryToggle { enabled } => {
+            if let ActiveView::Agent(id) = app.active_view
+                && let Some(agent) = app.agents.get(&id)
+                && let Some(session_id) = agent.session.session_id.clone()
+            {
+                return vec![Effect::MemoryToggle {
+                    agent_id: id,
+                    session_id,
+                    enabled,
+                }];
+            }
+            vec![]
+        }
+        Action::MemoryCopy { text } => {
+            let delivery = crate::clipboard::copy_text_or_file(&text);
+            with_active_agent(app, |agent| {
+                if let Some(crate::views::modal::ActiveModal::MemoryBrowser { state }) =
+                    agent.active_modal.as_mut()
+                {
+                    state.report_copy(&delivery);
+                }
+            });
             vec![]
         }
         Action::OpenGboom => dispatch_open_gboom(app),
@@ -1685,7 +1746,6 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::RewindCancelOffer => dispatch_rewind_cancel_offer(app),
         Action::RewindDismiss => dispatch_rewind_dismiss(app),
         Action::RewindDismissError => dispatch_rewind_dismiss_error(app),
-        Action::InlineEditSubmit => dispatch_inline_edit_submit(app),
         Action::JumpShowPicker => dispatch_jump_show_picker(app),
         Action::JumpPickerSelect(entry_id) => dispatch_jump_picker_select(app, entry_id),
         Action::JumpDismiss => dispatch_jump_dismiss(app),
@@ -1695,6 +1755,44 @@ pub(crate) fn dispatch(action: Action, app: &mut AppView) -> Vec<Effect> {
     sync_sleep_inhibitor(app);
     effects
 }
+
+/// Show the image notices queued so far as one message on the visible surface; true when a surface
+/// changed. The command that queued them may have navigated away (`/home`, `/new`), so the
+/// originating agent's own toast could be off-screen or gone.
+pub(crate) fn flush_image_notices(app: &mut AppView) -> bool {
+    if app.pending_image_notices.is_empty() {
+        return false;
+    }
+    if !app.screen_mode.is_minimal() {
+        let message = join_image_notices(&mut app.pending_image_notices);
+        app.show_toast(&message);
+        return true;
+    }
+    let target = match app.active_view {
+        ActiveView::Agent(id) => app.agents.get_mut(&id),
+        _ => app.agents.values_mut().next(),
+    };
+    let Some(agent) = target else {
+        return false;
+    };
+    let message = join_image_notices(&mut app.pending_image_notices);
+    agent
+        .scrollback
+        .push_block(crate::scrollback::block::RenderBlock::system(message));
+    true
+}
+
+/// Drain the queued notices into one `; `-joined message, dropping repeats.
+fn join_image_notices(pending: &mut Vec<String>) -> String {
+    let mut notices: Vec<String> = Vec::new();
+    for notice in pending.drain(..) {
+        if !notices.contains(&notice) {
+            notices.push(notice);
+        }
+    }
+    notices.join("; ")
+}
+
 fn restore_stash_where_the_draft_was_consumed(app: &mut AppView) {
     let ActiveView::Agent(id) = app.active_view else {
         return;

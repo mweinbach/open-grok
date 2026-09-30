@@ -7,9 +7,49 @@
 //! system-installed git.
 
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 static HERMETIC_GIT_INIT: Once = Once::new();
+
+/// Empty regular file standing in for "no configuration" (`GIT_CONFIG_GLOBAL`,
+/// `core.excludesFile`), created once per process and kept for its lifetime.
+/// `/dev/null` cannot play that role everywhere: a remote Bazel sandbox has
+/// exposed it as a non-empty regular file, and git then fails every spawn with
+/// this crate must stay dependency-free of it. Panics rather than falling back
+/// to the null device the callers are here to stop depending on.
+fn empty_config_file() -> &'static Path {
+    static EMPTY: OnceLock<PathBuf> = OnceLock::new();
+    EMPTY.get_or_init(|| {
+        let dir = std::env::temp_dir();
+        let mut last = String::new();
+        for attempt in 0..64 {
+            let path = dir.join(format!(
+                "xai-test-utils-empty-config-{}-{attempt}",
+                std::process::id()
+            ));
+            // `create_new` refuses an existing path, so a stale file left by a
+            // recycled pid is never written through.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => {
+                    let meta = std::fs::metadata(&path)
+                        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()));
+                    assert!(
+                        meta.is_file() && meta.len() == 0,
+                        "{} is not an empty regular file",
+                        path.display()
+                    );
+                    return path;
+                }
+                Err(e) => last = format!("{}: {e}", path.display()),
+            }
+        }
+        panic!("no empty config file could be created in {dir:?}: {last}");
+    })
+}
 
 /// Prepend the hermetic git binary directory to `PATH` so that
 /// `Command::new("git")` resolves to the Bazel-provided static binary
@@ -126,10 +166,7 @@ pub fn run_git_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Str
         .env("GIT_AUTHOR_EMAIL", "test@test.com")
         .env("GIT_COMMITTER_NAME", "Test User")
         .env("GIT_COMMITTER_EMAIL", "test@test.com")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
+        .env("GIT_CONFIG_GLOBAL", empty_config_file())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0");
     for (key, value) in envs {
@@ -186,8 +223,8 @@ pub fn make_feature_branch(dir: &Path, picks: usize) -> String {
 
 pub fn git_init_seed(dir: &Path) {
     run_git(dir, &["init", "-b", "main"]);
-    let null_path = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    run_git(dir, &["config", "core.excludesFile", null_path]);
+    let excludes = empty_config_file().to_string_lossy().into_owned();
+    run_git(dir, &["config", "core.excludesFile", &excludes]);
 }
 pub fn seed_repo(temp: &Path) -> PathBuf {
     let repo = temp.join("repo");
@@ -231,4 +268,20 @@ pub fn reflog_only_commit(worktree: &Path, when: Option<&str>) -> String {
         "no ref names it, so only the reflog does"
     );
     discarded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_config_file;
+
+    /// Remote CI sandboxes have exposed `/dev/null` as a non-empty regular
+    /// file, which fails every git spawn; the masked configuration must be a
+    /// real empty file instead.
+    #[test]
+    fn empty_config_file_is_an_empty_regular_file() {
+        let path = empty_config_file();
+        let meta = std::fs::metadata(path).expect("global config metadata");
+        assert!(meta.is_file(), "{} is not a regular file", path.display());
+        assert_eq!(meta.len(), 0, "{} is not empty", path.display());
+    }
 }

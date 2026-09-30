@@ -125,6 +125,68 @@ fn forgetting_is_durable_and_reconciliation_cannot_resurrect_observation() {
 }
 
 #[test]
+fn settled_tombstones_leave_the_manifest_alone_until_a_file_is_removed() {
+    let (_temporary, global, workspace) = fixture();
+    let first = capture_one_with_visibility(&workspace, "first", true);
+    let second = capture_one_with_visibility(&workspace, "second", true);
+    let forget_request = |relative: &Path, now: i64| ForgetRequest {
+        relative_path: relative.to_path_buf(),
+        expected_content_hash: blake3::hash(&std::fs::read(workspace.join(relative)).unwrap())
+            .to_hex()
+            .to_string(),
+        reason: ForgetReason::UserRequest,
+        now,
+    };
+    let manifest = workspace.join("MEMORY.md");
+    let store = V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
+        .unwrap();
+    store.forget(&forget_request(&first, 20)).unwrap();
+
+    // Reopening reconciles the settled tombstone again; nothing was removed, so the
+    // manifest on disk is not rewritten.
+    std::fs::write(&manifest, "sentinel").unwrap();
+    let reopened =
+        V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace)
+            .unwrap();
+    assert_eq!("sentinel", std::fs::read_to_string(&manifest).unwrap());
+
+    reopened.forget(&forget_request(&second, 21)).unwrap();
+    let regenerated = std::fs::read_to_string(&manifest).unwrap();
+    assert!(
+        regenerated.starts_with("# Workspace memory index"),
+        "{regenerated}"
+    );
+    assert!(!workspace.join(&second).exists());
+}
+
+#[test]
+fn archive_exclusion_join_is_served_by_the_normalized_source_path_index() {
+    let (_temporary, global, workspace) = fixture();
+    capture_one(&workspace);
+    V2MaintenanceStore::open(&workspace, V2MemoryScope::Workspace, &global, &workspace).unwrap();
+    let state_path = workspace.join("memory_state.sqlite");
+    let connection = JournalMode::for_db_path(&state_path)
+        .open(&state_path)
+        .unwrap();
+    let plan: Vec<String> = connection
+        .prepare(&format!(
+            "EXPLAIN QUERY PLAN {}",
+            crate::v2::COMMITTED_UNARCHIVED_FILES_SQL
+        ))
+        .unwrap()
+        .query_map(params![1], |row| row.get::<_, String>(3))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert!(
+        plan.iter().any(|step| {
+            step.contains("SEARCH a USING INDEX consolidation_archives_source_path_normalized")
+        }),
+        "{plan:#?}"
+    );
+}
+
+#[test]
 fn forgetting_matches_legacy_backslash_archive_paths() {
     let (_temporary, global, workspace) = fixture();
     let observation = capture_one(&workspace);

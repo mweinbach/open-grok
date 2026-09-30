@@ -1050,6 +1050,124 @@ impl SessionActor {
         }
     }
 
+    /// Seeds compacted `last_user_query` from the live objective.
+    /// Paused / blocked / budget-limited goals leave the human prompt in place.
+    pub(crate) fn goal_objective_for_compaction(&self) -> Option<String> {
+        let tracker = self.goal_tracker.lock();
+        let o = tracker.snapshot()?;
+        if o.status != crate::session::goal_tracker::GoalStatus::Active {
+            return None;
+        }
+        let objective = o.objective.trim();
+        if objective.is_empty() {
+            None
+        } else {
+            Some(o.objective.clone())
+        }
+    }
+
+    /// Summarizer pin so multi-compact cannot drop the objective.
+    pub(crate) fn goal_compaction_user_context(&self) -> Option<String> {
+        let (objective, plan_path) = {
+            let tracker = self.goal_tracker.lock();
+            let o = tracker.snapshot()?;
+            if o.status != crate::session::goal_tracker::GoalStatus::Active {
+                return None;
+            }
+            if o.objective.trim().is_empty() {
+                return None;
+            }
+            (
+                o.objective.clone(),
+                goal_reminder_plan_path(self.goal_planner_enabled, o)
+                    .map(std::path::Path::to_path_buf),
+            )
+        };
+        let mut ctx = format!(
+            "Objective: {objective}\nDo not restart this goal or revive a prior unrelated task. Continue from the current next step."
+        );
+        if let Some(step) = resolve_goal_next_step(plan_path.as_deref()) {
+            ctx.push_str("\nNext step: ");
+            ctx.push_str(&step);
+        }
+        Some(ctx)
+    }
+
+    /// Preserves caller `/compact <text>` when folding in the goal pin.
+    pub(crate) fn merge_goal_compaction_user_context(
+        &self,
+        user_context: Option<String>,
+    ) -> Option<String> {
+        let Some(goal_ctx) = self.goal_compaction_user_context() else {
+            return user_context;
+        };
+        match user_context {
+            Some(existing) if !existing.trim().is_empty() => {
+                Some(format!("{existing}\n\n{goal_ctx}"))
+            }
+            _ => Some(goal_ctx),
+        }
+    }
+
+    /// Live GoalTracker snapshot for the post-compaction reminder.
+    /// `None` when no goal exists or it already completed.
+    /// Continuation-style (next step), not create-style `goal_rules`.
+    pub(crate) async fn compaction_goal_section(&self) -> Option<String> {
+        use crate::session::goal_tracker::GoalStatus;
+
+        let names = self.resolve_goal_tool_names().await;
+        let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+        let (tokens_used, _) = self.goal_tokens(current_tokens);
+        let planner_enabled = self.goal_planner_enabled;
+        let (objective, status, elapsed, plan_path, is_active) = {
+            let mut tracker = self.goal_tracker.lock();
+            tracker.account_elapsed();
+            let o = tracker.snapshot()?;
+            if o.status == GoalStatus::Complete {
+                return None;
+            }
+            let elapsed = crate::session::goal_orchestrator::format_elapsed(o.elapsed_ms);
+            let is_active = o.status == GoalStatus::Active;
+            let status = match o.status {
+                GoalStatus::Active => "Active",
+                GoalStatus::UserPaused => "Paused",
+                GoalStatus::BackOffPaused => "Paused (back off)",
+                GoalStatus::NoProgressPaused => "Paused (no progress)",
+                GoalStatus::InfraPaused => "Paused (infrastructure error)",
+                GoalStatus::Blocked => "Blocked",
+                GoalStatus::BudgetLimited => "Budget limited",
+                GoalStatus::Complete => unreachable!("complete goals are omitted above"),
+            };
+            let plan_path =
+                goal_reminder_plan_path(planner_enabled, o).map(std::path::Path::to_path_buf);
+            (o.objective.clone(), status, elapsed, plan_path, is_active)
+        };
+        let next_step = resolve_goal_next_step(plan_path.as_deref())
+            .unwrap_or_else(|| format!("Check your `{}` list for next steps.", names.todo));
+        let body = if is_active {
+            format!(
+                "Objective: {objective}\nStatus: {status}\nTokens: {tokens_used} | Elapsed: {elapsed}\n\n{GOAL_CONTINUATION_SENTINEL}\n{next_step}\n\nDo not restart this goal or revive a prior unrelated task."
+            )
+        } else {
+            format!(
+                "Objective: {objective}\nStatus: {status}\nTokens: {tokens_used} | Elapsed: {elapsed}\n\nA live goal exists. Do not restart it or revive a prior unrelated task."
+            )
+        };
+        Some(format_compaction_goal_section(&body))
+    }
+
+    /// Inject GoalSummary so the next sample sees next-step, not create-style rules.
+    pub(crate) async fn reseed_active_goal_after_compaction(&self) {
+        let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
+        let Some(plan) = self
+            .prepare_goal_continuation(current_tokens, GoalContinuationPurpose::Compaction)
+            .await
+        else {
+            return;
+        };
+        self.inject_goal_continuation_message(plan.directive).await;
+    }
+
     pub(super) async fn prune_prior_goal_continuation_directives(&self) {
         use xai_grok_sampling_types::conversation::SyntheticReason;
 
@@ -1095,9 +1213,14 @@ impl SessionActor {
         true
     }
 
-    async fn prepare_goal_continuation(&self, current_tokens: i64) -> Option<GoalContinuationPlan> {
+    async fn prepare_goal_continuation(
+        &self,
+        current_tokens: i64,
+        purpose: GoalContinuationPurpose,
+    ) -> Option<GoalContinuationPlan> {
         let legacy = !self.goal_runs_on_workflow_engine();
-        if legacy {
+        let apply_turn_end = matches!(purpose, GoalContinuationPurpose::TurnEnd);
+        if apply_turn_end && legacy {
             self.drain_goal_updates(current_tokens, DrainPurpose::TurnEnd)
                 .await;
         }
@@ -1110,18 +1233,22 @@ impl SessionActor {
             return None;
         }
 
-        let stop_pattern = match self.assistant_text_signals_premature_stop().await {
-            Some(pattern) if self.has_pending_goal_todos().await => Some(pattern),
-            _ => None,
+        let stop_pattern = if apply_turn_end {
+            match self.assistant_text_signals_premature_stop().await {
+                Some(pattern) if self.has_pending_goal_todos().await => Some(pattern),
+                _ => None,
+            }
+        } else {
+            None
         };
 
         let (tokens_used, finished_marginal) = self.goal_tokens(current_tokens);
 
-        if self.enforce_goal_token_budget(current_tokens).await {
+        if apply_turn_end && self.enforce_goal_token_budget(current_tokens).await {
             return None;
         }
 
-        {
+        if apply_turn_end {
             let notify = self.goal_notify_sender();
             notify.emit_goal_updated(
                 &mut self.goal_tracker.lock(),
@@ -1151,7 +1278,9 @@ impl SessionActor {
             let mut tracker = self.goal_tracker.lock();
             tracker.account_elapsed();
             let o = tracker.snapshot_mut()?;
-            o.rounds_since_verify = o.rounds_since_verify.saturating_add(1);
+            if apply_turn_end {
+                o.rounds_since_verify = o.rounds_since_verify.saturating_add(1);
+            }
             let rounds_since_verify = o.rounds_since_verify;
             let refuted = o.consecutive_not_achieved >= 1;
             let elapsed = crate::session::goal_orchestrator::format_elapsed(o.elapsed_ms);
@@ -1355,7 +1484,10 @@ impl SessionActor {
             return GoalRoundDecision::EndTurn;
         }
         let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
-        let Some(mut plan) = self.prepare_goal_continuation(current_tokens).await else {
+        let Some(mut plan) = self
+            .prepare_goal_continuation(current_tokens, GoalContinuationPurpose::TurnEnd)
+            .await
+        else {
             return GoalRoundDecision::EndTurn;
         };
         plan.directive.push_str("\nEvaluator next step: ");
@@ -1378,7 +1510,10 @@ impl SessionActor {
 
     pub(super) async fn maybe_queue_goal_continuation(&self) {
         let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
-        let Some(plan) = self.prepare_goal_continuation(current_tokens).await else {
+        let Some(plan) = self
+            .prepare_goal_continuation(current_tokens, GoalContinuationPurpose::TurnEnd)
+            .await
+        else {
             return;
         };
         {
@@ -1978,7 +2113,10 @@ impl SessionActor {
     /// emitted here — once per continued round.
     pub(super) async fn run_goal_round_end_legacy(&self) -> GoalRoundDecision {
         let current_tokens = self.chat_state_handle.get_total_tokens().await as i64;
-        let Some(plan) = self.prepare_goal_continuation(current_tokens).await else {
+        let Some(plan) = self
+            .prepare_goal_continuation(current_tokens, GoalContinuationPurpose::TurnEnd)
+            .await
+        else {
             return GoalRoundDecision::EndTurn;
         };
         // A Continue directive is unconditionally injected — returning it

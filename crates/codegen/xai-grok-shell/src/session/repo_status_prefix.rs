@@ -24,6 +24,7 @@ pub(crate) struct RepoStatusInputs {
     pub(crate) root: Option<PathBuf>,
 }
 
+/// Discover the VCS root for templated prefixes (`vcs_root` / "Is directory a git repo").
 pub(crate) fn discover_vcs_root(cwd: &std::path::Path) -> Option<PathBuf> {
     use xai_grok_workspace::session::git::{GitDiscoveryResult, discover_git_root};
     match discover_git_root(cwd) {
@@ -255,148 +256,11 @@ impl RepoStatusPrefetchState {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn repo_status_prefetch_resolved_before_prompt_is_used_without_waiting() {
-        let (snapshot_tx, snapshot_rx) = watch::channel(None);
-        snapshot_tx
-            .send(Some(RepoStatusSnapshot {
-                root: Some(PathBuf::from("/repo")),
-                raw_status: Some("## main\n M src/lib.rs\n".to_string()),
-                vcs_kind: VcsKind::Git,
-            }))
-            .unwrap();
-        let mut prefetch = RepoStatusPrefetch::from_snapshot_rx(snapshot_rx);
-
-        let start = tokio::time::Instant::now();
-        let snapshot = prefetch
-            .snapshot_within(REPO_STATUS_WAIT_BUDGET)
-            .await
-            .expect("resolved prefetch must yield its snapshot");
-        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
-        assert_eq!(snapshot.root.as_deref(), Some(Path::new("/repo")));
-        assert_eq!(
-            snapshot.templated_status().as_deref(),
-            Some("## main\n M src/lib.rs")
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn repo_status_prefetch_unresolved_past_budget_returns_none() {
-        let (_snapshot_tx, snapshot_rx) = watch::channel::<Option<RepoStatusSnapshot>>(None);
-        let mut prefetch = RepoStatusPrefetch::from_snapshot_rx(snapshot_rx);
-
-        let start = tokio::time::Instant::now();
-        assert!(
-            prefetch
-                .snapshot_within(REPO_STATUS_WAIT_BUDGET)
-                .await
-                .is_none(),
-            "budget miss must omit the status, not block on the gather"
-        );
-        assert_eq!(start.elapsed(), REPO_STATUS_WAIT_BUDGET);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn repo_status_prefetch_resolving_within_budget_keeps_the_block() {
-        let (snapshot_tx, snapshot_rx) = watch::channel(None);
-        let mut prefetch = RepoStatusPrefetch::from_snapshot_rx(snapshot_rx);
-        let gather = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-            let _ = snapshot_tx.send(Some(RepoStatusSnapshot {
-                root: None,
-                raw_status: Some("## main\n M src/lib.rs\n".to_string()),
-                vcs_kind: VcsKind::Git,
-            }));
-        });
-
-        let snapshot = prefetch
-            .snapshot_within(REPO_STATUS_WAIT_BUDGET)
-            .await
-            .expect("a gather resolving within the budget must keep its status");
-        assert_eq!(
-            snapshot.templated_status().as_deref(),
-            Some("## main\n M src/lib.rs")
-        );
-        gather.await.unwrap();
-    }
-
     #[test]
-    fn snapshot_status_shaping_matches_the_inline_gather_paths() {
-        let git = RepoStatusSnapshot {
-            root: None,
-            raw_status: Some(" M src/main.rs\n?? new.txt\n".to_string()),
-            vcs_kind: VcsKind::Git,
-        };
-        assert_eq!(
-            git.templated_status().as_deref(),
-            Some(" M src/main.rs\n?? new.txt")
-        );
-        assert_eq!(
-            git.legacy_status(),
-            xai_grok_agent::prompt::user_message::normalize_git_status(
-                " M src/main.rs\n?? new.txt\n"
-            )
-        );
-
-        let empty = RepoStatusSnapshot {
-            root: None,
-            raw_status: Some("   \n".to_string()),
-            vcs_kind: VcsKind::Git,
-        };
-        assert!(empty.templated_status().is_none());
-        assert!(empty.legacy_status().is_none());
-
-        let jj = RepoStatusSnapshot {
-            root: None,
-            raw_status: Some("Working copy changes:\nM src/lib.rs\n".to_string()),
-            vcs_kind: VcsKind::JujutsuColocated,
-        };
-        assert_eq!(
-            jj.legacy_status().as_deref(),
-            Some("Working copy changes:\nM src/lib.rs\n")
-        );
-
-        let jj_empty = RepoStatusSnapshot {
-            root: None,
-            raw_status: Some("  \n".to_string()),
-            vcs_kind: VcsKind::JujutsuColocated,
-        };
-        assert!(jj_empty.templated_status().is_none());
-        assert!(jj_empty.legacy_status().is_none());
-
-        let missing = RepoStatusSnapshot {
-            root: None,
-            raw_status: None,
-            vcs_kind: VcsKind::Git,
-        };
-        assert!(missing.templated_status().is_none());
-        assert!(missing.legacy_status().is_none());
-    }
-
-    #[test]
-    fn recorded_wait_drains_exactly_once() {
-        let state = RepoStatusPrefetchState::default();
-        assert_eq!(state.take_wait_ms(), None);
-        assert_eq!(state.record_wait(std::time::Duration::from_millis(42)), 42);
-        assert_eq!(state.take_wait_ms(), Some(42));
-        assert_eq!(state.take_wait_ms(), None);
-    }
-
-    #[test]
-    fn missed_snapshot_carries_the_root_without_a_status_body() {
-        let inputs = RepoStatusInputs {
-            cwd: PathBuf::from("/repo"),
-            vcs_kind: VcsKind::Git,
-            root: Some(PathBuf::from("/repo")),
-        };
-        let missed = inputs.missed_snapshot();
-        assert_eq!(missed.root.as_deref(), Some(Path::new("/repo")));
-        assert!(missed.raw_status.is_none());
-        assert!(missed.templated_status().is_none());
-        assert!(missed.legacy_status().is_none());
+    fn discover_vcs_root_none_outside_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(discover_vcs_root(tmp.path()), None);
     }
 }

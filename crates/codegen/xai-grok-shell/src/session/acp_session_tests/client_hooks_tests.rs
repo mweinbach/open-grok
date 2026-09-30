@@ -255,7 +255,7 @@ async fn pre_tool_use_resolves_meta_dispatch_tool_name_end_to_end() {
             let mut deferred = Vec::new();
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.prepare_tool_call(call, &mut deferred),
+                actor.prepare_tool_call(call, &mut deferred, None),
             )
             .await
             .expect("prepare_tool_call must not hang")
@@ -477,7 +477,7 @@ async fn post_tool_use_and_failure_never_double_fire() {
 
             // Failure: no workspace session is bound, so the dispatch hard-errors.
             actor
-                .execute_tool_calls(vec![todo_call("call_err")])
+                .execute_tool_calls(vec![todo_call("call_err")], None)
                 .await
                 .expect("execute_tool_calls must not error");
             let mut failure_events = Vec::new();
@@ -545,7 +545,7 @@ async fn post_tool_use_and_failure_never_double_fire() {
                 )
                 .expect("bind_local_session must succeed");
             actor
-                .execute_tool_calls(vec![todo_call("call_ok")])
+                .execute_tool_calls(vec![todo_call("call_ok")], None)
                 .await
                 .expect("execute_tool_calls must not error");
             assert_eq!(
@@ -653,8 +653,8 @@ async fn nested_code_mode_hooks_replace_output_and_deliver_context_once_after_ou
         let before = actor.chat_state_handle.get_conversation().await;
         assert!(!before.iter().any(|item| item.text_content().contains("pre-note")));
         actor.chat_state_handle.push_tool_result(ConversationItem::tool_result("outer-exec", "outer-result"));
-        actor.execute_tool_calls(Vec::new()).await.unwrap();
-        actor.execute_tool_calls(Vec::new()).await.unwrap();
+        actor.execute_tool_calls(Vec::new(), None).await.unwrap();
+        actor.execute_tool_calls(Vec::new(), None).await.unwrap();
         let conversation = actor.chat_state_handle.get_conversation().await;
         let result_index = conversation.iter().position(|item| item.text_content().contains("outer-result")).unwrap();
         let mut previous = result_index;
@@ -797,7 +797,7 @@ async fn mcp_error_result_fires_only_failure_and_delivers_original_output() {
                 function: crate::sampling::types::ToolCallFunction::new("mock_error_tool", "{}"),
             };
             actor
-                .execute_tool_calls(vec![call])
+                .execute_tool_calls(vec![call], None)
                 .await
                 .expect("execute_tool_calls must not error");
             for _ in 0..10 {
@@ -851,7 +851,7 @@ async fn post_tool_use_failure_additional_context_reaches_model() {
             };
 
             actor
-                .execute_tool_calls(vec![failing_call])
+                .execute_tool_calls(vec![failing_call], None)
                 .await
                 .expect("execute_tool_calls must not error");
 
@@ -901,7 +901,7 @@ async fn pre_tool_use_deny_feeds_reason_back_and_continues_turn() {
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.execute_tool_calls(vec![call]),
+                actor.execute_tool_calls(vec![call], None),
             )
             .await
             .expect("execute_tool_calls must not hang")
@@ -1159,9 +1159,14 @@ async fn post_tool_use_dispatch_merges_file_then_client_contributions() {
                 tool_call_id: acp::ToolCallId::new("call_1"),
                 tool_name: "search__memory".to_string(),
                 raw_arguments: "{}".to_string(),
+                mcp_file: None,
                 parsed_args: serde_json::json!({}),
-                model_id: "test-model".to_string(),
+                model_id: Some("test-model".to_string()),
+                invocation_id: "018f6b6c-7b3a-7c3a-8c3a-000000000001".to_string(),
+                tool_id: "opaque".to_string(),
+                tool_version: None,
                 concatenated_json_count: 0,
+                coercion_note: None,
                 dispatch_target_name: None,
                 is_read_only: false,
                 rewriting_hook: None,
@@ -1531,7 +1536,7 @@ async fn agent_swarm_batch_rejects_mixed_calls_and_records_error_for_each_tool()
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.execute_tool_calls(calls),
+                actor.execute_tool_calls(calls, None),
             )
             .await
             .expect("execute_tool_calls should not hang")
@@ -1611,7 +1616,7 @@ async fn agent_swarm_parent_bypasses_permission_and_child_tool_still_prompts() {
             let mut deferred = Vec::new();
             let parent_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.prepare_tool_call(swarm_call, &mut deferred),
+                actor.prepare_tool_call(swarm_call, &mut deferred, None),
             )
             .await
             .expect("prepare_tool_call should not hang")
@@ -1631,7 +1636,7 @@ async fn agent_swarm_parent_bypasses_permission_and_child_tool_still_prompts() {
             let mut child_deferred = Vec::new();
             let child_result = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
-                actor.prepare_tool_call(child_call, &mut child_deferred),
+                actor.prepare_tool_call(child_call, &mut child_deferred, None),
             )
             .await
             .expect("prepare_tool_call should not hang")

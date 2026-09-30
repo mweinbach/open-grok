@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use xai_grok_sampling_types::{
-    ConversationItem, DanglingToolCallReason, SamplingConfig, TokenUsage,
+    ConversationItem, DanglingToolCallReason, SamplingConfig, TokenUsage, ToolSpec,
     dedup_duplicate_tool_results, repair_dangling_tool_calls,
 };
 
@@ -32,6 +32,24 @@ pub fn estimate_tool_definition_tokens(td: &xai_grok_sampling_types::ToolDefinit
 /// Sum [`estimate_tool_definition_tokens`] across a slice.
 pub fn estimate_tool_definitions_tokens(tds: &[xai_grok_sampling_types::ToolDefinition]) -> u64 {
     tds.iter().map(estimate_tool_definition_tokens).sum()
+}
+
+fn estimate_tool_tokens(
+    name: &str,
+    description: Option<&str>,
+    parameters: &serde_json::Value,
+) -> u64 {
+    let desc_len = description.map_or(0, str::len);
+    let params_len = parameters.to_string().len();
+    ((name.len() + desc_len + params_len) as u64) / xai_token_estimation::BYTES_PER_TOKEN
+}
+
+/// Bytes/4 estimate of the exact tool specs serialized on a request.
+pub fn estimate_tool_specs_tokens(tools: &[ToolSpec]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| estimate_tool_tokens(&tool.name, tool.description.as_deref(), &tool.parameters))
+        .sum()
 }
 
 /// Bytes/4 estimate for a single [`ConversationItem`].
@@ -297,6 +315,7 @@ mod tests {
 
     fn test_sampling_config() -> SamplingConfig {
         SamplingConfig {
+            max_request_bytes: None,
             base_url: "https://api.example.com".to_string(),
             model: "test-model".to_string(),
             max_completion_tokens: None,

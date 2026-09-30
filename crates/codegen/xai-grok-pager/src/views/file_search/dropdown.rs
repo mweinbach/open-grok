@@ -76,8 +76,6 @@ pub fn render_dropdown(buf: &mut Buffer, area: Rect, file_search: &FileSearchSta
         );
     }
 
-    // ── Scrollbar ───────────────────────────────────────────────────────
-
     if needs_scrollbar {
         let scrollbar_area = Rect {
             x: area.x + area.width - 1,

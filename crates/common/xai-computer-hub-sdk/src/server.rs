@@ -347,6 +347,7 @@ impl ToolServerBuilder {
             reconnect_attempt_reset_after: None,
             reconnect_after_terminal_close_codes: self.reconnect_after_terminal_close_codes.clone(),
             initial_connect_attempt_timeout: self.initial_connect_attempt_timeout,
+            auth_refresh_poll: None,
         }
     }
 
@@ -929,7 +930,11 @@ impl ToolServer {
         }
 
         let (tx, rx) = mpsc::channel(SESSION_INBOX_BUFFER);
-        connection.demux().register_session_inbox(sid.clone(), tx);
+        // Full rebind: the dead loop's sender goes now, so the session holds
+        // only the live inbox.
+        let demux = connection.demux();
+        demux.unregister_session_inbox(&sid);
+        demux.register_session_inbox(sid.clone(), tx, None);
         // Tie the per-session admission semaphore to the session-loop
         // lifetime (created here, removed on unbind / loop exit) so a
         // straggler call cannot recreate a leaked entry after teardown.

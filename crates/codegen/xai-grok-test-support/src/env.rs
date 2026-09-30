@@ -1,10 +1,18 @@
 //! Binary resolution, serial env guards, and git sandbox creation.
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use crate::sandbox::TestSandbox;
+
+// First setter wins and later sets are ignored, so parallel tests never race the process-wide choice.
+static GROK_BINARY_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+pub fn set_grok_binary_override(path: PathBuf) {
+    let _ = GROK_BINARY_OVERRIDE.set(path);
+}
 
 /// Parse env var `key` into `T`, falling back to `default` when it is unset or
 /// present-but-unparseable (warning in the latter case).
@@ -78,44 +86,98 @@ fn target_dir() -> PathBuf {
         .unwrap_or_else(|| workspace_root().join("target"))
 }
 
-fn local_grok_binary_path() -> PathBuf {
-    target_dir()
+/// Resolve a workspace binary: the prebuilt `target/debug/<bin>`, else `cargo build -p <package>
+/// --bin <bin>` with stdin closed, `pager_env()` applied, and the child detached from the TTY.
+pub fn ensure_cargo_bin(package: &str, bin: &str) -> PathBuf {
+    let binary = target_dir()
         .join("debug")
-        .join(format!("open-grok{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn ensure_local_grok_binary(binary: &Path) {
+        .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
     if binary.exists() {
-        return;
+        return binary;
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let mut cmd = Command::new(&cargo);
     cmd.current_dir(workspace_root())
-        .args(["build", "-p", "xai-grok-pager-bin", "--bin", "open-grok"])
+        .args(["build", "-p", package, "--bin", bin])
         .stdin(std::process::Stdio::null())
         .envs(xai_tty_utils::pager_env());
     xai_tty_utils::detach_std_command(&mut cmd);
     let output = cmd
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build open-grok: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build {bin}: {e}"));
 
     assert!(
         output.status.success(),
-        "failed to build open-grok for lifecycle tests (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        "failed to build {bin} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         binary.exists(),
-        "open-grok build completed but binary missing at {}",
+        "{bin} build completed but binary missing at {}",
         binary.display()
     );
+    binary
+}
+
+// Reserve four cores for the pager children other test threads spawn, so a cold build does not starve them.
+fn build_jobs() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    cores.saturating_sub(4).max(1)
+}
+
+pub fn ensure_cargo_bin_with_features(
+    package: &str,
+    bin: &str,
+    features: &[&str],
+    target_subdir: &str,
+) -> PathBuf {
+    let out_target = target_dir().join(target_subdir);
+    let binary = out_target
+        .join("debug")
+        .join(format!("{bin}{}", std::env::consts::EXE_SUFFIX));
+    if binary.exists() {
+        return binary;
+    }
+
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let mut cmd = Command::new(&cargo);
+    cmd.current_dir(workspace_root())
+        .args(["build", "-p", package, "--bin", bin])
+        .args(["--features", &features.join(",")])
+        .args(["--jobs", &build_jobs().to_string()])
+        .env("CARGO_TARGET_DIR", &out_target)
+        .stdin(std::process::Stdio::null())
+        .envs(xai_tty_utils::pager_env());
+    xai_tty_utils::detach_std_command(&mut cmd);
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {cargo} to build {bin}: {e}"));
+
+    assert!(
+        output.status.success(),
+        "failed to build {bin} with features {features:?} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        binary.exists(),
+        "{bin} build completed but binary missing at {}",
+        binary.display()
+    );
+    binary
 }
 
 /// Resolve the Open Grok binary: `GROK_BINARY` env (CI) or a local `open-grok` build.
 pub fn grok_binary() -> PathBuf {
+    if let Some(path) = GROK_BINARY_OVERRIDE.get() {
+        return path.clone();
+    }
     if let Ok(path) = std::env::var("GROK_BINARY") {
         let p = PathBuf::from(path);
         assert!(p.exists(), "GROK_BINARY does not exist: {}", p.display());
@@ -131,9 +193,7 @@ pub fn grok_binary() -> PathBuf {
         }
     }
 
-    let binary = local_grok_binary_path();
-    ensure_local_grok_binary(&binary);
-    binary
+    ensure_cargo_bin("xai-grok-pager-bin", "open-grok")
 }
 
 /// Create an owned, git-initialized [`TestSandbox`].

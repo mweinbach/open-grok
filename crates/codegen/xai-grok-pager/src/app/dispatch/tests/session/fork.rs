@@ -2,8 +2,6 @@
 
 use super::*;
 
-// ── Worktree session tests ───────────────────────────────────────
-
 #[test]
 fn open_new_worktree_dialog_sets_dialog_state() {
     let mut app = test_app();

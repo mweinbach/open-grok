@@ -131,6 +131,22 @@ impl SamplerHandle {
         }
     }
 
+    /// Test seam: `notify` fires when the first command is submitted.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn notify_on_submit(notify: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            if cmd_rx.recv().await.is_some() {
+                notify.notify_one();
+            }
+            while cmd_rx.recv().await.is_some() {}
+        });
+        Self {
+            cmd_tx,
+            codex_turn_state: CodexTurnState::default(),
+        }
+    }
+
     /// Create a no-op handle that discards all commands.
     ///
     /// Useful for tests and callers that need a `SamplerHandle` field

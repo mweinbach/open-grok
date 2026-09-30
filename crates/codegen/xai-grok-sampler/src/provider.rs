@@ -2358,6 +2358,7 @@ mod tests {
             provider_adapter(ModelProvider::Custom).apply_default_headers(
                 &mut headers,
                 &SamplerConfig {
+                    max_request_bytes: None,
                     api_key: Some("test-key".to_owned()),
                     base_url: "https://byo.example/v1".to_owned(),
                     model: "byo-model".to_owned(),
@@ -2896,6 +2897,7 @@ mod tests {
     fn xai_client_version_header_always_present_and_base_semver() {
         fn config_with_version(client_version: Option<&str>) -> SamplerConfig {
             SamplerConfig {
+                max_request_bytes: None,
                 api_key: Some("test-key".to_string()),
                 base_url: "https://api.x.ai".to_string(),
                 model: "grok-4.5".to_string(),

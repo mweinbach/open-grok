@@ -3706,3 +3706,62 @@ fn tool_media_overlay_exposes_filepath_click_rect() {
         "the image sits below its filepath line",
     );
 }
+
+/// Rewind dimming (`dim_from_entry`) on RGB themes keeps the gray_dim fg
+/// overwrite without the DIM attribute.
+///
+/// Fork note: upstream also covers its `Terminal` theme kind here; the fork
+/// has no such kind (terminal-native styling is the minimal-mode lock in
+/// `terminal_default.rs`), so only the RGB half is portable.
+#[test]
+fn dim_from_entry_uses_gray_dim_fg_on_rgb_themes() {
+    use ratatui::style::Modifier;
+
+    let _guard = crate::theme::cache::pin_theme();
+    let entries = make_entries(2);
+    let viewport = Rect::new(0, 0, 40, 10);
+
+    let render_dimmed = || {
+        let theme = Theme::current();
+        let appearance = AppearanceConfig::default();
+        let layouts = compute_layouts(&entries, viewport.width, &appearance);
+        let refs: Vec<&ScrollbackEntry> = entries.iter().collect();
+        let mut buf = Buffer::empty(viewport);
+        render_scrolled_entries_with_scratch(
+            &mut buf,
+            viewport,
+            &refs,
+            0,
+            None,
+            &theme,
+            &appearance,
+            &layouts,
+            0,
+            None,
+            Some(0), // dim everything from the first entry
+            None,
+            0,
+            0,
+            &[],
+            None,
+            None,
+        );
+        // Locate the first glyph of "Entry 0".
+        for y in 0..viewport.height {
+            let row = buffer_row_text(&buf, y);
+            if let Some(x) = row.find("Entry 0") {
+                return buf.cell((x as u16, y)).unwrap().clone();
+            }
+        }
+        panic!("'Entry 0' not rendered");
+    };
+
+    crate::theme::cache::set(crate::theme::ThemeKind::GrokNight);
+    let cell = render_dimmed();
+    assert_eq!(
+        cell.fg,
+        Theme::current().gray_dim,
+        "RGB themes keep the gray_dim fg overwrite"
+    );
+    assert!(!cell.modifier.contains(Modifier::DIM));
+}

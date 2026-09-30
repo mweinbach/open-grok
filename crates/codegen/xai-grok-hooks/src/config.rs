@@ -288,7 +288,10 @@ pub fn hook_origin(spec: &HookSpec) -> HookOrigin {
     match spec.layer {
         HookProvenance::SystemManaged => HookOrigin::SystemManaged,
         HookProvenance::Managed => HookOrigin::Managed,
-        HookProvenance::Requirements | HookProvenance::UserRequirements => HookOrigin::Requirements,
+        // All requirements tiers display as the requirements origin; only the policy exemption distinguishes root-owned or signed from user-owned
+        HookProvenance::Requirements
+        | HookProvenance::SignedRequirements
+        | HookProvenance::UserRequirements => HookOrigin::Requirements,
         HookProvenance::User => HookOrigin::UserConfig,
         HookProvenance::Plugin => HookOrigin::Plugin,
         HookProvenance::Unknown => HookOrigin::Unknown,
@@ -310,13 +313,32 @@ pub fn hook_origin(spec: &HookSpec) -> HookOrigin {
     }
 }
 
-pub fn hook_display_name(qualified: &str) -> &str {
+/// How a qualified hook name reads to the user; see [`hook_display_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookDisplayName<'a> {
+    /// A real name (`global/lint`), an agent identity (`agent:<name>`), or a `client:<id>`.
+    Named(&'a str),
+    /// Config-tier copy ("a managed policy hook") for sources whose stamped spec path means nothing to the user.
+    Tier(&'static str),
+}
+
+/// User-facing hook name for blocked-prompt copy: drops the stamped `:{event}[i].hooks[j]` tail, then renders config-tier sources as tier copy.
+/// The tier copy is split by [`HookProvenance::is_managed_policy`] (who controls the hook), not [`HookOrigin`]'s grouping.
+pub fn hook_display_label(qualified: &str) -> HookDisplayName<'_> {
     let source = strip_spec_path(qualified);
-    match source {
-        "user" | "requirements/user" => "a user hook",
-        "managed" => "a managed hook",
-        "system_managed" | "requirements/system" => "a managed policy hook",
-        _ => source,
+    match HookProvenance::from_config_label(source) {
+        Some(tier) if tier.is_managed_policy() => HookDisplayName::Tier("a managed policy hook"),
+        Some(HookProvenance::Managed) => HookDisplayName::Tier("a managed hook"),
+        Some(_) => HookDisplayName::Tier("a user hook"),
+        None => HookDisplayName::Named(source),
+    }
+}
+
+/// [`hook_display_label`] flattened for callers that read both forms the same way.
+pub fn hook_display_name(qualified: &str) -> &str {
+    match hook_display_label(qualified) {
+        HookDisplayName::Named(name) => name,
+        HookDisplayName::Tier(copy) => copy,
     }
 }
 
@@ -698,11 +720,14 @@ mod tests {
     use super::*;
     use crate::test_support::with_env_var;
 
+    // The exhaustive match forces this table to grow with the enum, so a new tier cannot become non-disableable unnoticed
     #[test]
-    fn is_managed_policy_covers_root_owned_tiers_only() {
+    fn is_managed_policy_covers_root_owned_and_signed_tiers_only() {
         fn expected(layer: HookProvenance) -> bool {
             match layer {
-                HookProvenance::SystemManaged | HookProvenance::Requirements => true,
+                HookProvenance::SystemManaged
+                | HookProvenance::Requirements
+                | HookProvenance::SignedRequirements => true,
                 HookProvenance::Managed
                 | HookProvenance::UserRequirements
                 | HookProvenance::User
@@ -715,6 +740,7 @@ mod tests {
             HookProvenance::SystemManaged,
             HookProvenance::Managed,
             HookProvenance::Requirements,
+            HookProvenance::SignedRequirements,
             HookProvenance::UserRequirements,
             HookProvenance::User,
             HookProvenance::File,
@@ -726,6 +752,21 @@ mod tests {
                 expected(layer),
                 "is_managed_policy wrong for {layer:?}"
             );
+            // Config tiers own a label that round-trips; hook-file tiers have none, so their names stay real names
+            match layer.config_label() {
+                Some(label) => assert_eq!(
+                    HookProvenance::from_config_label(label),
+                    Some(layer),
+                    "label {label} does not map back to {layer:?}"
+                ),
+                None => assert!(
+                    matches!(
+                        layer,
+                        HookProvenance::File | HookProvenance::Plugin | HookProvenance::Unknown
+                    ),
+                    "config tier {layer:?} has no label"
+                ),
+            }
         }
     }
 
@@ -740,6 +781,10 @@ mod tests {
             ("managed:pre_tool_use[2].hooks[1]", "a managed hook"),
             (
                 "requirements/system:pre_tool_use[0].hooks[0]",
+                "a managed policy hook",
+            ),
+            (
+                "requirements/signed:pre_tool_use[0].hooks[0]",
                 "a managed policy hook",
             ),
             (
@@ -761,28 +806,21 @@ mod tests {
         }
     }
 
+    /// Stamps each config tier's own label (the one the loader uses) so a drift between the label and the display copy fails here.
     #[test]
     fn hook_display_name_tracks_stamped_names() {
         let tiers = [
-            ("user", HookProvenance::User, "a user hook"),
-            (
-                "requirements/user",
-                HookProvenance::UserRequirements,
-                "a user hook",
-            ),
-            ("managed", HookProvenance::Managed, "a managed hook"),
-            (
-                "requirements/system",
-                HookProvenance::Requirements,
-                "a managed policy hook",
-            ),
-            (
-                "system_managed",
-                HookProvenance::SystemManaged,
-                "a managed policy hook",
-            ),
+            (HookProvenance::User, "a user hook"),
+            (HookProvenance::UserRequirements, "a user hook"),
+            (HookProvenance::Managed, "a managed hook"),
+            (HookProvenance::Requirements, "a managed policy hook"),
+            (HookProvenance::SignedRequirements, "a managed policy hook"),
+            (HookProvenance::SystemManaged, "a managed policy hook"),
         ];
-        for (source_name, provenance, expected) in tiers {
+        for (provenance, expected) in tiers {
+            let source_name = provenance
+                .config_label()
+                .unwrap_or_else(|| panic!("{provenance:?} is a config tier and needs a label"));
             let layer = xai_grok_config::HookConfigLayer::new(
                 provenance,
                 source_name,
@@ -793,8 +831,19 @@ mod tests {
             );
             let (specs, errors) = parse_hooks_from_config_layers(std::slice::from_ref(&layer));
             assert!(errors.is_empty(), "{source_name}: {errors:?}");
-            let name = &specs[0].name;
+            let spec = specs
+                .first()
+                .unwrap_or_else(|| panic!("expected specs item 0: {specs:?}"));
+            let name = spec.name.as_str();
             assert_eq!(hook_display_name(name), expected, "for stamped name {name}");
+            // Every requirements tier reports the requirements origin (telemetry `requirementsConfig`, inspect), and the wire string round-trips
+            assert_eq!(
+                hook_origin(spec) == HookOrigin::Requirements,
+                source_name.starts_with("requirements/"),
+                "{source_name}"
+            );
+            let wire: &str = provenance.as_str();
+            assert_eq!(wire.parse::<HookProvenance>(), Ok(provenance));
             assert_eq!(
                 expected == "a managed policy hook",
                 provenance.is_managed_policy(),

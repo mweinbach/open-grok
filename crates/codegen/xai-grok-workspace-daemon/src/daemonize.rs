@@ -32,8 +32,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 /// Unix surfaces this as `WouldBlock`; Windows as `ERROR_LOCK_VIOLATION` (OS
 /// error 33), matched via [`fs2::lock_contended_error`].
 ///
-/// A private copy of `xai_grok_workspace::util::is_lock_contended`, which stays
-/// in that crate for its other callers. This crate does not depend on it.
+/// Private flock-contention check; the bounded replacement lives in `xai-grok-file-lock` and this site migrates to it later.
 fn is_lock_contended(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::WouldBlock
         || (e.raw_os_error().is_some()

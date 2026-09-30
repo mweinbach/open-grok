@@ -272,8 +272,7 @@ impl SessionActor {
         };
         let cwd = std::path::Path::new(&self.session_info.cwd);
         let session_id = self.session_info.id.0.as_ref();
-        let (_, oauth_config_map) =
-            crate::util::config::load_mcp_servers_with_oauth(cwd, &self.rebuild_spec.compat);
+        let oauth_config_map = self.spawn_oauth_config_map(cwd);
         let byo_config = oauth_config_map.get(server_name).cloned();
         let event_writer = self.events.writer();
         let ctx = crate::session::mcp_servers::McpSpawnCtx::for_session(
@@ -730,6 +729,25 @@ impl SessionActor {
             .load(std::sync::atomic::Ordering::Relaxed)
         {
             return;
+        }
+        let has_restored_fingerprints = !self.mcp_announcements.lock().fingerprints.is_empty();
+        let has_live_servers = !self.connected_server_summaries().is_empty();
+        {
+            let mcp_state = self.mcp_state.lock().await;
+            let has_pending_servers =
+                !mcp_state.configs.is_empty() || !mcp_state.pending_acp_server_names().is_empty();
+            let has_settled_failure =
+                !mcp_state.init_failed.is_empty() || !mcp_state.auth_required.is_empty();
+            let is_unresolved_restore =
+                !has_settled_failure && !has_live_servers && has_restored_fingerprints;
+            if has_pending_servers
+                && !mcp_state.is_initialized()
+                && (mcp_state.is_initializing()
+                    || mcp_state.is_init_abandoned()
+                    || is_unresolved_restore)
+            {
+                return;
+            }
         }
         use xai_grok_tools::implementations::search_tool::fingerprint_servers;
         self.mcp_reminder_dirty
@@ -1992,14 +2010,31 @@ impl SessionActor {
         crate::session::tool_index::Bm25ToolSearchIndex::new(self.tool_metadata_snapshot.clone())
             .list_server_summaries()
     }
-    /// Render the tool usage hint appended to every injected MCP reminder
-    /// body, with the session's tool names substituted. Shared by the
-    /// injector and the `/context` estimate. `None` when the template
-    /// fails to render.
-    async fn rendered_mcp_hint(&self) -> Option<String> {
+    /// Render the tool usage hint appended to every injected MCP reminder body, with the session's tool names substituted.
+    /// Shared by the injector and the `/context` estimate.
+    /// `None` when the template fails to render.
+    pub(super) async fn rendered_mcp_hint(&self) -> Option<String> {
+        let file_supported = !self.mcp_file_forms_hidden().await
+            && self
+                .tool_bridge_handle()
+                .shared_resources()
+                .await
+                .lock()
+                .await
+                .get::<xai_grok_tools::types::resources::Params<
+                    xai_grok_tools::implementations::use_tool::UseToolParams,
+                >>()
+                .is_some_and(|params| params.0.supports_file_input());
         let hint_template = "\nTo use MCP tools, you MUST call `${{ tools.by_kind.search_tool }}` first to retrieve the tool's input schema before calling `${{ tools.by_kind.use_tool }}`. NEVER guess parameter names — always use the exact schema returned by `${{ tools.by_kind.search_tool }}`.";
+        let hint_template = if file_supported {
+            format!(
+                "{hint_template}\nFor large MCP arguments, prepare one complete UTF-8 JSON file and call `${{{{ tools.by_kind.use_tool }}}}` with {{\"${{{{ params.use_tool.file }}}}\":\"/tmp/mcp-call.json\"}}; the document contains canonical tool_name and object tool_input. Alternatively supply the target plus `${{{{ params.use_tool.tool_input_file }}}}` for an arguments-only object. File reads require Read permission before MCP approval."
+            )
+        } else {
+            hint_template.to_owned()
+        };
         self.tool_bridge_handle()
-            .render_prompt(hint_template, &serde_json::json!({}))
+            .render_prompt(&hint_template, &serde_json::json!({}))
             .await
     }
     /// The full MCP announcement for the current server set, for

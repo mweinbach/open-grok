@@ -1,10 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    DREAM_BUSY_NOTICE, DREAM_COMPLETED_NOTICE, DREAM_FAILED_NOTICE, DREAM_NO_WORK_NOTICE,
-    DREAM_RECOVERED_NOTICE, DREAM_RETRY_NOTICE, DREAM_SHADOW_NOTICE, V2CaptureFollowups,
-    V2DreamInvocation, V2DreamLeaseGuard, dream_plan_schema, parse_v2_dream_plan,
-    v2_capture_followups, v2_dream_invocation_enabled,
+    MemoryDreamDisposition, V2CaptureFollowups, V2DreamInvocation, V2DreamLeaseGuard, dream_notice,
+    dream_plan_schema, parse_v2_dream_plan, v2_capture_followups, v2_dream_invocation_enabled,
 };
 use crate::session::memory_state::V2DreamWorkers;
 
@@ -125,14 +123,18 @@ fn dream_plan_schema_matches_the_decoder() {
 #[test]
 fn dream_notices_are_fixed_content_free_vocabulary() {
     for notice in [
-        DREAM_BUSY_NOTICE,
-        DREAM_FAILED_NOTICE,
-        DREAM_NO_WORK_NOTICE,
-        DREAM_RECOVERED_NOTICE,
-        DREAM_RETRY_NOTICE,
-        DREAM_SHADOW_NOTICE,
-        DREAM_COMPLETED_NOTICE,
-    ] {
+        MemoryDreamDisposition::Busy,
+        MemoryDreamDisposition::Failed,
+        MemoryDreamDisposition::NoWork,
+        MemoryDreamDisposition::Recovered,
+        MemoryDreamDisposition::RetryRequired,
+        MemoryDreamDisposition::Shadow,
+        MemoryDreamDisposition::Completed,
+        MemoryDreamDisposition::Cancelled,
+        MemoryDreamDisposition::Disabled,
+    ]
+    .map(dream_notice)
+    {
         assert!(notice.len() <= 32);
         for forbidden in ["/", "\\", "sqlite", "permission", "model output", "secret"] {
             assert!(!notice.to_ascii_lowercase().contains(forbidden));

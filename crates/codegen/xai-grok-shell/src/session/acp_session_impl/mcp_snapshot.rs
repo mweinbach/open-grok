@@ -6,6 +6,32 @@ use super::*;
 
 pub(super) const MCP_INIT_CANCELLED_CONFIG_CHANGED: &str = "config_changed";
 
+/// The single MCP dispatch predicate. A server with a failure record or a handshake still in flight is not
+/// dispatched to; as in the reference, a call to a still-connecting server is rejected rather than waited on.
+/// Auth-required and "init finished, no ready client" both dispatch, so the bridge surfaces the real error.
+pub(super) async fn mcp_server_dispatchable(
+    mcp_state: &TokioMutex<McpState>,
+    server_name: &str,
+) -> bool {
+    let (failed, auth_required, client, settled) = {
+        let mcp_state = mcp_state.lock().await;
+        (
+            mcp_state.init_failed.contains_key(server_name),
+            mcp_state.auth_required.contains(server_name),
+            mcp_state.get_client(server_name).cloned(),
+            mcp_state.has_finished_init() && !mcp_state.is_server_handshaking(server_name),
+        )
+    };
+    if failed {
+        return false;
+    }
+    let ready = match client {
+        Some(client) => client.is_ready().await,
+        None => false,
+    };
+    ready || auth_required || settled
+}
+
 impl McpReminderMode {
     pub(super) fn from_env() -> Self {
         match std::env::var("MCP_REMINDER_MODE")

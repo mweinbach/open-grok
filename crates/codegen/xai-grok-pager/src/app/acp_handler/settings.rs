@@ -175,6 +175,12 @@ pub(super) fn handle_settings_update(notif: &acp::ExtNotification, app: &mut App
             app.apply_voice_mode_enabled(false);
         }
     }
+    // Presence-aware: omit (an older shell, or one without settings yet) keeps the seeded tier, null means fetched settings cleared it
+    // Only the settings row reads it; running agents keep the mode they latched when built
+    if let Some(remote) = update.subagent_model_inheritance_enabled {
+        app.subagent_model_inheritance.other_tiers.remote = remote;
+        crate::app::dispatch::refresh_open_settings_modals(app);
+    }
     if let Some(remote_v) = update.voice_mode_enabled {
         let v = crate::app::resolve_voice_mode_live(Some(remote_v), app.is_api_key_auth);
         if !v {
@@ -536,6 +542,10 @@ pub(super) struct PagerSettingsUpdate {
     privacy_banner_reshow_days: Option<u64>,
     #[serde(default)]
     voice_mode_enabled: Option<bool>,
+    /// Tri-state like `permission_mode`: the key is omitted by an older shell or one without settings yet, and `null`
+    /// when fetched settings lack the value.
+    #[serde(default, deserialize_with = "deserialize_presence_aware")]
+    subagent_model_inheritance_enabled: Option<Option<bool>>,
     #[serde(default)]
     session_picker_grouped: Option<bool>,
     #[serde(default)]
@@ -567,7 +577,7 @@ pub(super) struct PagerSettingsUpdate {
     /// Omission happens with older shells that predate the field (they can
     /// never clear a mode they don't know about) — that version skew is why
     /// this is tri-state instead of a plain `Option`.
-    #[serde(default, deserialize_with = "deserialize_presence_aware_string")]
+    #[serde(default, deserialize_with = "deserialize_presence_aware")]
     permission_mode: Option<Option<String>>,
     #[serde(default)]
     group_tool_verbs: Option<bool>,
@@ -577,15 +587,13 @@ pub(super) struct PagerSettingsUpdate {
     subscription_watch_interval_secs: Option<u64>,
 }
 
-/// Presence-aware string: omit → `None` (`#[serde(default)]`), null →
-/// `Some(None)`, string → `Some(Some(_))`.
-fn deserialize_presence_aware_string<'de, D>(
-    deserializer: D,
-) -> Result<Option<Option<String>>, D::Error>
+/// Presence-aware value: omit gives `None` (`#[serde(default)]`), null gives `Some(None)`, and a value gives `Some(Some(_))`.
+fn deserialize_presence_aware<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
 {
-    Ok(Some(Option::<String>::deserialize(deserializer)?))
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 /// Presence-aware + tolerant tags map for live settings updates.
@@ -621,7 +629,7 @@ mod presence_aware_dto_tests {
 
     #[derive(Deserialize)]
     struct Probe {
-        #[serde(default, deserialize_with = "deserialize_presence_aware_string")]
+        #[serde(default, deserialize_with = "deserialize_presence_aware")]
         permission_mode: Option<Option<String>>,
     }
 

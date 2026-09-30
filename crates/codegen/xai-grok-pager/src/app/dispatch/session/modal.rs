@@ -25,6 +25,29 @@ pub(in crate::app::dispatch) fn remove_agent_and_cleanup(app: &mut AppView, agen
         crate::memory_release::release_retained_memory_with("agent-close");
     }
 }
+/// Drop every agent but `keep` in minimal mode (single-session shell).
+/// Each dropped view that already has a session id must leave the crash-recovery registry.
+#[must_use]
+pub(in crate::app::dispatch) fn drop_other_agents_in_minimal(
+    app: &mut AppView,
+    keep: AgentId,
+) -> Vec<Effect> {
+    if !app.screen_mode.is_minimal() {
+        return vec![];
+    }
+    let stale: Vec<_> = app
+        .agents
+        .iter()
+        .filter(|(id, _)| **id != keep)
+        .map(|(id, agent)| (*id, agent.session.session_id.clone()))
+        .collect();
+    let mut effects = Vec::new();
+    for (id, session_id) in stale {
+        effects.extend(unregister_session_effect(session_id));
+        remove_agent_and_cleanup(app, id);
+    }
+    effects
+}
 /// Close (drop from this pager's in-memory list) the given agent.
 ///
 /// Order matters:

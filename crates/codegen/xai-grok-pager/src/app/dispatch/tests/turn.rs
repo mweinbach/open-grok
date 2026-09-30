@@ -1056,6 +1056,62 @@ fn reconcile_finishes_cancelling_turn_after_grace() {
     );
 }
 
+/// The tick-arm reconcile drains the queue outside any dispatched action; the flush that follows it in
+/// the event loop must deliver a queued image's read failure on the active view and request a redraw.
+#[test]
+fn reconcile_drain_notice_is_flushed_from_the_tick_arm() {
+    use crate::app::dispatch::tests::enqueue_local;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent.session.current_prompt_id = Some("pid-stuck".into());
+    }
+    enqueue_local(&mut app, id, "look at [Image #2]");
+    {
+        let mut image = crate::app::agent_view::test_fixtures::test_pasted_image();
+        image.display_number = 2;
+        image.encoded_bytes = None;
+        image.session_image_path = Some(dir.path().join("gone.png"));
+        app.agents
+            .get_mut(&id)
+            .unwrap()
+            .session
+            .pending_prompts
+            .back_mut()
+            .unwrap()
+            .images = vec![image];
+    }
+    arm_reconcile(
+        &mut app,
+        id,
+        "pid-stuck",
+        "end_turn",
+        TURN_END_RECONCILE_GRACE + std::time::Duration::from_secs(1),
+    );
+
+    let fired = reconcile_overdue_turn_ends(&mut app);
+    let shown = app.flush_image_notices_if_root();
+
+    assert!(
+        fired.is_some_and(|effects| effects
+            .iter()
+            .any(|e| matches!(e, Effect::SendPromptBlocks { .. }))),
+        "the reconcile must drain the queued prompt"
+    );
+    assert!(shown, "the flush must report the visible change");
+    assert_eq!(
+        app.agents[&id]
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str()),
+        Some("Image #2 couldn't be read — not sent")
+    );
+}
+
 /// A lost-RPC reconcile for a send-now cancel (`_meta.cancelTrigger: "send_now"`) pushes no marker.
 #[test]
 fn reconcile_suppresses_send_now_cancel_marker() {
@@ -1734,6 +1790,85 @@ fn bg_task_killed_keeps_pending_kill_on_killed_outcome() {
     // "killed" means signal sent, wait for task_completed — pending_kill stays
     let task = &app.agents[&AgentId(1)].session.bg_tasks["task-B-1"];
     assert!(task.pending_kill);
+}
+
+#[test]
+fn kill_bg_task_in_subagent_view_names_the_childs_session() {
+    let mut app = test_app_with_agent();
+    let root_id = AgentId(0);
+    let child_sid = "child-1";
+    let mut child = AgentView::new(
+        make_test_agent_session(&app, AgentId(1), child_sid),
+        ScrollbackState::new(),
+    );
+    child
+        .session
+        .bg_tasks
+        .insert("bg-child".into(), super::make_bg_task("bg-child"));
+    {
+        let root = app.agents.get_mut(&root_id).expect("root agent must exist");
+        root.subagent_views
+            .insert(child_sid.to_string(), Box::new(child));
+        root.active_subagent = Some(child_sid.to_string());
+    }
+
+    let effects = dispatch(Action::KillBgTask("bg-child".into()), &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::KillBgTask { session_id, task_id, .. }]
+                if session_id.0.as_ref() == child_sid && task_id == "bg-child"
+        ),
+        "the kill must name the child's session, got {effects:?}"
+    );
+    assert!(
+        child_task_pending_kill(&app, root_id, child_sid, "bg-child"),
+        "the kill must mark the child's row"
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::BgTaskKillFailed {
+            session_id: child_sid.into(),
+            task_id: "bg-child".into(),
+            error: "connection lost".into(),
+        }),
+        &mut app,
+    );
+
+    assert!(
+        !child_task_pending_kill(&app, root_id, child_sid, "bg-child"),
+        "a failed kill must clear the child's row"
+    );
+
+    dispatch(
+        Action::TaskComplete(TaskResult::BgTaskKilled {
+            session_id: child_sid.into(),
+            task_id: "bg-child".into(),
+            outcome: Some(xai_grok_tools::types::KillOutcome::NotFound),
+        }),
+        &mut app,
+    );
+
+    let child_has_row = app.agents[&root_id]
+        .subagent_views
+        .get(child_sid)
+        .is_some_and(|view| view.session.bg_tasks.contains_key("bg-child"));
+    assert!(!child_has_row, "an unknown task must drop the child's row");
+}
+
+fn child_task_pending_kill(
+    app: &AppView,
+    root_id: AgentId,
+    child_sid: &str,
+    task_id: &str,
+) -> bool {
+    app.agents[&root_id]
+        .subagent_views
+        .get(child_sid)
+        .and_then(|view| view.session.bg_tasks.get(task_id))
+        .map(|task| task.pending_kill)
+        .unwrap_or_else(|| panic!("missing the child's task {task_id}"))
 }
 
 #[test]

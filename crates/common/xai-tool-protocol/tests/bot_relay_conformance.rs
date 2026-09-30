@@ -8,7 +8,8 @@ use xai_tool_protocol::{
     COMMAND_REJECTED_ATTACHMENT_NOT_FOUND, COMMAND_REJECTED_ATTACHMENT_NOT_READY,
     COMMAND_REJECTED_ATTACHMENT_TOO_LARGE, COMMAND_REJECTED_ATTACHMENT_WRONG_SOURCE,
     COMMAND_REJECTED_ATTACHMENTS_NOT_SUPPORTED_IN_LIVE, COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD,
-    HubChannel, HubResyncRequiredEvent, HubTurnFinishedEvent,
+    COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED, COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE, HubChannel,
+    HubResyncRequiredEvent, HubTurnFinishedEvent,
 };
 const ERROR_IDENTITY_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_identity_unavailable.json");
@@ -58,6 +59,10 @@ const ERROR_COMMAND_REJECTED_ATTACHMENT_NOT_READY: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_attachment_not_ready.json");
 const ERROR_COMMAND_REJECTED_GATEWAY_UNKNOWN_METHOD: &str =
     include_str!("../fixtures/bot_relay/error_command_rejected_gateway_unknown_method.json");
+const ERROR_COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_voice_call_unavailable.json");
+const ERROR_COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED: &str =
+    include_str!("../fixtures/bot_relay/error_command_rejected_main_agent_not_enabled.json");
 const ERROR_COMPUTER_UNAVAILABLE: &str =
     include_str!("../fixtures/bot_relay/error_computer_unavailable.json");
 const ERROR_UPSTREAM_ERROR: &str = include_str!("../fixtures/bot_relay/error_upstream_error.json");
@@ -101,7 +106,7 @@ const METHOD_TRANSCRIPT_OFFBOX_RESULT: &str =
     include_str!("../fixtures/bot_relay/method_transcript_offbox_result.json");
 const METHOD_EMPTY_RESULT: &str = include_str!("../fixtures/bot_relay/method_empty_result.json");
 fn parse_object(raw: &str) -> Value {
-    let value: Value = serde_json::from_str(raw).unwrap_or_else(|error| {
+    let value: Value = serde_json::from_str(raw).unwrap_or_else(|e| {
         panic!("fixture is not JSON: {e}\n{raw}");
     });
     assert!(value.is_object(), "fixture must be a JSON object: {raw}");
@@ -110,13 +115,13 @@ fn parse_object(raw: &str) -> Value {
 fn replay_error(raw: &str) -> (Value, BotRelayError) {
     let value = parse_object(raw);
     let parsed: BotRelayError = serde_json::from_value(value.clone())
-        .unwrap_or_else(|error| panic!("BotRelayError rejected fixture: {e}\n{value}"));
+        .unwrap_or_else(|e| panic!("BotRelayError rejected fixture: {e}\n{value}"));
     (value, parsed)
 }
 fn replay_envelope(raw: &str) -> (Value, BotEventEnvelope) {
     let value = parse_object(raw);
     let parsed: BotEventEnvelope = serde_json::from_value(value.clone())
-        .unwrap_or_else(|error| panic!("BotEventEnvelope rejected fixture: {e}\n{value}"));
+        .unwrap_or_else(|e| panic!("BotEventEnvelope rejected fixture: {e}\n{value}"));
     (value, parsed)
 }
 fn assert_error(
@@ -419,6 +424,46 @@ fn handwritten_gateway_unknown_method_reason() {
     assert_eq!(err.detail.upstream, None);
 }
 #[test]
+fn handwritten_voice_call_unavailable_reason_keeps_upstream_detail() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE,
+        "command_rejected",
+        false,
+        json!({
+            "upstream": "status=400 connect=invalid_argument",
+            "upstreamMessage": "Voice call is not enabled for this account.",
+        }),
+        Some(COMMAND_REJECTED_VOICE_CALL_UNAVAILABLE),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(
+        Some("status=400 connect=invalid_argument"),
+        err.detail.upstream.as_deref()
+    );
+    assert_eq!(
+        Some("Voice call is not enabled for this account."),
+        err.detail.upstream_message.as_deref()
+    );
+}
+#[test]
+fn handwritten_main_agent_not_enabled_reason_keeps_upstream_detail() {
+    let err = assert_error(
+        ERROR_COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED,
+        "command_rejected",
+        false,
+        json!({
+            "upstream": "status=400 connect=invalid_argument",
+            "upstreamMessage": "Main bot is not enabled.",
+        }),
+        Some(COMMAND_REJECTED_MAIN_AGENT_NOT_ENABLED),
+        BotRelayErrorCode::CommandRejected,
+    );
+    assert_eq!(
+        Some("Main bot is not enabled."),
+        err.detail.upstream_message.as_deref()
+    );
+}
+#[test]
 fn unknown_error_code_degrades_to_upstream_error() {
     let (wire, err) = replay_error(ERROR_UNKNOWN_CODE);
     assert_eq!(wire["code"], "some_future_code");
@@ -441,6 +486,7 @@ fn hub_turn_finished_envelope() {
     assert_eq!(wire["event"]["agentId"], "agt_1");
     assert_eq!(wire["event"]["conversationIds"], json!(["conv_1"]));
     assert_eq!(wire["event"]["preview"], "done");
+    assert_eq!(wire["event"]["turnId"], "turn_7");
     assert!(wire.get("eventId").is_none());
     assert_eq!(env.v, 1);
     assert_eq!(env.agent_id, "agt_1");
@@ -451,6 +497,7 @@ fn hub_turn_finished_envelope() {
     assert_eq!(body.agent_id, "agt_1");
     assert_eq!(body.conversation_ids, vec!["conv_1".to_owned()]);
     assert_eq!(body.preview, "done");
+    assert_eq!(body.turn_id, "turn_7");
 }
 #[test]
 fn hub_resync_required_envelope() {
@@ -522,9 +569,9 @@ fn replay_sequence(raw: &str) -> SequenceFixture {
         .expect("sequence fixture must have frames");
     let parsed: Vec<BotEventEnvelope> = frames
         .iter()
-        .map(|formatter| {
-            serde_json::from_value(formatter.clone())
-                .unwrap_or_else(|error| panic!("sequence frame rejected: {e}\n{f}"))
+        .map(|f| {
+            serde_json::from_value(f.clone())
+                .unwrap_or_else(|e| panic!("sequence frame rejected: {e}\n{f}"))
         })
         .collect();
     SequenceFixture {

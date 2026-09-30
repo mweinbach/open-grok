@@ -30,20 +30,25 @@
 //!
 //! Unix-only: the leader transport here is a unix socket.
 
+use std::cell::RefCell;
+use std::future::Future;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
 use agent_client_protocol as acp;
 use tempfile::TempDir;
-use tokio::task::JoinSet;
+use tokio::task::{JoinSet, LocalSet};
 use tokio_util::sync::CancellationToken;
 use xai_acp_lib::{AcpClientRx, acp_send};
+use xai_grok_shell::agent::MvpAgent;
 use xai_grok_shell::leader::{
     ClientCapabilities as LeaderClientCapabilities, ClientMode, ConnectionStatus,
     LEADER_SOCKET_ENV, LeaderClient, LeaderEnvUrls, LeaderLock, LeaderReconnector,
-    LeaderServerControlState, LeaderServerMetadata, ReconnectPolicy, run_leader_server,
+    LeaderServerControlState, LeaderServerMetadata, ReconnectPolicy, SLOT_DIR_ENV,
+    run_leader_server,
 };
 use xai_grok_test_support::MockInferenceServer;
 
@@ -58,6 +63,26 @@ use crate::scrollback::block::RenderBlock;
 
 const PUMP_TICK: Duration = Duration::from_millis(10);
 const TURN_BUDGET: Duration = Duration::from_secs(60);
+
+/// Every agent the cluster ever spawned, killed generations included.
+/// `MvpAgent`'s background tasks hold raw `LocalRef` self-pointers and stay on the `LocalSet` after the agent's
+/// connection is aborted, so the agents must be freed only after the `LocalSet` is (`InProcessAgent::keepalive`).
+type AgentKeepalives = Rc<RefCell<Vec<Rc<MvpAgent>>>>;
+
+/// Run one scenario on a current-thread runtime and `LocalSet`, then tear down in the order the agents' `LocalRef`
+/// contract needs: the `LocalSet` (and every agent background task still on it) first, the agents themselves last.
+/// The keepalive sink is declared before the runtime so the order also holds while a failed scenario unwinds.
+fn run_cluster_scenario<Fut: Future<Output = ()>>(scenario: impl FnOnce(AgentKeepalives) -> Fut) {
+    let agent_keepalives = AgentKeepalives::default();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let local = LocalSet::new();
+    local.block_on(&rt, scenario(Rc::clone(&agent_keepalives)));
+    drop(local);
+    drop(agent_keepalives);
+}
 
 /// Await a bring-up step with a hard budget so an on-demand run that hangs
 /// names its phase instead of parking until the test-runner kill.
@@ -136,6 +161,8 @@ impl ClusterClient {
             ask_user: self.app.ask_user,
             restore_code: self.app.restore_code,
             agent_override: self.app.agent_override.clone(),
+            defer_builtin_agent_profile: crate::app::event_loop::session_create_or_load(&effs)
+                && crate::views::agents_modal::config_agent_is_explicit(),
             yolo_mode: self.app.default_yolo,
             auto_mode: dispatch::effective_auto(
                 self.app.default_yolo,
@@ -174,7 +201,16 @@ impl ClusterClient {
                 None => crate::app::session_startup::active_local_workspace().unwrap_or(None),
             },
         };
-        for eff in effs {
+        let mut effs = effs.into_iter().peekable();
+        while let Some(eff) = effs.next() {
+            let Some(eff) = effects::take_coalesced_interjects(
+                eff,
+                &mut effs,
+                &mut self.tasks,
+                &self.app.acp_tx,
+            ) else {
+                continue;
+            };
             let (_quit, _meta) = effects::execute(
                 eff,
                 &mut self.tasks,
@@ -310,6 +346,9 @@ struct PagerLeaderCluster {
     /// agent on the same OPENGROK_HOME (two agents on one updates.jsonl is the
     /// corruption class the real leader's flock exists to prevent).
     generation_tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Owned by [`run_cluster_scenario`], which frees the agents only after the `LocalSet`; a killed generation's
+    /// agent stays allocated (I/O tasks gone, background tasks idling against a live agent) rather than freed under them.
+    agent_keepalives: AgentKeepalives,
     client_count: Arc<AtomicUsize>,
     workdir: TempDir,
     authenticated: bool,
@@ -327,8 +366,8 @@ struct PagerLeaderCluster {
 
 impl PagerLeaderCluster {
     /// Stand up the cluster. Callers MUST be `#[serial_test::serial(OPENGROK_HOME)]`
-    /// (env mutation) and run inside a current-thread `LocalSet`.
-    async fn start() -> Self {
+    /// (env mutation) and run inside [`run_cluster_scenario`], whose keepalive sink this takes.
+    async fn start(agent_keepalives: AgentKeepalives) -> Self {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
         let server = MockInferenceServer::start().await.expect("mock server");
@@ -347,6 +386,8 @@ impl PagerLeaderCluster {
             // Pin every leader-path derivation (LeaderLock::new / reconnect's
             // connect_or_spawn) to this cluster's socket.
             crate::test_util::EnvVarGuard::set(LEADER_SOCKET_ENV, &sock_path),
+            // Keep the flock's acquire slot inside the sandbox rather than the host's `/tmp/grok-file-lock-<uid>`
+            crate::test_util::EnvVarGuard::set(SLOT_DIR_ENV, grok_home.path().join("lock-slots")),
         ];
 
         // Hold the flock for the cluster's lifetime (see field doc).
@@ -363,6 +404,7 @@ impl PagerLeaderCluster {
             server,
             server_cancel: CancellationToken::new(),
             generation_tasks: Vec::new(),
+            agent_keepalives,
             client_count,
             workdir,
             authenticated: false,
@@ -416,10 +458,9 @@ impl PagerLeaderCluster {
             .await;
         }));
 
-        generation_tasks.extend(xai_grok_shell::leader::in_process::spawn_agent(
-            acp_rx,
-            response_tx,
-        ));
+        let agent = xai_grok_shell::leader::in_process::spawn_agent(acp_rx, response_tx).await;
+        generation_tasks.extend(agent.tasks);
+        self.agent_keepalives.borrow_mut().push(agent.keepalive);
         self.generation_tasks = generation_tasks;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -528,9 +569,7 @@ impl PagerLeaderCluster {
                     .meta(
                         serde_json::json!({
                             "startupHints": {
-                                "nonInteractive": true,
-                                "skipGitStatus": true,
-                                "skipProjectLayout": true
+                                "nonInteractive": true
                             },
                             "clientType": "pager-cluster",
                             "clientVersion": "0.0.0-test",

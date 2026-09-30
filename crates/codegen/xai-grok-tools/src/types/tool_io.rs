@@ -144,7 +144,7 @@ impl ToolInput {
     /// `None`. Add any new dispatcher here.
     pub fn dispatch_target_name(&self) -> Option<String> {
         match self {
-            ToolInput::UseTool(input) => Some(input.tool_name.clone()),
+            ToolInput::UseTool(input) => input.target_name().map(str::to_owned),
             _ => None,
         }
     }
@@ -177,10 +177,12 @@ mod tests {
     }
     #[test]
     fn dispatch_target_name_resolves_meta_dispatch_tools() {
-        let use_tool = ToolInput::UseTool(UseToolInput {
-            tool_name: "linear__save_issue".to_string(),
-            tool_input: serde_json::json!({}),
-        });
+        let use_tool = ToolInput::UseTool(UseToolInput::Inline(
+            crate::implementations::use_tool::InlineMcpInvocation {
+                tool_name: "linear__save_issue".to_string(),
+                tool_input: serde_json::json!({}),
+            },
+        ));
         assert_eq!(
             use_tool.dispatch_target_name().as_deref(),
             Some("linear__save_issue")

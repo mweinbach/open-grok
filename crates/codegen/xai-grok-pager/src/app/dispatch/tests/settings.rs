@@ -1194,6 +1194,43 @@ fn dispatch_confirm_reset_setting_reset_on_already_default_is_no_op_with_toast()
         "expected 'already at default' toast, got: {toast_text:?}",
     );
 }
+/// Browse `d` then `y` on the coding-data row writes even when the local value already reads as the default "opt-out":
+/// that value may be the unconfirmed fail-safe, so "already at default" must not drop a confirmed decline.
+#[test]
+fn reset_via_keys_writes_consent_decline_even_when_already_default() {
+    use crate::app::app_view::InputOutcome;
+    use crate::views::modal::ActiveModal;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    let mut app = test_app_with_agent();
+    app.coding_data_retention_opt_out = true;
+    let _ = dispatch(Action::OpenSettings, &mut app);
+    {
+        let agent = app.agents.get_mut(&AgentId(0)).expect("agent must exist");
+        let Some(ActiveModal::Settings { state }) = agent.active_modal.as_mut() else {
+            panic!("settings modal must be open");
+        };
+        assert!(state.focus_key("coding_data_sharing"));
+    }
+    let press = |c| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+    let InputOutcome::Action(open) = app.handle_input(&press('d')) else {
+        panic!("`d` on the coding-data row must open the reset confirm");
+    };
+    let _ = dispatch(open, &mut app);
+    let InputOutcome::Action(confirm) = app.handle_input(&press('y')) else {
+        panic!("`y` must confirm the reset");
+    };
+    let effects = dispatch(confirm, &mut app);
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::SetCodingDataSharing {
+                opted_in: false,
+                ..
+            }]
+        ),
+        "an already-default consent reset must still reach the server: {effects:?}",
+    );
+}
 /// `refresh_open_settings_modals` walks into
 /// `ResetSettingsConfirm.settings_state` so a `set_X` (or
 /// rollback) running while the confirm dialog is open keeps the
@@ -1364,13 +1401,14 @@ fn every_persisting_setting_has_rollback_arm() {
             let mut app = test_app_with_agent();
             move_setting_away_from_default(&mut app, meta.key);
             for eff in dispatch(reset_action, &mut app) {
-                let Effect::PersistSetting {
-                    key,
-                    rollback_value,
-                    ..
-                } = eff
-                else {
-                    continue;
+                let (key, rollback_value) = match eff {
+                    Effect::PersistSetting {
+                        key,
+                        rollback_value,
+                        ..
+                    } => (key, rollback_value),
+                    Effect::PersistFeatureOverride { .. } => continue,
+                    _ => continue,
                 };
                 let mut rb_app = test_app_with_agent();
                 let _ = apply_setting_rollback(&mut rb_app, key, &rollback_value);
@@ -1770,6 +1808,100 @@ fn pr13_set_show_tips_toast_includes_restart_marker() {
         "toast must include the deferred-effect cue, got {toast:?}"
     );
 }
+/// The write a dispatch issued for the row, if any; panics on anything but a single `PersistFeatureOverride`.
+fn issued_feature_override(effects: Vec<Effect>) -> Option<Option<bool>> {
+    use xai_grok_shell::agent::config::Feature;
+    match effects.as_slice() {
+        [] => None,
+        [
+            Effect::PersistFeatureOverride {
+                feature: Feature::SubagentModelInheritance,
+                saved,
+            },
+        ] => Some(*saved),
+        other => panic!("expected at most one PersistFeatureOverride, got {other:?}"),
+    }
+}
+/// Both toggle directions write an explicit value and reset deletes the key. Reset with nothing saved writes nothing
+/// and names a managed layer that shows through; a pin refuses both the toggle and the reset before any effect.
+#[test]
+fn subagent_model_inheritance_persists_overrides_and_reset_deletes_the_key() {
+    use xai_grok_shell::agent::config::{Feature, FeatureConfigLayer, FeatureLayerValue};
+    let feature = Feature::SubagentModelInheritance;
+    let mut app = test_app_with_agent();
+    assert_eq!(None, app.subagent_model_inheritance.config.user);
+    let effects = dispatch(Action::SetSubagentModelInheritance(true), &mut app);
+    assert_eq!(Some(Some(true)), issued_feature_override(effects));
+    assert_eq!(Some(true), app.subagent_model_inheritance.config.user);
+    assert!(read_toast(&app).contains("restart to apply"));
+    let _ = handle_feature_override_persisted(&mut app, feature, Ok(Some(true)));
+    let effects = dispatch(Action::SetSubagentModelInheritance(false), &mut app);
+    assert_eq!(Some(Some(false)), issued_feature_override(effects));
+    let _ = handle_feature_override_persisted(&mut app, feature, Ok(Some(false)));
+    let effects = dispatch(Action::ClearSubagentModelInheritance, &mut app);
+    assert_eq!(Some(None), issued_feature_override(effects));
+    assert_eq!(None, app.subagent_model_inheritance.config.user);
+    let _ = handle_feature_override_persisted(&mut app, feature, Ok(None));
+    assert!(dispatch(Action::ClearSubagentModelInheritance, &mut app).is_empty());
+    assert!(read_toast(&app).ends_with("nothing to reset"));
+    app.subagent_model_inheritance.config.below_user = Some(FeatureLayerValue {
+        layer: FeatureConfigLayer::Managed,
+        value: true,
+    });
+    assert!(dispatch(Action::ClearSubagentModelInheritance, &mut app).is_empty());
+    assert!(read_toast(&app).ends_with("nothing to reset; managed_config.toml sets it"));
+    assert!(!dispatch(Action::SetSubagentModelInheritance(false), &mut app).is_empty());
+    app.subagent_model_inheritance.config.pin = Some(true);
+    assert!(dispatch(Action::SetSubagentModelInheritance(true), &mut app).is_empty());
+    assert!(read_toast(&app).contains("fixed by a requirements.toml pin or an MDM policy"));
+    assert!(dispatch(Action::ClearSubagentModelInheritance, &mut app).is_empty());
+    assert_eq!(Some(false), app.subagent_model_inheritance.config.user);
+    assert!(read_toast(&app).contains("fixed by a requirements.toml pin or an MDM policy"));
+}
+/// One write is on disk at a time: toggles under a pending write only queue the newest intent, the completion issues
+/// it (also after a failure) unless it already matches the disk, and a lone failure settles the mirror back on the disk.
+#[test]
+fn subagent_model_inheritance_writes_one_at_a_time_and_issues_the_newest_intent() {
+    use xai_grok_shell::agent::config::Feature;
+    let feature = Feature::SubagentModelInheritance;
+    let toggle = |app: &mut AppView, action: Action| issued_feature_override(dispatch(action, app));
+    let complete = |app: &mut AppView, result: Result<Option<bool>, String>| {
+        issued_feature_override(handle_feature_override_persisted(app, feature, result))
+    };
+    let mirror = |app: &AppView| app.subagent_model_inheritance.config.user;
+    let failed = || Err("disk".to_owned());
+    let mut app = test_app_with_agent();
+    assert_eq!(
+        Some(Some(true)),
+        toggle(&mut app, Action::SetSubagentModelInheritance(true))
+    );
+    assert_eq!(
+        None,
+        toggle(&mut app, Action::SetSubagentModelInheritance(false))
+    );
+    assert_eq!(
+        None,
+        toggle(&mut app, Action::ClearSubagentModelInheritance)
+    );
+    assert_eq!(None, mirror(&app));
+    assert_eq!(Some(None), complete(&mut app, Ok(Some(true))));
+    assert_eq!(None, complete(&mut app, Ok(None)));
+    assert_eq!(None, mirror(&app));
+    assert!(app.subagent_model_inheritance.writes.is_none());
+    let _ = toggle(&mut app, Action::SetSubagentModelInheritance(true));
+    let _ = toggle(&mut app, Action::SetSubagentModelInheritance(false));
+    assert_eq!(Some(Some(false)), complete(&mut app, failed()));
+    assert!(read_toast(&app).starts_with("✗ Could not save subagent_model_inheritance"));
+    assert_eq!(None, complete(&mut app, failed()));
+    assert_eq!(None, mirror(&app));
+    assert!(app.subagent_model_inheritance.writes.is_none());
+    let _ = toggle(&mut app, Action::SetSubagentModelInheritance(true));
+    let _ = toggle(&mut app, Action::SetSubagentModelInheritance(false));
+    let _ = toggle(&mut app, Action::SetSubagentModelInheritance(true));
+    assert_eq!(None, complete(&mut app, Ok(Some(true))));
+    assert_eq!(Some(true), mirror(&app));
+    assert!(app.subagent_model_inheritance.writes.is_none());
+}
 /// Helper for `every_setting_has_action_for_reset_arm`. Flips the
 /// setting to a non-default value so the round-trip dispatch has
 /// an observable effect (otherwise the assertion would pass
@@ -1791,6 +1923,10 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         "page_flip_on_send" => {
             let away = !crate::appearance::cache::load_page_flip_on_send();
             let _ = dispatch(Action::SetPageFlipOnSend(away), app);
+        }
+        "dashboard_preview" => {
+            let away = !app.current_ui.dashboard_preview_enabled();
+            let _ = dispatch(Action::SetDashboardPreview(away), app);
         }
         "confirm_before_rewind" => {
             let away = !app.current_ui.confirm_before_rewind_enabled();
@@ -1932,6 +2068,9 @@ fn move_setting_away_from_default(app: &mut AppView, key: crate::settings::Setti
         }
         "toolset.ask_user_question.timeout_enabled" => {
             let _ = dispatch(Action::SetAskUserQuestionTimeoutEnabled(false), app);
+        }
+        "subagent_model_inheritance" => {
+            let _ = dispatch(Action::SetSubagentModelInheritance(true), app);
         }
         "toolset.perplexity_web_search.enabled" => {
             let _ = dispatch(Action::SetPerplexityWebSearch(true), app);

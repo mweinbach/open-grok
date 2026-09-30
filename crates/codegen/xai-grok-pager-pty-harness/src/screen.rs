@@ -134,6 +134,11 @@ impl ScreenTracker {
     pub fn full_contains(&self, text: &str) -> bool {
         self.full_text().contains(text)
     }
+
+    /// Native select→copy of scrollback plus screen: wrap-joined, pads trimmed.
+    pub fn native_copy_text(&self) -> String {
+        self.terminal.native_copy_text()
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +187,18 @@ mod tests {
 
         // Drained exactly once — no duplicate delivery on the next call.
         assert!(s.drain_responses().is_empty());
+    }
+
+    #[test]
+    fn native_copy_joins_wrapped_rows() {
+        let mut s = ScreenTracker::new(3, 4);
+        s.feed(b"abcde\r\nxy\r\n");
+        let copy = s.native_copy_text();
+        assert!(copy.contains("abcde"), "WRAPLINE rows must join: {copy:?}");
+        assert!(
+            !copy.contains("abcd\ne"),
+            "soft wrap must not become a hard break: {copy:?}"
+        );
+        assert!(copy.contains("xy"), "{copy:?}");
     }
 }

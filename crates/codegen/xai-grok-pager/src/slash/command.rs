@@ -281,6 +281,13 @@ pub trait SlashCommand: Send + Sync {
         None
     }
 
+    /// `insert_text` of the row the args menu (dropdown or modal picker) opens on when no selection carries over.
+    /// Resolved by exact equality against the rows built from `suggest_args(ctx, args_query)`; `None` or an
+    /// unmatched value keeps the first row.
+    fn preselected_arg(&self, _ctx: &AppCtx, _args_query: &str) -> Option<String> {
+        None
+    }
+
     /// Whether this command is currently visible / executable.
     ///
     /// Default is `true` (every command is visible). Override to gate a

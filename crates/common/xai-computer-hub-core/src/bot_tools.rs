@@ -8,6 +8,7 @@ pub const GROK_BOT_TOOL_IDS: &[&str] = &[
     "bot_get_agent_transcript_window",
     "bot_transcript_offbox",
     "bot_await_turn",
+    "bot_voice_call_plan",
 ];
 pub fn is_grok_bot_tool(name: &str) -> bool {
     GROK_BOT_TOOL_IDS.contains(&name)
@@ -123,6 +124,12 @@ pub const GROK_BOT_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
          fire_and_forget and read the transcript (bot_transcript_offbox \
          when live waiting is unsupported). Use this instead \
          of re-sending the same prompt.",
+    ),
+    (
+        "bot_voice_call_plan",
+        "Plan a voice call with a Grok Bot agent: its spoken instructions, \
+         voice-side tools, greeting, and task receipt. For a voice backend at \
+         dial time; sends nothing to the agent.",
     ),
 ];
 pub fn grok_bot_tool_description(name: &str) -> Option<&'static str> {

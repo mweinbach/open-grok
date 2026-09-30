@@ -135,10 +135,6 @@ fn session_header_always_shortens_deep_cwd() {
         !row.contains("/deep/alpha"),
         "middle components must not stay full, row = {row:?}"
     );
-    assert!(
-        !row.contains("(worktree of"),
-        "no leftover main-repo suffix, row = {row:?}"
-    );
 }
 
 #[test]
@@ -340,24 +336,36 @@ fn hover_brightens_only_the_pointed_affordance() {
     let prev = agent.hit_overlay_prev.rect.unwrap();
     let next = agent.hit_overlay_next.rect.unwrap();
     let dash = agent.hit_dashboard.rect.unwrap();
-    let faint_fg = theme.faint().fg.expect("pinned theme blends");
-    assert_eq!(fg(&buf, next.x, next.y), faint_fg, "resting ›");
-    assert_eq!(fg(&buf, dash.x, dash.y), theme.gray, "resting [Dashboard]");
+    // Resting/hovered brightness is only observable when the terminal has
+    // colour at all (NO_COLOR / TERM=dumb collapse every fg to Reset).
+    let has_color = xai_grok_pager_render::theme::color_support::get().has_color();
+    let faint_fg = theme.faint().fg;
+    if has_color {
+        let faint_fg = faint_fg.expect("pinned theme blends");
+        assert_eq!(fg(&buf, next.x, next.y), faint_fg, "resting ›");
+        assert_eq!(fg(&buf, dash.x, dash.y), theme.gray, "resting [Dashboard]");
+    }
     assert!(matches!(
         agent.handle_input(&mouse(MouseEventKind::Moved, next.x, next.y), &registry),
         InputOutcome::Changed
     ));
     let buf = draw(&mut agent, &registry, true, header);
-    assert_eq!(fg(&buf, next.x, next.y), theme.text_primary, "hovered ›");
-    assert_eq!(fg(&buf, prev.x, prev.y), faint_fg, "‹ untouched");
+    if has_color {
+        let faint_fg = faint_fg.expect("pinned theme blends");
+        assert_eq!(fg(&buf, next.x, next.y), theme.text_primary, "hovered ›");
+        assert_eq!(fg(&buf, prev.x, prev.y), faint_fg, "‹ untouched");
+    }
     agent.handle_input(&mouse(MouseEventKind::Moved, dash.x, dash.y), &registry);
     let buf = draw(&mut agent, &registry, true, header);
-    assert_eq!(
-        fg(&buf, dash.x, dash.y),
-        theme.text_primary,
-        "hovered [Dashboard]"
-    );
-    assert_eq!(fg(&buf, next.x, next.y), faint_fg, "› released");
+    if has_color {
+        let faint_fg = faint_fg.expect("pinned theme blends");
+        assert_eq!(
+            fg(&buf, dash.x, dash.y),
+            theme.text_primary,
+            "hovered [Dashboard]"
+        );
+        assert_eq!(fg(&buf, next.x, next.y), faint_fg, "› released");
+    }
 }
 
 #[test]

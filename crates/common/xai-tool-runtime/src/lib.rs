@@ -19,7 +19,8 @@ pub mod tool;
 
 pub use context::{
     BehaviorVersion, Cancellation, Cwd, ListToolsContext, McpCallMetadata, SessionContext,
-    ToolCallContext, TraceContext, TypedExtensions, WorkspaceBindMetadata, WorkspaceViewerContext,
+    ToolApprovalPolicy, ToolCallContext, TraceContext, TypedExtensions, WorkspaceBindMetadata,
+    WorkspaceViewerContext,
 };
 pub use dispatch::ToolDispatch;
 pub use error::{ToolError, ToolErrorKind};

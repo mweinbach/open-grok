@@ -258,6 +258,7 @@ mod tests {
             running_tasks: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            images: Default::default(),
         }
     }
 
@@ -303,6 +304,7 @@ mod tests {
             running_tasks: vec![],
             running_subagents: vec![],
             todos: vec![],
+            images: Default::default(),
         };
         let result = to_system_reminder_sync(&ctx, &[], &[], None, None, None);
         let text = result.expect("should produce a reminder");
@@ -335,6 +337,7 @@ mod tests {
             running_subagents: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            images: Default::default(),
         };
         let text = to_system_reminder_sync(&ctx, &[], &[], None, None, None)
             .expect("should produce a reminder");
@@ -372,6 +375,7 @@ mod tests {
             running_tasks: vec![],
             running_subagents: vec![],
             connected_mcp_servers: vec![],
+            images: Default::default(),
         }
     }
 
@@ -453,6 +457,7 @@ mod tests {
             running_subagents: vec![],
             connected_mcp_servers: vec![],
             todos: vec![],
+            images: Default::default(),
         };
         let skills = [xai_grok_tools::implementations::skills::types::SkillInfo {
             name: "commit".into(),

@@ -46,11 +46,14 @@ pub mod resources;
 pub mod sandbox;
 pub mod scripted;
 pub mod sse;
+mod telemetry_events;
 #[cfg(unix)]
 pub mod uds_proxy;
 pub use acp_client::{GrokStdioClient, RawStdioClient};
 pub use counting_server::spawn_counting_server;
-pub use env::{EnvGuard, git_workdir, grok_binary};
+pub use env::{
+    EnvGuard, ensure_cargo_bin_with_features, git_workdir, grok_binary, set_grok_binary_override,
+};
 pub use headless::{
     HeadlessResult, assert_headless_success, assert_no_crashes, run_headless,
     run_headless_in_sandbox, run_headless_in_sandbox_borrowed,
@@ -61,7 +64,8 @@ pub use inference_override::{InferenceEndpoint, InferenceExpectation, InferenceR
 #[cfg(unix)]
 pub use leader::LeaderFixture;
 pub use mock_server::{
-    MockInferenceServer, MockModelEntry, ScriptedResponse, SseEvent, StorageUpload,
+    MockCanAdministerTeam, MockInferenceServer, MockModelEntry, MockUserTeam, ScriptedResponse,
+    SseEvent, StorageUpload,
 };
 #[cfg(unix)]
 pub use process::process_has_exited_without_reap;

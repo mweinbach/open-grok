@@ -17,7 +17,9 @@ use tokio::sync::mpsc;
 ///
 /// These invariants are upheld by construction: `LocalRef` is `!Send`
 /// (via `*const T`) and only used inside `spawn_local` closures on the
-/// agent's `LocalSet`.
+/// agent's `LocalSet`. Every entrypoint that builds a `MvpAgent` must hold an
+/// `Rc` to it, declared before the `LocalSet`, so the agent outlives every
+/// task on the set on normal exit and unwind alike.
 pub(crate) struct LocalRef<T> {
     ptr: *const T,
 }
@@ -272,12 +274,15 @@ pub(crate) struct SessionSpawnOptions<'a> {
     /// defer this write until final catalog/fallback selection is committed.
     pub persist_initial_model: bool,
     pub session_meta: Option<&'a acp::Meta>,
+    pub persisted_agent_profile: Option<xai_grok_agent::AgentDefinition>,
     pub model_agent_type: Option<&'a str>,
     pub session_model_id: acp::ModelId,
     pub session_yolo_mode: bool,
     pub session_auto_mode: bool,
     pub session_swarm_mode: bool,
     pub prompt_display_cwd: Option<String>,
+    /// Sticky chat product kind for ACU / product skills sourcing.
+    pub is_chat_kind: bool,
 }
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
@@ -450,12 +455,14 @@ pub(crate) fn chat_session_spawn_options<'a>(
         resolved_tool_policy_override: None,
         persist_initial_model: true,
         session_meta,
+        persisted_agent_profile: None,
         model_agent_type,
         session_model_id,
         session_yolo_mode,
         session_auto_mode: false,
         session_swarm_mode: false,
         prompt_display_cwd: None,
+        is_chat_kind: false,
     }
 }
 /// `_meta.noReplay` → skip gateway replay (client already has the transcript).
@@ -634,6 +641,10 @@ struct SettingsUpdateNotification {
     group_tool_verbs: Option<bool>,
     collapsed_edit_blocks: Option<bool>,
     subscription_watch_interval_secs: Option<u64>,
+    /// The remote tier the pager's settings row shows beside the saved `[features]` key.
+    /// Omitted while the agent has no settings (the pager keeps the tier it seeded itself); `null` once fetched settings lack the key.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent_model_inheritance_enabled: Option<Option<bool>>,
 }
 /// When the announcements push gate emits despite an unchanged visible list.
 #[derive(Clone, Copy, Debug)]
@@ -1345,53 +1356,6 @@ impl AuthRequestMeta {
             .unwrap_or_default()
     }
 }
-/// Inject standard proxy headers into an `extra_headers` map.
-///
-/// Every authenticated request to cli-chat-proxy (web search, image gen, and
-/// any future tools that go through the proxy) must carry these headers.
-/// Centralising them here means new tool code paths only need one call instead
-/// of remembering which headers the proxy expects.
-///
-/// Headers injected:
-///  - `x-grok-client-version` -- required by the proxy's version-gate check.
-///    Uses `client_version` when provided, otherwise falls back to cli-chat-proxy
-///    compile-time `CARGO_PKG_VERSION`.
-///  - `X-XAI-Token-Auth` / `x-authenticateresponse` -- required by the
-///    cli-chat-proxy auth middleware when the `base_url` is a known proxy URL.
-///  - optional extra access header -- only set when the corresponding key is
-///    `Some` *and* the `base_url` points at a matching non-production host
-///    (requires the optional non-production feature).
-///
-/// Existing entries are never overwritten so callers can pre-set a value.
-fn inject_proxy_headers(
-    headers: &mut indexmap::IndexMap<String, String>,
-    client_version: Option<&str>,
-    alpha_test_key: Option<&str>,
-    base_url: &str,
-) {
-    headers
-        .entry("x-grok-client-version".to_string())
-        .or_insert_with(|| {
-            client_version
-                .map(String::from)
-                .unwrap_or_else(|| xai_grok_version::version().to_string())
-        });
-    headers
-        .entry("x-grok-client-identifier".to_string())
-        .or_insert_with(crate::http::process_client_identifier);
-    if crate::util::is_cli_chat_proxy_url(base_url) {
-        headers
-            .entry("X-XAI-Token-Auth".to_string())
-            .or_insert_with(|| "xai-grok-cli".to_string());
-        headers
-            .entry("x-authenticateresponse".to_string())
-            .or_insert_with(|| "authenticate-response".to_string());
-        headers
-            .entry(crate::http::CLIENT_MODE_HEADER.to_string())
-            .or_insert_with(|| crate::http::process_client_mode().to_string());
-    }
-    let _ = (alpha_test_key, base_url);
-}
 fn resolve_inference_idle_timeout_secs(
     models: &indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
     model: &str,
@@ -1468,6 +1432,7 @@ mod session_bus_host;
 mod agent_ops;
 mod acp_agent;
 mod session_setup;
+pub use session_setup::SessionSetupPhase;
 use session_registry::SessionRegistry;
 pub(crate) use session_lifecycle::RegistrySnapshot;
 pub(super) use super::ext_parsers;
@@ -1739,7 +1704,9 @@ impl MvpAgent {
                 output_file: std::path::PathBuf::new(),
                 truncated: false,
                 exit_code: None,
-                signal: Some("session_restart".to_string()),
+                signal: Some(
+                    xai_grok_tools::computer::types::SESSION_RESTART_SIGNAL.to_string(),
+                ),
                 completed: true,
                 kind: xai_grok_tools::computer::types::TaskKind::Bash,
                 block_waited: false,
@@ -2152,6 +2119,10 @@ impl MvpAgent {
                 collapsed_edit_blocks: rs.and_then(|s| s.collapsed_edit_blocks),
                 subscription_watch_interval_secs: rs
                     .and_then(|s| s.subscription_watch_interval_secs),
+                subagent_model_inheritance_enabled: rs.map(|s| {
+                    xai_grok_config_types::Feature::SubagentModelInheritance
+                        .remote_value(Some(s))
+                }),
             }
         };
         if let Ok(params) = serde_json::value::to_raw_value(&payload) {

@@ -26,7 +26,30 @@ pub fn remap_json_keys(
     }
 }
 
+/// Remap wrapper keys without silently overwriting a canonical/randomized collision.
+///
+/// # Errors
+/// Returns an error when two input keys map to one output key.
+pub fn remap_json_keys_checked(
+    value: serde_json::Value,
+    mapping: &HashMap<String, String>,
+) -> Result<serde_json::Value, String> {
+    let serde_json::Value::Object(object) = value else {
+        return Ok(value);
+    };
+    let mut mapped = serde_json::Map::new();
+    for (key, value) in object {
+        let key = mapping.get(&key).cloned().unwrap_or(key);
+        if mapped.insert(key, value).is_some() {
+            return Err("ambiguous wrapper parameter mapping".to_owned());
+        }
+    }
+    Ok(serde_json::Value::Object(mapped))
+}
+
 /// Build a reverse map (model-facing → canonical) from a canonical → model-facing map.
+///
+/// Panics in debug mode if two canonical names map to the same model-facing
 ///
 /// Panics in debug mode if two canonical names map to the same model-facing
 /// name (collision would silently drop one mapping).
@@ -81,6 +104,17 @@ pub fn remap_schema_properties(
         schema["required"] = serde_json::Value::Array(new_items);
     }
 
+    // Combinators constrain the same object; property schemas constrain server data.
+    for keyword in ["oneOf", "anyOf", "allOf"] {
+        if let Some(serde_json::Value::Array(branches)) = schema.get_mut(keyword) {
+            for branch in branches {
+                *branch = remap_schema_properties(branch, param_map);
+            }
+        }
+    }
+    if let Some(not) = schema.get_mut("not") {
+        *not = remap_schema_properties(not, param_map);
+    }
     schema
 }
 

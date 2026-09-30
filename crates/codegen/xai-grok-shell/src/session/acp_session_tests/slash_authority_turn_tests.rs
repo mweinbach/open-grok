@@ -620,7 +620,7 @@ fn parent_compact_and_available_skill_execute_but_other_slashes_stay_inert() {
                 "/plugins reload",
                 "/hooks-trust",
                 "/hooks-list",
-                "/memory off",
+                "/memory",
                 "/config set unsafe=true",
                 "/always-approve off",
                 "/yolo off",
@@ -725,7 +725,7 @@ fn parent_skill_lookup_matches_advertised_gated_collision_and_skill_only_loader(
                 .await;
             let skill_dir = tempfile::tempdir().unwrap();
             let skill_path = skill_dir.path().join("SKILL.md");
-            std::fs::write(&skill_path, "flush skill body for $ARGUMENTS").unwrap();
+            std::fs::write(&skill_path, "goal skill body for $ARGUMENTS").unwrap();
             *actor.agent.borrow_mut() = test_agent_with_tools(vec![
                 xai_grok_tools::registry::types::ToolConfig::for_tool::<
                     xai_grok_tools::implementations::opencode::OpenCodeSkillTool,
@@ -738,7 +738,7 @@ fn parent_skill_lookup_matches_advertised_gated_collision_and_skill_only_loader(
                     None,
                     None,
                     vec![xai_grok_tools::implementations::skills::types::SkillInfo {
-                        name: "flush".into(),
+                        name: "goal".into(),
                         description: "Skill colliding with gated memory builtin".into(),
                         path: skill_path.display().to_string(),
                         ..Default::default()
@@ -763,38 +763,38 @@ fn parent_skill_lookup_matches_advertised_gated_collision_and_skill_only_loader(
                 })
                 .map(|command| command.name.as_str())
                 .collect();
-            assert_eq!(advertised_skill_names, ["flush"]);
+            assert_eq!(advertised_skill_names, ["goal"]);
 
-            run_parent_turn(&actor, parent_request("/flush keep auth", Vec::new()))
+            run_parent_turn(&actor, parent_request("/goal keep auth", Vec::new()))
                 .await
-                .expect("exact advertised flush skill reaches the model");
+                .expect("exact advertised goal skill reaches the model");
             let invoked_request = server
                 .requests()
                 .into_iter()
                 .rev()
                 .find(|request| request.path == "/v1/responses")
                 .and_then(|request| request.body)
-                .expect("flush skill request body")
+                .expect("goal skill request body")
                 .to_string();
-            assert!(invoked_request.contains("flush skill body for keep auth"));
-            assert_eq!(actor.active_skill.lock().as_deref(), Some("flush"));
+            assert!(invoked_request.contains("goal skill body for keep auth"));
+            assert_eq!(actor.active_skill.lock().as_deref(), Some("goal"));
 
             run_parent_turn(
                 &actor,
-                parent_request("/local:flush qualified-only", Vec::new()),
+                parent_request("/local:goal qualified-only", Vec::new()),
             )
             .await
-            .expect("unadvertised qualified flush remains inert text");
+            .expect("unadvertised qualified goal remains inert text");
             let inert_request = server
                 .requests()
                 .into_iter()
                 .rev()
                 .find(|request| request.path == "/v1/responses")
                 .and_then(|request| request.body)
-                .expect("qualified flush request body")
+                .expect("qualified goal request body")
                 .to_string();
-            assert!(inert_request.contains("/local:flush qualified-only"));
-            assert!(!inert_request.contains("flush skill body for qualified-only"));
+            assert!(inert_request.contains("/local:goal qualified-only"));
+            assert!(!inert_request.contains("goal skill body for qualified-only"));
         })
     });
 }

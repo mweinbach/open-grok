@@ -118,6 +118,21 @@ impl Theme {
             link_fg: Color::Blue,
         }
     }
+
+    /// Zero opaque cells: every bg stays `Reset` so the terminal canvas shows through (a bright-black band is unreadable on some palettes).
+    /// Emphasis is reverse/bold. Decoration uses bright black as foreground; only `prompt_border_active` keeps full default fg.
+    pub const fn terminal() -> Self {
+        let mut theme = Self::terminal_default();
+        theme.selection_border = Color::DarkGray;
+        theme.hover_border = Color::DarkGray;
+        theme.prompt_border = Color::DarkGray;
+        theme.scrollbar_fg = Color::DarkGray;
+        // Decoration only (borders, dividers, gutters) via direct
+        // `fg(gray_dim)` reads; readable content goes through
+        // `Theme::dim()`/`muted()`, which stay on Reset + DIM here.
+        theme.gray_dim = Color::DarkGray;
+        theme
+    }
 }
 
 #[cfg(test)]

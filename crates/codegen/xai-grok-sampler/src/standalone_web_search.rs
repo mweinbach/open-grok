@@ -289,6 +289,7 @@ mod tests {
 
     fn config(base_url: String) -> SamplerConfig {
         SamplerConfig {
+            max_request_bytes: None,
             api_key: Some("codex-token".to_string()),
             base_url,
             model: "gpt-test".to_string(),

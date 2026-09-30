@@ -122,6 +122,7 @@ fn test_config(base_url: String, model: &str) -> SamplerConfig {
         query_params: IndexMap::new(),
         env_http_headers: IndexMap::new(),
         context_window: 128_000,
+        max_request_bytes: None,
         // Axum mocks speak cleartext HTTP/1.1; keep the fallback path simple.
         force_http1: true,
         // Keep retries minimal so tests don't take forever.

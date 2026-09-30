@@ -130,6 +130,9 @@ fn parse_plugin_name(source_label: &str) -> Option<String> {
 #[serde(rename_all = "camelCase")]
 pub struct McpsListResponse {
     pub servers: Vec<McpsServerEntry>,
+    /// Session-scoped. True when session MCP init reports `is_initialized`.
+    #[serde(default)]
+    pub session_mcp_resolved: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -163,6 +166,10 @@ pub struct McpsServerSession {
     pub auth_required: bool,
     #[serde(default)]
     pub setup_required: bool,
+    /// Managed-policy verdict for a server the merge dropped (absent on
+    /// older shells and on live servers).
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
@@ -213,6 +220,8 @@ pub struct McpServerInfo {
     pub tools: Vec<McpToolDetail>,
     /// Whether the server is enabled in config.
     pub enabled: bool,
+    /// Policy verdict text for the expanded row; `status` carries the classification.
+    pub blocked_reason: Option<String>,
     /// Display label from `source_label` or wire `source` (e.g. `"plugin: foo"`).
     pub source: String,
     /// Wire `source` enum before display overlay.
@@ -229,6 +238,8 @@ pub enum McpServerDisplayStatus {
     SetupRequired,
     Unavailable,
     Initializing,
+    /// Dropped by managed (organization) policy; the row says why it will not start.
+    BlockedByPolicy,
 }
 
 impl McpServerDisplayStatus {
@@ -240,6 +251,7 @@ impl McpServerDisplayStatus {
             Self::SetupRequired => theme.warning,
             Self::Unavailable => theme.accent_error,
             Self::Initializing => theme.running,
+            Self::BlockedByPolicy => theme.accent_error,
         }
     }
 
@@ -251,6 +263,7 @@ impl McpServerDisplayStatus {
             Self::SetupRequired => "setup required",
             Self::Unavailable => "unavailable",
             Self::Initializing => "initializing",
+            Self::BlockedByPolicy => "blocked by policy",
         }
     }
 }
@@ -263,8 +276,17 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
             let (status, tool_count, tools, auth_required, enabled) =
                 if let Some(session) = &entry.session {
                     let enabled = session.enabled;
-                    // Prefer setupRequired bool; status is a fallback for older shells.
-                    if session.setup_required {
+                    // The shell sets blockedReason only on servers its merge dropped: a terminal
+                    // verdict, so it outranks the live setup/auth statuses.
+                    if session.blocked_reason.is_some() {
+                        (
+                            McpServerDisplayStatus::BlockedByPolicy,
+                            0,
+                            vec![],
+                            false,
+                            false,
+                        )
+                    } else if session.setup_required {
                         (
                             McpServerDisplayStatus::SetupRequired,
                             0,
@@ -317,11 +339,8 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
                 .source_label
                 .or(entry.source)
                 .unwrap_or_else(|| "local".to_string());
-            let setup_required = entry
-                .session
-                .as_ref()
-                .is_some_and(|session| session.setup_required)
-                || matches!(status, McpServerDisplayStatus::SetupRequired);
+            // Derived from the status so a policy-blocked row cannot also open the setup form.
+            let setup_required = status == McpServerDisplayStatus::SetupRequired;
             McpServerInfo {
                 name: entry.name,
                 display_name: entry.display_name,
@@ -333,6 +352,7 @@ pub fn convert_list_response(resp: McpsListResponse) -> Vec<McpServerInfo> {
                 setup_values: entry.setup_values.unwrap_or_default(),
                 tools,
                 enabled,
+                blocked_reason: entry.session.and_then(|s| s.blocked_reason),
                 source,
                 wire_source,
                 plugin_name,
@@ -411,6 +431,7 @@ mod tests {
             setup_values: std::collections::HashMap::new(),
             tools: Vec::new(),
             enabled: true,
+            blocked_reason: None,
             source: "local".to_string(),
             wire_source: McpWireSource::Local,
             plugin_name: None,
@@ -447,12 +468,58 @@ mod tests {
                     tools: vec![],
                     auth_required: false,
                     setup_required: false,
+                    blocked_reason: None,
                 }),
             }],
+            session_mcp_resolved: None,
         })
         .into_iter()
         .next()
         .unwrap()
+    }
+
+    /// A policy-dropped server (wire `blockedReason`) converts to the "blocked by policy" status
+    /// with its reason kept; an old shell that omits the field keeps the "unavailable" fallback.
+    #[test]
+    fn convert_list_response_labels_policy_blocked_servers() {
+        let convert = |session: serde_json::Value| {
+            let entry: McpsServerEntry =
+                serde_json::from_value(serde_json::json!({ "name": "corp", "session": session }))
+                    .unwrap();
+            convert_list_response(McpsListResponse {
+                servers: vec![entry],
+                session_mcp_resolved: None,
+            })
+            .remove(0)
+        };
+
+        let blocked = convert(serde_json::json!({
+            "enabled": false,
+            "blockedReason": "matches deniedMcpServers (/etc/grok/managed_config.toml)"
+        }));
+        assert_eq!(blocked.status, McpServerDisplayStatus::BlockedByPolicy);
+        assert_eq!(blocked.status.label(), "blocked by policy");
+        assert!(!blocked.enabled);
+        assert_eq!(
+            blocked.blocked_reason.as_deref(),
+            Some("matches deniedMcpServers (/etc/grok/managed_config.toml)")
+        );
+
+        // The verdict outranks a co-emitted setup flag, including the field the setup form keys on.
+        let blocked_setup = convert(serde_json::json!({
+            "enabled": false,
+            "setupRequired": true,
+            "blockedReason": "matches deniedMcpServers (/etc/grok/managed_config.toml)"
+        }));
+        assert_eq!(
+            blocked_setup.status,
+            McpServerDisplayStatus::BlockedByPolicy
+        );
+        assert!(!blocked_setup.setup_required);
+
+        let disabled = convert(serde_json::json!({ "enabled": false }));
+        assert_eq!(disabled.status, McpServerDisplayStatus::Unavailable);
+        assert_eq!(disabled.blocked_reason, None);
     }
 
     #[test]
@@ -605,6 +672,7 @@ mod tests {
                     tools: vec![],
                     auth_required: false,
                     setup_required: false,
+                    blocked_reason: None,
                 }),
             }
         }
@@ -613,6 +681,7 @@ mod tests {
                 gateway_entry("managed_gateway:zeta", "Alpha"),
                 gateway_entry("managed_gateway:alpha", "Zeta"),
             ],
+            session_mcp_resolved: None,
         });
         assert_eq!(servers[0].display_name.as_deref(), Some("Alpha"));
         assert_eq!(servers[0].name, "managed_gateway:zeta");
@@ -648,8 +717,10 @@ mod tests {
                     tools: vec![],
                     auth_required: true,
                     setup_required: true,
+                    blocked_reason: None,
                 }),
             }],
+            session_mcp_resolved: None,
         });
         assert_eq!(servers.len(), 1);
         assert!(servers[0].setup_required);
@@ -726,6 +797,7 @@ mod tests {
                 enabled: true,
             }],
             enabled: true,
+            blocked_reason: None,
             source: "local".into(),
             wire_source: McpWireSource::Local,
             plugin_name: None,

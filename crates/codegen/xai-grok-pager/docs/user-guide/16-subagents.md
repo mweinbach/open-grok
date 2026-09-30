@@ -27,9 +27,10 @@ Manage both in the agents modal. Open it with `/config-agents` (alias `/agents`)
 
 ## Disabling Subagents
 
-Disable subagents with an environment variable or the config file:
+Disable subagents with a CLI flag, an environment variable, or the config file (highest priority first). The same rules apply to the interactive `open-grok` TUI, `open-grok agent stdio`, and headless runs.
 
 ```bash
+grok --no-subagents                  # This session only
 export GROK_SUBAGENTS=0              # Environment variable
 ```
 
@@ -38,6 +39,8 @@ export GROK_SUBAGENTS=0              # Environment variable
 [subagents]
 enabled = false
 ```
+
+Only an explicit `enabled = false` turns subagents off. A `[subagents]` table that sets `max_depth`, `[subagents.models]`, or `[subagents.toggle]` without an `enabled` key keeps them on.
 
 ---
 
@@ -55,7 +58,7 @@ The parent receives the child's output -- usually a summary -- when the child fi
 
 ## Built-in Agent Types
 
-The `spawn_subagent` tool accepts a `subagent_type` parameter that selects the child's role:
+Built-in types still exist as host types. The model-facing spawn schema omits `subagent_type`. An omitted key is `general-purpose`.
 
 | Type              | Description                                          |
 | ----------------- | ---------------------------------------------------- |
@@ -142,18 +145,18 @@ If a persona is requested but cannot be resolved -- it is not found, has no inst
 
 The main agent calls the `spawn_subagent` tool. Its parameters:
 
-| Parameter         | Description                                                       |
-| ----------------- | ---------------------------------------------------------------- |
-| `prompt`          | The full task prompt for the subagent.                           |
-| `description`     | A short label for the task (3-5 words).                          |
-| `subagent_type`   | The agent type to launch. Defaults to `general-purpose`.         |
-| `background`       | Run the subagent in the background and return immediately with a subagent ID. Defaults to `false`. |
-| `capability_mode` | Restrict the subagent's tools: `read-only`, `read-write`, `execute`, or `all`. |
-| `isolation`       | `none` (shared workspace, the default) or `worktree` (isolated git worktree). |
-| `resume_from`     | Continue a completed subagent's conversation. Pass its subagent ID. |
-| `cwd`             | Working directory for the subagent. Mutually exclusive with `isolation: worktree`; ignored when `resume_from` is set (the resumed child inherits its source's directory). |
-| `model`           | Optional model slug. Omit it to inherit the parent model; resumed agents keep their source model. |
-| `reasoning_effort` | Optional effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. Omit it to use role/persona defaults and then the parent session. It may be supplied when resuming and must be supported by the effective model. |
+| Parameter           | Description                                                       |
+| ------------------- | ---------------------------------------------------------------- |
+| `prompt`            | The full task prompt for the subagent.                           |
+| `description`       | A short label for the task (3-5 words).                          |
+| `subagent_type`     | The agent type to launch. Defaults to `general-purpose`.         |
+| `run_in_background` | Run in the background and return a subagent ID. Defaults to `true`. |
+| `capability_mode`   | Restrict the subagent's tools: `read-only`, `read-write`, `execute`, or `all`. |
+| `isolation`         | `none` (shared workspace, the default) or `worktree` (isolated git worktree). |
+| `resume_from`       | Continue a completed subagent's conversation. Pass its subagent ID. |
+| `cwd`               | Working directory for the subagent. Mutually exclusive with `isolation: worktree`; ignored when `resume_from` is set (the resumed child inherits its source's directory). |
+| `model`             | Optional model slug. Omit it to inherit the parent model; resumed agents keep their source model. |
+| `reasoning_effort`  | Optional effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or `ultra`. Omit it to use role/persona defaults and then the parent session. It may be supplied when resuming and must be supported by the effective model. |
 
 When you run a subagent in the background, retrieve its result later with `get_command_or_subagent_output`.
 
@@ -217,6 +220,14 @@ The model-facing `agent_swarm` tool supports:
 | `resume_agent_ids` | Ordered object mapping completed subagent IDs to continuation prompts. Resumed members run first and keep their original profile. |
 
 Open Grok validates the full swarm before starting any child. It launches up to five members immediately, then ramps additional members every 700 ms. If an in-process provider rate-limits a member, the swarm card shows that live child as waiting while the scheduler retries the same session after 3 s, 6 s, 12 s, and progressively longer delays. Waiting retries take priority over resumes and new members; concurrency shrinks during repeated rate limits and recovers after a quiet period. A rate-limited member fails normally when it is the only unfinished member, so the swarm cannot remain suspended forever.
+
+The transcript shows each send as a one-line `Message` row: a verb for the outcome, then the subagent's label (its persona, role, tag, or Subagent fallback) and its description in curly quotes, as its `Subagent …: “…”` scrollback row quotes it, clamped to the first line and 40 characters. The verb carries the delivery, so a steer stays unmarked:
+
+- `Message sent to Subagent “find callers”` (steer)
+- `Message queued for Subagent “find callers”` / `Message interjected to Subagent “find callers”`
+- `Message sending to …` with an animated bullet while the send is in flight
+- `Message rejected · Subagent “find callers”` for a refused send, `Message unconfirmed · Subagent “find callers”` for one the shell could not confirm
+- `Message sent to parent` when a child messages its parent
 
 Swarms use the same flat subagent tree: swarm members cannot spawn `task` or another `agent_swarm`.
 
@@ -301,6 +312,8 @@ The new subagent inherits the source's transcript, tool state, and model; its sy
 
 ### MCP inheritance
 
+The primary session overlays the active agent’s `mcpServers` frontmatter onto the disk/client merge by name (agent.md headers beat `config.toml`). Switching the primary agent replaces that overlay with the new seat only. Child inline `mcpServers` still become owned clients and beat inherited shared clients. Plugin agents cannot declare `mcpServers`.
+
 Subagents inherit the parent session’s **already-connected** MCP servers by default. That includes local stdio/HTTP servers and plugin-sourced agents (for example `my-plugin:reviewer`). The child discovers and calls those tools with `search_tool` / `use_tool` the same way the parent does.
 
 Control inheritance with agent frontmatter `mcpInheritance`:
@@ -363,6 +376,18 @@ explore = "grok-build"               # route explore to a specific model
 ```
 
 Per-type model overrides apply for any parent. Without an override, a subagent inherits the parent's model.
+
+### Model Selection by the Agent
+
+The `spawn_subagent` tool offers the agent a `model` argument, and its description lists the models you can pick, for when you explicitly ask for a subagent on a different model. With `[features] subagent_model_inheritance = true` (or `GROK_SUBAGENT_MODEL_INHERITANCE=1`), both are hidden whenever every model in your picker is an xAI model: subagents then always inherit the parent's model, and a spawn that still names one fails with a message asking the agent to retry without it. Catalogs with a third-party model, a model with no declared family, or a catalog still loading keep the argument. `[subagents.models]` pins, roles, and personas are unaffected. Read when a session starts; changing it requires a restart. Precedence: a `requirements.toml`/MDM pin, then the environment variable, then `config.toml`, then remote settings, then the default (off).
+
+You can also toggle it from `/settings` → Models → **Subagent model inheritance**:
+
+- On: Grok cannot set models for subagents
+- Off: Grok may choose a different model for a subagent. Takes effect after restart.
+- NOTE: This setting only applies when all models are xAI "model_family". You likely don't need to configure this setting.
+
+The row shows the value that applies after restart. Toggling writes `[features] subagent_model_inheritance = true` or `= false` (an explicit `false` overrides a remote `true`); `d` (reset) deletes the key so `managed_config.toml`, remote settings, or the default apply again. Agents already running keep the mode they started with. When a layer your `config.toml` cannot override decides the value — a `requirements.toml`/MDM pin, the environment variable, the `GROK_CONFIG` overlay, or an active campaign — both the toggle and the reset are refused with a toast that names that layer.
 
 ### Custom Roles and Personas
 
@@ -427,8 +452,36 @@ As noted above — grouped under "Subagents", with spinners, elapsed times, and 
 When you open a subagent (from a scrollback block or the tasks pane), the parent view is replaced by a bordered frame containing the child's full transcript:
 
 - Title bar inside the frame: status icon (spinner / ✓ / ✗), label + bold description + model, optional "resumed"/"forked" badge, live activity · elapsed time, and [✗] close button.
-- The child's own scrollback, thinking, tool calls, and (limited) prompt area render inside the frame.
-- Subagent views are largely observational — you generally cannot send new top-level prompts directly to them the way you can a parent session.
+- The child's own scrollback, thinking, and tool calls render inside the frame.
+- The parent tasks pane, todos pane, dock, and catalog hide for the duration of the view.
+
+This view is observational. The composer is hidden (zero rows). You cannot focus it, type a prompt, stash a draft, or send a follow-up from here. The parent session still owns prompts. To steer a running child, close the view and use `send_message` from the parent (see [Agent Mailboxes](#agent-mailboxes)).
+
+**What still works**
+
+- Scroll, fold, copy, open links, and open the block viewer on the child's transcript.
+- `Ctrl+C` cancels **this child's** turn. It does not cancel the parent.
+- `Ctrl+.` / `Ctrl+X` opens the shortcuts cheatsheet for the child's keys.
+- The child view paints no `[Dashboard]` button. Inside the dashboard overlay the button is the way back.
+- Idle `Enter` in the **block viewer** quotes the selected line into the parent composer and closes the view.
+
+**What does nothing (fail closed)**
+
+Root-only chords never start on this surface. They do not open a modal on the child, and they do not leak to the parent:
+
+- Command palette (`Ctrl+P`), model picker (`Ctrl+M`), session picker (`F3`)
+- Settings, extensions, always-approve (`Ctrl+O`), send-to-background (`Ctrl+B`)
+- External prompt editor, Shift+Tab mode cycle
+
+A denied action is a silent redraw. There is no toast.
+
+If a prompt-queue overlay appears, it is a **read-only mirror**. You cannot edit, send-now, or remove rows. Queue RPCs always target the parent session.
+
+**How to leave**
+
+- `q` or `Esc` from bare scrollback, or click [✗].
+- If scrollback search is open, `q` / `Esc` closes search first. A later press closes the view.
+- `Ctrl+Q` always quits Open Grok. It is never swallowed here.
 
 Use `q`, `Esc`, or click the close button to pop back to the parent view. The parent's scrollback continues to show the subagent's status.
 

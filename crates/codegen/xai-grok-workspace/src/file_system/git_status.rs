@@ -32,7 +32,7 @@ pub async fn git_status(working_directory: impl Into<PathBuf>) -> Result<String,
 
 /// Matches Node's default `execFile` `maxBuffer` (1 MiB). This cap is
 /// load-bearing: `git status` output at or above it makes the spawn throw, so
-/// the repo is dropped from `<git_status>` entirely (never truncated).
+/// the repo is dropped from the status result entirely (never truncated).
 /// Oversized output is treated as an error -- the caller maps `Err` to a
 /// dropped section.
 const GIT_STATUS_BUFFER_LIMIT: usize = 1024 * 1024;

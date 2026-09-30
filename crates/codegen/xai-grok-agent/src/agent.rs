@@ -8,7 +8,7 @@ use xai_grok_tools::types::definition::ToolDefinition;
 
 use crate::compaction::CompactionPolicy;
 use crate::config::{AgentDefinition, CompletionRequirement, PermissionMode};
-use crate::prompt::context::PromptContext;
+use crate::prompt::context::{PromptContext, RenderedPrompt};
 use crate::system_reminder::ReminderPolicy;
 
 /// A fully built agent: definition + session context.
@@ -163,6 +163,11 @@ impl Agent {
     /// The structured prompt context for inspection and re-rendering.
     pub fn prompt_context(&self) -> &PromptContext {
         &self.prompt_context
+    }
+
+    /// The pair comes only from [`PromptContext::render_paired`], so the installed context always matches its prompt.
+    pub fn set_rendered_prompt(&mut self, rendered: RenderedPrompt) {
+        (self.prompt_context, self.system_prompt) = rendered.into_parts();
     }
 
     /// Audience this agent's prompt was rendered for (Primary or Subagent).

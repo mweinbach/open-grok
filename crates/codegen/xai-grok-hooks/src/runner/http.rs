@@ -1038,6 +1038,7 @@ mod tests {
             session_id: "test",
             workspace_root: "/tmp",
             process_scope: None,
+            disabled: Default::default(),
         }
     }
 
@@ -1118,6 +1119,7 @@ mod tests {
             session_id: "10.0.0.1",
             workspace_root: "/tmp",
             process_scope: None,
+            disabled: Default::default(),
         };
 
         let (result, _, info, _) = run_http_hook(&spec, &envelope, &context, GateKind::Tool).await;

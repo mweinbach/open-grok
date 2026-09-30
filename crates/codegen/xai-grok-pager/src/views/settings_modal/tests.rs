@@ -912,6 +912,7 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "screen_mode",
             "show_timestamps",
             "show_timeline",
+            "dashboard_preview",
             // PAGER-owned page_flip_on_send (Appearance).
             "page_flip_on_send",
             "simple_mode",
@@ -988,6 +989,9 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             "image_generation_provider",
             // SHELL-owned default_model (Models category).
             "default_model",
+            // SHELL-owned `[features]` row (Models category, registered right after default_model)
+            "subagent_model_inheritance",
+            // Models category. `default_reasoning_effort`, `web_search_model`, and `session_summary_model` are not exposed in the modal.
             // Kimi service selector and isolated credentials.
             "kimi_api_endpoint",
             "kimi_api_key",
@@ -1026,9 +1030,6 @@ fn rows_contain_categories_and_settings_through_pr_14() {
             // Auxiliary model selectors persist IDs while rendering names.
             "recap_model",
             "memory_model",
-            // Models category. `default_reasoning_effort`,
-            // `web_search_model`, and `session_summary_model` are
-            // not exposed in the modal.
             "fork_secondary_model",
             // `auto_compact_threshold_percent` (Session category) is
             // not exposed in the modal.
@@ -8116,8 +8117,57 @@ fn locked_coding_data_sharing_row_renders_locked_value_without_chevron() {
     );
 }
 
-/// Expanding a locked row replaces the registry description with the lock
-/// reason; the unlocked expansion shows the description.
+/// A `\n` in a description starts a new painted line in the expanded detail instead of rendering as a control cell.
+#[test]
+fn expanded_description_newlines_start_new_lines() {
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 80,
+    };
+    let mut s = make_state();
+    let description = s
+        .registry
+        .find("subagent_model_inheritance")
+        .expect("registered")
+        .description;
+    let paragraph_heads: Vec<String> = description
+        .split('\n')
+        .map(|paragraph| {
+            paragraph
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    assert!(
+        paragraph_heads.len() > 1,
+        "the row's description is multi-line"
+    );
+    s.selected = s
+        .rows
+        .iter()
+        .position(
+            |r| matches!(r, RowEntry::Setting { key, .. } if *key == "subagent_model_inheritance"),
+        )
+        .expect("row present");
+    s.expanded_keys.insert("subagent_model_inheritance");
+    let mut buf = Buffer::empty(area);
+    render_rows(&mut buf, area, &mut s, &Theme::current());
+    let rows: Vec<String> = (0..area.height)
+        .map(|y| buf_row_text(&buf, y, area.x, area.width).trim().to_owned())
+        .collect();
+    for head in &paragraph_heads {
+        assert!(
+            rows.iter().any(|row| row.starts_with(head.as_str())),
+            "paragraph {head:?} must begin a painted line: {rows:?}"
+        );
+    }
+}
+
+/// Expanding a locked row replaces the registry description with the lock reason; the unlocked expansion shows the description.
 #[test]
 fn locked_coding_data_sharing_expanded_description_replaces_with_reason() {
     let area = Rect {

@@ -45,10 +45,26 @@ impl FuzzyMatcher {
         items: &[T],
         query: &str,
         limit: usize,
-        mut key_fn: F,
+        key_fn: F,
     ) -> Vec<(usize, u32)>
     where
         F: FnMut(&T) -> &str,
+    {
+        self.rank_either(items, query, limit, key_fn, |_| "")
+    }
+
+    /// Rank by `key_a`, then `key_b` when `key_a` misses. Ties keep the `key_a` hit first.
+    pub fn rank_either<T, A, B>(
+        &mut self,
+        items: &[T],
+        query: &str,
+        limit: usize,
+        mut key_a: A,
+        mut key_b: B,
+    ) -> Vec<(usize, u32)>
+    where
+        A: FnMut(&T) -> &str,
+        B: FnMut(&T) -> &str,
     {
         if limit == 0 || items.is_empty() {
             return Vec::new();
@@ -63,28 +79,39 @@ impl FuzzyMatcher {
         self.pattern
             .reparse(0, trimmed, CaseMatching::Smart, Normalization::Smart, false);
 
-        let mut hits: Vec<(usize, u32, String)> = Vec::new();
+        let mut hits: Vec<(usize, u32, u8, String)> = Vec::new();
         for (idx, item) in items.iter().enumerate() {
-            let text = key_fn(item);
-            if text.is_empty() {
+            let primary = key_a(item);
+            let (score, fallback_rank) = if let Some(score) = self.score_prepared(primary) {
+                (score, 0_u8)
+            } else if let Some(score) = self.score_prepared(key_b(item)) {
+                (score, 1)
+            } else {
                 continue;
-            }
-            let matcher_text = Utf32String::from(text);
-            if let Some(score) = self
-                .pattern
-                .score(std::slice::from_ref(&matcher_text), &mut self.matcher)
-            {
-                hits.push((idx, score, text.to_owned()));
-            }
+            };
+            hits.push((idx, score, fallback_rank, primary.to_owned()));
         }
 
-        hits.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.2.cmp(&b.2)));
+        hits.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.3.cmp(&b.3))
+        });
         if hits.len() > limit {
             hits.truncate(limit);
         }
         hits.into_iter()
-            .map(|(idx, score, _)| (idx, score))
+            .map(|(idx, score, _, _)| (idx, score))
             .collect()
+    }
+
+    fn score_prepared(&mut self, text: &str) -> Option<u32> {
+        if text.is_empty() {
+            return None;
+        }
+        let matcher_text = Utf32String::from(text);
+        self.pattern
+            .score(std::slice::from_ref(&matcher_text), &mut self.matcher)
     }
 
     /// Extract fuzzy match highlight indices for the most recent pattern.
@@ -183,5 +210,52 @@ mod tests {
         // Matcher limit=1 secondary sort is ascending key text → pager-headless wins.
         let top1 = matcher.rank(&items, "p", 1, |item| item);
         assert_eq!(items[top1[0].0], "pager-headless");
+    }
+
+    #[test]
+    fn label_fallback_matches_when_id_misses() {
+        let mut matcher = FuzzyMatcher::new();
+        let items = [("max", "Extra High")];
+        let hits = matcher.rank_either(&items, "extra", items.len(), |item| item.0, |item| item.1);
+        assert_eq!(hits.first().map(|&(idx, _)| idx), Some(0));
+        let id_only = matcher.rank(&items, "extra", items.len(), |item| item.0);
+        assert!(id_only.is_empty());
+    }
+
+    #[test]
+    fn id_hit_keeps_its_score_when_label_scores_higher() {
+        let mut matcher = FuzzyMatcher::new();
+        let items = [("x-high", "high")];
+        let either = matcher.rank_either(&items, "high", 1, |item| item.0, |item| item.1);
+        let id_only = matcher.rank(&items, "high", 1, |item| item.0);
+        let label_only = matcher.rank(&items, "high", 1, |item| item.1);
+        let either_score = either.first().map(|&(_, score)| score);
+        let id_score = id_only.first().map(|&(_, score)| score);
+        let label_score = label_only.first().map(|&(_, score)| score);
+        assert_eq!(either_score, id_score);
+        assert!(
+            label_score > id_score,
+            "fixture must score the label above the id: label={label_score:?} id={id_score:?}"
+        );
+    }
+
+    #[test]
+    fn tied_id_hit_outranks_earlier_label_match_text() {
+        let mut matcher = FuzzyMatcher::new();
+        let items = [("a max", "Very High"), ("b high", "High")];
+        let hits = matcher.rank_either(&items, "high", items.len(), |item| item.0, |item| item.1);
+        let id_score = hits
+            .iter()
+            .find(|&&(idx, _)| idx == 1)
+            .map(|&(_, score)| score);
+        let label_score = hits
+            .iter()
+            .find(|&&(idx, _)| idx == 0)
+            .map(|&(_, score)| score);
+        assert_eq!(
+            id_score, label_score,
+            "fixture must share a score bucket: id={id_score:?} label={label_score:?} hits={hits:?}"
+        );
+        assert_eq!(hits.first().map(|&(idx, _)| idx), Some(1));
     }
 }

@@ -3,8 +3,6 @@
 use super::*;
 use xai_grok_shell::sampling::error::is_free_usage_exhausted_error;
 
-// ── Credit-limit upsell / max-tier tests ───────────────────────────
-
 /// Open the non-max-tier Q&A upsell modal. Panics if the modal was not created.
 fn open_upsell_qa(app: &mut AppView, mode: CreditLimitUpsellMode) {
     let agent = app.agents.get_mut(&AgentId(0)).unwrap();
@@ -210,6 +208,7 @@ fn send_prompt_now_clears_credit_limit_stash() {
         Action::SendPromptNow {
             text: "steer it".into(),
             images: Vec::new(),
+            image_notice: None,
         },
         &mut app,
     );
@@ -355,7 +354,7 @@ fn credit_limit_retry_waits_for_provider_and_model_rebind() {
         assert_eq!(agent.session.pending_prompts[0].text, "retry me");
         agent.session.provider_rebind_pending = false;
         agent.session.model_switch_pending = false;
-        let effects = maybe_drain_queue(agent).effects;
+        let effects = maybe_drain_queue(agent, &mut app.pending_image_notices).effects;
         assert_eq!(
             effects
                 .iter()
@@ -365,7 +364,11 @@ fn credit_limit_retry_waits_for_provider_and_model_rebind() {
                 .count(),
             1
         );
-        assert!(maybe_drain_queue(agent).effects.is_empty());
+        assert!(
+            maybe_drain_queue(agent, &mut app.pending_image_notices)
+                .effects
+                .is_empty()
+        );
     }
 }
 
@@ -394,9 +397,13 @@ fn credit_limit_retry_waits_for_server_owned_queue() {
     assert_eq!(agent.session.pending_prompts[0].text, "retry me");
     assert_eq!(agent.shared_queue[0].id, "server-first");
     agent.shared_queue.clear();
-    let effects = maybe_drain_queue(agent).effects;
+    let effects = maybe_drain_queue(agent, &mut app.pending_image_notices).effects;
     assert!(matches!(effects.as_slice(), [Effect::SendPrompt { text, .. }] if text == "retry me"));
-    assert!(maybe_drain_queue(agent).effects.is_empty());
+    assert!(
+        maybe_drain_queue(agent, &mut app.pending_image_notices)
+            .effects
+            .is_empty()
+    );
 }
 
 #[test]
@@ -830,8 +837,6 @@ fn upsell_max_tier_idempotent_when_question_view_already_open() {
     assert_eq!(agent.prompt.text(), "draft");
 }
 
-// ── ShowUsage / session usage ───────────────────────────────────────
-
 fn is_session_usage_fetch(effects: &[Effect]) -> bool {
     matches!(
         effects,
@@ -1210,8 +1215,6 @@ fn session_usage_failed_drops_stale_session() {
     assert_eq!(agent_scrollback_len(&app), before);
 }
 
-// ── BillingFetched dispatch tests ───────────────────────────────────
-
 #[test]
 fn billing_fetched_updates_app_credit_balance() {
     let mut app = test_app_with_agent();
@@ -1468,8 +1471,6 @@ fn app_billing_fetched_stores_autotopup() {
     assert!(app.auto_topup.is_some_and(|at| !at.enabled));
 }
 
-// ── BillingError dispatch tests ─────────────────────────────────────
-
 #[test]
 fn billing_error_silent_does_not_push_scrollback() {
     let mut app = test_app_with_agent();
@@ -1509,8 +1510,6 @@ fn billing_error_non_silent_pushes_error_message() {
         "non-silent billing error should push an error message"
     );
 }
-
-// ── Free-usage paywall tests ────────────────────────────────────────
 
 #[test]
 fn free_usage_error_detected_by_embedded_code() {
@@ -1657,8 +1656,6 @@ fn free_usage_translate_local_submit_maps_options() {
     }
 }
 
-// ── Restricted-command upsell tests ─────────────────────────────────
-
 /// Submitting a tier-restricted command opens the three-option SuperGrok
 /// upsell and neither runs the command nor leaks the text to the model.
 #[test]
@@ -1787,8 +1784,6 @@ fn unknown_non_restricted_command_still_passes_through() {
         "no upsell for genuinely unknown commands"
     );
 }
-
-// ── Browser-unavailable URL fallback ────────────────────────────────
 
 /// When the OS browser opener cannot run (simulated via a broken
 /// `GROK_TEST_OPEN_URL_FILE` seam), `Action::OpenUrl` for a billing CTA

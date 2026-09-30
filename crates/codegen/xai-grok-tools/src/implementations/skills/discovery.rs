@@ -14,6 +14,8 @@ use crate::types::compat::CompatConfig;
 
 pub const MAX_DESCRIPTION_LEN: usize = 1024;
 pub const MAX_NAME_LEN: usize = 64;
+/// `origin:` is a telemetry identifier, so it is held to a tighter slug than `name`.
+pub const MAX_ORIGIN_LEN: usize = 32;
 pub const MAX_FRONTMATTER_BYTES: usize = 4096;
 pub const MAX_BODY_PEEK_BYTES: usize = 2048;
 pub const MAX_SKILL_WALK_DEPTH: usize = 5;
@@ -169,6 +171,19 @@ fn parse_boolean_frontmatter(value: Option<&serde_yaml::Value>) -> bool {
         || matches!(value, Some(Value::String(s)) if s == "true")
 }
 
+/// Parse the `origin:` provenance slug (the tool that wrote the skill, e.g. `learn`). The value is
+/// trimmed and lowercased, then accepted only as `[a-z0-9-]{1,MAX_ORIGIN_LEN}`; anything else is
+/// `None`, so telemetry never carries a free-form user string.
+fn parse_origin_frontmatter(value: Option<&serde_yaml::Value>) -> Option<String> {
+    let origin = value?.as_str()?.trim().to_ascii_lowercase();
+    let is_slug = !origin.is_empty()
+        && origin.len() <= MAX_ORIGIN_LEN
+        && origin
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    is_slug.then_some(origin)
+}
+
 /// Coerce `allowed-tools`: a comma- or space-delimited string, or a YAML list.
 /// Separators inside `()` are kept whole so a spec like `Bash(git diff:*)`
 /// survives. A wrong type yields `None`.
@@ -316,6 +331,8 @@ pub struct ParsedFrontmatter {
     pub has_user_specified_description: bool,
     /// Glob patterns gating when the skill is surfaced. None = always.
     pub paths: Option<Vec<String>>,
+    /// Validated `origin:` slug naming the tool that wrote the skill. None = absent or invalid.
+    pub origin: Option<String>,
 }
 
 #[derive(Debug)]
@@ -566,6 +583,7 @@ pub fn parse_skill_frontmatter(
         when_to_use,
         has_user_specified_description,
         paths,
+        origin: parse_origin_frontmatter(frontmatter.get("origin")),
     })
 }
 
@@ -713,6 +731,7 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
                             when_to_use: None,
                             has_user_specified_description: false,
                             paths: None,
+                            origin: None,
                         },
                         _ => return None,
                     }
@@ -738,6 +757,7 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
                             when_to_use: None,
                             has_user_specified_description: false,
                             paths: None,
+                            origin: None,
                         },
                         _ => return None,
                     }
@@ -807,6 +827,7 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
                 when_to_use: parsed.when_to_use,
                 has_user_specified_description: parsed.has_user_specified_description,
                 paths: parsed.paths,
+                origin: parsed.origin,
                 enabled: true,
                 body: None,
             })
@@ -1151,6 +1172,37 @@ mod tests {
         let absent = parse_one("g", "---\nname: g\ndescription: x\n---\n");
         assert!(absent.user_invocable);
         assert!(!absent.disable_model_invocation);
+    }
+
+    #[test]
+    fn origin_frontmatter_is_a_lowercase_slug_or_none() {
+        let at_cap = "a".repeat(MAX_ORIGIN_LEN);
+        let over_cap = "a".repeat(MAX_ORIGIN_LEN + 1);
+        let cases = [
+            ("learn", Some("learn")),
+            ("  Create-Skill  ", Some("create-skill")),
+            ("plugin2", Some("plugin2")),
+            (at_cap.as_str(), Some(at_cap.as_str())),
+            (over_cap.as_str(), None),
+            ("has space", None),
+            ("under_score", None),
+            ("", None),
+        ];
+        for (raw, expected) in cases {
+            let skill = parse_one(
+                "d",
+                &format!("---\nname: d\ndescription: x\norigin: \"{raw}\"\n---\n"),
+            );
+            assert_eq!(expected, skill.origin.as_deref(), "origin: {raw:?}");
+        }
+
+        let absent = parse_one("d", "---\nname: d\ndescription: x\n---\n");
+        assert_eq!(None, absent.origin);
+        let non_scalar = parse_one(
+            "d",
+            "---\nname: d\ndescription: x\norigin:\n  - learn\n---\n",
+        );
+        assert_eq!(None, non_scalar.origin);
     }
 
     #[test]
