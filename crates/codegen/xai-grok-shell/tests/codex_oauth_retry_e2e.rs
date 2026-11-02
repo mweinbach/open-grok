@@ -158,6 +158,7 @@ fn write_xai_oauth(grok_home: &std::path::Path) {
     "create_time": "2026-01-01T00:00:00Z",
     "user_id": "sticky-boundary-user",
     "email": "sticky-boundary-user@test.invalid",
+    "coding_data_retention_opt_out": false,
     "expires_at": "2030-01-01T00:00:00Z",
     "refresh_token": "xai-sticky-refresh-token",
     "oidc_issuer": "https://auth.x.ai",
@@ -725,6 +726,10 @@ model = "grok-build"
 name = "xAI sticky boundary test"
 provider = "xai"
 base_url = "{base_url}"
+# The loopback inference server needs its own key. The OAuth login exercises
+# account features across the provider switch.
+api_key = "xai-sticky-inference-byok"
+auth_scheme = "bearer"
 api_backend = "responses"
 agent_type = "grok-build"
 tool_mode = "direct"
@@ -784,11 +789,13 @@ default = "xai-sticky"
     let first_turns = main_turn_requests(&first_requests[requests_before_first..]);
     assert!(!first_turns.is_empty(), "initial xAI turn must run");
     assert!(first_turns.iter().all(|request| {
-        request.authorization.as_deref() == Some("Bearer xai-sticky-oauth-token")
+        request.authorization.as_deref() == Some("Bearer xai-sticky-inference-byok")
     }));
     assert!(
-        server.storage_request_count() > 0,
-        "xAI OAuth session must exercise trace export before the boundary closes"
+        server.storage_uploads().iter().any(|upload| {
+            upload.authorization.as_deref() == Some("Bearer xai-sticky-oauth-token")
+        }),
+        "the mock must accept an OAuth-authenticated trace upload before the boundary closes"
     );
 
     let before_boundary_feedback = run(&[
@@ -875,7 +882,7 @@ default = "xai-sticky"
     let xai_return_turns = main_turn_requests(&xai_return_requests[requests_before_xai_return..]);
     assert!(!xai_return_turns.is_empty(), "returning xAI turn must run");
     assert!(xai_return_turns.iter().all(|request| {
-        request.authorization.as_deref() == Some("Bearer xai-sticky-oauth-token")
+        request.authorization.as_deref() == Some("Bearer xai-sticky-inference-byok")
     }));
     assert_eq!(
         server.storage_request_count(),
