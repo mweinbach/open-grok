@@ -694,6 +694,10 @@ fn drop_stale_natives_for_headless_cross(
         *entries = Some(Vec::new());
     }
 }
+fn can_search_session_content(trimmed_query: &str) -> bool {
+    trimmed_query.chars().nth(1).is_some()
+}
+
 pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
     app: &mut AppView,
 ) -> Vec<Effect> {
@@ -737,7 +741,10 @@ pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
             drop_stale_natives_for_headless_cross(entries, *source_filter);
             *loading = true;
             let query = state.query().trim().to_string();
-            if !chat_mode && !source_filter.is_content_search_disabled() && query.len() >= 2 {
+            if !chat_mode
+                && !source_filter.is_content_search_disabled()
+                && can_search_session_content(&query)
+            {
                 *content_loading = true;
                 restart_search = Some(Effect::DeepSearchSessions {
                     host: request_identity.0,
@@ -778,7 +785,7 @@ pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
                 && !app
                     .session_picker_source_filter
                     .is_content_search_disabled()
-                && query.len() >= 2
+                && can_search_session_content(&query)
             {
                 app.session_picker_content_loading = true;
                 restart_search = Some(Effect::DeepSearchSessions {
@@ -842,7 +849,7 @@ pub(in crate::app::dispatch) fn dispatch_trigger_deep_search(
         let query = state.query().trim().to_string();
         *deep_search_seq += 1;
         let seq = *deep_search_seq;
-        if query.len() < 2 {
+        if !can_search_session_content(&query) {
             *content_results = None;
             *content_loading = false;
             return vec![];
@@ -879,7 +886,7 @@ pub(in crate::app::dispatch) fn dispatch_trigger_deep_search(
     let query = app.session_picker_state.query().trim().to_string();
     app.session_picker_deep_search_seq += 1;
     let seq = app.session_picker_deep_search_seq;
-    if query.len() < 2 {
+    if !can_search_session_content(&query) {
         app.session_picker_content_results = None;
         app.session_picker_content_loading = false;
         return vec![];

@@ -18,6 +18,50 @@ use xai_grok_workspace::session::git::normalize_repo_url;
 
 pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Metadata filter shared by the interactive picker and local session listing.
+/// ID fragments and explicit directory paths can be pasted verbatim. Ordinary
+/// search words match the start of words in one title, in any order.
+pub struct SessionListQuery {
+    text: String,
+    words: Vec<String>,
+}
+
+impl SessionListQuery {
+    pub fn new(query: &str) -> Self {
+        let query = query.trim();
+        let text = query.to_lowercase();
+        let words = if query.chars().nth(1).is_none() || query.contains(['/', '\\']) {
+            Vec::new()
+        } else {
+            text.split(|c: char| !c.is_alphanumeric())
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
+        Self { text, words }
+    }
+
+    pub fn matches(&self, id: &str, cwd: &str, titles: &[&str]) -> bool {
+        if self.text.is_empty() || id.to_lowercase().contains(&self.text) {
+            return true;
+        }
+        if self.text.contains(['/', '\\']) && cwd.to_lowercase().contains(&self.text) {
+            return true;
+        }
+        titles.iter().copied().chain([id]).any(|field| {
+            let field = field.to_lowercase();
+            if self.words.is_empty() {
+                return field.contains(&self.text);
+            }
+            self.words.iter().all(|prefix| {
+                field
+                    .split(|c: char| !c.is_alphanumeric())
+                    .any(|word| word.starts_with(prefix))
+            })
+        })
+    }
+}
+
 /// Over-fetch factor: extra headroom for the cross-lane merge before truncation.
 pub(crate) fn over_fetch(limit: usize) -> usize {
     (limit * 3).max(100)
@@ -339,16 +383,14 @@ fn merge_impl(
     let mut by_id: HashMap<String, MergedSession> =
         HashMap::with_capacity(remote.len() + local.len());
 
-    let query_lower = query.map(|q| q.to_lowercase());
+    let query = query.map(SessionListQuery::new);
     for s in local {
-        if let Some(ref q) = query_lower
-            && !s.session_summary.to_lowercase().contains(q.as_str())
-            && !s.info.id.to_string().to_lowercase().contains(q.as_str())
-            && !s.display_title().to_lowercase().contains(q.as_str())
+        let id = s.info.id.to_string();
+        if let Some(query) = &query
+            && !query.matches(&id, &s.info.cwd, &[s.display_title(), &s.session_summary])
         {
             continue;
         }
-        let id = s.info.id.to_string();
         let display_summary = s.display_title().to_owned();
         let repo_name = s
             .git_root_dir
@@ -897,6 +939,19 @@ mod tests {
             .collect();
         let merged = merge(Vec::new(), local, None, &[], 3);
         assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn listing_matches_local_word_prefixes_and_keeps_remote_content_hits() {
+        let date = "2026-03-01T00:00:00Z";
+        let local = vec![
+            make_summary("1111", "Blog prefix cleanup", date),
+            make_summary("2222", "Fix log-rotation", date),
+        ];
+        let remote = vec![make_remote("3333", "Server-side content match", date)];
+        let (rows, _) = merge_for_listing(remote, local, Some("log fix"), &[], true);
+        let ids: HashSet<_> = rows.iter().map(|row| row.session_id.as_str()).collect();
+        assert_eq!(ids, HashSet::from(["2222", "3333"]));
     }
 
     #[test]

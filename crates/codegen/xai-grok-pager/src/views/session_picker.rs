@@ -425,17 +425,6 @@ fn selectable_fallback<T>(map: &[Option<T>], preferred: usize) -> Option<usize> 
 // Filtering
 // ---------------------------------------------------------------------------
 
-/// All search words must appear as substrings, in any order. Punctuation and
-/// whitespace separate words in both the query and the title or ID.
-pub(crate) fn fuzzy_matches_session(name: &str, query: &str) -> bool {
-    if query.trim().is_empty() {
-        return true;
-    }
-    let name = crate::app::session_title_resolve::title_key(name);
-    let query = crate::app::session_title_resolve::title_key(query);
-    !query.is_empty() && query.split_whitespace().all(|word| name.contains(word))
-}
-
 /// The query the picker's local fuzzy filter should apply on top of the current entries.
 ///
 /// When `entries_query` (the query the entries were server-fetched with) matches the live query, the entries are already filtered server-side.
@@ -463,15 +452,13 @@ pub(crate) fn filter_session_entries(
     let Some(entries) = entries else {
         return vec![];
     };
-    let q = query.to_lowercase();
+    let query = xai_grok_shell::session::merge::SessionListQuery::new(query);
     entries
         .iter()
         .enumerate()
         .filter(|(_, e)| {
             source_filter.matches(&e.source, e.session_kind.as_deref())
-                && (query.is_empty()
-                    || fuzzy_matches_session(&e.id, &q)
-                    || fuzzy_matches_session(&e.summary, &q))
+                && query.matches(&e.id, &e.cwd, &[&e.summary])
         })
         .map(|(i, _)| i)
         .collect()
@@ -1009,26 +996,22 @@ mod tests {
     fn repo_name_from_cwd_single_dir() {
         assert_eq!(repo_name_from_cwd("/xai"), "xai");
     }
-    /// Search terms may appear in any order; arbitrary subsequences do not match.
     #[test]
-    fn fuzzy_matches_session_uses_all_words_in_any_order() {
-        assert!(fuzzy_matches_session("Rust-Check pipeline", "rust-check"));
-        assert!(fuzzy_matches_session("Fix session picker", "picker"));
-        assert!(fuzzy_matches_session("Fix session-picker bug", "BUG_fix"));
-        assert!(fuzzy_matches_session(
-            "Fix session-picker bug",
-            "picker   session"
-        ));
-        assert!(!fuzzy_matches_session(
-            "Fix session-picker bug",
-            "picker missing"
-        ));
-        assert!(!fuzzy_matches_session("Fix session-picker bug", "---"));
-        assert!(fuzzy_matches_session("anything", ""));
-        assert!(
-            !fuzzy_matches_session("rust-check", "rc"),
-            "ordered-chars subsequence must no longer match"
-        );
+    fn picker_matches_word_prefixes_in_any_order_and_literal_paths_and_ids() {
+        let mut misleading = make_entry("1111", "one");
+        misleading.summary = "Blog prefix cleanup".into();
+        let mut wanted = make_entry("6789-abcd", "two");
+        wanted.summary = "Fix: log-rotation".into();
+        wanted.cwd = "/workspace/team.v2/café".into();
+        let entries = [misleading, wanted];
+        let search = |query| filter_session_entries(Some(&entries), query, SourceFilter::All);
+        for query in ["LOG_fix", "rot  fix", "789-ab", "team.v2/caf", ":"] {
+            assert_eq!(search(query), [1], "{query:?}");
+        }
+        for query in ["log missing", "frx", "---"] {
+            assert!(search(query).is_empty(), "{query:?}");
+        }
+        assert_eq!(search(""), [0, 1]);
     }
     /// Entries stamped as server search results for the live query skip the local title/id fuzzy match.
     /// The backend also matches message content, so a hit titled nothing like the query must survive filtering.

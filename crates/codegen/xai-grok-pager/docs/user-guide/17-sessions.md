@@ -89,9 +89,9 @@ Use the `/resume` command to browse and resume previous sessions:
 /resume
 ```
 
-This opens a session picker that lists recent sessions for the current workspace. Select a session to resume it. The command takes no arguments.
+This opens a picker of recent sessions for the current workspace. Use `/resume <query>` to start with the picker filtered. A unique exact title or session ID can open directly.
 
-Typing in the picker filters the list by title and also searches your conversation content as you type; content matches appear under an "Extended search results" heading. Press `Ctrl+/` to search immediately without the brief pause.
+Title searches match the start of each word in any order. For example, `log fix` finds “Fix log rotation” and skips “Blog prefix cleanup.” You can also paste a session ID fragment or part of a directory path. Typing one character filters the visible rows. With two or more characters, the Welcome and in-session pickers can also show conversation matches under “Extended search results.” Press `Ctrl+/` to search immediately.
 
 For the live top-level sessions in this pager (parent and forks) — switch, rename, peek, dispatch, or close — use the [Agent Dashboard](23-dashboard.md): `/dashboard` (aliases `/sessions`, `/agents-dashboard`) or `Ctrl+\`.
 

@@ -1941,6 +1941,38 @@ fn build_mode_short_query_clears_results_and_invalidates_armed_debounce() {
         "expiry armed before the clear must not search, got {effects:?}"
     );
 }
+
+#[test]
+fn build_mode_content_search_counts_characters_in_welcome_and_modal_pickers() {
+    use crate::views::modal::ActiveModal;
+
+    let mut welcome = test_app();
+    let mut modal = test_app_with_agent();
+    open_session_picker_with(&mut modal, vec![]);
+    for (query, should_search) in [("é", false), ("界", false), ("界é", true)] {
+        welcome.session_picker_state.set_query(query);
+        let Some(ActiveModal::SessionPicker { state, .. }) = get_active_agent_mut(&mut modal)
+            .unwrap()
+            .active_modal
+            .as_mut()
+        else {
+            panic!("expected session picker");
+        };
+        state.set_query(query);
+        for app in [&mut welcome, &mut modal] {
+            let effects = dispatch(Action::ForceDeepSearch, app);
+            if should_search {
+                assert!(matches!(
+                    &effects[..],
+                    [Effect::DeepSearchSessions { query: pushed, .. }] if pushed == query
+                ));
+            } else {
+                assert!(effects.is_empty(), "{query:?}: {effects:?}");
+            }
+        }
+    }
+}
+
 /// Build mode: a current-seq debounce expiry dispatches the deep search; one superseded by newer typing is dropped.
 /// A current expiry with the welcome picker hidden behind another view is dropped too.
 /// Build-mode deep search (unlike chat mode) requires the welcome view to be visible.
