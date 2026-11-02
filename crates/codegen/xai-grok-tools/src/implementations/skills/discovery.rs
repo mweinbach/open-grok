@@ -5,7 +5,7 @@
 //! frontmatter parsing) used by both startup and dynamic discovery.
 
 use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use super::skill::extract_skill_body;
@@ -108,9 +108,8 @@ pub fn scan_md_files(dir: &Path) -> Vec<PathBuf> {
 /// or a config path pointing directly at a skill directory) plus the
 /// recursive walk of subdirectories.
 ///
-/// Single source of truth for "what loads from a skill dir" — used by the
-/// plugin skill loader, the plugin count/name reporters, and config-path
-/// collection so they can never drift apart.
+/// Explicit skill-directory configuration can follow external links. Plugin
+/// scanning instead confines both traversal and reads to the plugin root.
 pub fn find_skill_md_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let self_skill_md = dir.join("SKILL.md");
@@ -588,16 +587,19 @@ pub fn parse_skill_frontmatter(
 }
 
 pub fn read_frontmatter_only(path: &Path) -> std::io::Result<(String, usize)> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
+    read_frontmatter(&mut std::fs::File::open(path)?)
+}
+
+fn read_frontmatter(file: &mut std::fs::File) -> std::io::Result<(String, usize)> {
+    let mut reader = BufReader::new(file.take(MAX_FRONTMATTER_BYTES as u64 + 1));
     let mut frontmatter = String::new();
     let mut total_bytes = 0usize;
     let mut found_opening = false;
-    let mut line_buf = String::new();
+    let mut line_buf = Vec::new();
 
     loop {
         line_buf.clear();
-        let bytes_read = reader.read_line(&mut line_buf)?;
+        let bytes_read = reader.read_until(b'\n', &mut line_buf)?;
         if bytes_read == 0 {
             break;
         }
@@ -606,16 +608,18 @@ pub fn read_frontmatter_only(path: &Path) -> std::io::Result<(String, usize)> {
             break;
         }
 
-        let trimmed = line_buf.trim();
+        let line = std::str::from_utf8(&line_buf)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        let trimmed = line.trim();
         if !found_opening {
             if trimmed == "---" {
                 found_opening = true;
-                frontmatter.push_str(&line_buf);
+                frontmatter.push_str(line);
             } else if !trimmed.is_empty() {
                 break;
             }
         } else {
-            frontmatter.push_str(&line_buf);
+            frontmatter.push_str(line);
             if trimmed == "---" {
                 return Ok((frontmatter, total_bytes));
             }
@@ -623,6 +627,21 @@ pub fn read_frontmatter_only(path: &Path) -> std::io::Result<(String, usize)> {
     }
 
     Ok((frontmatter, total_bytes))
+}
+
+/// Plugin inventories include disabled plugins. For a missing description,
+/// inspect only the frontmatter and the bounded start of the body.
+fn description_source(file: &mut std::fs::File, plugin: bool) -> std::io::Result<String> {
+    file.rewind()?;
+    if !plugin {
+        let mut full = String::new();
+        file.read_to_string(&mut full)?;
+        return Ok(full);
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_FRONTMATTER_BYTES + MAX_BODY_PEEK_BYTES) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// First top-level prose paragraph of a markdown body (headings excluded).
@@ -688,12 +707,33 @@ fn extract_lead_block(body: &str, include_headings: bool) -> Option<String> {
 /// host-driven scans), so the vendor-default denylist is applied here to cover
 /// every path. See [`is_vendor_default_skill`].
 pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillInfo> {
+    parse_at_root(skill_files, None)
+}
+
+pub fn parse_plugin_skill_files(
+    skill_files: Vec<(PathBuf, SkillScope)>,
+    canonical_root: &Path,
+) -> Vec<SkillInfo> {
+    parse_at_root(skill_files, Some(canonical_root))
+}
+
+fn parse_at_root(
+    skill_files: Vec<(PathBuf, SkillScope)>,
+    plugin_root: Option<&Path>,
+) -> Vec<SkillInfo> {
     let mut skills: Vec<SkillInfo> = skill_files
         .into_iter()
         .filter_map(|(path, scope)| {
             let path_str = path.to_string_lossy().to_string();
 
-            let (content, _) = match read_frontmatter_only(&path) {
+            let opened = match plugin_root {
+                Some(root) => super::plugin_files::open(root, &path),
+                None => std::fs::File::open(&path),
+            };
+            let mut file = opened.inspect_err(|err| {
+                tracing::warn!(%err, path = %path.display(), "failed to open skill");
+            }).ok()?;
+            let (content, _) = match read_frontmatter(&mut file) {
                 Ok(result) => result,
                 Err(err) => {
                     tracing::warn!(%err, "failed to read skill");
@@ -783,7 +823,7 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
             }
 
             if parsed.description.is_empty() {
-                if let Ok(full) = std::fs::read_to_string(&path) {
+                if let Ok(full) = description_source(&mut file, plugin_root.is_some()) {
                     let body = extract_skill_body(&full);
                     let peek = if body.len() > MAX_BODY_PEEK_BYTES {
                         let end = crate::util::floor_char_boundary(&body, MAX_BODY_PEEK_BYTES);
@@ -817,7 +857,7 @@ pub fn parse_skill_files(skill_files: Vec<(PathBuf, SkillScope)>) -> Vec<SkillIn
                 config_source: None,
                 plugin_name: None,
                 plugin_version: None,
-                plugin_root: None,
+                plugin_root: plugin_root.map(|root| root.to_string_lossy().into_owned()),
                 plugin_data: None,
                 allowed_tools: parsed.allowed_tools,
                 model: parsed.model,

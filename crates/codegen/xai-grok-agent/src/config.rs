@@ -1362,31 +1362,40 @@ impl AgentDefinition {
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, AgentBuildError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentBuildError::IoError)?;
-        let mut def = Self::parse(&content)?;
-        def.source_path = Some(path.to_path_buf());
-        def.plugin_name = None;
-        def.scope = Self::scope_from_path(path);
-        Ok(def)
+        Self::from_file_content(path, &content, true)
     }
     /// Parse only YAML frontmatter from an agent file, leaving prompt_body unset.
     pub fn from_file_frontmatter_only(path: impl AsRef<Path>) -> Result<Self, AgentBuildError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentBuildError::IoError)?;
-        let trimmed = content.trim_start();
-        if !trimmed.starts_with("---") {
-            return Err(AgentBuildError::ParseError(
-                "missing frontmatter delimiters".to_string(),
-            ));
-        }
-        let after_opening = &trimmed[3..];
-        let closing_idx = after_opening.find("\n---").ok_or_else(|| {
-            AgentBuildError::ParseError("missing closing frontmatter delimiter".to_string())
-        })?;
-        let yaml_content = &after_opening[..closing_idx];
-        let mut def: AgentDefinition = serde_yaml::from_str(yaml_content)
-            .map_err(|e| AgentBuildError::ParseError(e.to_string()))?;
-        def.prompt_body = None;
-        def.system_prompt = TemplateOverride::None;
+        Self::from_file_content(path, &content, false)
+    }
+
+    pub(crate) fn from_file_content(
+        path: &Path,
+        content: &str,
+        include_body: bool,
+    ) -> Result<Self, AgentBuildError> {
+        let mut def = if include_body {
+            Self::parse(content)?
+        } else {
+            let trimmed = content.trim_start();
+            if !trimmed.starts_with("---") {
+                return Err(AgentBuildError::ParseError(
+                    "missing frontmatter delimiters".to_string(),
+                ));
+            }
+            let after_opening = &trimmed[3..];
+            let closing_idx = after_opening.find("\n---").ok_or_else(|| {
+                AgentBuildError::ParseError("missing closing frontmatter delimiter".to_string())
+            })?;
+            let yaml_content = &after_opening[..closing_idx];
+            let mut def: AgentDefinition = serde_yaml::from_str(yaml_content)
+                .map_err(|e| AgentBuildError::ParseError(e.to_string()))?;
+            def.prompt_body = None;
+            def.system_prompt = TemplateOverride::None;
+            def
+        };
         def.source_path = Some(path.to_path_buf());
         def.plugin_name = None;
         def.scope = Self::scope_from_path(path);

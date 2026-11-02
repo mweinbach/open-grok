@@ -141,6 +141,8 @@ To hide the plugins and hooks interface entirely, set `disable_plugins = true` i
 
 ## Trust and security
 
+Plugin skills, slash commands, and agent definitions must resolve to files inside the plugin folder. Links to files elsewhere are skipped during discovery and rejected if a previously listed file is redirected before use.
+
 Plugins run with your privileges, so treat them like any software you install: only add marketplaces and install plugins from sources you trust.
 
 Enabling a plugin loads its skills, commands, and agents. Trust is separate and controls whether a plugin's code runs: even when enabled, its hooks, MCP servers, and LSP servers stay inactive until you trust it. Open Grok trusts plugins in `~/.opengrok/plugins/` automatically; project plugins in `.opengrok/plugins/` require trust. Install with `--trust` to grant it:

@@ -121,23 +121,9 @@ fn find_skill<'a>(name: &str, skills: &'a [SkillInfo]) -> FindSkillResult<'a> {
 
 /// Load skill content from its SKILL.md file, stripping YAML frontmatter.
 async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
-    let path = Path::new(&skill.path);
-    match crate::util::file_reader::read_file(
-        path,
-        crate::util::file_reader::FileReadOptions::default(),
-    )
-    .await
-    .and_then(|bytes| {
-        String::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-        })
-    }) {
-        Ok(content) => Ok(extract_skill_body(&content)),
-        Err(e) => Err(format!("Failed to read skill file '{}': {}", skill.path, e)),
-    }
+    crate::implementations::skills::skill::read_skill_text(skill)
+        .await
+        .map(|text| extract_skill_body(&text))
 }
 
 /// List up to `limit` bundled files in the skill directory, excluding SKILL.md.
@@ -148,6 +134,18 @@ async fn list_skill_files(skill: &SkillInfo, limit: usize) -> Vec<String> {
         None => return vec![],
     };
 
+    let permitted_dir;
+    let dir = if let Some(root) = skill.plugin_root.as_deref() {
+        let Ok(resolved) =
+            crate::implementations::skills::plugin_files::resolve(Path::new(root), dir)
+        else {
+            return vec![];
+        };
+        permitted_dir = resolved;
+        permitted_dir.as_path()
+    } else {
+        dir
+    };
     let mut entries = match tokio::fs::read_dir(dir).await {
         Ok(entries) => entries,
         Err(_) => return vec![],
@@ -163,6 +161,12 @@ async fn list_skill_files(skill: &SkillInfo, limit: usize) -> Vec<String> {
         if path
             .file_name()
             .is_some_and(|n| n.eq_ignore_ascii_case("SKILL.md"))
+        {
+            continue;
+        }
+        if let Some(root) = skill.plugin_root.as_deref()
+            && crate::implementations::skills::plugin_files::resolve(Path::new(root), &path)
+                .is_err()
         {
             continue;
         }

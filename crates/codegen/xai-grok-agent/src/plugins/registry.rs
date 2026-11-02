@@ -147,15 +147,24 @@ impl PluginRegistry {
             }
 
             // Count components
-            let skill_count =
-                count_skill_subdirs(&dp.skill_dirs) + count_md_files(&dp.command_dirs);
-            let agent_count = count_md_files(&dp.agent_dirs);
-            let skill_names = {
-                let mut names = collect_skill_names(&dp.skill_dirs);
-                names.extend(collect_md_names(&dp.command_dirs));
-                names
-            };
-            let agent_names = collect_md_names(&dp.agent_dirs);
+            let skill_names: Vec<_> =
+                plugin_skills(&dp.canonical_root, &dp.skill_dirs, &dp.command_dirs)
+                    .into_iter()
+                    .map(|skill| skill.name)
+                    .collect();
+            let skill_count = skill_names.len();
+            let agent_names: Vec<_> = dp
+                .agent_dirs
+                .iter()
+                .flat_map(|dir| {
+                    xai_grok_tools::implementations::skills::plugin_files::markdown_files(
+                        &dp.canonical_root,
+                        dir,
+                    )
+                })
+                .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+                .collect();
+            let agent_count = agent_names.len();
             let has_hooks = dp.hooks_path.is_some() || dp.manifest.inline_hooks().is_some();
             let has_inline_hooks_only =
                 dp.hooks_path.is_none() && dp.manifest.inline_hooks().is_some();
@@ -464,75 +473,33 @@ impl SharedPluginRegistryHandle {
 
 // ── Component counting helpers ────────────────────────────────────────
 
-/// Collect the SKILL.md paths that load from the given skill dirs.
-///
-/// Discovery via `find_skill_md_paths`; deduped by the loader's per-plugin
-/// identity — the normalized parent-dir basename (`stamp_plugin_fields` names
-/// plugin skills by directory basename, and `merge_skills_with_plugins`
-/// dedupes on `plugin:<name>`) — so counts equal what actually loads, both
-/// for overlapping dir entries and same-basename dirs at different paths.
-pub fn skill_md_paths(skill_dirs: &[PathBuf]) -> Vec<PathBuf> {
-    use xai_grok_tools::implementations::skills::discovery::{
-        find_skill_md_paths, normalize_skill_name,
+/// Shared skill inventory for prompts, slash commands, and plugin component counts.
+pub fn plugin_skills(
+    root: &Path,
+    skill_dirs: &[PathBuf],
+    command_dirs: &[PathBuf],
+) -> Vec<xai_grok_tools::implementations::skills::types::SkillInfo> {
+    use xai_grok_tools::implementations::skills::{
+        discovery::{normalize_skill_name, parse_plugin_skill_files},
+        plugin_files,
+        types::{SkillScope, skill_name_from_path},
     };
-
-    let mut paths: Vec<PathBuf> = skill_dirs
-        .iter()
-        .flat_map(|d| find_skill_md_paths(d))
+    let paths = plugin_files::discover(root, skill_dirs, command_dirs)
+        .into_iter()
+        .map(|path| (path, SkillScope::Repo))
         .collect();
-    let mut seen = std::collections::HashSet::new();
-    paths.retain(|p| {
-        p.parent()
-            .and_then(|d| d.file_name())
-            .and_then(|n| n.to_str())
-            .map(|name| seen.insert(normalize_skill_name(name)))
-            .unwrap_or(true)
+    let mut skills = parse_plugin_skill_files(paths, root);
+    let mut names = std::collections::HashSet::new();
+    skills.retain_mut(|skill| {
+        if let Some(dir_name) = skill_name_from_path(&skill.path) {
+            let name = normalize_skill_name(dir_name);
+            if !name.is_empty() && name != skill.name {
+                skill.display_name = Some(std::mem::replace(&mut skill.name, name));
+            }
+        }
+        names.insert(skill.name.clone())
     });
-    paths
-}
-
-/// Count skills under the skill dirs (each discovered SKILL.md = 1 skill).
-fn count_skill_subdirs(skill_dirs: &[PathBuf]) -> usize {
-    skill_md_paths(skill_dirs).len()
-}
-
-fn count_md_files(dirs: &[PathBuf]) -> usize {
-    dirs.iter()
-        .flat_map(|dir| std::fs::read_dir(dir).ok())
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                && e.path().extension().is_some_and(|ext| ext == "md")
-        })
-        .count()
-}
-
-fn collect_md_names(dirs: &[PathBuf]) -> Vec<String> {
-    dirs.iter()
-        .flat_map(|dir| std::fs::read_dir(dir).ok())
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                && e.path().extension().is_some_and(|ext| ext == "md")
-        })
-        .filter_map(|e| {
-            e.path()
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(String::from)
-        })
-        .collect()
-}
-
-fn collect_skill_names(skill_dirs: &[PathBuf]) -> Vec<String> {
-    // Skill name = basename of the directory containing SKILL.md.
-    skill_md_paths(skill_dirs)
-        .iter()
-        .filter_map(|p| p.parent())
-        .filter_map(|dir| dir.file_name().and_then(|n| n.to_str()).map(String::from))
-        .collect()
+    skills
 }
 
 /// Deduped union of MCP server names from a plugin's `.mcp.json` file and its
@@ -675,6 +642,85 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_skill_paths_stay_inside_plugin_at_discovery_and_invocation() {
+        use std::os::unix::fs::symlink;
+        use xai_grok_tools::implementations::skills::{
+            discovery::parse_skill_files, skill::load_skill_content, types::SkillScope,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("plugin");
+        let foreign = tmp.path().join("plugin-other");
+        let skills = root.join("skills");
+        let commands = root.join("commands");
+        let internal = root.join("library").join("retained");
+        for dir in [
+            &foreign,
+            &internal,
+            &commands,
+            &skills.join("external-leaf"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            internal.join("SKILL.md"),
+            "---\nname: original\ndescription: internal\n---\ninternal body",
+        )
+        .unwrap();
+        std::fs::write(
+            foreign.join("SKILL.md"),
+            "---\nname: foreign\ndescription: outside\n---\nforeign body",
+        )
+        .unwrap();
+        symlink(&internal, skills.join("inside")).unwrap();
+        symlink(&skills, skills.join("cycle")).unwrap();
+        symlink(&foreign, skills.join("outside")).unwrap();
+        symlink(
+            foreign.join("SKILL.md"),
+            skills.join("external-leaf/SKILL.md"),
+        )
+        .unwrap();
+        symlink(foreign.join("SKILL.md"), commands.join("external.md")).unwrap();
+        std::fs::write(
+            commands.join("valid.md"),
+            "---\nname: command\ndescription: good\n---\nrun",
+        )
+        .unwrap();
+
+        let canonical = dunce::canonicalize(&root).unwrap();
+        let mut entries = plugin_skills(&canonical, &[skills.clone()], &[commands]);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|skill| skill.name.as_str())
+                .collect::<Vec<_>>(),
+            ["inside", "command"]
+        );
+        let mut issued = entries.remove(0);
+        issued.plugin_name = Some("fixture".into());
+        assert_eq!(issued.plugin_root.as_deref(), canonical.to_str());
+        assert!(
+            load_skill_content(&issued)
+                .await
+                .unwrap()
+                .contains("internal body")
+        );
+        std::fs::remove_file(skills.join("inside")).unwrap();
+        symlink(&foreign, skills.join("inside")).unwrap();
+        assert!(load_skill_content(&issued).await.is_err());
+
+        // Explicit ordinary skill paths retain their existing link semantics.
+        let ordinary = parse_skill_files(vec![(skills.join("inside/SKILL.md"), SkillScope::User)]);
+        assert!(
+            load_skill_content(&ordinary[0])
+                .await
+                .unwrap()
+                .contains("foreign body")
+        );
+    }
+
     #[test]
     fn skill_counts_include_root_level_skill_md() {
         // Manifest `skills` entries pointing directly at skill dirs
@@ -692,8 +738,14 @@ mod tests {
         }
 
         let dirs = vec![one, two];
-        assert_eq!(count_skill_subdirs(&dirs), 2);
-        let mut names = collect_skill_names(&dirs);
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[]).len(),
+            2
+        );
+        let mut names = plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[])
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, vec!["one".to_string(), "two".to_string()]);
     }
@@ -711,8 +763,17 @@ mod tests {
         }
 
         let dirs = vec![tmp.path().join("a"), tmp.path().join("b")];
-        assert_eq!(count_skill_subdirs(&dirs), 1);
-        assert_eq!(collect_skill_names(&dirs), vec!["dup-skill".to_string()]);
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[]).len(),
+            1
+        );
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[])
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>(),
+            vec!["dup-skill".to_string()]
+        );
     }
 
     #[test]
@@ -726,8 +787,17 @@ mod tests {
         std::fs::write(child.join("SKILL.md"), "---\nname: one\n---\n").unwrap();
 
         let dirs = vec![parent, child];
-        assert_eq!(count_skill_subdirs(&dirs), 1);
-        assert_eq!(collect_skill_names(&dirs), vec!["one".to_string()]);
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[]).len(),
+            1
+        );
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[])
+                .into_iter()
+                .map(|skill| skill.name)
+                .collect::<Vec<_>>(),
+            vec!["one".to_string()]
+        );
     }
 
     #[test]
@@ -742,8 +812,14 @@ mod tests {
         }
 
         let dirs = vec![parent];
-        assert_eq!(count_skill_subdirs(&dirs), 2);
-        let mut names = collect_skill_names(&dirs);
+        assert_eq!(
+            plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[]).len(),
+            2
+        );
+        let mut names = plugin_skills(&dunce::canonicalize(tmp.path()).unwrap(), &dirs, &[])
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
     }

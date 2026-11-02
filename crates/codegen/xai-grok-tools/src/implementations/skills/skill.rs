@@ -474,60 +474,46 @@ pub fn extract_skill_body(content: &str) -> String {
     content.to_string()
 }
 
-/// Load skill content from its file, stripping YAML frontmatter.
-///
-/// Public entrypoint for the shell crate to load skill content at
-/// prompt-assembly time (the new zero-round-trip path). The private
-/// `load_skill_content` in `grok_build/skill/mod.rs` is a duplicate
-/// of this.
-pub async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
+/// Read a skill again at invocation time. A plugin tree may have changed since
+/// discovery, so acquire the file under its original canonical root each time.
+pub(crate) async fn read_skill_text(skill: &SkillInfo) -> Result<String, String> {
     let path = std::path::Path::new(&skill.path);
-    match crate::util::file_reader::read_file(
-        path,
-        crate::util::file_reader::FileReadOptions::default(),
-    )
-    .await
-    .and_then(|bytes| {
-        String::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
+    let result = if let Some(root) = skill.plugin_root.as_ref() {
+        let path = path.to_owned();
+        let root = std::path::PathBuf::from(root);
+        tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut text = String::new();
+            super::plugin_files::open(&root, &path)?.read_to_string(&mut text)?;
+            Ok(text)
         })
-    }) {
-        Ok(content) => {
-            let body = extract_skill_body(&content);
-            Ok(match path.parent() {
-                Some(skill_dir) => resolve_skill_internal_links(&body, skill_dir),
-                None => body,
+        .await
+        .map_err(|err| err.to_string())?
+    } else if skill.plugin_name.is_some() {
+        return Err("Plugin skill has no source root".to_owned());
+    } else {
+        crate::util::file_reader::read_file(path, Default::default())
+            .await
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
             })
-        }
-        Err(e) => Err(format!("Failed to read skill file '{}': {}", skill.path, e)),
-    }
+    };
+    result.map_err(|err| format!("Failed to read skill file '{}': {err}", skill.path))
+}
+
+pub async fn load_skill_content(skill: &SkillInfo) -> Result<String, String> {
+    let content = read_skill_text(skill).await?;
+    let body = extract_skill_body(&content);
+    Ok(match std::path::Path::new(&skill.path).parent() {
+        Some(dir) => resolve_skill_internal_links(&body, dir),
+        None => body,
+    })
 }
 
 /// Load skill body into SkillInfo.
 pub async fn load_skill_with_body(skill: &SkillInfo) -> Result<SkillInfo, String> {
-    let path = std::path::Path::new(&skill.path);
-    let content = crate::util::file_reader::read_file(
-        path,
-        crate::util::file_reader::FileReadOptions::default(),
-    )
-    .await
-    .and_then(|bytes| {
-        String::from_utf8(bytes).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-        })
-    })
-    .map_err(|e| format!("Failed to read {}: {}", skill.path, e))?;
-    let body = extract_skill_body(&content);
-    let body = match path.parent() {
-        Some(skill_dir) => resolve_skill_internal_links(&body, skill_dir),
-        None => body,
-    };
+    let body = load_skill_content(skill).await?;
     let mut loaded = skill.clone();
     loaded.body = if body.is_empty() { None } else { Some(body) };
     Ok(loaded)

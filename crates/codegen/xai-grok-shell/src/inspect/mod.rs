@@ -899,11 +899,23 @@ fn list_plugins(discovered: &[xai_grok_agent::plugins::DiscoveredPlugin]) -> Vec
                 path: p.root.display().to_string(),
                 enabled: p.trusted,
                 provides: PluginProvides {
-                    // Count actual SKILL.md files discovered (root-level or in
-                    // subdirs), not the number of configured skill dirs, so the
-                    // reported count matches what the skills registry loads.
-                    skills: xai_grok_agent::plugins::registry::skill_md_paths(&p.skill_dirs).len(),
-                    agents: p.agent_dirs.len(),
+                    skills: xai_grok_agent::plugins::registry::plugin_skills(
+                        &p.canonical_root,
+                        &p.skill_dirs,
+                        &p.command_dirs,
+                    )
+                    .len(),
+                    agents: p
+                        .agent_dirs
+                        .iter()
+                        .map(|dir| {
+                            xai_grok_tools::implementations::skills::plugin_files::markdown_files(
+                                &p.canonical_root,
+                                dir,
+                            )
+                            .len()
+                        })
+                        .sum(),
                     hooks: p.hooks_path.is_some(),
                     mcp_servers: if p.mcp_config_path.is_some() { 1 } else { 0 },
                 },

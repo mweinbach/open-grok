@@ -16,7 +16,7 @@ pub use xai_grok_tools::types::compat::CompatConfig;
 
 use xai_grok_tools::implementations::skills::discovery::{
     find_command_paths, find_skill_md_paths, find_skill_paths, is_valid_skill_name,
-    normalize_skill_name, parse_skill_files, scan_md_files, walk_for_skill_md,
+    normalize_skill_name, parse_skill_files, walk_for_skill_md,
 };
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
@@ -541,18 +541,8 @@ fn stamp_plugin_fields(skills: &mut [SkillInfo], plugin: &crate::plugins::Loaded
         skill.scope = scope;
         skill.plugin_name = Some(plugin.name.clone());
         skill.plugin_version = plugin.version.clone();
-        skill.plugin_root = Some(plugin.root_str());
+        skill.plugin_root = Some(plugin.canonical_root.to_string_lossy().into_owned());
         skill.plugin_data = Some(plugin.data_dir_str());
-        // Identity is the directory basename (`plugin:<dir>`), keeping sibling
-        // skills collision-free; frontmatter `name` becomes the display label.
-        // Normalize the basename so the slash name is a valid slug, matching how
-        // frontmatter/fallback names are slugged at parse time.
-        if let Some(dir) = skill_name_from_path(&skill.path) {
-            let dir = normalize_skill_name(dir);
-            if !dir.is_empty() && dir != skill.name {
-                skill.display_name = Some(std::mem::replace(&mut skill.name, dir));
-            }
-        }
         skill.config_source = Some(xai_grok_tools::types::config_source::ConfigSource::Plugin {
             plugin_name: plugin.name.clone(),
             path: PathBuf::from(&skill.path),
@@ -564,30 +554,11 @@ fn collect_plugin_skills(registry: &crate::plugins::PluginRegistry) -> Vec<Skill
     let mut skills = Vec::new();
 
     for plugin in registry.enabled_plugins() {
-        let mut paths: Vec<(PathBuf, SkillScope)> = Vec::new();
-
-        // Skills: shared discovery primitive (see `find_skill_md_paths`).
-        for skill_dir in &plugin.skill_dirs {
-            if !skill_dir.is_dir() {
-                continue;
-            }
-            paths.extend(
-                find_skill_md_paths(skill_dir)
-                    .into_iter()
-                    .map(|p| (p, SkillScope::Repo)),
-            );
-        }
-
-        // Commands (.md files in command directories)
-        for cmd_dir in &plugin.command_dirs {
-            paths.extend(
-                scan_md_files(cmd_dir)
-                    .into_iter()
-                    .map(|p| (p, SkillScope::Repo)),
-            );
-        }
-
-        let mut parsed = parse_skill_files(paths);
+        let mut parsed = crate::plugins::registry::plugin_skills(
+            &plugin.canonical_root,
+            &plugin.skill_dirs,
+            &plugin.command_dirs,
+        );
         stamp_plugin_fields(&mut parsed, plugin);
         skills.extend(parsed);
     }
@@ -1662,7 +1633,7 @@ mod tests {
             },
             id: PluginId::new(PluginScope::User, root, name),
             root: root.to_path_buf(),
-            canonical_root: root.to_path_buf(),
+            canonical_root: dunce::canonicalize(root).unwrap(),
             scope: PluginScope::User,
             origin: crate::plugins::PluginOrigin::UserGrok,
             trusted: true,
@@ -2330,61 +2301,20 @@ mod tests {
 
     // ── Plugin skill identity ─────────────────────────────
 
-    fn min_plugin(name: &str) -> crate::plugins::LoadedPlugin {
-        use crate::plugins::discovery::PluginId;
-        let root = PathBuf::from(format!("/tmp/{name}"));
-        crate::plugins::LoadedPlugin {
-            name: name.to_string(),
-            id: PluginId::new(PluginScope::Project, &root, name),
-            root: root.clone(),
-            canonical_root: root,
-            scope: PluginScope::Project,
-            origin: crate::plugins::PluginOrigin::ProjectGrok,
-            trusted: true,
-            enabled: true,
-            version: Some("1.0.0".to_string()),
-            description: None,
-            skill_dirs: vec![],
-            command_dirs: vec![],
-            agent_dirs: vec![],
-            hooks_path: None,
-            mcp_config_path: None,
-            lsp_config_path: None,
-            skill_count: 0,
-            agent_count: 0,
-            skill_names: vec![],
-            agent_names: vec![],
-            has_hooks: false,
-            hook_count: 0,
-            has_inline_hooks_only: false,
-            mcp_server_count: 0,
-            has_inline_mcp_only: false,
-            lsp_server_count: 0,
-            has_inline_lsp_only: false,
-            inline_hooks: None,
-            inline_mcp_servers: None,
-            inline_lsp_servers: None,
-            conflict: None,
+    fn plugin_skills_named_deploy(dir_names: &[&str]) -> Vec<SkillInfo> {
+        let root = tempfile::tempdir().unwrap();
+        let skill_root = root.path().join("skills");
+        for dir in dir_names {
+            write_skill_md(&skill_root.join(dir), "deploy");
         }
+        let registry = make_registry_with_skill_dirs("infra", root.path(), vec![skill_root]);
+        collect_plugin_skills(&registry)
     }
 
     #[test]
     fn stamp_plugin_fields_uses_dir_basename_as_identity() {
         // Siblings sharing the frontmatter name `deploy` must not collide.
-        let mut skills = vec![
-            SkillInfo {
-                name: "deploy".to_owned(),
-                path: "/p/skills/deploy-prod/SKILL.md".to_owned(),
-                ..SkillInfo::default()
-            },
-            SkillInfo {
-                name: "deploy".to_owned(),
-                path: "/p/skills/deploy-staging/SKILL.md".to_owned(),
-                ..SkillInfo::default()
-            },
-        ];
-        stamp_plugin_fields(&mut skills, &min_plugin("infra"));
-
+        let skills = plugin_skills_named_deploy(&["deploy-prod", "deploy-staging"]);
         assert_eq!(skills[0].name, "deploy-prod");
         assert_eq!(skills[0].display_name.as_deref(), Some("deploy"));
         assert_eq!(skills[0].dedup_key(), "infra:deploy-prod");
@@ -2393,25 +2323,14 @@ mod tests {
 
     #[test]
     fn stamp_plugin_fields_normalizes_dir_basename() {
-        let mut skills = vec![SkillInfo {
-            name: "deploy".to_owned(),
-            path: "/p/skills/Deploy_Prod/SKILL.md".to_owned(),
-            ..SkillInfo::default()
-        }];
-        stamp_plugin_fields(&mut skills, &min_plugin("infra"));
+        let skills = plugin_skills_named_deploy(&["Deploy_Prod"]);
         assert_eq!(skills[0].name, "deploy-prod");
         assert_eq!(skills[0].display_name.as_deref(), Some("deploy"));
     }
 
     #[test]
     fn stamp_plugin_fields_keeps_name_when_dir_matches() {
-        let mut skills = vec![SkillInfo {
-            name: "deploy".to_owned(),
-            path: "/p/skills/deploy/SKILL.md".to_owned(),
-            ..SkillInfo::default()
-        }];
-        stamp_plugin_fields(&mut skills, &min_plugin("infra"));
-
+        let skills = plugin_skills_named_deploy(&["deploy"]);
         assert_eq!(skills[0].name, "deploy");
         assert_eq!(skills[0].display_name, None);
         assert_eq!(skills[0].label(), "deploy");

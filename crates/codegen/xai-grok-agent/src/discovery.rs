@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use xai_grok_tools::implementations::skills::plugin_files;
 use xai_grok_tools::types::config_source::ConfigSource;
 
 use crate::config::{AgentDefinition, AgentScope, BuiltinAgentName};
@@ -321,14 +322,7 @@ pub fn plugin_agents(registry: &crate::plugins::PluginRegistry) -> Vec<PluginAge
     let mut agents = Vec::new();
     for plugin in registry.enabled_plugins() {
         for agent_dir in &plugin.agent_dirs {
-            let Ok(entries) = std::fs::read_dir(agent_dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|extension| extension.to_str()) != Some("md") {
-                    continue;
-                }
+            for path in plugin_files::markdown_files(&plugin.canonical_root, agent_dir) {
                 let Some(definition) = load_plugin_agent_definition(plugin, &path) else {
                     continue;
                 };
@@ -438,7 +432,7 @@ fn by_name_in_cwd_with_plugins_and_home(
             && plugin.enabled
         {
             for agent_dir in &plugin.agent_dirs {
-                let agent_file = agent_dir.join(format!("{agent_name}.md"));
+                let agent_file = named_agent_path(agent_dir, agent_name)?;
                 if agent_file.is_file()
                     && let Some(mut def) = load_plugin_agent_definition(plugin, &agent_file)
                 {
@@ -454,8 +448,10 @@ fn by_name_in_cwd_with_plugins_and_home(
             Vec::new();
         for plugin in registry.enabled_plugins() {
             for agent_dir in &plugin.agent_dirs {
-                let agent_file = agent_dir.join(format!("{name}.md"));
-                if agent_file.is_file() {
+                let agent_file = named_agent_path(agent_dir, name)?;
+                if plugin_files::resolve(&plugin.canonical_root, &agent_file)
+                    .is_ok_and(|path| path.is_file())
+                {
                     matches.push((plugin, agent_file));
                 }
             }
@@ -488,11 +484,15 @@ fn load_plugin_agent_definition(
     plugin: &crate::plugins::LoadedPlugin,
     path: &Path,
 ) -> Option<AgentDefinition> {
-    let loaded = if plugin.trusted {
-        AgentDefinition::from_file(path)
-    } else {
-        AgentDefinition::from_file_frontmatter_only(path)
-    };
+    use std::io::Read;
+    let loaded = plugin_files::open(&plugin.canonical_root, path)
+        .and_then(|mut file| {
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            Ok(content)
+        })
+        .map_err(crate::error::AgentBuildError::IoError)
+        .and_then(|content| AgentDefinition::from_file_content(path, &content, plugin.trusted));
     match loaded {
         Ok(mut def) => {
             def.plugin_name = Some(plugin.name.clone());
@@ -550,9 +550,8 @@ fn load_project_definitions(
 /// [`project_agent_dirs`] SSOT), highest-priority dir first.
 fn load_project_definition_by_name(name: &str, cwd: &Path) -> Option<AgentDefinition> {
     for agents_dir in project_agent_dirs(Some(cwd)).0 {
-        let agent_file = agents_dir.join(format!("{name}.md"));
-        if let Some(def) = load_definition_from_path(
-            &agent_file,
+        if let Some(def) = load_definition_by_name(
+            &agents_dir,
             name,
             "Failed to parse project agent definition",
             Some(AgentScope::Project),
@@ -563,13 +562,22 @@ fn load_project_definition_by_name(name: &str, cwd: &Path) -> Option<AgentDefini
     None
 }
 
+/// A named lookup can select one file in a discovered agent directory. Interpret
+/// separators the same way on every host; the caller handles plugin qualification.
+fn named_agent_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    if matches!(name, "" | "." | "..") || name.contains(['/', '\\', ':', '\0']) {
+        return None;
+    }
+    Some(dir.join(format!("{name}.md")))
+}
+
 fn load_definition_by_name(
     dir: &Path,
     name: &str,
     error_message: &str,
     scope_override: Option<AgentScope>,
 ) -> Option<AgentDefinition> {
-    let agent_file = dir.join(format!("{}.md", name));
+    let agent_file = named_agent_path(dir, name)?;
     load_definition_from_path(&agent_file, name, error_message, scope_override)
 }
 
@@ -669,7 +677,11 @@ mod tests {
         scope: PluginScope,
         agent_dirs: Vec<PathBuf>,
     ) -> PluginRegistry {
-        let root = PathBuf::from(format!("/tmp/{plugin_name}"));
+        let root = agent_dirs
+            .first()
+            .and_then(|d| d.parent())
+            .map(|p| dunce::canonicalize(p).unwrap())
+            .unwrap_or_else(|| PathBuf::from(format!("/tmp/{plugin_name}")));
         let loaded = LoadedPlugin {
             name: plugin_name.to_string(),
             id: PluginId::new(scope, &root, plugin_name),
@@ -1378,6 +1390,103 @@ mod tests {
         assert_eq!(def.scope, AgentScope::Bundled);
         assert_eq!(def.description, "Bundled reviewer");
         assert!(def.plugin_name.is_none());
+    }
+
+    #[test]
+    fn by_name_cannot_load_arbitrary_agent_paths_or_escape_a_plugin_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("workspace");
+        let project = cwd.join(".opengrok/agents");
+        let state = temp.path().join("state");
+        let user = state.join("agents");
+        let plugin = temp.path().join("enabled-plugin/agents");
+        let disabled = temp.path().join("disabled-plugin/agents");
+        for dir in [&project, &user, &plugin, &disabled] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write_agent_file(&project, "project-agent.md", "project-agent", "project");
+        write_agent_file(&user, "user-agent.md", "user-agent", "user");
+        write_agent_file(&plugin, "helper.md", "helper", "plugin");
+        let outside = disabled.join("restricted.md");
+        fs::write(
+            &outside,
+            "---\nname: restricted\ndescription: fixture\n---\nEXTERNAL AGENT BODY",
+        )
+        .unwrap();
+        let absolute = outside.with_extension("");
+        let registry = make_plugin_registry("demo", PluginScope::User, vec![plugin]);
+        let lookup = |name| {
+            by_name_in_cwd_with_plugins_and_home(name, &cwd, Some(&registry), None, Some(&state))
+        };
+        assert_eq!(lookup("project-agent").unwrap().scope, AgentScope::Project);
+        assert_eq!(lookup("user-agent").unwrap().scope, AgentScope::User);
+        assert_eq!(
+            lookup("demo:helper").unwrap().plugin_name.as_deref(),
+            Some("demo")
+        );
+        assert_eq!(
+            AgentDefinition::from_file(&outside)
+                .unwrap()
+                .prompt_body
+                .as_deref(),
+            Some("EXTERNAL AGENT BODY")
+        );
+
+        for name in [
+            absolute.to_str().unwrap(),
+            "../../../disabled-plugin/agents/restricted",
+            "../../disabled-plugin/agents/restricted",
+            "demo:../../disabled-plugin/agents/restricted",
+            &format!("demo:{}", absolute.display()),
+            r"..\..\disabled-plugin\agents\restricted",
+            r"C:\foreign\restricted",
+            r"\\host\share\restricted",
+            "C:restricted",
+            "demo:another:helper",
+            ".",
+            "..",
+        ] {
+            assert!(lookup(name).is_none(), "named discovery loaded {name:?}");
+            assert!(
+                by_name_with_home(name, None, Some(&state)).is_none(),
+                "user named discovery loaded {name:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_agent_paths_stay_inside_plugin_for_catalog_and_exact_lookup() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("cwd");
+        let agents = temp.path().join("plugin/agents");
+        let outside = temp.path().join("plugin-sibling");
+        for dir in [&cwd, &agents, &outside] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        write_agent_file(&agents, "good.md", "good", "inside");
+        write_agent_file(&outside, "external.md", "external", "outside");
+        symlink(outside.join("external.md"), agents.join("external.md")).unwrap();
+        let registry = make_plugin_registry("demo", PluginScope::User, vec![agents.clone()]);
+        let names: Vec<_> = plugin_agents(&registry)
+            .into_iter()
+            .map(|agent| agent.qualified_name)
+            .collect();
+        assert_eq!(names, ["demo:good"]);
+        let lookup =
+            |name| by_name_in_cwd_with_plugins_and_home(name, &cwd, Some(&registry), None, None);
+        assert!(lookup("demo:good").is_some());
+        for name in [
+            "external",
+            "demo:external",
+            "demo:../../plugin-sibling/external",
+        ] {
+            assert!(lookup(name).is_none(), "{name}");
+        }
+        fs::remove_file(agents.join("good.md")).unwrap();
+        symlink(outside.join("external.md"), agents.join("good.md")).unwrap();
+        assert!(lookup("demo:good").is_none());
     }
 
     #[test]
