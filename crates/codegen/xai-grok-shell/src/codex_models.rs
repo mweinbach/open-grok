@@ -13,6 +13,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use indexmap::IndexMap;
 use reqwest::StatusCode;
 use reqwest::header::{ETAG, USER_AGENT};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::Write;
@@ -30,42 +31,33 @@ pub(crate) const CODEX_MODELS_CACHE_FILE: &str = "codex_models_cache.json";
 pub(crate) const CODEX_CLIENT_VERSION_ENV: &str = "OPENGROK_CODEX_CLIENT_VERSION";
 /// Codex compatibility version advertised to the backend. This is independent
 /// from Open Grok's package version and the source revisions recorded in the port docs.
-pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.164.0";
+pub(crate) const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.167.0-alpha.3";
 const CODEX_MODELS_CACHE_TTL: Duration = Duration::from_secs(300);
-const CODEX_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CODEX_MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const REFRESH_TIMED_OUT: &str = "Codex models refresh timed out";
 const DEFAULT_EFFECTIVE_CONTEXT_WINDOW_PERCENT: i64 = 95;
 
 const fn default_true() -> bool {
     true
 }
 
-/// Resolve the Codex compatibility version advertised to `/models`.
-/// Prerelease/build suffixes are deliberately removed, matching codex-rs's
-/// `client_version_to_whole` behavior.
-pub(crate) fn codex_client_version() -> String {
-    match std::env::var(CODEX_CLIENT_VERSION_ENV) {
-        Ok(value) => match normalize_whole_semver(&value) {
-            Some(version) => version,
-            None => {
-                tracing::warn!(
-                    value = %value,
-                    fallback = DEFAULT_CODEX_CLIENT_VERSION,
-                    "invalid OPENGROK_CODEX_CLIENT_VERSION; using pinned compatibility version"
-                );
-                DEFAULT_CODEX_CLIENT_VERSION.to_owned()
-            }
-        },
-        Err(_) => DEFAULT_CODEX_CLIENT_VERSION.to_owned(),
+/// Full build version used in Codex request headers.
+pub(crate) fn codex_client_version() -> Version {
+    if let Ok(value) = std::env::var(CODEX_CLIENT_VERSION_ENV) {
+        if let Ok(version) = parse_client_version(&value) {
+            return version;
+        }
+        tracing::warn!(
+            fallback = DEFAULT_CODEX_CLIENT_VERSION,
+            "invalid OPENGROK_CODEX_CLIENT_VERSION; using pinned compatibility version"
+        );
     }
+    Version::parse(DEFAULT_CODEX_CLIENT_VERSION).expect("valid pinned Codex version")
 }
 
-fn normalize_whole_semver(value: &str) -> Option<String> {
-    let value = value.trim().strip_prefix('v').unwrap_or(value.trim());
-    let version = semver::Version::parse(value).ok()?;
-    Some(format!(
-        "{}.{}.{}",
-        version.major, version.minor, version.patch
-    ))
+fn parse_client_version(value: &str) -> Result<Version, semver::Error> {
+    let value = value.trim();
+    Version::parse(value.strip_prefix('v').unwrap_or(value))
 }
 
 /// Codex backend visibility is distinct from xAI's auth-dependent picker flag.
@@ -370,7 +362,7 @@ pub(crate) struct CodexModelsClient {
     cache_path: PathBuf,
     base_url: String,
     open_grok_version: String,
-    client_version: String,
+    client_version: Version,
     cache_ttl: Duration,
     auth: Arc<dyn CodexModelsAuthSource>,
 }
@@ -406,35 +398,68 @@ impl CodexModelsClient {
     /// result; transport/protocol failures are returned and leave any old cache
     /// untouched.
     pub(crate) async fn fetch_and_cache(&self) -> anyhow::Result<Option<CodexModelsCatalog>> {
-        let Some(mut credentials) = self.auth.fresh_credentials().await? else {
+        let deadline = tokio::time::Instant::now() + CODEX_MODELS_REFRESH_TIMEOUT;
+        let Some((fetched, credentials)) = tokio::time::timeout_at(deadline, self.fetch(deadline))
+            .await
+            .context(REFRESH_TIMED_OUT)??
+        else {
             return Ok(None);
-        };
-
-        let fetched = match self.fetch_once(&credentials).await {
-            Ok(fetched) => fetched,
-            Err(CodexModelsRequestError::Unauthorized) => {
-                credentials = self
-                    .auth
-                    .force_refresh()
-                    .await?
-                    .ok_or_else(|| anyhow!("OpenAI Codex login is no longer available"))?;
-                self.fetch_once(&credentials)
-                    .await
-                    .map_err(CodexModelsRequestError::into_anyhow)?
-            }
-            Err(error) => return Err(error.into_anyhow()),
         };
 
         // Cache persistence is best-effort: a read-only or full home directory
         // must not make a successfully fetched catalog unavailable to the user.
         // Recheck the principal first so a request completed after an account
         // switch cannot overwrite the new account's cache with the old result.
-        if !self.catalog_matches_current_account(&fetched) {
+        let matches_account = self.catalog_matches_current_account(&fetched);
+        // Catalog conversion and the principal recheck are synchronous.
+        ensure_refresh_time_remaining(deadline)?;
+        if !matches_account {
             tracing::debug!("skipping Codex models cache write: account changed during request");
         } else if let Err(error) = self.persist(&fetched, &credentials, Utc::now()) {
             tracing::warn!(%error, path = %self.cache_path.display(), "Codex models cache write failed");
         }
         Ok(Some(fetched))
+    }
+
+    async fn fetch(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<Option<(CodexModelsCatalog, CodexCredentials)>> {
+        let Some(mut credentials) = self.refresh_credentials(false).await? else {
+            return Ok(None);
+        };
+
+        let fetched = match self.fetch_once(&credentials, deadline).await {
+            Ok(fetched) => fetched,
+            Err(CodexModelsRequestError::Unauthorized) => {
+                ensure_refresh_time_remaining(deadline)?;
+                credentials = self
+                    .refresh_credentials(true)
+                    .await?
+                    .ok_or_else(|| anyhow!("OpenAI Codex login is no longer available"))?;
+                self.fetch_once(&credentials, deadline)
+                    .await
+                    .map_err(CodexModelsRequestError::into_anyhow)?
+            }
+            Err(error) => return Err(error.into_anyhow()),
+        };
+
+        Ok(Some((fetched, credentials)))
+    }
+
+    async fn refresh_credentials(&self, force: bool) -> anyhow::Result<Option<CodexCredentials>> {
+        let auth = Arc::clone(&self.auth);
+        // A refresh token can rotate before its replacement reaches disk. Dropping
+        // this join handle leaves only the credential operation running to completion.
+        tokio::spawn(async move {
+            if force {
+                auth.force_refresh().await
+            } else {
+                auth.fresh_credentials().await
+            }
+        })
+        .await
+        .context("Codex models credential task failed")?
     }
 
     /// Codex-rs `OnlineIfUncached`: use a fresh matching cache, otherwise fetch.
@@ -497,10 +522,10 @@ impl CodexModelsClient {
             );
             return None;
         }
-        if cache.client_version != self.client_version {
+        if cache.client_version != self.catalog_version() {
             tracing::debug!(
                 cached = %cache.client_version,
-                expected = %self.client_version,
+                expected = %self.catalog_version(),
                 "Codex models cache version mismatch"
             );
             return None;
@@ -529,6 +554,7 @@ impl CodexModelsClient {
     async fn fetch_once(
         &self,
         credentials: &CodexCredentials,
+        deadline: tokio::time::Instant,
     ) -> Result<CodexModelsCatalog, CodexModelsRequestError> {
         let request_account = account_fingerprint(credentials).ok_or_else(|| {
             CodexModelsRequestError::Other(anyhow!(
@@ -540,7 +566,6 @@ impl CodexModelsClient {
             .http
             .client()
             .get(url)
-            .timeout(CODEX_MODELS_REQUEST_TIMEOUT)
             .bearer_auth(&credentials.access_token)
             // codex-rs's default HTTP client applies both of these headers to
             // the `/models` request before provider auth is layered on top.
@@ -548,7 +573,7 @@ impl CodexModelsClient {
             .header(USER_AGENT, self.codex_user_agent())
             // Matches codex-rs's first-party OpenAI provider header. This must
             // advertise the compatible Codex client, not Open Grok's package.
-            .header("version", &self.client_version);
+            .header("version", self.client_version.to_string());
         if let Some(account_id) = credentials.account_id.as_deref() {
             request = request.header("ChatGPT-Account-ID", account_id);
         }
@@ -556,6 +581,8 @@ impl CodexModelsClient {
             request = request.header("X-OpenAI-Fedramp", "true");
         }
 
+        // Lazy HTTP client construction may spend time loading the OS trust store.
+        ensure_refresh_time_remaining(deadline).map_err(CodexModelsRequestError::Other)?;
         let response = request.send().await.map_err(|error| {
             CodexModelsRequestError::Other(anyhow!(error).context("Codex models request failed"))
         })?;
@@ -819,12 +846,18 @@ impl CodexModelsClient {
         })
     }
 
+    /// Codex keys model discovery and its cache on major.minor.patch.
+    fn catalog_version(&self) -> String {
+        let version = &self.client_version;
+        format!("{}.{}.{}", version.major, version.minor, version.patch)
+    }
+
     fn models_url(&self) -> anyhow::Result<Url> {
         let mut url = Url::parse(&self.base_url).context("Codex models base URL is invalid")?;
         let path = format!("{}/models", url.path().trim_end_matches('/'));
         url.set_path(&path);
         url.query_pairs_mut()
-            .append_pair("client_version", &self.client_version);
+            .append_pair("client_version", &self.catalog_version());
         Ok(url)
     }
 
@@ -857,7 +890,7 @@ impl CodexModelsClient {
         let cache = CodexModelsCache {
             fetched_at,
             open_grok_version: self.open_grok_version.clone(),
-            client_version: self.client_version.clone(),
+            client_version: self.catalog_version(),
             base_origin,
             base_url,
             account_fingerprint: account_fingerprint(credentials)
@@ -895,7 +928,7 @@ impl CodexModelsClient {
     fn for_test(
         cache_path: PathBuf,
         base_url: String,
-        client_version: String,
+        client_version: &str,
         cache_ttl: Duration,
         auth: Arc<dyn CodexModelsAuthSource>,
     ) -> Self {
@@ -904,7 +937,7 @@ impl CodexModelsClient {
             cache_path,
             base_url,
             open_grok_version: "test-open-grok".to_owned(),
-            client_version,
+            client_version: parse_client_version(client_version).unwrap(),
             cache_ttl,
             auth,
         }
@@ -915,6 +948,11 @@ impl Default for CodexModelsClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn ensure_refresh_time_remaining(deadline: tokio::time::Instant) -> anyhow::Result<()> {
+    anyhow::ensure!(tokio::time::Instant::now() < deadline, REFRESH_TIMED_OUT);
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1041,12 +1079,36 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::Notify;
 
+    #[derive(Debug, Default)]
+    struct RefreshGate {
+        initial: bool,
+        started: Notify,
+        release: Notify,
+        saved: Notify,
+    }
+
     #[derive(Debug)]
     struct TestAuthSource {
         current: Mutex<Option<CodexCredentials>>,
         fresh: Option<CodexCredentials>,
         refreshed: Option<CodexCredentials>,
         force_calls: AtomicUsize,
+        gate: Option<Arc<RefreshGate>>,
+    }
+
+    impl TestAuthSource {
+        async fn rotate(&self) -> Option<CodexCredentials> {
+            if let Some(gate) = &self.gate {
+                gate.started.notify_one();
+                gate.release.notified().await;
+            }
+            let refreshed = self.refreshed.clone();
+            *self.current.lock().unwrap() = refreshed.clone();
+            if let Some(gate) = &self.gate {
+                gate.saved.notify_one();
+            }
+            refreshed
+        }
     }
 
     #[async_trait]
@@ -1056,14 +1118,15 @@ mod tests {
         }
 
         async fn fresh_credentials(&self) -> anyhow::Result<Option<CodexCredentials>> {
+            if self.gate.as_ref().is_some_and(|gate| gate.initial) {
+                return Ok(self.rotate().await);
+            }
             Ok(self.fresh.clone())
         }
 
         async fn force_refresh(&self) -> anyhow::Result<Option<CodexCredentials>> {
             self.force_calls.fetch_add(1, Ordering::SeqCst);
-            let refreshed = self.refreshed.clone();
-            *self.current.lock().unwrap() = refreshed.clone();
-            Ok(refreshed)
+            Ok(self.rotate().await)
         }
     }
 
@@ -1085,7 +1148,24 @@ mod tests {
             fresh: Some(credentials.clone()),
             refreshed: Some(credentials),
             force_calls: AtomicUsize::new(0),
+            gate: None,
         })
+    }
+
+    fn gated_auth_source(initial: bool) -> (Arc<TestAuthSource>, Arc<RefreshGate>) {
+        let old = credentials("old-token", "workspace-1", false);
+        let gate = Arc::new(RefreshGate {
+            initial,
+            ..Default::default()
+        });
+        let auth = Arc::new(TestAuthSource {
+            current: Mutex::new(Some(old.clone())),
+            fresh: Some(old),
+            refreshed: Some(credentials("rotated-token", "workspace-1", false)),
+            force_calls: AtomicUsize::new(0),
+            gate: Some(gate.clone()),
+        });
+        (auth, gate)
     }
 
     fn model_response() -> serde_json::Value {
@@ -1263,7 +1343,7 @@ mod tests {
         CodexModelsClient::for_test(
             temp.path().join(CODEX_MODELS_CACHE_FILE),
             base_url,
-            version.to_owned(),
+            version,
             ttl,
             auth,
         )
@@ -1275,7 +1355,13 @@ mod tests {
             spawn_models_server([StatusCode::OK], model_response(), Some("live-etag")).await;
         let temp = tempfile::tempdir().unwrap();
         let auth = auth_source(credentials("codex-token", "workspace-1", true));
-        let client = test_client(&temp, base_url, "9.8.7", Duration::from_secs(300), auth);
+        let client = test_client(
+            &temp,
+            base_url,
+            DEFAULT_CODEX_CLIENT_VERSION,
+            Duration::from_secs(300),
+            auth,
+        );
 
         let catalog = client.fetch_and_cache().await.unwrap().unwrap();
         server.abort();
@@ -1284,7 +1370,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].query.get("client_version").map(String::as_str),
-            Some("9.8.7")
+            Some("0.167.0")
         );
         assert_eq!(
             requests[0].authorization.as_deref(),
@@ -1292,14 +1378,14 @@ mod tests {
         );
         assert_eq!(requests[0].account_id.as_deref(), Some("workspace-1"));
         assert_eq!(requests[0].fedramp.as_deref(), Some("true"));
-        assert_eq!(requests[0].version.as_deref(), Some("9.8.7"));
+        assert_eq!(requests[0].version.as_deref(), Some("0.167.0-alpha.3"));
         assert_eq!(
             requests[0].originator.as_deref(),
             Some(codex_auth::CODEX_ORIGINATOR)
         );
         assert_eq!(
             requests[0].user_agent.as_deref(),
-            Some("codex_cli_rs/9.8.7")
+            Some("codex_cli_rs/0.167.0-alpha.3")
         );
         assert_eq!(requests[0].xai_token_auth, None);
         assert_eq!(requests[0].x_api_key, None);
@@ -1378,6 +1464,99 @@ mod tests {
         assert!(catalog.models[1].entry.info.hidden);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_catalog_fetch_leaves_initial_credential_rotation_running() {
+        let (base_url, observed, server) =
+            spawn_models_server([StatusCode::OK], model_response(), None).await;
+        let temp = tempfile::tempdir().unwrap();
+        let (auth, refresh) = gated_auth_source(true);
+        let client = test_client(
+            &temp,
+            base_url,
+            "1.2.3",
+            CODEX_MODELS_CACHE_TTL,
+            auth.clone(),
+        );
+        let fetching = tokio::spawn({
+            let client = client.clone();
+            async move { client.fetch_and_cache().await }
+        });
+        refresh.started.notified().await;
+        fetching.abort();
+        assert!(fetching.await.unwrap_err().is_cancelled());
+
+        refresh.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), refresh.saved.notified())
+            .await
+            .expect("cancelled credential rotation was abandoned");
+        assert_eq!(
+            auth.current_credentials().unwrap().unwrap().access_token,
+            "rotated-token"
+        );
+        assert!(observed.lock().unwrap().is_empty());
+        assert!(!client.cache_path().exists());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn catalog_deadline_spans_first_request_and_forced_credential_rotation() {
+        let requested = Arc::new(Notify::new());
+        let respond = Arc::new(Notify::new());
+        let (base_url, observed, server) = spawn_models_server_with_gate(
+            [StatusCode::UNAUTHORIZED, StatusCode::OK],
+            model_response(),
+            None,
+            Some((requested.clone(), respond.clone())),
+        )
+        .await;
+        let temp = tempfile::tempdir().unwrap();
+        let (auth, refresh) = gated_auth_source(false);
+        let client = test_client(
+            &temp,
+            base_url,
+            "1.2.3",
+            CODEX_MODELS_CACHE_TTL,
+            auth.clone(),
+        );
+        client.http.client();
+        let fetching = tokio::spawn({
+            let client = client.clone();
+            async move { client.fetch_and_cache().await }
+        });
+
+        tokio::time::timeout(CODEX_MODELS_REFRESH_TIMEOUT, requested.notified())
+            .await
+            .expect("server did not receive the first request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        // Allow loopback I/O to deliver the 401 without auto-advancing the timer.
+        tokio::time::resume();
+        respond.notify_one();
+        tokio::time::timeout(CODEX_MODELS_REFRESH_TIMEOUT, refresh.started.notified())
+            .await
+            .expect("401 did not start a credential refresh");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = tokio::time::timeout(Duration::from_millis(100), fetching)
+            .await
+            .expect("401 handling restarted the five-second budget")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+
+        refresh.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), refresh.saved.notified())
+            .await
+            .expect("timeout abandoned the rotated credentials");
+        assert_eq!(
+            auth.current_credentials().unwrap().unwrap().access_token,
+            "rotated-token"
+        );
+        assert_eq!(observed.lock().unwrap().len(), 1);
+        assert!(!client.cache_path().exists());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn unauthorized_forces_one_refresh_and_retries_with_rotated_bearer() {
         let (base_url, observed, server) = spawn_models_server(
@@ -1394,6 +1573,7 @@ mod tests {
             fresh: Some(old),
             refreshed: Some(new),
             force_calls: AtomicUsize::new(0),
+            gate: None,
         });
         let client = test_client(
             &temp,
@@ -1438,6 +1618,7 @@ mod tests {
             fresh: Some(account_a.clone()),
             refreshed: Some(account_a),
             force_calls: AtomicUsize::new(0),
+            gate: None,
         });
         let client = test_client(
             &temp,
@@ -1516,6 +1697,15 @@ mod tests {
         let catalog = client.fetch_and_cache().await.unwrap().unwrap();
         server.abort();
         assert!(client.load_fresh_cache().is_some());
+
+        let same_catalog_version = test_client(
+            &temp,
+            base_url.clone(),
+            "1.2.3-alpha.3+build",
+            Duration::from_secs(300),
+            auth_source(creds.clone()),
+        );
+        assert!(same_catalog_version.load_fresh_cache().is_some());
 
         let version_mismatch = test_client(
             &temp,
@@ -1938,16 +2128,13 @@ mod tests {
     }
 
     #[test]
-    fn codex_compatibility_version_normalizes_to_whole_semver() {
+    fn codex_compatibility_version_preserves_build_identity() {
         assert_eq!(
-            normalize_whole_semver("0.144.5-alpha.1+build"),
-            Some("0.144.5".to_owned())
+            parse_client_version(" v0.167.0-alpha.3+build ")
+                .unwrap()
+                .to_string(),
+            "0.167.0-alpha.3+build"
         );
-        assert_eq!(
-            normalize_whole_semver(" v0.145.0 "),
-            Some("0.145.0".to_owned())
-        );
-        assert_eq!(normalize_whole_semver("not-a-version"), None);
-        assert_eq!(DEFAULT_CODEX_CLIENT_VERSION, "0.164.0");
+        assert!(parse_client_version("not-a-version").is_err());
     }
 }

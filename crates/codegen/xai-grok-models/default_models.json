@@ -337,79 +337,215 @@
       "supports_backend_search": true
     },
     {
-      "model": "gpt-6-astra",
-      "name": "GPT-6-astra",
-      "default_reasoning_summary": "none",
-      "description": "Latest frontier agentic coding model",
+      "model": "gpt-6.1-sol",
+      "name": "GPT-6.1-Sol",
+      "description": "Latest workhorse model for coding and everyday work.",
       "context_window": 258400,
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
       "multi_agent_version": "v2",
       "use_responses_lite": true,
-      "experimental_supported_tools": [
-        "send_user_message_async"
-      ],
+      "experimental_supported_tools": ["send_user_message_async", "clock"],
       "apply_patch_tool_type": "freeform",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "2x speed, increased usage" }
+      ],
       "codex_model": {
         "context_window": 272000,
-        "max_context_window": 372000,
-        "effective_context_window_percent": 95,
+        "max_context_window": 872000,
         "comp_hash": "3000",
         "multi_agent_reasoning_effort": "xhigh",
-        "supported_reasoning_efforts": [
-          "low",
-          "medium",
-          "high",
-          "xhigh",
-          "max",
-          "ultra"
-        ],
         "support_verbosity": true,
         "default_verbosity": "low",
-        "input_modalities": [
-          "text",
-          "image"
-        ]
+        "input_modalities": ["text", "image"]
       },
       "reasoning_efforts": [
-        {
-          "value": "low"
-        },
-        {
-          "value": "medium",
-          "default": true
-        },
-        {
-          "value": "high"
-        },
-        {
-          "value": "xhigh"
-        },
-        {
-          "value": "max"
-        },
-        {
-          "value": "ultra"
-        }
+        { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-6-astra",
+      "name": "GPT-6-astra",
+      "description": "Frontier intelligence for the most demanding work.",
+      "context_window": 258400,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "experimental_supported_tools": ["send_user_message_async", "clock"],
+      "apply_patch_tool_type": "freeform",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "2x speed, increased usage" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "multi_agent_reasoning_effort": "xhigh",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"]
+      },
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-6-sol",
+      "name": "GPT-6-Sol",
+      "description": "Previous generation workhorse model.",
+      "context_window": 258400,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "experimental_supported_tools": ["send_user_message_async", "clock"],
+      "apply_patch_tool_type": "freeform",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "1.5x speed" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"]
+      },
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-6-luna",
+      "name": "GPT-6-Luna",
+      "description": "Fast and affordable model for easier tasks.",
+      "context_window": 258400,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "experimental_supported_tools": ["send_user_message_async", "clock"],
+      "apply_patch_tool_type": "freeform",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "1.5x speed" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"]
+      },
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning" },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" }
       ]
     },
     {
       "model": "gpt-5.6-sol",
-      "name": "GPT-5.6 Sol",
-      "description": "Latest frontier agentic coding model",
-      "context_window": 353000,
+      "name": "GPT-5.6-Sol",
+      "description": "Older generation workhorse model.",
+      "context_window": 258400,
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
       "subagent_context_default": "forked",
       "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "apply_patch_tool_type": "freeform",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "1.5x speed, increased usage" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"],
+        "upgrade": {"model": "gpt-6-sol", "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n", "retirement_at": null}
+      },
+      "reasoning_efforts": [
+        { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
+        { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
+        { "value": "high", "description": "Greater reasoning depth for complex problems" },
+        { "value": "xhigh", "description": "Extra high reasoning depth for complex problems" },
+        { "value": "max", "description": "Maximum reasoning depth for the hardest problems" },
+        { "value": "ultra", "description": "Maximum reasoning with automatic task delegation" }
+      ]
+    },
+    {
+      "model": "gpt-6.1-terra",
+      "name": "GPT-6.1 Terra",
+      "description": "GPT-6.1 Terra Codex model.",
+      "context_window": 475000,
+      "api_backend": "responses",
+      "provider": "codex",
+      "tool_mode": "code_mode_only",
+      "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "experimental_supported_tools": ["send_user_message_async", "clock"],
+      "apply_patch_tool_type": "freeform",
+      "agent_type": "codex",
+      "supported_in_api": false,
+      "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "description": "1.5x speed", "id": "priority", "name": "Fast" }
+      ],
+      "codex_model": {
+        "context_window": 500000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "multi_agent_reasoning_effort": "xhigh",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"]
+      },
       "reasoning_efforts": [
         { "value": "low", "description": "Fast responses with lighter reasoning", "default": true },
         { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks" },
@@ -421,16 +557,31 @@
     },
     {
       "model": "gpt-5.6-terra",
-      "name": "GPT-5.6 Terra",
-      "description": "Balanced agentic coding model for everyday work",
-      "context_window": 353000,
+      "name": "GPT-5.6-Terra",
+      "description": "Older balanced model for straightforward work.",
+      "context_window": 258400,
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
       "multi_agent_version": "v2",
+      "use_responses_lite": true,
+      "apply_patch_tool_type": "freeform",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "1.5x speed, increased usage" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"],
+        "upgrade": {"model": "gpt-6-sol", "migration_markdown": "Meet GPT-6 Sol\n\nOur latest Sol is more intelligent and more efficient so your usage limits go further. This model is a great daily driver for complex tasks, especially coding.\n", "retirement_at": null}
+      },
       "reasoning_efforts": [
         { "value": "low", "description": "Fast responses with lighter reasoning" },
         { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },
@@ -442,16 +593,31 @@
     },
     {
       "model": "gpt-5.6-luna",
-      "name": "GPT-5.6 Luna",
-      "description": "Fast and affordable agentic coding model",
-      "context_window": 353000,
+      "name": "GPT-5.6-Luna",
+      "description": "Older fast and efficient model.",
+      "context_window": 258400,
       "api_backend": "responses",
       "provider": "codex",
       "tool_mode": "code_mode_only",
       "multi_agent_version": "v1",
+      "use_responses_lite": true,
+      "apply_patch_tool_type": "freeform",
       "agent_type": "codex",
       "supported_in_api": false,
       "supports_backend_search": true,
+      "default_reasoning_summary": "none",
+      "service_tiers": [
+        { "id": "priority", "name": "Fast", "description": "1.5x speed, increased usage" }
+      ],
+      "codex_model": {
+        "context_window": 272000,
+        "max_context_window": 872000,
+        "comp_hash": "3000",
+        "support_verbosity": true,
+        "default_verbosity": "low",
+        "input_modalities": ["text", "image"],
+        "upgrade": {"model": "gpt-6-luna", "migration_markdown": "Meet GPT-6 Luna\n\nOur latest Luna is significantly more efficient, so your usage limits go even further. Reach for it for any job that doesn't require frontier intelligence.\n", "retirement_at": null}
+      },
       "reasoning_efforts": [
         { "value": "low", "description": "Fast responses with lighter reasoning" },
         { "value": "medium", "description": "Balances speed and reasoning depth for everyday tasks", "default": true },

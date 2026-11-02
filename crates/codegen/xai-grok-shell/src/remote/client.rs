@@ -1027,6 +1027,7 @@ pub(crate) fn parse_remote_model_value(
                     .collect()
             })
             .unwrap_or_default(),
+        service_tiers: Vec::new(),
         supports_reasoning_summary_parameter: false,
         default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
         supports_backend_search: obj

@@ -3821,7 +3821,11 @@ fn merge_remote_provider_partition(
             entry.info.supports_reasoning_effort = donor.info.supports_reasoning_effort;
             entry.info.reasoning_effort = donor.info.reasoning_effort;
         }
-        if entry.info.service_tiers.is_empty() && !donor.info.service_tiers.is_empty() {
+        // A live Codex row can withdraw Fast for this account or model.
+        if provider != ModelProvider::Codex
+            && entry.info.service_tiers.is_empty()
+            && !donor.info.service_tiers.is_empty()
+        {
             entry.info.service_tiers = donor.info.service_tiers.clone();
         }
     }
@@ -4465,6 +4469,8 @@ struct DefaultModelJson {
     #[serde(default)]
     reasoning_efforts: Vec<ReasoningEffortOption>,
     #[serde(default)]
+    service_tiers: Vec<xai_grok_sampling_types::ModelServiceTier>,
+    #[serde(default)]
     variants: Vec<ModelVariant>,
     /// When false, only OAuth users see this in the picker.
     #[serde(default = "default_true")]
@@ -4630,6 +4636,7 @@ fn default_models(
                 reasoning_efforts: m.reasoning_efforts,
                 reasoning_effort_server_default: false,
                 variants: m.variants,
+                service_tiers: m.service_tiers,
                 supports_reasoning_summary_parameter: m.provider == ModelProvider::Codex,
                 // The embedded catalog is only an offline fallback. Supported
                 // Codex models default to detailed summaries; live models.json
@@ -4727,6 +4734,8 @@ pub struct ModelEntryConfig {
     /// The id to send for each effort, empty unless the backend spells the effort into the model id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<ModelVariant>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_tiers: Vec<xai_grok_sampling_types::ModelServiceTier>,
     /// Whether this model accepts the Responses `reasoning.summary` member.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub supports_reasoning_summary_parameter: bool,
@@ -4990,6 +4999,7 @@ impl ConfigModelOverride {
             entry.info.reasoning_effort = None;
             entry.info.supports_reasoning_effort = false;
             entry.info.reasoning_efforts.clear();
+            entry.info.service_tiers.clear();
             let supports_reasoning_summary = entry.info.provider == ModelProvider::Codex;
             entry.info.supports_reasoning_summary_parameter = supports_reasoning_summary;
             entry.info.default_reasoning_summary = if supports_reasoning_summary {
@@ -5417,7 +5427,7 @@ impl ModelInfo {
             reasoning_efforts: entry.reasoning_efforts.clone(),
             reasoning_effort_server_default: entry.reasoning_effort_server_default,
             variants: entry.variants.clone(),
-            service_tiers: Vec::new(),
+            service_tiers: entry.service_tiers.clone(),
             supports_reasoning_summary_parameter: entry.supports_reasoning_summary_parameter,
             default_reasoning_summary: entry.default_reasoning_summary,
             supports_backend_search: entry.supports_backend_search,
@@ -6751,7 +6761,7 @@ pub fn sampling_config_for_model(
             .or_insert_with(|| crate::codex_auth::CODEX_ORIGINATOR.to_owned());
         extra_headers
             .entry("version".to_owned())
-            .or_insert_with(crate::codex_models::codex_client_version);
+            .or_insert_with(|| crate::codex_models::codex_client_version().to_string());
     }
     if uses_codex_oauth {
         crate::codex_auth::set_oauth_identity_anchor(
@@ -9651,8 +9661,8 @@ reasoning_effort = "low"
             Some(crate::codex_auth::CODEX_ORIGINATOR)
         );
         assert_eq!(
-            sampling.extra_headers.get("version").map(String::as_str),
-            Some(crate::codex_models::codex_client_version().as_str())
+            sampling.extra_headers.get("version"),
+            Some(&crate::codex_models::codex_client_version().to_string())
         );
 
         let byok_sampling = sampling_config_for_model(
@@ -10166,6 +10176,7 @@ reasoning_effort = "low"
             notice: None,
             context_windows: Vec::new(),
             variants: Vec::new(),
+            service_tiers: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -10342,6 +10353,7 @@ reasoning_effort = "low"
             notice: None,
             context_windows: Vec::new(),
             variants: Vec::new(),
+            service_tiers: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -10878,6 +10890,7 @@ reasoning_effort = "low"
             notice: None,
             context_windows: Vec::new(),
             variants: Vec::new(),
+            service_tiers: Vec::new(),
             id: None,
             model: "test".to_string(),
             base_url: "https://test.api/v1".to_string(),
@@ -16186,6 +16199,7 @@ default = "grok-4.5"
         assert_eq!(entry.info.api_backend, ApiBackend::ChatCompletions);
         assert_eq!(entry.info.tool_mode, None);
         assert!(!entry.info.codex_multi_agent_v2);
+        assert!(entry.info.service_tiers.is_empty());
         assert_eq!(entry.info.agent_type, DEFAULT_AGENT_TYPE);
         assert!(!entry.info.supports_backend_search);
         assert!(!entry.info.supports_reasoning_summary_parameter);
@@ -16246,73 +16260,73 @@ default = "grok-4.5"
     }
     #[test]
     fn embedded_codex_fallback_uses_codex_transport_and_harness() {
-        let defaults = default_model_entries(&EndpointsConfig::default());
-        for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
-            let entry = defaults.get(slug).expect("embedded Codex fallback");
-            assert_eq!(entry.info.provider, ModelProvider::Codex);
-            assert_eq!(
-                entry.info.base_url,
-                crate::codex_auth::CODEX_INFERENCE_BASE_URL
-            );
+        use ReasoningEffort::{High, Low, Max, Medium, Ultra, Xhigh};
+        let defaults = resolve_model_list(&Config::default(), None);
+        let full_menu = [Low, Medium, High, Xhigh, Max, Ultra];
+        for (slug, raw_context, default_effort, supports_ultra, multi_agent_v2) in [
+            ("gpt-6.1-sol", 272_000, Low, true, true),
+            ("gpt-6-astra", 272_000, Low, true, true),
+            ("gpt-6-sol", 272_000, Medium, true, true),
+            ("gpt-6-luna", 272_000, Medium, false, true),
+            ("gpt-5.6-sol", 272_000, Low, true, true),
+            ("gpt-6.1-terra", 500_000, Low, true, true),
+            ("gpt-5.6-terra", 272_000, Medium, true, true),
+            ("gpt-5.6-luna", 272_000, Medium, false, false),
+        ] {
+            let entry = &defaults[slug];
+            let info = entry.info();
+            assert_eq!(info.provider, ModelProvider::Codex);
+            assert_eq!(info.base_url, crate::codex_auth::CODEX_INFERENCE_BASE_URL);
             assert!(entry.api_base_url.is_none());
-            assert_eq!(entry.info.context_window.get(), 353_000);
-            assert_eq!(entry.info.agent_type, "codex");
-            assert_eq!(entry.info.tool_mode, Some(ToolMode::CodeModeOnly));
-            assert_eq!(entry.info.api_backend, ApiBackend::Responses);
-            assert!(entry.info.supports_reasoning_summary_parameter);
+            assert!(!info.supported_in_api, "fallback requires Codex OAuth");
+            assert_eq!(info.agent_type, "codex");
+            assert_eq!(info.tool_mode, Some(ToolMode::CodeModeOnly));
+            assert_eq!(info.api_backend, ApiBackend::Responses);
+            assert!(info.use_responses_lite);
+            assert_eq!(info.apply_patch_tool_type.as_deref(), Some("freeform"));
+            assert!(info.supports_reasoning_summary_parameter);
+            assert_eq!(info.default_reasoning_summary, ReasoningSummary::None);
+            assert_eq!(model_reasoning_summary(info), Some(ReasoningSummary::Auto));
+            assert_eq!(info.reasoning_effort, Some(default_effort), "{slug}");
             assert_eq!(
-                entry.info.default_reasoning_summary,
-                ReasoningSummary::Detailed
+                supports_codex_multi_agent_v2(info),
+                multi_agent_v2,
+                "{slug}"
             );
-            assert_eq!(
-                model_reasoning_summary(entry.info()),
-                Some(ReasoningSummary::Detailed)
-            );
-            assert!(
-                !entry.info.supported_in_api,
-                "embedded Codex fallbacks require a Codex OAuth session"
-            );
+            let metadata = info.codex_metadata();
+            assert_eq!(metadata.context_window, Some(raw_context));
+            assert_eq!(metadata.max_context_window, Some(872_000));
+            assert_eq!(metadata.comp_hash.as_deref(), Some("3000"));
+            assert_eq!(info.context_window.get(), raw_context * 95 / 100);
+            assert_eq!(metadata.compact_limit(), Some(raw_context * 90 / 100));
+            let menu = if supports_ultra {
+                &full_menu[..]
+            } else {
+                &full_menu[..5]
+            };
+            assert_eq!(metadata.supported_reasoning_efforts, menu, "{slug}");
+            assert_eq!(info.service_tiers.len(), 1);
+            assert_eq!(info.service_tiers[0].id, "priority");
         }
+        assert_eq!(
+            defaults["gpt-6.1-terra"]
+                .info()
+                .codex_metadata()
+                .ultra_effort(),
+            Xhigh
+        );
+        assert_eq!(
+            defaults["gpt-6-sol"].info().codex_metadata().ultra_effort(),
+            Max
+        );
+    }
 
-        let efforts = |slug: &str| {
-            defaults[slug]
-                .info
-                .reasoning_efforts
-                .iter()
-                .map(|option| option.value)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            efforts("gpt-5.6-sol"),
-            vec![
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::Xhigh,
-                ReasoningEffort::Max,
-                ReasoningEffort::Ultra,
-            ]
-        );
-        assert_eq!(efforts("gpt-5.6-terra"), efforts("gpt-5.6-sol"));
-        assert!(supports_codex_multi_agent_v2(
-            defaults["gpt-5.6-sol"].info()
-        ));
-        assert!(supports_codex_multi_agent_v2(
-            defaults["gpt-5.6-terra"].info()
-        ));
-        assert_eq!(
-            efforts("gpt-5.6-luna"),
-            vec![
-                ReasoningEffort::Low,
-                ReasoningEffort::Medium,
-                ReasoningEffort::High,
-                ReasoningEffort::Xhigh,
-                ReasoningEffort::Max,
-            ]
-        );
-        assert!(!supports_codex_multi_agent_v2(
-            defaults["gpt-5.6-luna"].info()
-        ));
+    #[test]
+    fn live_codex_catalog_can_withdraw_an_embedded_fast_tier() {
+        let slug = "gpt-6.1-terra";
+        let remote = IndexMap::from([(slug.to_owned(), codex_model_entry(slug, 475_000))]);
+        let models = resolve_model_list_with_codex(&Config::default(), None, Some(remote), true);
+        assert!(models[slug].info.service_tiers.is_empty());
     }
 
     #[test]
@@ -16598,7 +16612,7 @@ default = "grok-4.5"
         assert_eq!(xai.info.api_backend, ApiBackend::ChatCompletions);
         assert_eq!(xai.info.tool_mode, None);
         assert_eq!(codex.info.provider, ModelProvider::Codex);
-        assert_eq!(codex.info.context_window.get(), 353_000);
+        assert_eq!(codex.info.context_window.get(), 258_400);
         assert_eq!(codex.info.api_backend, ApiBackend::Responses);
         assert_eq!(codex.info.tool_mode, Some(ToolMode::CodeModeOnly));
     }

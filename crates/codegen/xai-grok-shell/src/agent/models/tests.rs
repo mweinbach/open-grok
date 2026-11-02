@@ -2306,6 +2306,7 @@ fn make_entry_config_with_id(
         reasoning_efforts: Vec::new(),
         reasoning_effort_server_default: false,
         variants: Vec::new(),
+        service_tiers: Vec::new(),
         supports_reasoning_summary_parameter: false,
         default_reasoning_summary: xai_grok_sampling_types::ReasoningSummary::None,
         supports_backend_search: false,

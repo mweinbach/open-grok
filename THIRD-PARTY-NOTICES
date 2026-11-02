@@ -16664,6 +16664,7 @@ Source revisions:
   cbc83d961e8132bfff4d340ab8342d181b79e95e (live model catalog contract)
   985641272869835d01d025ed2a218fbbce35fa9f (Codex 0.153.1 catalog and behavior contracts)
   2b5bdcf67547860f2e5c5a605009a70026796b2b (standalone web-search parity)
+  5978db4733a25260f5abec7c4b3046e8902e14f8 (Codex 0.167.0-alpha.3 catalog, incomplete responses and standalone search)
 Upstream paths: codex-rs/code-mode, codex-rs/code-mode-protocol,
   codex-rs/core/src/tools/code_mode/, codex-rs/core/src/tools/handlers/
   (and apply-patch crate), codex-rs/ext/web-search, codex-rs/models-manager,
@@ -16689,6 +16690,8 @@ Additional requirements / notices:
     crates/codegen/xai-grok-shell/src/session/code_mode.rs
   Codex live-model transport and provider-isolated cache under:
     crates/codegen/xai-grok-shell/src/codex_models.rs
+  The curated Codex entries in crates/codegen/xai-grok-models/default_models.json
+  adapt codex-rs/models-manager/models.json to Open Grok's model format.
   Codex 0.153.1 metadata, Ultra/persistent request mapping, and actor MCP policy
   adapters under xai-grok-sampling-types/src/codex_model.rs,
   xai-grok-sampler/src/provider.rs, xai-grok-sampler/src/client.rs, and

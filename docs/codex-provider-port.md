@@ -17,11 +17,17 @@ at `6d4d9442c7142c08ac5c5098dfd6e82d8cd9f65a`; this includes the
 `6219b7c40fc9`.
 
 The Responses Lite and asynchronous user-message contracts were refreshed
-against Codex commit `8e93b1a405e02f8797a04d747bb7d1654b839685`. The default
-advertised Codex compatibility version is `0.164.0`. The model-catalog and
-behavior implementation was last refreshed against the `rust-v0.153.1`
-release commit `985641272869835d01d025ed2a218fbbce35fa9f`; the advertised version
-bump does not imply a new source import.
+against Codex commit `8e93b1a405e02f8797a04d747bb7d1654b839685`. The
+0.153.1 behavior refresh below used commit `985641272869835d01d025ed2a218fbbce35fa9f`.
+
+### 0.167 compatibility
+
+The default Codex build identity is `0.167.0-alpha.3`. Codex requests use the
+full build in the `version` header, and catalog requests include it in the
+`User-Agent` prefix. The `/models` query and disk cache use the whole version
+`0.167.0`. A valid `OPENGROK_CODEX_CLIENT_VERSION` override follows the same
+rules. The source reference for this refresh is
+[rust-v0.167.0-alpha.3](https://github.com/openai/codex/tree/5978db4733a25260f5abec7c4b3046e8902e14f8/codex-rs).
 
 ### 0.153.1 catalog and behavior refresh
 
@@ -106,12 +112,17 @@ changed.
 
 ## Live model catalog
 
-Open Grok embeds GPT-6-astra and GPT-5.6 Sol, Terra, and Luna definitions so the
-picker and headless model resolution still work offline. With ChatGPT Codex
-credentials available, the shell follows codex-rs' live catalog contract:
+The offline picker includes GPT-6.1 Sol and Terra, GPT-6 Astra, Sol and Luna,
+and GPT-5.6 Sol, Terra and Luna. The fallback preserves each model's reasoning
+levels, context limits and Fast tier. A live Codex entry can withdraw Fast.
+These values come from the [tagged Codex model catalog](https://github.com/openai/codex/blob/5978db4733a25260f5abec7c4b3046e8902e14f8/codex-rs/models-manager/models.json).
+
+With ChatGPT Codex credentials available, the shell follows these rules.
 
 - GET `https://chatgpt.com/backend-api/codex/models?client_version=<version>`
-  with a five-second timeout.
+  with one five-second deadline across credential lookup, HTTP and the 401
+  retry. If a caller times out during token rotation, the credential task can
+  finish saving the new token. The timed-out request cannot publish a catalog.
 - Send the Codex bearer plus `ChatGPT-Account-ID` and `X-OpenAI-Fedramp` when
   present, with one forced token refresh and retry after a 401.
 - Read the response `ETag` and cache the parsed catalog for five minutes.
@@ -144,6 +155,10 @@ providers clears the inherited values; there is no global enable switch.
   `reasoning.context` is `all_turns`. Input-image detail fields are omitted.
   Hosted tools are not advertised through Lite; the existing standalone search
   and image tools retain their own provider/auth availability gates.
+- Standalone `web__run` exposes `literature_search_query` when the selected
+  Codex model advertises that name in `experimental_supported_tools`. It uses
+  the same query shape as `search_query`. A model switch revokes the old
+  route's capability. Backend error text is limited to 1,024 UTF-8 bytes.
 - `experimental_supported_tools` must explicitly contain
   `send_user_message_async` to expose that tool. It is root-session-only and
   direct-only, including in Code Mode Only. It sends a normal visible assistant
@@ -283,7 +298,7 @@ ChatGPT OAuth requests use the Codex Responses endpoint, live bearer refresh,
 account and FedRAMP headers when present, and the Codex originator header. An
 explicit model API key remains authoritative and is never replaced by OAuth.
 
-GPT-5.6 Sol's fallback entry uses the Responses API, a 353,000-token effective
+GPT-5.6 Sol's fallback entry uses the Responses API, a 258,400-token effective
 context window, `code_mode_only`, and backend-hosted search. Max and Ultra stay
 distinct in local session state. Max encodes as `max`; Ultra uses the catalog's
 validated multi-agent effort (Max when available as its fallback) and adds the
@@ -303,12 +318,14 @@ The stream treats `response.output_item.done` as the durable Codex output
 carrier because `response.completed` may contain only response metadata and
 usage. Finished messages, complete tool arguments, reasoning IDs, and
 `encrypted_content` therefore survive persistence and byte-stable replay even
-when the terminal response has an empty output array. A nonempty terminal output
-remains authoritative so xAI and legacy streams are not duplicated.
+when the terminal response has an empty output array. On an incomplete Codex
+response, only items from streamed `output_item.done` events can be retained or
+executed. A successful terminal response can still carry the full output.
 
 Reasoning-summary support and its default mode come from the authenticated
-model catalog. The request omits `reasoning.summary` for unsupported models or
-the catalog's `none` mode and passes `auto`, `concise`, or `detailed` otherwise.
+model catalog. The request omits `reasoning.summary` for unsupported models.
+For supported models Open Grok maps the catalog's `none` default to `auto` to
+keep thinking summaries visible, and passes `auto`, `concise`, or `detailed` through.
 Summary deltas are scoped by output item and summary index, rendered once, and
 attached to the matching durable reasoning item without losing its encrypted
 payload. Unknown future top-level `response.*` side-channel events are ignored;
