@@ -49,6 +49,7 @@ pub(crate) enum CopyEntryKind {
 pub(crate) struct CopyEntry {
     pub(crate) rel_path: PathBuf,
     pub(crate) kind: CopyEntryKind,
+    pub(crate) tracked: bool,
 }
 
 /// Configuration for the parallel copy operation.
@@ -70,8 +71,9 @@ pub(crate) struct ParallelCopyConfig {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ParallelCopyResult {
     pub stats: CopyStats,
-    /// All relative paths that were successfully copied (for deduplication in subsequent copies).
-    pub copied_paths: DashSet<PathBuf>,
+    /// Paths copied or intentionally skipped during clean creation. The ignored-only
+    /// pass must not overwrite files restored from HEAD.
+    pub handled_paths: DashSet<PathBuf>,
     /// Metadata for files that were copied (for index updates). Only regular files, not symlinks/dirs.
     pub file_metadata: DashMap<PathBuf, Metadata>,
 }

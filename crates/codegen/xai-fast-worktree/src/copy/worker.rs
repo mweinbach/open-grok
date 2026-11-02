@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::Metadata;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,118 +18,68 @@ pub(crate) struct WorkerCtx {
     pub dirs_created: Arc<AtomicU64>,
     pub symlinks_copied: Arc<AtomicU64>,
     pub issues: Arc<std::sync::Mutex<Vec<String>>>,
-    pub copied_paths: Arc<DashSet<PathBuf>>,
+    pub handled_paths: Arc<DashSet<PathBuf>>,
     pub file_metadata: Arc<DashMap<PathBuf, Metadata>>,
 }
 
-pub(crate) fn run_worker(rx: crossbeam::channel::Receiver<CopyEntry>, ctx: WorkerCtx) {
-    // Track created directories to avoid redundant mkdir calls.
-    let mut created_dirs: HashSet<PathBuf> = HashSet::new();
-
+pub(crate) fn run_worker(
+    rx: crossbeam::channel::Receiver<CopyEntry>,
+    ctx: WorkerCtx,
+) -> anyhow::Result<()> {
+    let mut created_dirs = HashSet::new();
+    let mut fatal = None;
     for entry in rx {
-        let src = ctx.source.join(&entry.rel_path);
-        let dst = ctx.dest.join(&entry.rel_path);
-
-        let success = process_entry(
-            &entry,
-            &src,
-            &dst,
-            &mut created_dirs,
-            &ctx.files_copied,
-            &ctx.dirs_created,
-            &ctx.symlinks_copied,
-            &ctx.issues,
-            &ctx.file_metadata,
-        );
-
-        if success {
-            ctx.copied_paths.insert(entry.rel_path);
+        // Drain the bounded queue even on failure, so the producer can finish
+        // and the caller can join every worker before removing the destination.
+        if fatal.is_some() {
+            continue;
+        }
+        match process_entry(&entry, &ctx, &mut created_dirs) {
+            Ok(()) => {
+                ctx.handled_paths.insert(entry.rel_path);
+            }
+            Err(error) => {
+                let error = error.context(format!("copy {}", entry.rel_path.display()));
+                if entry.tracked || crate::api::is_out_of_disk(&error) {
+                    fatal = Some(error);
+                } else {
+                    ctx.issues.lock().unwrap().push(format!("{error:#}"));
+                }
+            }
         }
     }
+    fatal.map_or(Ok(()), Err)
 }
 
 fn process_entry(
     entry: &CopyEntry,
-    src: &Path,
-    dst: &Path,
+    ctx: &WorkerCtx,
     created_dirs: &mut HashSet<PathBuf>,
-    files_copied: &AtomicU64,
-    dirs_created: &AtomicU64,
-    symlinks_copied: &AtomicU64,
-    issues: &std::sync::Mutex<Vec<String>>,
-    file_metadata: &DashMap<PathBuf, Metadata>,
-) -> bool {
-    // Ensure parent directory exists.
+) -> anyhow::Result<()> {
+    let src = ctx.source.join(&entry.rel_path);
+    let dst = ctx.dest.join(&entry.rel_path);
     if let Some(parent) = dst.parent()
         && !parent.as_os_str().is_empty()
         && created_dirs.insert(parent.to_path_buf())
-        && let Err(e) = std::fs::create_dir_all(parent)
-        && e.kind() != std::io::ErrorKind::AlreadyExists
     {
-        issues
-            .lock()
-            .unwrap()
-            .push(format!("mkdir {}: {}", parent.display(), e));
-        return false;
+        std::fs::create_dir_all(parent)?;
     }
-
     match entry.kind {
-        CopyEntryKind::Dir => match std::fs::create_dir_all(dst) {
-            Ok(()) => {
-                dirs_created.fetch_add(1, Ordering::Relaxed);
-                true
+        CopyEntryKind::Dir => {
+            std::fs::create_dir_all(&dst)?;
+            ctx.dirs_created.fetch_add(1, Ordering::Relaxed);
+        }
+        CopyEntryKind::Symlink => {
+            cow::replace_symlink(&std::fs::read_link(&src)?, &dst)?;
+            ctx.symlinks_copied.fetch_add(1, Ordering::Relaxed);
+        }
+        CopyEntryKind::File => {
+            cow::clone_file(&src, &dst)?;
+            ctx.files_copied.fetch_add(1, Ordering::Relaxed);
+            if let Ok(metadata) = std::fs::metadata(&dst) {
+                ctx.file_metadata.insert(entry.rel_path.clone(), metadata);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => true,
-            Err(e) => {
-                issues
-                    .lock()
-                    .unwrap()
-                    .push(format!("mkdir {}: {}", entry.rel_path.display(), e));
-                false
-            }
-        },
-        CopyEntryKind::Symlink => match std::fs::read_link(src) {
-            Ok(target) => match cow::replace_symlink(&target, dst) {
-                Ok(()) => {
-                    symlinks_copied.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                Err(e) => {
-                    issues.lock().unwrap().push(format!(
-                        "symlink {}: {}",
-                        entry.rel_path.display(),
-                        e
-                    ));
-                    false
-                }
-            },
-            Err(e) => {
-                issues.lock().unwrap().push(format!(
-                    "read_link {}: {}",
-                    entry.rel_path.display(),
-                    e
-                ));
-                false
-            }
-        },
-        CopyEntryKind::File => match cow::clone_file(src, dst) {
-            Ok(()) => {
-                files_copied.fetch_add(1, Ordering::Relaxed);
-
-                // Collect file metadata for index updates
-                if let Ok(metadata) = std::fs::metadata(dst) {
-                    file_metadata.insert(entry.rel_path.clone(), metadata);
-                }
-
-                true
-            }
-            Err(e) => {
-                issues
-                    .lock()
-                    .unwrap()
-                    .push(format!("copy {}: {}", entry.rel_path.display(), e));
-                false
-            }
-        },
+        }
     }
+    Ok(())
 }

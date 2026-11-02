@@ -1024,12 +1024,12 @@ fn execute_copy_worktree(plan: WorktreePlan) -> Result<CreateWorktreeResult> {
         IgnoredFilesMode::Skip | IgnoredFilesMode::CopyOnly { .. } => None,
         IgnoredFilesMode::Copy { skip_patterns } => {
             let ignored_start = std::time::Instant::now();
-            let already_copied = copy_result.copied_paths;
+            let handled_paths = copy_result.handled_paths;
 
             let copy_config = ParallelCopyConfig {
                 num_workers: effective_ignored_parallelism,
                 channel_buffer,
-                skip_files: Some(Arc::new(already_copied)),
+                skip_files: Some(Arc::new(handled_paths)),
                 respect_gitignore: false, // We want all files.
                 skip_patterns,
             };
@@ -1307,7 +1307,7 @@ fn execute_standalone_worktree(plan: WorktreePlan) -> Result<CreateWorktreeResul
 
     // Destructure before the finalize match consumes file_metadata.
     let copy_stats = copy_result.stats;
-    let copied_paths = copy_result.copied_paths;
+    let handled_paths = copy_result.handled_paths;
     let file_metadata = copy_result.file_metadata;
 
     // Phase 4: Finalize index.
@@ -1367,7 +1367,7 @@ fn execute_standalone_worktree(plan: WorktreePlan) -> Result<CreateWorktreeResul
             let copy_config = ParallelCopyConfig {
                 num_workers: effective_ignored_parallelism,
                 channel_buffer,
-                skip_files: Some(Arc::new(copied_paths)),
+                skip_files: Some(Arc::new(handled_paths)),
                 respect_gitignore: false,
                 skip_patterns,
             };
@@ -1505,6 +1505,109 @@ fn execute_git_checkout_worktree(plan: WorktreePlan) -> Result<CreateWorktreeRes
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn file_copy_preserves_gitignored_tracked_files() {
+        use crate::CreationMode;
+        use xai_test_utils::git::{git_commit_all, init_git_repo};
+
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        init_git_repo(&source);
+        let tracked = Path::new("generated/nested/fixture");
+        let deleted = Path::new("generated/deleted");
+        let ignored = Path::new("generated/scratch");
+        std::fs::create_dir_all(source.join(tracked.parent().unwrap())).unwrap();
+        std::fs::write(source.join(tracked), "committed").unwrap();
+        std::fs::write(source.join(deleted), "original").unwrap();
+        git_commit_all(&source, "track fixtures");
+        std::fs::write(source.join(".gitignore"), "generated/\n").unwrap();
+        git_commit_all(&source, "ignore new generated files");
+        std::fs::write(source.join(tracked), "working edit").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(source.join(tracked), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::remove_file(source.join(deleted)).unwrap();
+        std::fs::write(source.join(ignored), "scratch").unwrap();
+
+        for standalone in [false, true] {
+            for clean in [false, true] {
+                let dest = temp.path().join(format!("copy-{standalone}-{clean}"));
+                let plan = WorktreePlan {
+                    source: source.clone(),
+                    dest: dest.clone(),
+                    git_ref: "HEAD".into(),
+                    parallelism: 2,
+                    channel_buffer: 16,
+                    working_tree: if clean {
+                        WorkingTreeMode::CleanAll
+                    } else {
+                        WorkingTreeMode::PreserveWorkingTree
+                    },
+                    ignored_files: if clean {
+                        IgnoredFilesMode::Copy {
+                            skip_patterns: Vec::new(),
+                        }
+                    } else {
+                        IgnoredFilesMode::Skip
+                    },
+                    ignored_parallelism: 2,
+                    creation_mode: if standalone {
+                        CreationMode::Standalone
+                    } else {
+                        CreationMode::Linked
+                    },
+                    cancellation_token: tokio_util::sync::CancellationToken::new(),
+                    btrfs_delegate: None,
+                    worktree_id: crate::worktree::plan::worktree_id_from_path(&dest),
+                    nfs: None,
+                };
+                if standalone {
+                    execute_standalone_worktree(plan).unwrap();
+                } else {
+                    execute_copy_worktree(plan).unwrap();
+                }
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(tracked)).unwrap(),
+                    if clean { "committed" } else { "working edit" }
+                );
+                #[cfg(unix)]
+                if !clean {
+                    use std::os::unix::fs::PermissionsExt;
+                    assert_eq!(
+                        std::fs::metadata(dest.join(tracked))
+                            .unwrap()
+                            .permissions()
+                            .mode()
+                            & 0o777,
+                        0o755
+                    );
+                }
+                assert_eq!(dest.join(deleted).exists(), clean);
+                assert_eq!(dest.join(ignored).exists(), clean);
+                // A separate copy-ignored operation must preserve a newer
+                // destination edit, even under a fully ignored parent directory.
+                std::fs::write(dest.join(tracked), "destination edit").unwrap();
+                crate::WorktreeBuilder::new(&source, &dest)
+                    .parallelism(2)
+                    .copy_ignored_only()
+                    .unwrap();
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(tracked)).unwrap(),
+                    "destination edit"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(dest.join(ignored)).unwrap(),
+                    "scratch"
+                );
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

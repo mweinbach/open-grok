@@ -598,7 +598,7 @@ pub const ENOSPC_OS_MESSAGE: &str = "No space left on device";
 /// std maps `ENOSPC` (Linux/macOS) and `ERROR_DISK_FULL` /
 /// `ERROR_HANDLE_DISK_FULL` (Windows) onto it, so this is correct on every
 /// platform. `git` subcommands instead surface the failure only as stderr text.
-fn is_out_of_disk(err: &anyhow::Error) -> bool {
+pub(crate) fn is_out_of_disk(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if let Some(io) = cause.downcast_ref::<std::io::Error>()
             && io.kind() == std::io::ErrorKind::StorageFull

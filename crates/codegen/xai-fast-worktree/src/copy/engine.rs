@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Result;
 use crossbeam::channel::{Sender, bounded};
 use dashmap::{DashMap, DashSet};
-use ignore::{WalkBuilder, WalkState};
+use ignore::WalkState;
 use tokio_util::sync::CancellationToken;
 
 use crate::copy::shard::shard_for_path;
-use crate::copy::skip::build_skip_matcher;
+use crate::copy::skip::{build_skip_matcher, walk_copy_entries};
 use crate::copy::types::{
     CopyEntry, CopyEntryKind, CopyStats, ParallelCopyConfig, ParallelCopyResult,
 };
@@ -48,6 +48,10 @@ pub(crate) fn copy_parallel(
         None
     };
 
+    if cancellation_token.is_cancelled() {
+        return Ok(ParallelCopyResult::default());
+    }
+
     // Create bounded channels for each shard.
     let channels: Vec<_> = (0..num_workers)
         .map(|_| bounded::<CopyEntry>(config.channel_buffer))
@@ -60,8 +64,8 @@ pub(crate) fn copy_parallel(
     let files_skipped = Arc::new(AtomicU64::new(0));
     let issues: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-    // Track successfully copied paths for deduplication.
-    let copied_paths: Arc<DashSet<std::path::PathBuf>> = Arc::new(DashSet::new());
+    // Track handled paths for the optional ignored-only pass.
+    let handled_paths: Arc<DashSet<std::path::PathBuf>> = Arc::new(DashSet::new());
 
     // Collect file metadata for index updates.
     let file_metadata: Arc<DashMap<std::path::PathBuf, std::fs::Metadata>> =
@@ -79,7 +83,7 @@ pub(crate) fn copy_parallel(
                 dirs_created: Arc::clone(&dirs_created),
                 symlinks_copied: Arc::clone(&symlinks_copied),
                 issues: Arc::clone(&issues),
-                copied_paths: Arc::clone(&copied_paths),
+                handled_paths: Arc::clone(&handled_paths),
                 file_metadata: Arc::clone(&file_metadata),
             };
 
@@ -88,62 +92,20 @@ pub(crate) fn copy_parallel(
         .collect();
 
     // Collect senders for the walker.
-    let senders: Vec<Sender<CopyEntry>> = channels.iter().map(|(tx, _)| tx.clone()).collect();
+    let senders: Vec<Sender<CopyEntry>> = channels.into_iter().map(|(tx, _)| tx).collect();
 
-    // Build the walker.
-    // IMPORTANT: Limit walker threads to match num_workers to avoid FD exhaustion.
-    // On macOS, the default FD limit (256) can easily be exceeded when:
-    // - num_cpus walker threads (default) × directories open per thread
-    // - Plus num_workers copy workers × files being copied
-    // Deep directory trees (15+ levels) amplify this significantly.
-    let mut builder = WalkBuilder::new(source);
-    builder
-        .hidden(false) // Include hidden files.
-        .git_ignore(config.respect_gitignore)
-        .git_global(false) // Never use global gitignore (~/.config/git/ignore) —
-        // it contains personal preferences irrelevant to worktree creation.
-        .git_exclude(false) // Never use .git/info/exclude — external tooling
-        // can append broad patterns (*.min.js, *.zip) that
-        // incorrectly skip git-tracked files. The `ignore` crate doesn't
-        // check tracking status, so tracked files matching these patterns
-        // get silently dropped during the copy.
-        .threads(num_workers) // Limit walker parallelism to avoid FD exhaustion
-        .filter_entry(|entry| {
-            // Always skip .git directory.
-            entry.file_name() != ".git"
-        });
-
-    let walker = builder.build_parallel();
-
-    // Clone data for the walker closure.
-    let source_for_walker = source.to_path_buf();
-    let skip_files = config.skip_files.clone();
-    let files_skipped_walker = Arc::clone(&files_skipped);
-    let skip_matcher = skip_matcher.map(Arc::new);
-
-    // Run the parallel walker.
-    walker.run(|| {
-        let senders = senders.clone();
-        let source = source_for_walker.clone();
-        let n = num_workers;
-        let skip_files = skip_files.clone();
-        let files_skipped = Arc::clone(&files_skipped_walker);
-        let skip_matcher = skip_matcher.clone();
-        let cancellation_token = cancellation_token.clone();
-
-        Box::new(move |entry_result| {
+    let walk_result = walk_copy_entries(
+        source,
+        num_workers,
+        config.respect_gitignore,
+        |entry, tracked| {
             // Check for cancellation
             if cancellation_token.is_cancelled() {
                 return WalkState::Quit;
             }
 
-            let entry = match entry_result {
-                Ok(e) => e,
-                Err(_) => return WalkState::Continue,
-            };
-
             // Get relative path.
-            let rel_path = match entry.path().strip_prefix(&source) {
+            let rel_path = match entry.path().strip_prefix(source) {
                 Ok(p) => p.to_path_buf(),
                 Err(_) => return WalkState::Continue,
             };
@@ -154,10 +116,15 @@ pub(crate) fn copy_parallel(
             }
 
             // Check if this file should be skipped (already copied or explicitly skipped).
-            if let Some(ref skip) = skip_files
+            if let Some(ref skip) = config.skip_files
                 && skip.contains(&rel_path)
             {
                 files_skipped.fetch_add(1, Ordering::Relaxed);
+                if config.respect_gitignore {
+                    // Clean modes restore skipped tracked paths from HEAD. A later
+                    // ignored-only copy must not overwrite them with dirty bytes.
+                    handled_paths.insert(rel_path);
+                }
                 return WalkState::Continue;
             }
 
@@ -185,23 +152,32 @@ pub(crate) fn copy_parallel(
             };
 
             // Compute shard and send.
-            let shard = shard_for_path(&rel_path, n);
-            let _ = senders[shard].send(CopyEntry { rel_path, kind });
+            let shard = shard_for_path(&rel_path, num_workers);
+            let _ = senders[shard].send(CopyEntry {
+                rel_path,
+                kind,
+                tracked,
+            });
 
             WalkState::Continue
-        })
-    });
+        },
+    );
 
     // Close senders to signal workers to finish.
     drop(senders);
-    for (tx, _) in channels {
-        drop(tx);
-    }
 
     // Wait for all workers.
+    let mut copy_result = Ok(());
     for worker in workers {
-        let _ = worker.join();
+        let result = worker
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("worktree copy worker panicked")));
+        if copy_result.is_ok() {
+            copy_result = result;
+        }
     }
+    walk_result?;
+    copy_result?;
 
     // Collect issues.
     let issues = match Arc::try_unwrap(issues) {
@@ -209,7 +185,7 @@ pub(crate) fn copy_parallel(
         Err(arc) => arc.lock().unwrap().clone(),
     };
 
-    let copied_paths = match Arc::try_unwrap(copied_paths) {
+    let handled_paths = match Arc::try_unwrap(handled_paths) {
         Ok(set) => set,
         Err(arc) => {
             let mut set = DashSet::new();
@@ -237,7 +213,7 @@ pub(crate) fn copy_parallel(
             files_skipped: files_skipped.load(Ordering::Relaxed),
             issues,
         },
-        copied_paths,
+        handled_paths,
         file_metadata,
     })
 }
@@ -248,6 +224,134 @@ mod tests {
     use crate::copy::types::ParallelCopyConfig;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn worktree_copy_respects_git_and_search_exclusions_in_subdirectories() {
+        use xai_test_utils::git::{git_commit_all, init_git_repo, run_git};
+
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("source");
+        let source = repo.join("sub");
+        std::fs::create_dir_all(&source).unwrap();
+        init_git_repo(&repo);
+        for name in [
+            "tracked.local",
+            "tracked.global",
+            "tracked.search",
+            "visible",
+        ] {
+            std::fs::write(source.join(name), "original").unwrap();
+        }
+        git_commit_all(&repo, "track fixtures");
+        let global = temp.path().join("excludes");
+        std::fs::write(&global, "*.global\n").unwrap();
+        run_git(
+            &repo,
+            &["config", "core.excludesFile", global.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(repo.join(".git/info")).unwrap();
+        std::fs::write(repo.join(".git/info/exclude"), "*.local\n").unwrap();
+        std::fs::write(source.join(".ignore"), "*.search\n").unwrap();
+        for name in [
+            "private.local",
+            "private.global",
+            "private.search",
+            "new-file",
+        ] {
+            std::fs::write(source.join(name), "untracked").unwrap();
+        }
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&dest).unwrap();
+        let config = ParallelCopyConfig {
+            respect_gitignore: true,
+            num_workers: 2,
+            channel_buffer: 32,
+            ..Default::default()
+        };
+        copy_parallel(&source, &dest, config, CancellationToken::new()).unwrap();
+        for name in [
+            "tracked.local",
+            "tracked.global",
+            "tracked.search",
+            "visible",
+            "new-file",
+        ] {
+            assert!(dest.join(name).is_file(), "{name}");
+        }
+        for name in ["private.local", "private.global", "private.search"] {
+            assert!(!dest.join(name).exists(), "{name}");
+        }
+        std::fs::write(dest.join("tracked.global"), "destination edit").unwrap();
+        crate::WorktreeBuilder::new(&source, &dest)
+            .parallelism(2)
+            .ignored_files_mode(crate::IgnoredFilesMode::CopyOnly {
+                skip_patterns: vec!["*.local".into()],
+            })
+            .copy_ignored_only()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tracked.global")).unwrap(),
+            "destination edit"
+        );
+        assert!(dest.join("private.global").is_file());
+        assert!(dest.join("private.search").is_file());
+        assert!(!dest.join("private.local").exists());
+    }
+
+    #[test]
+    fn worktree_copy_leaves_sparse_checkout_paths_absent() {
+        use xai_test_utils::git::{git_commit_all, init_git_repo, run_git};
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("source");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&source).unwrap();
+        init_git_repo(&source);
+        for dir in ["included", "excluded"] {
+            std::fs::create_dir(source.join(dir)).unwrap();
+            std::fs::write(source.join(dir).join("file"), dir).unwrap();
+        }
+        git_commit_all(&source, "sparse fixture");
+        run_git(&source, &["sparse-checkout", "set", "--cone", "included"]);
+        assert!(!source.join("excluded/file").exists());
+
+        std::fs::create_dir(&dest).unwrap();
+        let config = ParallelCopyConfig {
+            respect_gitignore: true,
+            num_workers: 2,
+            channel_buffer: 32,
+            ..Default::default()
+        };
+        copy_parallel(&source, &dest, config, CancellationToken::new()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("included/file")).unwrap(),
+            "included"
+        );
+        assert!(!dest.join("excluded").exists());
+    }
+
+    #[test]
+    fn worktree_copy_propagates_tracked_copy_errors() {
+        use xai_test_utils::git::{git_commit_all, init_git_repo};
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("repo");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&source).unwrap();
+        init_git_repo(&source);
+        std::fs::write(source.join("tracked"), "tracked").unwrap();
+        git_commit_all(&source, "fixture");
+        std::fs::create_dir_all(dest.join("tracked")).unwrap();
+        let config = ParallelCopyConfig {
+            respect_gitignore: true,
+            num_workers: 2,
+            channel_buffer: 32,
+            ..Default::default()
+        };
+        let err = copy_parallel(&source, &dest, config, CancellationToken::new()).unwrap_err();
+        assert!(format!("{err:#}").contains("copy tracked"), "{err:#}");
+    }
 
     #[test]
     fn test_copy_parallel_simple() {
@@ -274,7 +378,7 @@ mod tests {
         assert!(dest.path().join("file1.txt").exists());
         assert!(dest.path().join("file2.txt").exists());
         assert!(dest.path().join("subdir/file3.txt").exists());
-        assert_eq!(result.copied_paths.len(), 4); // 3 files + 1 dir
+        assert_eq!(result.handled_paths.len(), 4); // 3 files + 1 dir
     }
 
     #[test]
