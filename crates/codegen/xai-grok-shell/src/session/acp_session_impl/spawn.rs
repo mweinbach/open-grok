@@ -1419,7 +1419,7 @@ pub(crate) async fn spawn_session_actor(
         memory_v2_exposed: memory_config
             .as_ref()
             .is_some_and(|mc| mc.enabled && mc.mode.is_v2() && mc.v2.can_expose_memory()),
-        web_search: parking_lot::RwLock::new(web_search_state.clone()),
+        web_search: Arc::new(arc_swap::ArcSwap::from_pointee(web_search_state.clone())),
         active_sampling_config: parking_lot::RwLock::new(sampling_config.clone()),
         chat_state_handle: chat_state_handle.clone(),
         x_search_enabled: crate::util::config::load_x_search_config_sync().enabled,

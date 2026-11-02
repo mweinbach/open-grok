@@ -12,6 +12,7 @@ use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_metadata::shared_resources;
 
 pub const WEB_RUN_TOOL_NAME: &str = "web__run";
+pub const LITERATURE_SEARCH_QUERY: &str = "literature_search_query";
 const WEB_RUN_DESCRIPTION: &str = include_str!("web_run_description.md");
 const MAX_SEARCH_ERROR_BYTES: usize = 1_024;
 
@@ -74,6 +75,9 @@ pub struct SearchCommands {
     /// Query the internet search engine for a given list of queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub search_query: Option<Vec<SearchQuery>>,
+    /// Search for scientific papers. Open relevant papers and cite the primary sources you use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub literature_search_query: Option<Vec<SearchQuery>>,
     /// Query the image search engine for a given list of queries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_query: Option<Vec<SearchQuery>>,
@@ -109,6 +113,10 @@ pub struct SearchCommands {
 impl SearchCommands {
     pub fn is_empty(&self) -> bool {
         self.search_query.as_ref().is_none_or(Vec::is_empty)
+            && self
+                .literature_search_query
+                .as_ref()
+                .is_none_or(Vec::is_empty)
             && self.image_query.as_ref().is_none_or(Vec::is_empty)
             && self.open.as_ref().is_none_or(Vec::is_empty)
             && self.click.as_ref().is_none_or(Vec::is_empty)
@@ -125,6 +133,11 @@ impl SearchCommands {
             .search_query
             .as_ref()
             .and_then(|queries| queries.first())
+            .or_else(|| {
+                self.literature_search_query
+                    .as_ref()
+                    .and_then(|queries| queries.first())
+            })
             .or_else(|| {
                 self.image_query
                     .as_ref()
@@ -297,6 +310,10 @@ pub type StandaloneWebSearchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
 pub trait StandaloneWebSearchBackend: Send + Sync + std::fmt::Debug {
+    fn supports_literature_search(&self) -> bool {
+        false
+    }
+
     fn search<'a>(&'a self, commands: SearchCommands) -> StandaloneWebSearchFuture<'a>;
 }
 
@@ -409,6 +426,11 @@ impl xai_tool_runtime::Tool for WebRunTool {
                 .0
                 .clone()
         };
+        if commands.literature_search_query.is_some() && !backend.supports_literature_search() {
+            return Err(xai_tool_runtime::ToolError::invalid_arguments(
+                "literature_search_query is unavailable for this model",
+            ));
+        }
         let output = backend.search(commands).await.map_err(|error| {
             let message = if error.len() > MAX_SEARCH_ERROR_BYTES {
                 const SUFFIX: &str = "… [truncated]";
@@ -443,10 +465,17 @@ mod tests {
     use crate::types::tool_metadata::test_ctx_with_call_id;
 
     #[derive(Debug)]
-    struct FakeBackend;
+    struct FakeBackend {
+        literature_search: bool,
+    }
 
     impl StandaloneWebSearchBackend for FakeBackend {
+        fn supports_literature_search(&self) -> bool {
+            self.literature_search
+        }
+
         fn search<'a>(&'a self, commands: SearchCommands) -> StandaloneWebSearchFuture<'a> {
+            assert!(commands.literature_search_query.is_none() || self.literature_search);
             Box::pin(async move { Ok(format!("result for {}", commands.summary())) })
         }
     }
@@ -541,7 +570,9 @@ mod tests {
     #[tokio::test]
     async fn tool_returns_compact_backend_output() {
         let mut resources = Resources::new();
-        resources.insert(StandaloneWebSearchBackendResource(Arc::new(FakeBackend)));
+        resources.insert(StandaloneWebSearchBackendResource(Arc::new(FakeBackend {
+            literature_search: false,
+        })));
         let output = xai_tool_runtime::Tool::run(
             &WebRunTool,
             test_ctx_with_call_id(resources.into_shared(), "web-run-call"),
@@ -557,6 +588,34 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output.output, "result for Open Grok");
+    }
+
+    #[tokio::test]
+    async fn literature_search_requires_the_backend_capability() {
+        let query = json!({"literature_search_query": [{"q":"papers","recency":3,"domains":["example.org"]}]});
+        let commands: SearchCommands = serde_json::from_value(query.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&commands).unwrap(), query);
+        assert!(!commands.is_empty());
+        for enabled in [false, true] {
+            let mut resources = Resources::new();
+            resources.insert(StandaloneWebSearchBackendResource(Arc::new(FakeBackend {
+                literature_search: enabled,
+            })));
+            let result = xai_tool_runtime::Tool::run(
+                &WebRunTool,
+                test_ctx_with_call_id(resources.into_shared(), "web-run-call"),
+                commands.clone(),
+            )
+            .await;
+            if enabled {
+                assert_eq!(result.unwrap().output, "result for papers");
+            } else {
+                assert_eq!(
+                    result.unwrap_err().detail,
+                    "literature_search_query is unavailable for this model"
+                );
+            }
+        }
     }
 
     #[tokio::test]

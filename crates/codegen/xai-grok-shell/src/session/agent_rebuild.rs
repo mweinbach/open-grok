@@ -135,6 +135,22 @@ impl ResolvedWebSearchState {
     }
 }
 
+/// A capability granted by one resolved search route. Each model switch or
+/// search-source change replaces that route, even when model slugs are equal.
+#[derive(Clone)]
+pub(crate) struct LiteratureSearchRoute {
+    active: std::sync::Weak<arc_swap::ArcSwap<ResolvedWebSearchState>>,
+    selected: std::sync::Weak<ResolvedWebSearchState>,
+}
+
+impl LiteratureSearchRoute {
+    pub(crate) fn is_current(&self) -> bool {
+        self.active
+            .upgrade()
+            .is_some_and(|active| self.selected.ptr_eq(&Arc::downgrade(&active.load())))
+    }
+}
+
 fn standalone_web_search_active(
     candidates: &crate::tools::config::WebSearchCandidates,
     config: &xai_grok_sampler::SamplerConfig,
@@ -204,7 +220,7 @@ pub(crate) struct AgentRebuildSpec {
     /// replaces it so a later zero-turn rebuild renders the same prompt as a fresh spawn.
     pub memory_v2_access: MemoryV2AccessSlot,
     pub memory_v2_exposed: bool,
-    pub web_search: parking_lot::RwLock<ResolvedWebSearchState>,
+    pub web_search: Arc<arc_swap::ArcSwap<ResolvedWebSearchState>>,
     pub active_sampling_config: parking_lot::RwLock<xai_grok_sampler::SamplerConfig>,
     pub chat_state_handle: xai_chat_state::ChatStateHandle,
     /// `[toolset.x_search].enabled` at spawn. The client x_search tool is
@@ -279,14 +295,14 @@ pub(crate) struct AgentRebuildSpec {
 }
 impl AgentRebuildSpec {
     pub(crate) fn web_search_state(&self) -> ResolvedWebSearchState {
-        self.web_search.read().clone()
+        (**self.web_search.load()).clone()
     }
 
     pub(crate) fn replace_web_search_state(
         &self,
-        next: ResolvedWebSearchState,
-    ) -> ResolvedWebSearchState {
-        std::mem::replace(&mut *self.web_search.write(), next)
+        next: impl Into<Arc<ResolvedWebSearchState>>,
+    ) -> Arc<ResolvedWebSearchState> {
+        self.web_search.swap(next.into())
     }
 
     pub(crate) fn replace_active_sampling_config(
@@ -417,7 +433,7 @@ impl AgentRebuildSpec {
         } = self.as_ref();
         let _ = mcp_state;
         let _ = code_mode_runtime;
-        let web_search_state = web_search.read().clone();
+        let web_search_state = web_search.load_full();
         let web_search_config = web_search_state.config.clone();
         #[allow(unused_variables)]
         let is_cursor_template =
@@ -461,7 +477,7 @@ impl AgentRebuildSpec {
         .with_state_path(bridge_state_path.clone())
         .with_web_search_config(web_search_config)
         .with_x_search_config(if *x_search_enabled {
-            web_search.read().candidates.xai.clone()
+            web_search_state.candidates.xai.clone()
         } else {
             xai_grok_tools::implementations::web_search::WebSearchConfig::Disabled
         })
@@ -523,11 +539,24 @@ impl AgentRebuildSpec {
             builder = builder.with_attribution_callback(attribution_callback);
         }
         if web_search_state.standalone_active {
+            use xai_grok_tools::implementations::grok_build::web_run::LITERATURE_SEARCH_QUERY;
+            let sampling = active_sampling_config.read().clone();
+            let literature_search_route =
+                (standalone_web_search_active(&web_search_state.candidates, &sampling)
+                    && sampling
+                        .experimental_supported_tools
+                        .iter()
+                        .any(|name| name == LITERATURE_SEARCH_QUERY))
+                .then(|| LiteratureSearchRoute {
+                    active: Arc::downgrade(web_search),
+                    selected: Arc::downgrade(&web_search_state),
+                });
             let backend =
                 crate::tools::standalone_web_search::SamplerStandaloneWebSearchBackend::new(
-                    active_sampling_config.read().clone(),
+                    sampling,
                     chat_state_handle.clone(),
                     session_id_str.clone(),
+                    literature_search_route,
                 )
                 .map_err(|error| AgentBuildError::ToolError(error.to_string()))?;
             builder = builder.with_standalone_web_search_backend(backend);
@@ -766,9 +795,11 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         memory_backend: None,
         memory_v2_access: MemoryV2AccessSlot::new(None),
         memory_v2_exposed: false,
-        web_search: parking_lot::RwLock::new(ResolvedWebSearchState::resolved_for(
-            crate::tools::config::WebSearchCandidates::disabled(),
-            &active_sampling_config,
+        web_search: Arc::new(arc_swap::ArcSwap::from_pointee(
+            ResolvedWebSearchState::resolved_for(
+                crate::tools::config::WebSearchCandidates::disabled(),
+                &active_sampling_config,
+            ),
         )),
         active_sampling_config: parking_lot::RwLock::new(active_sampling_config),
         chat_state_handle,
@@ -1212,7 +1243,7 @@ mod tests {
                 Arc::get_mut(&mut spec).expect("test rebuild spec should be uniquely owned");
             spec_mut.web_search_domains = domains;
             spec_mut.backend_search = true;
-            spec_mut.web_search = parking_lot::RwLock::new(state(candidates(
+            spec_mut.replace_web_search_state(state(candidates(
                 xai_enabled_config(),
                 None,
                 WebSearchSourceConfig::default(),
@@ -1323,41 +1354,116 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn rebuild_registers_standalone_web_run_for_supported_native_route() {
+        use xai_grok_tools::implementations::grok_build::{
+            SearchCommands, StandaloneWebSearchBackendResource,
+        };
         tokio::task::LocalSet::new()
             .run_until(async {
                 let spec = test_rebuild_spec_default();
-                let config = xai_grok_sampler::SamplerConfig {
-                    base_url: "https://chatgpt.com/backend-api/codex".into(),
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+                let app = axum::Router::new().route(
+                    "/v1/alpha/search",
+                    axum::routing::post(
+                        |headers: axum::http::HeaderMap,
+                         axum::Json(body): axum::Json<serde_json::Value>| async move {
+                            let echo = serde_json::json!([
+                                headers["authorization"].to_str().unwrap(),
+                                body["model"],
+                                body["commands"]
+                            ]);
+                            axum::Json(serde_json::json!({"output": echo.to_string()}))
+                        },
+                    ),
+                );
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let mut config = xai_grok_sampler::SamplerConfig {
+                    base_url,
                     model: "gpt-test".into(),
                     api_backend: xai_grok_sampling_types::ApiBackend::Responses,
                     provider: ModelProvider::Codex,
                     supports_standalone_web_search: true,
                     ..Default::default()
                 };
-                spec.replace_active_sampling_config(config.clone());
-                spec.replace_web_search_state(ResolvedWebSearchState::resolved_for(
-                    candidates(
-                        WebSearchConfig::Disabled,
-                        None,
-                        WebSearchSourceConfig::default(),
-                        false,
-                        true,
-                    ),
-                    &config,
-                ));
-
-                let agent = spec
-                    .build_agent(AgentDefinition::default_grok_build())
-                    .await
-                    .expect("agent build should succeed");
-                let names = agent
-                    .tool_bridge()
-                    .toolset()
-                    .tool_definitions()
-                    .into_iter()
-                    .map(|definition| definition.function.name)
-                    .collect::<Vec<_>>();
-                assert!(names.iter().any(|name| name == "web__run"));
+                let candidates = candidates(
+                    WebSearchConfig::Disabled,
+                    None,
+                    WebSearchSourceConfig::default(),
+                    false,
+                    true,
+                );
+                let mut previous: Option<StandaloneWebSearchBackendResource> = None;
+                let wire_commands =
+                    serde_json::json!({"literature_search_query":[{"q":"papers","recency":7}]});
+                let commands: SearchCommands =
+                    serde_json::from_value(wire_commands.clone()).unwrap();
+                for (key, enabled) in [
+                    ("first", false),
+                    ("first", true),
+                    ("replacement", true),
+                    ("replacement", false),
+                ] {
+                    config.experimental_supported_tools = if enabled {
+                        vec!["literature_search_query".into()]
+                    } else {
+                        vec![]
+                    };
+                    config.api_key = Some(key.to_owned());
+                    let previous_route = spec.replace_web_search_state(
+                        ResolvedWebSearchState::resolved_for(candidates.clone(), &config),
+                    );
+                    spec.replace_active_sampling_config(config.clone());
+                    if let Some(old_backend) = previous.take() {
+                        assert!(!old_backend.0.supports_literature_search());
+                        assert_eq!(
+                            old_backend.0.search(commands.clone()).await.unwrap_err(),
+                            "literature_search_query is unavailable for this model"
+                        );
+                        if key == "replacement" && enabled {
+                            // A failed account switch reinstalls the exact previous route.
+                            let proposed_route = spec.replace_web_search_state(previous_route);
+                            assert!(old_backend.0.supports_literature_search());
+                            spec.replace_web_search_state(proposed_route);
+                        }
+                    }
+                    let agent = spec
+                        .build_agent(AgentDefinition::default_grok_build())
+                        .await
+                        .unwrap();
+                    let toolset = agent.tool_bridge().toolset();
+                    let web = toolset
+                        .tool_definitions()
+                        .into_iter()
+                        .find(|definition| definition.function.name == "web__run")
+                        .unwrap();
+                    let nested = crate::session::code_mode::to_code_mode_tool_definition(&web);
+                    for schema in [
+                        &web.function.parameters,
+                        nested.input_schema.as_ref().unwrap(),
+                    ] {
+                        assert_eq!(
+                            schema["properties"]
+                                .get("literature_search_query")
+                                .is_some(),
+                            enabled
+                        );
+                    }
+                    let backend = toolset
+                        .get_resource_cloned::<StandaloneWebSearchBackendResource>()
+                        .await
+                        .unwrap();
+                    assert_eq!(backend.0.supports_literature_search(), enabled);
+                    if enabled {
+                        let output = backend.0.search(commands.clone()).await.unwrap();
+                        let echo: serde_json::Value = serde_json::from_str(&output).unwrap();
+                        assert_eq!(
+                            echo,
+                            serde_json::json!([format!("Bearer {key}"), "gpt-test", wire_commands])
+                        );
+                    }
+                    previous = Some(backend);
+                }
+                server.abort();
             })
             .await;
     }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::session::agent_rebuild::LiteratureSearchRoute;
 use xai_grok_sampler::StandaloneSearchInput;
 use xai_grok_sampler::StandaloneSearchMessage;
 use xai_grok_sampling_types::ConversationItem;
@@ -20,6 +21,7 @@ pub(crate) struct SamplerStandaloneWebSearchBackend {
     chat_state: xai_chat_state::ChatStateHandle,
     session_id: String,
     model: String,
+    literature_search_route: Option<LiteratureSearchRoute>,
 }
 
 impl SamplerStandaloneWebSearchBackend {
@@ -27,6 +29,7 @@ impl SamplerStandaloneWebSearchBackend {
         config: xai_grok_sampler::SamplerConfig,
         chat_state: xai_chat_state::ChatStateHandle,
         session_id: String,
+        literature_search_route: Option<LiteratureSearchRoute>,
     ) -> Result<Arc<Self>, xai_grok_sampling_types::SamplingError> {
         let model = config.model.clone();
         let client = xai_grok_sampler::SamplingClient::new(config)?;
@@ -35,6 +38,7 @@ impl SamplerStandaloneWebSearchBackend {
             chat_state,
             session_id,
             model,
+            literature_search_route,
         }))
     }
 
@@ -106,17 +110,24 @@ impl SamplerStandaloneWebSearchBackend {
         &self,
         commands: SearchCommands,
     ) -> Result<xai_grok_sampler::StandaloneSearchRequest, String> {
-        let model = self
-            .chat_state
-            .get_sampling_config()
-            .await
-            .map(|config| config.model)
-            .unwrap_or_else(|| self.model.clone());
+        let input = self.request_input().await;
+        let model = if commands.literature_search_query.is_some() {
+            if !self.supports_literature_search() {
+                return Err("literature_search_query is unavailable for this model".into());
+            }
+            self.model.clone()
+        } else {
+            self.chat_state
+                .get_sampling_config()
+                .await
+                .map(|config| config.model)
+                .unwrap_or_else(|| self.model.clone())
+        };
         Ok(xai_grok_sampler::StandaloneSearchRequest {
             id: self.session_id.clone(),
             model,
             reasoning: None,
-            input: self.request_input().await,
+            input,
             commands: serde_json::to_value(commands).map_err(|error| error.to_string())?,
             settings: xai_grok_sampler::StandaloneSearchSettings::direct_with_external_web_access(),
             max_output_tokens: Some(DEFAULT_SEARCH_OUTPUT_TOKEN_BUDGET),
@@ -135,6 +146,12 @@ impl std::fmt::Debug for SamplerStandaloneWebSearchBackend {
 }
 
 impl StandaloneWebSearchBackend for SamplerStandaloneWebSearchBackend {
+    fn supports_literature_search(&self) -> bool {
+        self.literature_search_route
+            .as_ref()
+            .is_some_and(LiteratureSearchRoute::is_current)
+    }
+
     fn search<'a>(&'a self, commands: SearchCommands) -> StandaloneWebSearchFuture<'a> {
         Box::pin(async move {
             let request = self.build_request(commands).await?;
@@ -222,6 +239,7 @@ mod tests {
             xai_grok_sampler::SamplerConfig::default(),
             chat_state,
             "child-session".to_string(),
+            None,
         )
         .expect("standalone backend should build")
     }

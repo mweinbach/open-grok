@@ -761,6 +761,13 @@ impl ToolRegistryBuilder {
         });
     }
     pub fn new() -> Self {
+        Self::new_with_standalone_search(None)
+    }
+
+    /// Derive native search commands from the route that will execute them.
+    pub fn new_with_standalone_search(
+        backend: Option<&dyn grok_build::StandaloneWebSearchBackend>,
+    ) -> Self {
         let mut b = Self {
             tools: HashMap::new(),
             reminders: Vec::new(),
@@ -813,6 +820,15 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::MessageSessionTool>();
         b.register::<grok_build::WebSearchTool>();
         b.register::<grok_build::WebRunTool>();
+        if !backend.is_some_and(|backend| backend.supports_literature_search()) {
+            b.tools
+                .get_mut("GrokBuild:web__run")
+                .expect("web__run is registered")
+                .input_schema["properties"]
+                .as_object_mut()
+                .expect("search commands have an object schema")
+                .remove(grok_build::web_run::LITERATURE_SEARCH_QUERY);
+        }
         b.register::<grok_build::XSearchTool>();
         b.register_with_params::<grok_build::WebFetchTool, grok_build::web_fetch::WebFetchParams>();
         b.register::<grok_build::LspTool>();

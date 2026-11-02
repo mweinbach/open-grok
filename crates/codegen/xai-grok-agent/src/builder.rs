@@ -939,11 +939,15 @@ impl AgentBuilder {
         } else {
             std::collections::HashSet::new()
         };
-        let tool_bridge_builder = if self.mcp_file_input_preparation {
-            ToolBridge::get_builder().with_mcp_file_input_preparation()
-        } else {
-            ToolBridge::get_builder()
-        };
+        let mut tool_bridge_builder =
+            xai_grok_tools::registry::types::ToolRegistryBuilder::new_with_standalone_search(
+                self.standalone_web_search_backend
+                    .as_ref()
+                    .map(|backend| backend.0.as_ref()),
+            );
+        if self.mcp_file_input_preparation {
+            tool_bridge_builder = tool_bridge_builder.with_mcp_file_input_preparation();
+        }
         let state_path = self.state_path.clone().unwrap_or_default();
         let mut tool_config = definition.tool_config.clone();
         tool_config.tools.retain(|tool| {
