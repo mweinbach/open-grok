@@ -1,10 +1,13 @@
-use super::picker_routing::{PickerRequest, PickerSeqKind, PickerTarget, accept_picker_result};
+use super::picker_routing::{
+    PickerRequest, PickerSeqKind, PickerTarget, abandon_picker_continuation, accept_picker_result,
+    picker_for_host,
+};
 use crate::app::actions::Effect;
 use crate::app::app_view::{AppView, SessionPickerEntry};
 use crate::app::dispatch::ctx::{get_active_agent, get_active_agent_mut};
 use crate::app::effects::ConversationsPartial;
 use crate::views::modal::ActiveModal;
-use crate::views::session_picker::repo_name_from_cwd;
+use crate::views::session_picker::{SessionListPagination, SessionListQuery, repo_name_from_cwd};
 use crate::views::session_picker_surface::SessionPickerHost;
 
 use xai_grok_shell::session::unified_list::ListScope;
@@ -26,24 +29,77 @@ pub(in crate::app::dispatch) fn welcome_history_kind_filter(app: &AppView) -> Op
     None
 }
 
-/// Server-side headless policy for the picker that will consume the fetch (modal first, then welcome, the same order as the loaded handler).
-/// `Only` on the Headless page, `Exclude` everywhere else.
-pub(in crate::app::dispatch) fn active_picker_headless_policy(
-    app: &AppView,
-) -> xai_grok_shell::session::unified_list::HeadlessPolicy {
-    let filter = if let Some(agent) = get_active_agent(app)
-        && let Some(ActiveModal::SessionPicker { source_filter, .. }) = agent.active_modal.as_ref()
-    {
-        *source_filter
-    } else {
-        app.session_picker_source_filter
-    };
-    filter.headless_policy()
-}
-
+/// A new list or debounced server search invalidates the old stream immediately.
 pub(in crate::app::dispatch) fn next_picker_list_generation(app: &mut AppView) -> u64 {
+    app.session_picker_lanes.pagination = Default::default();
+    if let Some(target) = picker_for_host(app, SessionPickerHost::AgentModal) {
+        target.lanes.pagination = Default::default();
+    }
     app.session_picker_list_seq = app.session_picker_list_seq.wrapping_add(1);
     app.session_picker_list_seq
+}
+
+pub(in crate::app::dispatch) fn first_session_list_page(
+    app: &mut AppView,
+    host: SessionPickerHost,
+    query: Option<String>,
+    cwd_override: Option<std::path::PathBuf>,
+) -> Vec<Effect> {
+    let kind_filter = match host {
+        SessionPickerHost::Dashboard => Some(vec!["build".to_owned()]),
+        _ => welcome_history_kind_filter(app),
+    };
+    let cwd = cwd_override.as_ref().unwrap_or(&app.cwd).clone();
+    let Some(target) = picker_for_host(app, host) else {
+        return vec![];
+    };
+    let headless_policy = target.source_filter.headless_policy();
+    target.lanes.pagination = SessionListPagination::new(
+        target.list_seq,
+        SessionListQuery {
+            cwd,
+            query: query.clone(),
+            kind_filter: kind_filter.clone(),
+            headless_policy,
+        },
+    );
+    vec![Effect::FetchSessionList {
+        host,
+        generation: target.generation,
+        seq: target.list_seq,
+        cursor: None,
+        cwd_override,
+        query,
+        kind_filter,
+        headless_policy,
+    }]
+}
+
+pub(in crate::app::dispatch) fn dispatch_load_more_sessions(
+    app: &mut AppView,
+    host: SessionPickerHost,
+) -> Vec<Effect> {
+    let Some(target) = picker_for_host(app, host) else {
+        return vec![];
+    };
+    if target.source_filter.is_content_search_disabled()
+        || target.lanes.pending_resume_argument.is_some()
+    {
+        return vec![];
+    }
+    let Some((request, cursor)) = target.lanes.pagination.begin_next(target.list_seq) else {
+        return vec![];
+    };
+    vec![Effect::FetchSessionList {
+        host,
+        generation: target.generation,
+        seq: target.list_seq,
+        cwd_override: Some(request.cwd.clone()),
+        query: request.query.clone(),
+        kind_filter: request.kind_filter.clone(),
+        headless_policy: request.headless_policy,
+        cursor: Some(cursor),
+    }]
 }
 
 pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -> Vec<Effect> {
@@ -63,30 +119,16 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     app.session_picker_content_loading = false;
     app.session_picker_entries_query = None;
     app.session_picker_pending_delete = None;
-    let seq = next_picker_list_generation(app);
+    next_picker_list_generation(app);
     app.foreign_session_scan_seq += 1;
     let foreign_seq = app.foreign_session_scan_seq;
-    let kind_filter = welcome_history_kind_filter(app);
     #[cfg(feature = "local-workspace")]
     crate::views::welcome::workspace_mode::log_history_source(
         "session_list_fetch_dispatch",
         Some(app.welcome_workspace_mode),
-        kind_filter.as_deref(),
+        welcome_history_kind_filter(app).as_deref(),
         None,
     );
-    let (host, generation) = match modal_generation {
-        Some(generation) => (SessionPickerHost::AgentModal, generation),
-        None => (SessionPickerHost::Welcome, app.session_picker_generation),
-    };
-    let mut effects = vec![Effect::FetchSessionList {
-        host,
-        cwd_override: None,
-        generation,
-        query: None,
-        seq,
-        kind_filter,
-        headless_policy: active_picker_headless_policy(app),
-    }];
     let foreign_effect = if app.chat_mode {
         app.foreign_scan_coordinator.begin_request(foreign_seq);
         None
@@ -118,6 +160,12 @@ pub(in crate::app::dispatch) fn dispatch_fetch_session_list(app: &mut AppView) -
     app.session_picker_lanes.foreign_loading = foreign_loading && !modal_lanes_set;
     app.session_picker_lanes.pending_notice = None;
     app.session_picker_lanes.pending_resume_argument = None;
+    let host = if modal_lanes_set {
+        SessionPickerHost::AgentModal
+    } else {
+        SessionPickerHost::Welcome
+    };
+    let mut effects = first_session_list_page(app, host, None, None);
     effects.extend(foreign_effect);
     effects
 }
@@ -166,6 +214,8 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
     partial: Option<ConversationsPartial>,
     scope: ListScope,
     query: Option<String>,
+    cursor: Option<String>,
+    next_cursor: Option<String>,
 ) -> Vec<Effect> {
     let chat_mode = app.chat_mode;
     let is_browse = query.is_none();
@@ -175,8 +225,22 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
         let Some(mut target) =
             accept_picker_result(app, request, PickerSeqKind::List, "session list")
         else {
+            abandon_picker_continuation(app, request, cursor.as_deref());
             return vec![];
         };
+        if !target
+            .lanes
+            .pagination
+            .accept(request.seq, cursor.as_deref())
+        {
+            return vec![];
+        }
+        if target.lanes.pagination.scope_changed(scope) {
+            target.lanes.pagination.advance(scope, None);
+            app.show_toast("The session list changed directories. Reopen /resume to refresh it.");
+            return vec![];
+        }
+        let advanced = target.lanes.pagination.advance(scope, next_cursor);
         if let Some(partial) = partial {
             crate::unified_log::warn(
                 "session.list.partial",
@@ -189,18 +253,34 @@ pub(in crate::app::dispatch) fn handle_session_list_loaded(
             |partial| partial.picker_notice().to_owned(),
         );
         let partial_notice = partial.map(ConversationsPartial::picker_notice);
-        let argument = target.lanes.pending_resume_argument.take();
-        notice = target.native_loaded(sessions, query, chat_mode, empty_notice, partial_notice);
-        auto_pick = argument
-            .filter(|argument| {
-                is_browse && partial.is_none() && target.state.query().trim() == argument
-            })
-            .and_then(|argument| {
-                target.entries.as_deref().and_then(|entries| {
-                    unique_resume_match(entries, target.source_filter, &argument)
+        if cursor.is_some() {
+            target.append_native_page(sessions);
+            auto_pick = None;
+            notice = if !advanced {
+                Some(
+                    "Session history returned a repeated cursor. Reopen /resume to refresh it."
+                        .to_owned(),
+                )
+            } else {
+                partial_notice.filter(|_| chat_mode).map(str::to_owned)
+            };
+        } else {
+            let argument = target.lanes.pending_resume_argument.take();
+            notice = target.native_loaded(sessions, query, chat_mode, empty_notice, partial_notice);
+            auto_pick = argument
+                .filter(|argument| {
+                    is_browse
+                        && partial.is_none()
+                        && !target.lanes.pagination.has_more()
+                        && target.state.query().trim() == argument
                 })
-            });
-        *target.detail_seq += 1;
+                .and_then(|argument| {
+                    target.entries.as_deref().and_then(|entries| {
+                        unique_resume_match(entries, target.source_filter, &argument)
+                    })
+                });
+            *target.detail_seq += 1;
+        }
     }
     if let Some(notice) = notice {
         app.show_toast(&notice);
@@ -241,6 +321,7 @@ pub(in crate::app::dispatch) fn handle_session_list_failed(
     request: PickerRequest,
     error: String,
     query: Option<String>,
+    cursor: Option<String>,
 ) -> Vec<Effect> {
     let chat_mode = app.chat_mode;
     let is_search = query.is_some();
@@ -249,8 +330,22 @@ pub(in crate::app::dispatch) fn handle_session_list_failed(
         let Some(mut target) =
             accept_picker_result(app, request, PickerSeqKind::List, "session list failure")
         else {
+            abandon_picker_continuation(app, request, cursor.as_deref());
             return vec![];
         };
+        if !target
+            .lanes
+            .pagination
+            .accept(request.seq, cursor.as_deref())
+        {
+            return vec![];
+        }
+        if cursor.is_some() {
+            target.lanes.pagination.page_failed();
+            app.show_toast(&format!("Couldn't load more sessions: {error}"));
+            return vec![];
+        }
+        target.lanes.pagination = Default::default();
         target.lanes.pending_resume_argument = None;
         tracing::warn!(error = %error, "session list fetch failed");
         let error_notice = format!("Couldn't load sessions: {error}");

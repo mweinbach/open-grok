@@ -106,6 +106,10 @@ pub enum Action {
     OpenPrevLink,
     /// Fetch the session list for the session picker on the welcome screen.
     FetchSessionList,
+    /// Request the next page of sessions from an open resume picker.
+    LoadMoreSessions {
+        host: crate::views::session_picker_surface::SessionPickerHost,
+    },
     /// Cycle the active session picker's source filter.
     CycleSessionSourceFilter,
     /// Load a selected session from the session picker.
@@ -2043,6 +2047,8 @@ pub enum Effect {
     FetchSessionList {
         /// The picker this fetch was issued for; the result routes back to this host's storage only.
         host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Opaque continuation returned by the shell. Omit for the first page.
+        cursor: Option<String>,
         /// Directory the list request should use. `None` keeps the process cwd
         /// (welcome / in-session pickers). Dashboard `/resume` passes the
         /// dashboard location so a `/cd` does not leak into the process cwd.
@@ -3429,6 +3435,10 @@ pub enum TaskResult {
     SessionListLoaded {
         /// Echo of [`Effect::FetchSessionList::host`]; results apply only to the requesting host's picker storage.
         host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Cursor used to fetch this page, for matching it to the pending request.
+        cursor: Option<String>,
+        /// Opaque continuation for the next page, when supplied by the shell.
+        next_cursor: Option<String>,
         /// Echo of [`Effect::FetchSessionList::generation`]; results for a superseded picker incarnation are dropped.
         generation: u64,
         sessions: Vec<crate::app::app_view::SessionPickerEntry>,
@@ -3464,6 +3474,8 @@ pub enum TaskResult {
     SessionListFailed {
         /// Echo of [`Effect::FetchSessionList::host`].
         host: crate::views::session_picker_surface::SessionPickerHost,
+        /// Cursor used by the failed request.
+        cursor: Option<String>,
         /// Echo of [`Effect::FetchSessionList::generation`].
         generation: u64,
         error: String,

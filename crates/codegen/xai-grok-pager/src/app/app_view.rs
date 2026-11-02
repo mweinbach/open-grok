@@ -16,6 +16,7 @@ use crate::notifications::NotificationService;
 use crate::render::draw::CursorState;
 use crate::scrollback::render::ScratchBuffer;
 use crate::views::prompt_widget::PromptWidget;
+use crate::views::session_picker_surface::{SessionPageControl, SessionPickerHost};
 use crate::views::welcome::WelcomePromptFocus;
 use agent_client_protocol as acp;
 use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -3184,6 +3185,10 @@ impl AppView {
                     is_zdr_blocked: zdr_blocked,
                     sp_entries: &mut self.session_picker_entries,
                     sp_loading,
+                    sp_page_control: SessionPageControl::for_picker(
+                        &self.session_picker_lanes,
+                        self.session_picker_source_filter,
+                    ),
                     sp_state: &mut self.session_picker_state,
                     sp_content_results: &self.session_picker_content_results,
                     sp_content_loading: self.session_picker_content_loading,
@@ -3846,6 +3851,7 @@ struct WelcomeInputCtx<'a> {
     /// Mirrors the render's `session_picker_loading` param: the spinner-only
     /// picker still owns input (Esc must dismiss it, not hit the hidden menu).
     sp_loading: bool,
+    sp_page_control: SessionPageControl,
     sp_state: &'a mut crate::views::picker::PickerState,
     sp_content_results:
         &'a Option<Vec<xai_grok_shell::extensions::session_search::SearchSessionHit>>,
@@ -4076,6 +4082,14 @@ fn handle_welcome_input(ev: &Event, ctx: &mut WelcomeInputCtx<'_>) -> InputOutco
                     }
                 });
             }
+        }
+        if let Some(outcome) = ctx.sp_page_control.handle_input(
+            ev,
+            ctx.sp_state,
+            &non_selectable_flags,
+            SessionPickerHost::Welcome,
+        ) {
+            return outcome;
         }
         let outcome = handle_picker_input(ev, ctx.sp_state, entry_count, &config);
         match outcome {
@@ -5109,6 +5123,10 @@ impl AppView {
                             mouse_pos: self.last_mouse_pos,
                             is_zdr_blocked: zdr_blocked_for_draw,
                             session_picker: self.session_picker_entries.as_deref(),
+                            session_picker_page_control: SessionPageControl::for_picker(
+                                &self.session_picker_lanes,
+                                self.session_picker_source_filter,
+                            ),
                             session_picker_loading:
                                 crate::views::session_picker::loading_spinner_active(
                                     self.session_picker_entries.as_deref(),
@@ -5720,6 +5738,10 @@ impl AppView {
             || self.custom_provider_modal.is_some()
             || self.new_worktree_dialog.is_some()
             || self.welcome_doc_viewer.is_some()
+            || matches!(self.active_view, ActiveView::Welcome)
+                && (self.session_picker_entries.is_some()
+                    || self.session_picker_loading
+                    || self.session_picker_lanes.foreign_loading)
             || self.tutorial.is_some()
             || matches!(
                 self.active_view,
@@ -11437,6 +11459,25 @@ pub(crate) mod tests {
             _ => panic!("expected DocViewer"),
         };
         assert!(scroll > 0, "wheel must advance doc scroll, got {scroll}");
+    }
+    #[test]
+    fn session_pagination_welcome_wheel_reaches_the_open_picker() {
+        let mut app = test_app();
+        app.session_picker_entries = Some(vec![welcome_session_entry("wheel")]);
+        app.session_picker_state.hit_areas = Some(crate::views::picker::PickerHitAreas {
+            close_button: Default::default(),
+            search_bar: Default::default(),
+            item_rects: vec![ratatui::layout::Rect::new(5, 4, 24, 1)],
+            entry_indices: vec![0],
+            tab_rects: vec![],
+            filter_rect: None,
+        });
+        assert!(matches!(
+            app.handle_input(&scroll_event(MouseEventKind::ScrollDown, 10, 4)),
+            InputOutcome::Changed
+        ));
+        assert_eq!(app.session_picker_state.scroll_offset, Some(3));
+        assert!(app.last_scroll_pos.is_none());
     }
     #[test]
     fn tutorial_is_scroll_blocking_and_wheel_scrolls_topic() {

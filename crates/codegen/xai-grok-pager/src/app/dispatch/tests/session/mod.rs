@@ -7,6 +7,7 @@ mod fork;
 mod lifecycle;
 mod load;
 mod modal;
+mod pagination;
 mod take_deferred;
 
 fn content_hit(session_id: &str) -> xai_grok_shell::extensions::session_search::SearchSessionHit {

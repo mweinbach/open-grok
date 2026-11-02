@@ -3665,6 +3665,8 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -3686,6 +3688,8 @@ fn session_list_partial_no_oauth_surfaces_login_hint() {
 fn session_list_relax_surfaces_notice_once() {
     let relax_response = |generation| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Repo,
@@ -3714,6 +3718,8 @@ fn session_list_relax_surfaces_notice_once() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Cwd,
@@ -3732,6 +3738,8 @@ fn session_list_relax_surfaces_notice_once() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Cwd,
@@ -3756,6 +3764,8 @@ fn session_list_relax_on_welcome_does_not_latch() {
     assert!(matches!(app.active_view, ActiveView::Welcome));
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::All,
@@ -3778,6 +3788,8 @@ fn session_list_relax_on_welcome_does_not_latch() {
 fn session_list_relax_renotifies_when_cwd_changes() {
     let relax = |generation| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Repo,
@@ -3815,6 +3827,8 @@ fn session_list_empty_without_partial_keeps_generic_toast() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -3836,6 +3850,8 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     app.chat_mode = true;
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -3859,6 +3875,8 @@ fn session_list_nonempty_partial_toasts_retry_in_chat_mode_only() {
     let mut app = test_app_with_agent();
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -3885,6 +3903,8 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -3916,6 +3936,8 @@ fn session_list_nonempty_partial_modal_toasts_in_chat_mode_only() {
     open_session_picker_with(&mut app, vec![]);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,

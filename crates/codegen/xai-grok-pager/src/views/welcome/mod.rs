@@ -619,6 +619,8 @@ pub struct WelcomeRenderParams<'a> {
     pub is_zdr_blocked: bool,
     pub session_picker: Option<&'a [SessionPickerEntry]>,
     pub session_picker_loading: bool,
+    pub(crate) session_picker_page_control:
+        crate::views::session_picker_surface::SessionPageControl,
     pub compact: bool,
     pub pending_hint: Option<crate::views::shortcuts_bar::PendingHint>,
     pub startup_warnings: &'a [StartupWarning],
@@ -1821,14 +1823,15 @@ fn render_welcome_done(
         if p.session_picker_loading {
             1
         } else {
-            // Reserve a row for the pinned hidden-external hint when shown.
+            // Reserve a row for pagination status and the hidden-external hint.
             let hint_row = u16::from(
-                !p.chat_mode
-                    && crate::views::session_picker::hidden_external_hint(
-                        p.session_picker,
-                        p.session_picker_source_filter,
-                    )
-                    .is_some(),
+                p.session_picker_page_control.label().is_some()
+                    || (!p.chat_mode
+                        && crate::views::session_picker::hidden_external_hint(
+                            p.session_picker,
+                            p.session_picker_source_filter,
+                        )
+                        .is_some()),
             );
             (picker_count as u16).min(15) + 3 + hint_row // +3 for title + search + gap
         }
@@ -1879,6 +1882,7 @@ fn render_welcome_done(
                 state: session_picker_state,
                 sessions: p.session_picker,
                 loading: p.session_picker_loading,
+                page_control: p.session_picker_page_control,
                 pending_hint: p.pending_hint,
                 shortcuts_area: None,
                 content_results: p.session_picker_content_results,
@@ -2292,6 +2296,7 @@ pub(crate) struct SessionPickerRenderCtx<'a> {
     /// the current repo's group to the top.
     pub(crate) cwd: &'a std::path::Path,
     pub(crate) loading: bool,
+    pub(crate) page_control: crate::views::session_picker_surface::SessionPageControl,
     pub(crate) pending_hint: Option<crate::views::shortcuts_bar::PendingHint>,
     pub(crate) shortcuts_area: Option<Rect>,
     pub(crate) content_results:
@@ -2476,6 +2481,11 @@ pub(crate) fn render_session_picker(
     } else {
         crate::views::session_picker::hidden_external_hint(ctx.sessions, ctx.source_filter)
     };
+    let header_note = match (ctx.page_control.label(), hidden_hint) {
+        (Some(page), Some(hidden)) => Some(format!("{page}  ·  {hidden}")),
+        (Some(page), None) => Some(page.to_string()),
+        (None, hidden) => hidden,
+    };
 
     // Build shortcuts for fullscreen mode. Chat mode drops the worktree /
     // deep-search / filter hints (local-Build-row actions).
@@ -2526,7 +2536,7 @@ pub(crate) fn render_session_picker(
         filter_label: (!ctx.chat_mode).then(|| ctx.source_filter.label()),
         filter_key_hint: (!ctx.chat_mode).then_some("f"),
         filter_active: !ctx.chat_mode && ctx.source_filter.is_active(),
-        header_note: hidden_hint.as_deref(),
+        header_note: header_note.as_deref(),
         action_keys: &[],
         disable_search: false,
         compact_bottom_bar: false,
@@ -2870,6 +2880,7 @@ mod tests {
             is_zdr_blocked: false,
             session_picker,
             session_picker_loading: false,
+            session_picker_page_control: Default::default(),
             compact: false,
             pending_hint: None,
             startup_warnings: &[],
@@ -3057,6 +3068,7 @@ mod tests {
                     sessions: Some(&entries),
                     cwd: std::path::Path::new("/repo"),
                     loading: false,
+                    page_control: Default::default(),
                     pending_hint: None,
                     shortcuts_area: None,
                     content_results: None,
@@ -3140,6 +3152,7 @@ mod tests {
                     sessions: Some(&entries),
                     cwd: std::path::Path::new("/repo"),
                     loading: false,
+                    page_control: Default::default(),
                     pending_hint: None,
                     shortcuts_area: None,
                     content_results: None,

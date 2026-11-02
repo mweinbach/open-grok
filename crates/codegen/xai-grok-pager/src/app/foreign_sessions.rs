@@ -495,6 +495,29 @@ pub(crate) fn replace_foreign_entries(
     *entries = (!merged.is_empty()).then_some(merged);
 }
 
+/// Keep the first copy of overlapping native rows, including any cached card detail.
+pub(crate) fn append_native_entries(
+    entries: &mut Option<Vec<SessionPickerEntry>>,
+    mut page: Vec<SessionPickerEntry>,
+) {
+    let entries = entries.get_or_insert_with(Vec::new);
+    let native_key =
+        |entry: &SessionPickerEntry| (entry.source == "conversation", entry.id.clone());
+    let mut seen: HashSet<_> = entries
+        .iter()
+        .filter(|entry| !is_foreign_picker_source(&entry.source))
+        .map(native_key)
+        .collect();
+    page.retain(|entry| seen.insert(native_key(entry)));
+    let has_foreign = entries
+        .iter()
+        .any(|entry| is_foreign_picker_source(&entry.source));
+    entries.extend(page);
+    if has_foreign {
+        sort_picker_entries(entries);
+    }
+}
+
 pub(crate) fn replace_native_entries(
     entries: &mut Option<Vec<SessionPickerEntry>>,
     mut native: Vec<SessionPickerEntry>,

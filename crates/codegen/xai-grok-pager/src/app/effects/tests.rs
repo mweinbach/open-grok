@@ -64,7 +64,7 @@ fn picker_parses_last_recap_and_last_turn_summary() {
                 "lastRecap": "Where we left off: auth refactor across the API"
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert_eq!(entries.len(), 1);
     assert_eq!(
             entries[0].last_turn_summary.as_deref(),
@@ -98,7 +98,7 @@ fn picker_parses_session_kind() {
                 }
             ]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].session_kind.as_deref(), Some("headless"));
     assert_eq!(entries[1].session_kind, None);
@@ -149,7 +149,11 @@ async fn fetch_dashboard_sessions_explicitly_excludes_headless() {
                 let params = serde_json::from_str(args.request.params.get())
                     .expect("params JSON");
                 *captured_for_task.lock().unwrap() = Some(params);
-                let body = serde_json::json!({ "result": { "sessions": [] } });
+                let body = serde_json::json!({ "result": { "sessions": [
+                    { "sessionId": "old", "summary": "Old title", "updatedAt": "2000-01-01T00:00:00Z" },
+                    { "sessionId": "undated", "summary": "No date" },
+                    { "sessionId": "recent", "summary": "Current title", "updatedAt": chrono::Utc::now().to_rfc3339() },
+                ] } });
                 let raw = serde_json::value::RawValue::from_string(body.to_string())
                     .expect("serialize list response");
                 let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
@@ -168,7 +172,10 @@ async fn fetch_dashboard_sessions_explicitly_excludes_headless() {
         &progress_tx,
     );
     match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::DashboardSessionsLoaded { sessions } => assert!(sessions.is_empty()),
+        TaskResult::DashboardSessionsLoaded { sessions } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].session_id, "recent");
+        }
         other => panic!("expected DashboardSessionsLoaded, got {other:?}"),
     }
     let captured = captured.lock().unwrap();
@@ -202,6 +209,7 @@ async fn fetch_session_list_sends_kind_facet_filter() {
     execute(
         Effect::FetchSessionList {
             host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
+            cursor: None,
             cwd_override: None,
             generation: 1,
             query: None,
@@ -457,7 +465,7 @@ fn picker_keeps_conversation_with_empty_cwd_and_missing_updated_at() {
                 "_meta": { "x.ai/session": { "kind": "chat" } }
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert_eq!(entries.len(), 1, "conversation must not vanish");
     assert_eq!(entries[0].id, "conv_abc");
     assert_eq!(entries[0].cwd, "");
@@ -475,7 +483,7 @@ fn picker_keeps_old_conversation_past_cutoff() {
                 "_meta": { "x.ai/session": { "kind": "chat" } }
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert_eq!(entries.len(), 1, "old conversation must still render");
     assert_eq!(entries[0].source, "conversation");
 }
@@ -489,7 +497,7 @@ fn picker_drops_local_with_missing_updated_at() {
                 "source": "local"
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert!(
             entries.is_empty(),
             "local rows still require a parseable updatedAt"
@@ -508,7 +516,7 @@ fn picker_keeps_untitled_conversation_as_untitled() {
                 "_meta": { "x.ai/session": { "kind": "chat" } }
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert_eq!(entries.len(), 1, "untitled conversation must not vanish");
     assert_eq!(entries[0].summary, "Untitled");
     assert_eq!(entries[0].source, "conversation");
@@ -525,7 +533,7 @@ fn picker_still_drops_build_row_with_empty_summary() {
                 "updatedAt": "2026-07-01T00:00:00Z"
             }]
         });
-    let entries = parse_session_picker_entries(&payload);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
     assert!(entries.is_empty(), "empty-summary Build rows stay dropped");
 }
 #[test]
@@ -1921,11 +1929,13 @@ async fn foreign_resume_detection_runs_as_task_result() {
 }
 /// `FetchSessionList` wire shape: search sends `query` (no `allowRelax`);
 /// browse opts into `allowRelax` and parses `x.ai/listScope`; all
-/// outcomes echo `seq`/`query`.
+/// outcomes echo the request metadata, including the opaque cursor on later pages.
 #[tokio::test]
 async fn fetch_session_list_pushes_query_and_echoes_seq() {
     use std::sync::{Arc, Mutex};
     use xai_acp_lib::AcpAgentMessage;
+    use xai_grok_shell::session::unified_list::HeadlessPolicy;
+    const CURSOR: &str = " +older/Ω== ";
     let captured: Arc<Mutex<Vec<serde_json::Value>>> = Arc::default();
     let captured_for_task = captured.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1937,22 +1947,24 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
                         args.request.params.get(),
                     )
                     .expect("params JSON");
-                let fail = params.get("query").and_then(|q| q.as_str())
-                    == Some("fail-me");
-                let browse = params.get("query").is_none();
-                captured_for_task.lock().unwrap().push(params);
-                let body = if fail {
-                    serde_json::json!({ "error": "boom" })
-                } else if browse {
-                    serde_json::json!({
-                            "result": {
-                                "sessions": [],
-                                "_meta": { "x.ai/listScope": "repo" },
-                            }
-                        })
-                } else {
-                    serde_json::json!({ "result": { "sessions": [] } })
+                let body = match params.get("query").and_then(|q| q.as_str()) {
+                    Some("fail-me") => serde_json::json!({ "error": "boom" }),
+                    Some("malformed") => serde_json::json!({ "result": { "sessions": [], "nextCursor": 4 } }),
+                    Some(_) => serde_json::json!({ "result": { "sessions": [] } }),
+                    None if params.get("cursor").is_none() => serde_json::json!({ "result": {
+                        "sessions": [
+                            { "sessionId": "first", "summary": "First row", "updatedAt": "2000-02-01T00:00:00Z" },
+                            { "sessionId": "undated", "summary": "No date" },
+                        ],
+                        "nextCursor": CURSOR, "_meta": { "x.ai/listScope": "repo" },
+                    } }),
+                    None => serde_json::json!({ "result": {
+                        "sessions": [{ "sessionId": "older", "summary": "Older row",
+                            "updatedAt": "2000-01-01T00:00:00Z" }],
+                        "nextCursor": null, "_meta": { "x.ai/listScope": "repo" },
+                    } }),
                 };
+                captured_for_task.lock().unwrap().push(params);
                 let raw = serde_json::value::RawValue::from_string(body.to_string())
                     .expect("serialize list response");
                 let _ = args.response_tx.send(Ok(acp::ExtResponse::new(Arc::from(raw))));
@@ -1975,6 +1987,7 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
     use crate::views::session_picker_surface::SessionPickerHost;
     let mut tasks = run(Effect::FetchSessionList {
         host: SessionPickerHost::AgentModal,
+        cursor: None,
         cwd_override: None,
         generation: 41,
         query: Some("hit".into()),
@@ -1990,8 +2003,12 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
             scope,
             seq,
             query,
+            cursor,
+            next_cursor,
             ..
         } => {
+            assert_eq!(cursor, None);
+            assert_eq!(next_cursor, None, "older servers can omit nextCursor");
             assert!(sessions.is_empty());
             assert_eq!(host, SessionPickerHost::AgentModal, "host must be echoed");
             assert_eq!(generation, 41, "generation must be echoed");
@@ -2004,28 +2021,48 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         }
         other => panic!("expected SessionListLoaded, got {other:?}"),
     }
-    let mut tasks = run(Effect::FetchSessionList {
+    let browse = |cursor| Effect::FetchSessionList {
         host: SessionPickerHost::Welcome,
-        cwd_override: None,
+        cursor,
+        cwd_override: Some("dashboard-root".into()),
         generation: 42,
         query: None,
         seq: 8,
-        kind_filter: None,
-        headless_policy: Default::default(),
-    });
-    match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::SessionListLoaded { scope, seq, query, .. } => {
+        kind_filter: Some(vec!["build".into()]),
+        headless_policy: HeadlessPolicy::Only,
+    };
+    let mut tasks = run(browse(None));
+    let next_cursor = match tasks.join_next().await.expect("task").expect("no panic") {
+        TaskResult::SessionListLoaded { scope, sessions, seq, query, cursor, next_cursor, .. } => {
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "first");
             assert_eq!(seq, 8);
             assert_eq!(query, None);
+            assert_eq!(cursor, None);
+            assert_eq!(next_cursor.as_deref(), Some(CURSOR));
             assert!(
                     scope.is_relaxed(),
                     "_meta[\"x.ai/listScope\"] must parse into the task result"
                 );
+            next_cursor
+        }
+        other => panic!("expected SessionListLoaded, got {other:?}"),
+    };
+    let mut tasks = run(browse(next_cursor));
+    match tasks.join_next().await.expect("task").expect("no panic") {
+        TaskResult::SessionListLoaded { scope, sessions, seq, cursor, next_cursor, .. } => {
+            assert_eq!(seq, 8);
+            assert!(scope.is_relaxed());
+            assert_eq!(cursor.as_deref(), Some(CURSOR));
+            assert_eq!(next_cursor, None);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].id, "older");
         }
         other => panic!("expected SessionListLoaded, got {other:?}"),
     }
     let mut tasks = run(Effect::FetchSessionList {
         host: SessionPickerHost::Welcome,
+        cursor: Some(CURSOR.into()),
         cwd_override: None,
         generation: 43,
         query: Some("fail-me".into()),
@@ -2034,11 +2071,12 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         headless_policy: Default::default(),
     });
     match tasks.join_next().await.expect("task").expect("no panic") {
-        TaskResult::SessionListFailed { host, generation, error, seq, query } => {
+        TaskResult::SessionListFailed { host, generation, error, seq, query, cursor } => {
             assert_eq!(error, "boom");
             assert_eq!(host, SessionPickerHost::Welcome, "failure must echo the host");
             assert_eq!(generation, 43, "failure must echo the generation");
             assert_eq!(seq, 9);
+            assert_eq!(cursor.as_deref(), Some(CURSOR));
             assert_eq!(
                     query.as_deref(),
                     Some("fail-me"),
@@ -2047,13 +2085,32 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
         }
         other => panic!("expected SessionListFailed, got {other:?}"),
     }
+    let mut tasks = run(Effect::FetchSessionList {
+        host: SessionPickerHost::AgentModal,
+        cursor: Some(CURSOR.into()),
+        cwd_override: None,
+        generation: 44,
+        query: Some("malformed".into()),
+        seq: 10,
+        kind_filter: None,
+        headless_policy: Default::default(),
+    });
+    assert!(matches!(tasks.join_next().await.unwrap().unwrap(),
+        TaskResult::SessionListFailed { cursor: Some(cursor), error, .. }
+            if cursor == CURSOR && error == "Invalid session list cursor"));
     let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 3);
+    assert_eq!(captured.len(), 5);
     assert_eq!(captured[0]["query"], "hit");
     assert_eq!(captured[0]["limit"], 30);
     assert_eq!(captured[0]["headless"], "exclude");
-    assert_eq!(captured[1]["headless"], "exclude");
-    assert_eq!(captured[2]["headless"], "exclude");
+    assert!(captured[0].get("cursor").is_none());
+    assert_eq!(captured[1]["headless"], "only");
+    assert_eq!(captured[1]["cwd"], "dashboard-root");
+    assert_eq!(captured[1]["_meta"]["x.ai/facetFilters"]["kind"], serde_json::json!(["build"]));
+    assert!(captured[1].get("cursor").is_none());
+    let mut expected_continuation = captured[1].clone();
+    expected_continuation["cursor"] = serde_json::json!(CURSOR);
+    assert_eq!(captured[2], expected_continuation);
     assert!(captured[0]["cwd"].is_string());
     assert!(
             captured[0].get("allowRelax").is_none(),
@@ -2069,7 +2126,9 @@ async fn fetch_session_list_pushes_query_and_echoes_seq() {
             captured[1]["allowRelax"], true,
             "browse fetches opt into relaxing"
         );
-    assert_eq!(captured[2]["query"], "fail-me");
+    assert_eq!(captured[3]["query"], "fail-me");
+    assert_eq!(captured[3]["cursor"], CURSOR);
+    assert!(captured[3].get("allowRelax").is_none());
 }
 #[tokio::test]
 async fn fetch_workflows_list_sends_session_id() {
@@ -2862,12 +2921,12 @@ fn resume_list_parser_keeps_older_and_untitled_rows() {
     let payload = serde_json::json!({"sessions": [
         {"sessionId": "old", "summary": "Old title", "updatedAt": "2000-01-01T00:00:00Z"},
         {"sessionId": "untitled", "summary": "", "updatedAt": "2000-01-01T00:00:00Z"},
+        {"sessionId": "undated", "summary": "Undated title"},
     ]});
-    assert!(parse_session_picker_entries(&payload).is_empty());
-    let entries = parse_session_picker_entries_for_resume(&payload);
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].id, "old");
-    assert_eq!(entries[1].id, "untitled");
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResumePicker);
+    assert_eq!(entries.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["old"]);
+    let entries = parse_session_picker_entries(&payload, SessionListPurpose::ResolveArgument);
+    assert_eq!(entries.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["old", "untitled", "undated"]);
 }
 
 #[tokio::test]
@@ -2907,7 +2966,7 @@ async fn resume_list_fetch_pages_and_rejects_repeated_cursors() {
         kind_filter: None, headless_policy: Default::default(),
     }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
     match tasks.join_next().await.unwrap().unwrap() {
-        TaskResult::SessionListLoaded { sessions, partial, .. } => {
+        TaskResult::SessionListLoaded { sessions, partial, cursor: None, next_cursor: None, .. } => {
             assert_eq!(sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), ["first", "second"]);
             assert_eq!(partial, Some(ConversationsPartial::BuildIncomplete));
         }
@@ -2925,7 +2984,7 @@ async fn resume_list_fetch_pages_and_rejects_repeated_cursors() {
         kind_filter: None, headless_policy: Default::default(),
     }, &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx);
     assert!(matches!(tasks.join_next().await.unwrap().unwrap(),
-        TaskResult::SessionListFailed { error, .. } if error.contains("cursor repeated")));
+        TaskResult::SessionListFailed { error, cursor: None, .. } if error.contains("cursor repeated")));
     execute(Effect::FetchSessionListForResume {
         argument: "12345678-1234-1234-1234-123456789abc".into(), host: SessionPickerHost::AgentModal,
         cwd_override: Some("complete-test".into()), generation: 5, seq: 6,

@@ -77,6 +77,8 @@ fn dashboard_resume_owns_picker_lifecycle_and_leaves_welcome_untouched() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Dashboard,
             generation: generation + 1,
             sessions: vec![],
@@ -108,6 +110,8 @@ fn dashboard_resume_owns_picker_lifecycle_and_leaves_welcome_untouched() {
     assert!(app.dashboard_session_picker.is_none());
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Dashboard,
             generation,
             sessions: vec![super::make_picker_entry("late-dashboard", "/late")],
@@ -7223,6 +7227,8 @@ fn dashboard_resume_argument_cancels_auto_pick_after_query_change() {
     entry.summary = "target".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Dashboard,
             generation,
             seq,

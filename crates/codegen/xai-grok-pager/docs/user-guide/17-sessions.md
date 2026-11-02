@@ -89,7 +89,9 @@ Use the `/resume` command to browse and resume previous sessions:
 /resume
 ```
 
-This opens a picker of recent sessions for the current workspace. Use `/resume <query>` to start with the picker filtered. A unique exact title or session ID can open directly.
+The picker shows the newest sessions for the current workspace first. Scroll to the end of the list or press `F5` to load up to 30 more sessions. If loading fails, the sessions already on screen stay available and `F5` retries the same page.
+
+Use `/resume <query>` to start with the picker filtered. A unique exact title or session ID can open directly.
 
 Title searches match the start of each word in any order. For example, `log fix` finds “Fix log rotation” and skips “Blog prefix cleanup.” You can also paste a session ID fragment or part of a directory path. Typing one character filters the visible rows. With two or more characters, the Welcome and in-session pickers can also show conversation matches under “Extended search results.” Press `Ctrl+/` to search immediately.
 

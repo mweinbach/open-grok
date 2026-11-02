@@ -208,6 +208,8 @@ fn native_empty_waits_for_foreign_and_foreign_only_rows_survive() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -258,6 +260,8 @@ fn foreign_empty_then_native_empty_finishes_once_without_resurrecting() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -290,6 +294,7 @@ fn modal_native_failure_waits_for_foreign_rows_before_toast() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             error: "native failed".into(),
@@ -327,6 +332,8 @@ fn modal_empty_notice_waits_until_both_lanes_are_empty() {
     }
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -440,6 +447,8 @@ fn modal_selection_survives_native_and_foreign_completion_races() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -642,6 +651,8 @@ fn empty_headless_welcome_keeps_picker_open() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -691,6 +702,7 @@ fn failed_headless_welcome_keeps_picker_open() {
 
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             error: "boom".into(),
@@ -1318,4 +1330,219 @@ fn native_fetch_effect_precedes_background_foreign_gate() {
         ]
     ));
     assert!(app.session_picker_lanes.foreign_loading);
+}
+
+#[test]
+fn appending_pages_preserves_expanded_cards_and_their_inflight_details() {
+    use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
+    use std::collections::HashSet;
+
+    for with_foreign in [false, true] {
+        let mut app = test_app();
+        app.foreign_session_compat.codex = with_foreign;
+        app.session_picker_source_filter = SourceFilter::All;
+        dispatch(Action::FetchSessionList, &mut app);
+        let host = SessionPickerHost::Welcome;
+        let generation = app.session_picker_generation;
+        let seq = app.session_picker_list_seq;
+        let page = |sessions, cursor: Option<&str>, next: Option<&str>| {
+            Action::TaskComplete(TaskResult::SessionListLoaded {
+                host,
+                generation,
+                seq,
+                query: None,
+                cursor: cursor.map(str::to_owned),
+                next_cursor: next.map(str::to_owned),
+                sessions,
+                scope: ListScope::Cwd,
+                partial: None,
+            })
+        };
+        dispatch(
+            page(
+                vec![at(make_picker_entry("shared", "/repo"), 20)],
+                None,
+                Some("next"),
+            ),
+            &mut app,
+        );
+        if with_foreign {
+            dispatch(
+                Action::TaskComplete(TaskResult::ForeignSessionsScanned {
+                    entries: vec![at(make_foreign_entry("shared", "codex", "/repo"), 10)],
+                    seq: app.foreign_session_scan_seq,
+                }),
+                &mut app,
+            );
+        }
+
+        app.session_picker_content_results = Some(vec![content_hit("content")]);
+        let expand = |id: &str| Action::ExpandSessionCard {
+            source: "local".into(),
+            session_id: id.into(),
+        };
+        assert!(dispatch(expand("content"), &mut app).is_empty());
+        let detail_effects = dispatch(expand("shared"), &mut app);
+        let [
+            Effect::LoadCardDetail {
+                seq: detail_seq, ..
+            },
+        ] = detail_effects.as_slice()
+        else {
+            panic!("expected a pending detail request");
+        };
+        let continuation = dispatch(Action::LoadMoreSessions { host }, &mut app);
+        assert!(
+            matches!(continuation.as_slice(), [Effect::FetchSessionList { cursor: Some(c), .. }] if c == "next")
+        );
+        dispatch(
+            page(
+                vec![at(make_picker_entry("added", "/repo"), 30)],
+                Some("next"),
+                None,
+            ),
+            &mut app,
+        );
+        dispatch(
+            Action::TaskComplete(TaskResult::CardDetailLoaded {
+                host,
+                generation,
+                seq: *detail_seq,
+                source: "local".into(),
+                session_id: "shared".into(),
+                detail: crate::app::app_view::CardDetail {
+                    turn_count: 7,
+                    tool_call_count: 1,
+                    first_prompt_preview: "original prompt".into(),
+                },
+            }),
+            &mut app,
+        );
+
+        let index = usize::from(with_foreign);
+        assert_eq!(
+            app.session_picker_state.expanded,
+            HashSet::from([index, CONTENT_EXPAND_OFFSET])
+        );
+        let entries = app.session_picker_entries.as_ref().unwrap();
+        assert_eq!(
+            (entries[index].source.as_str(), entries[index].id.as_str()),
+            ("local", "shared")
+        );
+        assert_eq!(entries[index].card_detail.as_ref().unwrap().turn_count, 7);
+        assert!(
+            entries
+                .iter()
+                .enumerate()
+                .all(|(i, e)| i == index || e.card_detail.is_none())
+        );
+    }
+}
+
+#[test]
+fn background_continuations_release_only_the_owning_root_or_child_page_for_retry() {
+    let id = AgentId(0);
+    let host = SessionPickerHost::AgentModal;
+    for (child, advance_seq, fail) in [
+        (false, false, false),
+        (true, false, true),
+        (false, true, true),
+    ] {
+        let mut app = test_app_with_agent();
+        if child {
+            let session = make_test_agent_session(&app, id, "child");
+            let view = AgentView::new(session, ScrollbackState::new());
+            let root = app.agents.get_mut(&id).unwrap();
+            root.active_subagent = Some("child".into());
+            root.subagent_views.insert("child".into(), Box::new(view));
+        }
+        let initial = dispatch(Action::ShowSessionPicker, &mut app);
+        let [
+            Effect::FetchSessionList {
+                generation, seq, ..
+            },
+        ] = initial.as_slice()
+        else {
+            panic!("missing modal fetch");
+        };
+        let result = |seq, cursor: Option<&str>, next: Option<&str>, entry| {
+            Action::TaskComplete(TaskResult::SessionListLoaded {
+                host,
+                generation: *generation,
+                seq,
+                cursor: cursor.map(str::to_owned),
+                next_cursor: next.map(str::to_owned),
+                scope: ListScope::Cwd,
+                query: None,
+                sessions: vec![make_picker_entry(entry, "/repo")],
+                partial: None,
+            })
+        };
+        dispatch(result(*seq, None, Some("older"), "keep"), &mut app);
+        let more = || Action::LoadMoreSessions { host };
+        assert!(
+            matches!(dispatch(more(), &mut app).as_slice(), [Effect::FetchSessionList { cursor: Some(c), .. }] if c == "older")
+        );
+
+        app.active_view = ActiveView::Welcome;
+        if advance_seq {
+            dispatch(Action::FetchSessionList, &mut app);
+            app.active_view = ActiveView::Agent(id);
+        }
+        // The same opaque token on a different request cannot release this page.
+        dispatch(
+            result(seq.wrapping_add(2), Some("older"), None, "obsolete"),
+            &mut app,
+        );
+        dispatch(
+            result(*seq, Some("wrong-token"), None, "obsolete"),
+            &mut app,
+        );
+        let modal = |app: &AppView| {
+            let root = &app.agents[&id];
+            let owner = if child {
+                &*root.subagent_views["child"]
+            } else {
+                root
+            };
+            let Some(ActiveModal::SessionPicker { lanes, entries, .. }) =
+                owner.active_modal.as_ref()
+            else {
+                panic!("owner's modal missing");
+            };
+            assert_eq!(
+                entries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|e| e.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["keep"]
+            );
+            (lanes.pagination.is_loading(), lanes.pagination.failed())
+        };
+        assert_eq!(modal(&app), (true, false));
+        let dropped = if fail {
+            Action::TaskComplete(TaskResult::SessionListFailed {
+                host,
+                generation: *generation,
+                seq: *seq,
+                cursor: Some("older".into()),
+                query: None,
+                error: "background read failed".into(),
+            })
+        } else {
+            result(*seq, Some("older"), None, "background result")
+        };
+        dispatch(dropped, &mut app);
+        assert_eq!(modal(&app), (false, true));
+        assert!(app.welcome_toast.is_none());
+        assert!(app.agents[&id].toast.is_none());
+        app.active_view = ActiveView::Agent(id);
+        let retried = dispatch(more(), &mut app);
+        assert!(
+            matches!(retried.as_slice(), [Effect::FetchSessionList { generation: retry_generation, seq: retry_seq, cursor: Some(c), .. }]
+            if retry_generation == generation && *retry_seq == app.session_picker_list_seq && c == "older")
+        );
+    }
 }

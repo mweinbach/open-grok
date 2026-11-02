@@ -169,9 +169,128 @@ pub(crate) enum SessionPickerPendingNotice {
     Empty(String),
     Error(String),
 }
+/// Parameters that must stay fixed while following an opaque session-list cursor.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionListQuery {
+    pub cwd: std::path::PathBuf,
+    pub kind_filter: Option<Vec<String>>,
+    pub headless_policy: xai_grok_shell::session::unified_list::HeadlessPolicy,
+    pub query: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PageStatus {
+    #[default]
+    Ready,
+    Loading,
+    Failed,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SessionListPagination {
+    seq: u64,
+    request: Option<SessionListQuery>,
+    scope: Option<xai_grok_shell::session::unified_list::ListScope>,
+    next_cursor: Option<String>,
+    used_cursors: HashSet<String>,
+    status: PageStatus,
+}
+
+impl SessionListPagination {
+    pub(crate) fn new(seq: u64, request: SessionListQuery) -> Self {
+        Self {
+            seq,
+            request: Some(request),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn has_more(&self) -> bool {
+        self.next_cursor.is_some()
+    }
+
+    pub(crate) fn is_loading(&self) -> bool {
+        self.status == PageStatus::Loading
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.status == PageStatus::Failed
+    }
+
+    pub(crate) fn begin_next(&mut self, seq: u64) -> Option<(&SessionListQuery, String)> {
+        if self.is_loading() && seq == self.seq {
+            return None;
+        }
+        let request = self.request.as_ref()?;
+        let cursor = self.next_cursor.clone()?;
+        self.seq = seq;
+        self.status = PageStatus::Loading;
+        Some((request, cursor))
+    }
+
+    pub(crate) fn accept(&mut self, seq: u64, cursor: Option<&str>) -> bool {
+        // A background modal can outlive another host advancing the shared list sequence.
+        if seq != self.seq && cursor.is_none() {
+            *self = Self {
+                seq,
+                ..Default::default()
+            };
+        }
+        match cursor {
+            Some(cursor) => self.pending(seq, cursor),
+            None => self.scope.is_none(),
+        }
+    }
+
+    fn pending(&self, seq: u64, cursor: &str) -> bool {
+        self.seq == seq && self.is_loading() && self.next_cursor.as_deref() == Some(cursor)
+    }
+
+    pub(crate) fn abandon(&mut self, seq: u64, cursor: &str) {
+        if self.pending(seq, cursor) {
+            self.page_failed();
+        }
+    }
+
+    pub(crate) fn page_failed(&mut self) {
+        self.status = PageStatus::Failed;
+    }
+
+    pub(crate) fn scope_changed(
+        &self,
+        scope: xai_grok_shell::session::unified_list::ListScope,
+    ) -> bool {
+        self.scope.is_some_and(|previous| previous != scope)
+    }
+
+    /// Return false if the server points back to a page we have already requested.
+    pub(crate) fn advance(
+        &mut self,
+        scope: xai_grok_shell::session::unified_list::ListScope,
+        next: Option<String>,
+    ) -> bool {
+        self.status = PageStatus::Ready;
+        if let Some(cursor) = self.next_cursor.take() {
+            self.used_cursors.insert(cursor);
+        }
+        if self.request.is_some() {
+            self.scope = Some(scope);
+        }
+        if next
+            .as_ref()
+            .is_some_and(|cursor| self.used_cursors.contains(cursor))
+        {
+            return false;
+        }
+        self.next_cursor = next;
+        true
+    }
+}
+
 /// Native/foreign completion state shared by the welcome and modal session pickers.
 #[derive(Debug, Clone, Default)]
 pub struct SessionPickerLanes {
+    pub(crate) pagination: SessionListPagination,
     pub(crate) foreign_loading: bool,
     pub(crate) pending_notice: Option<SessionPickerPendingNotice>,
     /// Pending initial argument, consumed only by its complete list response.
@@ -399,6 +518,15 @@ pub(crate) fn restore_picker_selection(
                         .and_then(|results| results.get(*hit_index))
                         .is_some_and(|hit| &hit.session_id == id)
                 }
+                (
+                    PickerSelectionKey::Content { id },
+                    Some(PickerItem::Fuzzy { original_index }),
+                ) => {
+                    entries
+                        .and_then(|entries| entries.get(*original_index))
+                        .and_then(build_session_id)
+                        == Some(id.as_str())
+                }
                 _ => false,
             })
         })
@@ -468,6 +596,20 @@ pub(crate) fn filter_session_entries(
 // Entry map building
 // ---------------------------------------------------------------------------
 
+/// Only a native build row can replace a local transcript hit with the same ID.
+fn build_session_id(entry: &SessionPickerEntry) -> Option<&str> {
+    (entry.source != "conversation" && !crate::app::is_foreign_picker_source(&entry.source))
+        .then_some(entry.id.as_str())
+}
+
+fn visible_build_ids<'a>(entries: &'a [SessionPickerEntry], indices: &[usize]) -> HashSet<&'a str> {
+    indices
+        .iter()
+        .filter_map(|&index| entries.get(index))
+        .filter_map(build_session_id)
+        .collect()
+}
+
 /// Build a flat list of picker items from fuzzy and content results, deduplicating content hits that already appear in the fuzzy list.
 pub(crate) fn build_virtual_list(
     entries: Option<&[SessionPickerEntry]>,
@@ -476,18 +618,7 @@ pub(crate) fn build_virtual_list(
     source_filter: SourceFilter,
 ) -> Vec<PickerItem> {
     let fuzzy_indices = filter_session_entries(entries, query, source_filter);
-    let fuzzy_ids: HashSet<&str> = entries
-        .map(|ents| {
-            fuzzy_indices
-                .iter()
-                .filter_map(|&i| {
-                    ents.get(i)
-                        .filter(|entry| !crate::app::is_foreign_picker_source(&entry.source))
-                        .map(|entry| entry.id.as_str())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let fuzzy_ids = visible_build_ids(entries.unwrap_or_default(), &fuzzy_indices);
     let mut items: Vec<PickerItem> = fuzzy_indices
         .into_iter()
         .map(|i| PickerItem::Fuzzy { original_index: i })
@@ -552,15 +683,7 @@ pub(crate) fn build_entry_map(
                 }
             }
         }
-        let fuzzy_ids: HashSet<&str> = filtered
-            .iter()
-            .filter_map(|&i| {
-                entries_data
-                    .get(i)
-                    .filter(|entry| !crate::app::is_foreign_picker_source(&entry.source))
-                    .map(|entry| entry.id.as_str())
-            })
-            .collect();
+        let fuzzy_ids = visible_build_ids(entries_data, &filtered);
         let content_items: Vec<usize> = if !source_filter.is_content_search_disabled()
             && let Some(hits) = content_results
             && !query.is_empty()
@@ -833,14 +956,7 @@ pub(crate) fn build_content_entry_data(
     state: &PickerState,
     content_start: usize,
 ) -> Vec<SessionEntryData> {
-    let fuzzy_ids: HashSet<&str> = entries_data
-        .iter()
-        .enumerate()
-        .filter(|(i, entry)| {
-            filtered_indices.contains(i) && !crate::app::is_foreign_picker_source(&entry.source)
-        })
-        .map(|(_, e)| e.id.as_str())
-        .collect();
+    let fuzzy_ids = visible_build_ids(entries_data, filtered_indices);
     let mut row_offset = 0usize;
     hits.iter()
         .enumerate()

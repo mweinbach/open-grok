@@ -17,6 +17,7 @@ use super::app_view::InputOutcome;
 
 use crate::theme::Theme;
 use crate::views::modal::{self, ActiveModal};
+use crate::views::session_picker_surface::{SessionPageControl, SessionPickerHost};
 
 impl AgentView {
     /// `suggest_args` falls back to model rows when the query is not in effort
@@ -1016,6 +1017,7 @@ impl AgentView {
                 entries,
                 state,
                 loading: _,
+                lanes,
                 previous_palette,
                 content_results,
                 content_loading,
@@ -1128,6 +1130,14 @@ impl AgentView {
                 }
 
                 let selected_before = state.selected;
+                if let Some(outcome) = SessionPageControl::for_picker(lanes, *source_filter)
+                    .handle_input(ev, state, &non_sel, SessionPickerHost::AgentModal)
+                {
+                    if state.selected != selected_before {
+                        *pending_delete = None;
+                    }
+                    return outcome;
+                }
                 let outcome = handle_picker_input(ev, state, entry_count, &config);
                 if pending_delete.is_some() && state.selected != selected_before {
                     *pending_delete = None;
@@ -2007,6 +2017,15 @@ impl AgentView {
                         clickable: false,
                         id: 0,
                     }];
+                    if let Some(label) =
+                        SessionPageControl::for_picker(lanes, *source_filter).label()
+                    {
+                        shortcuts.push(Shortcut {
+                            label,
+                            clickable: false,
+                            id: 0,
+                        });
+                    }
                     if !external {
                         shortcuts.extend([
                             Shortcut {

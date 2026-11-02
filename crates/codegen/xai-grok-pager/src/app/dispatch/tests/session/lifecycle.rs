@@ -3765,6 +3765,7 @@ mod welcome_workspace_mode {
         assert!(!welcome_history_build_bypass_applies(&[], true));
         assert!(!welcome_history_build_bypass_applies(
             &[Effect::FetchSessionList {
+                cursor: None,
                 host: crate::views::session_picker_surface::SessionPickerHost::Welcome,
                 cwd_override: None,
                 generation: 0,

@@ -313,19 +313,13 @@ pub(super) fn dispatch_dashboard_open_session_picker(app: &mut AppView) -> Vec<E
     surface.source_filter = SourceFilter::Local;
     surface.loading = true;
     surface.list_seq += 1;
-    let seq = surface.list_seq;
-    let headless_policy = surface.source_filter.headless_policy();
     app.dashboard_session_picker = Some(surface);
-
-    vec![Effect::FetchSessionList {
-        host: SessionPickerHost::Dashboard,
-        cwd_override: Some(cwd),
-        generation,
-        query: None,
-        seq,
-        kind_filter: Some(vec!["build".to_owned()]),
-        headless_policy,
-    }]
+    super::session::foreign::first_session_list_page(
+        app,
+        SessionPickerHost::Dashboard,
+        None,
+        Some(cwd),
+    )
 }
 
 pub(super) fn dispatch_dashboard_open_session_picker_for(

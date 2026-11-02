@@ -3479,6 +3479,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
         } => handle_codex_session_load_auth_required(app, agent_id, session_id),
         TaskResult::SessionListLoaded {
+            cursor,
+            next_cursor,
             host,
             generation,
             sessions,
@@ -3497,6 +3499,8 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             partial,
             scope,
             query,
+            cursor,
+            next_cursor,
         ),
         TaskResult::ForeignSessionsScanned { entries, seq } => {
             handle_foreign_sessions_scanned(app, entries, seq)
@@ -3529,6 +3533,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
         TaskResult::SessionListFailed {
+            cursor,
             host,
             generation,
             error,
@@ -3543,6 +3548,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             },
             error,
             query,
+            cursor,
         ),
         TaskResult::SessionSearchDebounceExpired {
             host,

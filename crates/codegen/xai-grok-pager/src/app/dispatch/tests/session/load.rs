@@ -2192,6 +2192,8 @@ fn stale_session_list_responses_are_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -2208,6 +2210,7 @@ fn stale_session_list_responses_are_dropped() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             error: "boom".into(),
@@ -2222,6 +2225,8 @@ fn stale_session_list_responses_are_dropped() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -2269,6 +2274,8 @@ fn modal_search_response_lands_and_stale_is_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -2310,6 +2317,8 @@ fn modal_search_response_lands_and_stale_is_dropped() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             scope: ListScope::Cwd,
@@ -2368,6 +2377,8 @@ fn modal_close_drops_in_flight_search_response() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Cwd,
@@ -2416,6 +2427,8 @@ fn modal_pick_drops_in_flight_search_response() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Cwd,
@@ -2462,6 +2475,8 @@ fn welcome_esc_drops_in_flight_fetch_response() {
     let _ = dispatch(Action::SessionPickerClosed, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation,
             scope: ListScope::Cwd,
@@ -2513,6 +2528,8 @@ fn build_welcome_esc_during_load_dismisses_without_resurrection() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation,
             scope: ListScope::Cwd,
@@ -2594,6 +2611,8 @@ fn build_mode_close_and_reopen_drop_opposite_policy_response() {
     let exclude_seq = *exclude_seq;
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: old_generation,
             scope: ListScope::Cwd,
@@ -2622,6 +2641,8 @@ fn build_mode_close_and_reopen_drop_opposite_policy_response() {
     );
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: new_generation,
             scope: ListScope::Cwd,
@@ -2651,6 +2672,8 @@ fn build_mode_close_and_reopen_drop_opposite_policy_response() {
     assert!(app.session_picker_entries_query.is_none());
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: new_generation,
             scope: ListScope::Cwd,
@@ -2681,6 +2704,8 @@ fn zero_hit_search_shows_empty_list_without_toast() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -2705,6 +2730,8 @@ fn zero_hit_search_shows_empty_list_without_toast() {
     let _ = dispatch(Action::FetchSessionList, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -2768,6 +2795,7 @@ fn current_seq_failed_search_clears_indicator_and_stamp() {
     assert!(app.session_picker_content_loading);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             error: "boom".into(),
@@ -2810,6 +2838,7 @@ fn modal_failed_search_clears_indicator_and_plain_failure_preserves_spinner() {
     let _ = dispatch(Action::ForceDeepSearch, &mut app);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             error: "boom".into(),
@@ -2859,6 +2888,7 @@ fn modal_failed_search_clears_indicator_and_plain_failure_preserves_spinner() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: modal_picker_generation(&app),
             error: "boom".into(),
@@ -2894,6 +2924,8 @@ fn build_mode_list_response_preserves_deep_search_spinner() {
     assert!(app.session_picker_content_loading, "deep search in flight");
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -2911,6 +2943,7 @@ fn build_mode_list_response_preserves_deep_search_spinner() {
     assert!(app.session_picker_entries.is_some(), "entries still land");
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             error: "boom".into(),
@@ -2962,6 +2995,8 @@ fn build_mode_rapid_plain_fetches_drop_superseded_response() {
     assert!(*second_seq > *first_seq);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: first_generation,
             scope: ListScope::Cwd,
@@ -2982,6 +3017,8 @@ fn build_mode_rapid_plain_fetches_drop_superseded_response() {
     );
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: second_generation,
             scope: ListScope::Cwd,
@@ -3002,6 +3039,8 @@ fn build_mode_rapid_plain_fetches_drop_superseded_response() {
     assert!(!app.session_picker_loading);
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: first_generation,
             scope: ListScope::Cwd,
@@ -3107,6 +3146,8 @@ fn reopened_modal_drops_prior_incarnation_list_result() {
     let second_seq = *second_seq;
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: first_generation,
             scope: ListScope::Cwd,
@@ -3134,6 +3175,8 @@ fn reopened_modal_drops_prior_incarnation_list_result() {
     }
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: second_generation,
             scope: ListScope::Cwd,
@@ -3249,6 +3292,8 @@ fn welcome_fetch_response_does_not_retarget_open_modal() {
     let _ = dispatch(Action::ShowSessionPicker, &mut app);
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: welcome_generation,
             scope: ListScope::Cwd,
@@ -3291,6 +3336,8 @@ fn dashboard_host_results_route_to_surface_only() {
     app.dashboard_session_picker = Some(surface);
     let list_result = |generation, id: &str| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Dashboard,
             generation,
             scope: ListScope::Cwd,
@@ -3385,6 +3432,7 @@ fn dashboard_host_results_route_to_surface_only() {
     }
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListFailed {
+            cursor: None,
             host: SessionPickerHost::Dashboard,
             generation,
             error: "boom".into(),
@@ -3432,6 +3480,8 @@ fn modal_result_does_not_cross_agents_and_background_modal_starves() {
     assert_ne!(a_generation, b_generation);
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation: a_generation,
             scope: ListScope::Cwd,
@@ -3543,6 +3593,8 @@ fn background_modal_card_detail_survives_welcome_refetch() {
     let modal_seq = *modal_seq;
     let modal_list = |generation, seq| {
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::AgentModal,
             generation,
             scope: ListScope::Cwd,
@@ -3592,6 +3644,8 @@ fn background_modal_card_detail_survives_welcome_refetch() {
     let welcome_detail_seq = app.session_picker_detail_seq;
     let _ = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host: SessionPickerHost::Welcome,
             generation: app.session_picker_generation,
             scope: ListScope::Cwd,
@@ -3945,6 +3999,8 @@ fn resume_argument_filters_picker_and_does_not_open_ambiguous_or_partial_matches
         }
         let result = dispatch(
             Action::TaskComplete(TaskResult::SessionListLoaded {
+                cursor: None,
+                next_cursor: None,
                 host,
                 generation,
                 seq,
@@ -3994,6 +4050,8 @@ fn resume_argument_cancels_auto_pick_after_user_changes_query() {
     entry.summary = "target".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host,
             generation,
             seq,
@@ -4029,6 +4087,8 @@ fn resume_argument_opens_one_exact_match_only_after_complete_result() {
     entry.summary = "My Review".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host,
             generation,
             seq,
@@ -4060,6 +4120,8 @@ fn resume_argument_does_not_open_if_build_list_is_incomplete() {
     entry.summary = "title".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host,
             generation,
             seq,
@@ -4112,6 +4174,8 @@ fn resume_argument_refresh_cancels_pending_direct_lookup() {
     entry.summary = "target".into();
     let effects = dispatch(
         Action::TaskComplete(TaskResult::SessionListLoaded {
+            cursor: None,
+            next_cursor: None,
             host,
             generation,
             seq,

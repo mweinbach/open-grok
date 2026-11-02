@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 
 use crate::app::app_view::SessionPickerEntry;
 use crate::theme::Theme;
+use crate::views::session_picker::{SessionPickerLanes, SourceFilter};
 
 /// Which surface a picker fetch was issued for.
 /// Results route back to the requesting host's storage only; a live picker on another host never absorbs them.
@@ -14,6 +15,111 @@ pub enum SessionPickerHost {
     AgentModal,
     /// Dashboard picker (`AppView::dashboard_session_picker`).
     Dashboard,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SessionPageControl {
+    #[default]
+    None,
+    More,
+    Loading,
+    Retry,
+}
+
+impl SessionPageControl {
+    pub(crate) fn for_picker(lanes: &SessionPickerLanes, source: SourceFilter) -> Self {
+        if source == SourceFilter::External {
+            Self::None
+        } else if lanes.pagination.is_loading() {
+            Self::Loading
+        } else if lanes.pagination.failed() {
+            Self::Retry
+        } else if lanes.pagination.has_more() {
+            Self::More
+        } else {
+            Self::None
+        }
+    }
+
+    pub(crate) fn label(self) -> Option<&'static str> {
+        match self {
+            Self::None => None,
+            Self::More => Some("F5 load more"),
+            Self::Loading => Some("Loading more…"),
+            Self::Retry => Some("Load failed · F5 retry"),
+        }
+    }
+
+    /// Handle explicit page requests and forward navigation at the loaded edge.
+    /// Other input, including the search editor's End key, stays with the picker.
+    pub(crate) fn handle_input(
+        self,
+        ev: &crossterm::event::Event,
+        state: &mut crate::views::picker::PickerState,
+        non_selectable: &[bool],
+        host: SessionPickerHost,
+    ) -> Option<crate::app::app_view::InputOutcome> {
+        use crate::app::{actions::Action, app_view::InputOutcome};
+        use crossterm::event::{Event, KeyCode, KeyEventKind, MouseEventKind};
+
+        let load_more = || InputOutcome::Action(Action::LoadMoreSessions { host });
+        match ev {
+            Event::Key(key) if key.kind != KeyEventKind::Release && key.modifiers.is_empty() => {
+                if key.code == KeyCode::F(5) {
+                    return Some(if matches!(self, Self::More | Self::Retry) {
+                        load_more()
+                    } else {
+                        InputOutcome::Unchanged
+                    });
+                }
+                if state.search_active || state.tabs_focused {
+                    return None;
+                }
+                let mut following = non_selectable
+                    .iter()
+                    .enumerate()
+                    .skip(state.selected.saturating_add(1))
+                    .filter_map(|(i, &skip)| (!skip).then_some(i));
+                let target = match key.code {
+                    KeyCode::Down | KeyCode::Char('j') if self != Self::None => following.next(),
+                    KeyCode::PageDown => {
+                        let page_size = state
+                            .hit_areas
+                            .as_ref()
+                            .map_or(1, |hit| hit.entry_indices.len().max(1));
+                        following.nth(page_size - 1)
+                    }
+                    KeyCode::End => None,
+                    _ => return None,
+                };
+                let last = non_selectable.iter().rposition(|&skip| !skip)?;
+                let target = target.unwrap_or(last);
+                if target != last && matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
+                    return None;
+                }
+                state.selected = target;
+                state.selection_hidden = false;
+                state.hovered = None;
+                state.scroll_offset = None;
+                Some(if target == last && self == Self::More {
+                    load_more()
+                } else {
+                    InputOutcome::Changed
+                })
+            }
+            Event::Mouse(mouse)
+                if self == Self::More && mouse.kind == MouseEventKind::ScrollDown =>
+            {
+                let hit = state.hit_areas.as_ref()?;
+                let last = non_selectable.iter().rposition(|&skip| !skip)?;
+                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
+                (hit.entry_indices.contains(&last)
+                    && hit.item_rects.iter().any(|r| r.contains(pos)))
+                .then(load_more)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Shared by dashboard picker paint and input so a copy change cannot update only one site.
@@ -77,6 +183,7 @@ pub(crate) struct SessionPickerRenderCtx<'a> {
     pub(crate) sessions: Option<&'a [SessionPickerEntry]>,
     pub(crate) cwd: &'a std::path::Path,
     pub(crate) loading: bool,
+    pub(crate) page_control: SessionPageControl,
     pub(crate) pending_hint: Option<crate::views::shortcuts_bar::PendingHint>,
     pub(crate) shortcuts_area: Option<Rect>,
     pub(crate) content_results:
@@ -108,6 +215,7 @@ pub(crate) fn render_session_picker(
                 sessions: ctx.sessions,
                 cwd: ctx.cwd,
                 loading: ctx.loading,
+                page_control: ctx.page_control,
                 pending_hint: ctx.pending_hint,
                 shortcuts_area: ctx.shortcuts_area,
                 content_results: ctx.content_results,
@@ -187,7 +295,7 @@ fn render_simple_session_picker_modal(
     use crate::views::modal_window::{ModalSizing, ModalWindowConfig, Shortcut};
     use crate::views::picker::{self, PickerField};
 
-    let shortcuts = vec![
+    let mut shortcuts = vec![
         Shortcut {
             label: "\u{2191}\u{2193} nav",
             clickable: false,
@@ -209,6 +317,13 @@ fn render_simple_session_picker_modal(
             id: 0,
         },
     ];
+    if let Some(label) = ctx.page_control.label() {
+        shortcuts.push(Shortcut {
+            label,
+            clickable: false,
+            id: 0,
+        });
+    }
     let modal_config = ModalWindowConfig {
         title,
         tabs: None,
@@ -314,12 +429,116 @@ fn render_simple_session_picker_modal(
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui::style::Modifier;
 
-    use super::render_session_picker_search_bar;
+    use super::{
+        SessionPageControl, SessionPickerHost, empty_hit_areas, render_session_picker_search_bar,
+    };
+    use crate::app::{actions::Action, app_view::InputOutcome};
     use crate::theme::Theme;
+    use crate::views::picker::PickerState;
+
+    fn key(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn loads_page(input: Option<InputOutcome>, expected: SessionPickerHost) -> bool {
+        matches!(input, Some(InputOutcome::Action(Action::LoadMoreSessions { host })) if host == expected)
+    }
+
+    #[test]
+    fn session_pagination_navigates_past_headers_and_keeps_the_last_row_focused() {
+        let host = SessionPickerHost::AgentModal;
+        let more = SessionPageControl::More;
+        let rows = [true, false, true, false, false, true, false, true];
+        let mut state = PickerState::default();
+        state.selected = 1;
+        let mut hit = empty_hit_areas();
+        hit.entry_indices = vec![1, 3];
+        state.hit_areas = Some(hit);
+        assert!(matches!(
+            more.handle_input(&key(KeyCode::PageDown), &mut state, &rows, host),
+            Some(InputOutcome::Changed)
+        ));
+        assert_eq!(state.selected, 4);
+        assert!(loads_page(
+            more.handle_input(&key(KeyCode::Down), &mut state, &rows, host),
+            host
+        ));
+        assert_eq!(state.selected, 6);
+        assert!(matches!(
+            SessionPageControl::Loading.handle_input(&key(KeyCode::Down), &mut state, &rows, host),
+            Some(InputOutcome::Changed)
+        ));
+        assert_eq!(state.selected, 6);
+        assert!(!state.search_active);
+        state.selected = 1;
+        assert!(loads_page(
+            more.handle_input(&key(KeyCode::End), &mut state, &rows, host),
+            host
+        ));
+        assert_eq!(state.selected, 6);
+    }
+
+    #[test]
+    fn session_pagination_explicitly_retries_empty_results_during_search() {
+        let host = SessionPickerHost::Welcome;
+        let mut state = PickerState::input_active();
+        state.set_query("older");
+        for control in [SessionPageControl::More, SessionPageControl::Retry] {
+            assert!(loads_page(
+                control.handle_input(&key(KeyCode::F(5)), &mut state, &[], host),
+                host
+            ));
+            assert!(
+                control
+                    .handle_input(&key(KeyCode::End), &mut state, &[], host)
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            SessionPageControl::Loading.handle_input(&key(KeyCode::F(5)), &mut state, &[], host),
+            Some(InputOutcome::Unchanged)
+        ));
+        assert_eq!(state.query(), "older");
+        assert!(state.search_active);
+    }
+
+    #[test]
+    fn session_pagination_scrolls_only_at_the_visible_bottom_of_the_list() {
+        let host = SessionPickerHost::Dashboard;
+        let rows = [true, false, false];
+        let mut hit = empty_hit_areas();
+        hit.entry_indices = vec![1];
+        hit.item_rects = vec![Rect::new(5, 4, 24, 1)];
+        let mut state = PickerState::default();
+        state.hit_areas = Some(hit);
+        let scroll = |row| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let more = SessionPageControl::More;
+        assert!(
+            more.handle_input(&scroll(4), &mut state, &rows, host)
+                .is_none()
+        );
+        state.hit_areas.as_mut().unwrap().entry_indices = vec![2];
+        assert!(loads_page(
+            more.handle_input(&scroll(4), &mut state, &rows, host),
+            host
+        ));
+        assert!(
+            more.handle_input(&scroll(1), &mut state, &rows, host)
+                .is_none()
+        );
+    }
 
     fn row_text(buf: &Buffer) -> String {
         (0..buf.area.width).fold(String::new(), |mut text, x| {

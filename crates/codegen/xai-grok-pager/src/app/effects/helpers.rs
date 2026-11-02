@@ -803,30 +803,21 @@ pub(super) fn parse_session_list_scope(payload: &serde_json::Value) -> ListScope
         _ => ListScope::Cwd,
     }
 }
-/// Parse the `x.ai/session/list` response payload (the unwrapped
-/// `{ "sessions": [...] }` object) into [`SessionPickerEntry`] rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionListPurpose {
+    ResumePicker,
+    DashboardRoster,
+    ResolveArgument,
+}
+
+/// Parse rows from the unwrapped `x.ai/session/list` response.
 ///
-/// Shared by the resume picker ([`Effect::FetchSessionList`]) and the
-/// dashboard's non-leader idle-session fallback
-/// ([`Effect::FetchDashboardSessions`]) so both produce identical labels.
-/// Sessions older than 30 days, and sessions with no usable user prompt
-/// (empty `summary` after fallbacks), are dropped.
+/// The dashboard's idle roster shows recent Build sessions. The resume picker
+/// shows dated, titled Build sessions of any age. Exact argument resolution
+/// also needs untitled and undated rows to look up IDs and detect ambiguity.
 pub(super) fn parse_session_picker_entries(
     payload: &serde_json::Value,
-) -> Vec<crate::app::app_view::SessionPickerEntry> {
-    parse_session_picker_entries_inner(payload, false)
-}
-
-/// Include older and untitled rows when checking an exact resume argument.
-pub(super) fn parse_session_picker_entries_for_resume(
-    payload: &serde_json::Value,
-) -> Vec<crate::app::app_view::SessionPickerEntry> {
-    parse_session_picker_entries_inner(payload, true)
-}
-
-fn parse_session_picker_entries_inner(
-    payload: &serde_json::Value,
-    include_all: bool,
+    purpose: SessionListPurpose,
 ) -> Vec<crate::app::app_view::SessionPickerEntry> {
     use crate::app::app_view::SessionPickerEntry;
     let entries: Vec<serde_json::Value> = payload
@@ -871,13 +862,13 @@ fn parse_session_picker_entries_inner(
                 .and_then(|s| s.parse().ok());
             let updated_at: chrono::DateTime<chrono::Utc> = match parsed_updated {
                 Some(ts) => {
-                    if !include_all && !is_conversation && ts < cutoff {
+                    if purpose == SessionListPurpose::DashboardRoster && !is_conversation && ts < cutoff {
                         return None;
                     }
                     ts
                 }
                 None => {
-                    if !include_all && !is_conversation {
+                    if purpose != SessionListPurpose::ResolveArgument && !is_conversation {
                         return None;
                     }
                     parsed_created.unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH)
@@ -977,7 +968,7 @@ fn parse_session_picker_entries_inner(
             })
         })
         .filter_map(|mut e| {
-            if e.summary.is_empty() && !include_all {
+            if e.summary.is_empty() && purpose != SessionListPurpose::ResolveArgument {
                 if e.source == "conversation" {
                     e.summary = "Untitled".to_string();
                 } else {

@@ -1,6 +1,7 @@
 //! Session loading, session pickers, and deep-search dispatchers.
 use super::foreign::{
-    dispatch_fetch_session_list, invalidate_foreign_picker, next_picker_list_generation,
+    dispatch_fetch_session_list, first_session_list_page, invalidate_foreign_picker,
+    next_picker_list_generation,
 };
 use super::fork::build_child_fork_marker;
 use super::lifecycle::{
@@ -801,16 +802,8 @@ pub(in crate::app::dispatch) fn dispatch_cycle_session_source_filter(
     if !has_crossed_headless {
         return vec![];
     }
-    let seq = next_picker_list_generation(app);
-    let mut effects = vec![Effect::FetchSessionList {
-        host: request_identity.0,
-        cwd_override: None,
-        generation: request_identity.1,
-        query: None,
-        seq,
-        kind_filter: super::foreign::welcome_history_kind_filter(app),
-        headless_policy: super::foreign::active_picker_headless_policy(app),
-    }];
+    next_picker_list_generation(app);
+    let mut effects = first_session_list_page(app, request_identity.0, None, None);
     effects.extend(restart_search);
     effects
 }
@@ -936,27 +929,11 @@ fn dispatch_chat_search_refetch(app: &mut AppView, force: bool) -> Vec<Effect> {
     let seq = next_picker_list_generation(app);
     if query.is_empty() {
         set_chat_search_loading(app, host, false);
-        return vec![Effect::FetchSessionList {
-            host,
-            cwd_override: None,
-            generation,
-            query: None,
-            seq,
-            kind_filter: super::foreign::welcome_history_kind_filter(app),
-            headless_policy: super::foreign::active_picker_headless_policy(app),
-        }];
+        return first_session_list_page(app, host, None, None);
     }
     set_chat_search_loading(app, host, true);
     if force {
-        vec![Effect::FetchSessionList {
-            host,
-            cwd_override: None,
-            generation,
-            query: Some(query),
-            seq,
-            kind_filter: super::foreign::welcome_history_kind_filter(app),
-            headless_policy: super::foreign::active_picker_headless_policy(app),
-        }]
+        first_session_list_page(app, host, Some(query), None)
     } else {
         vec![Effect::DebounceSessionSearch {
             host,
@@ -987,22 +964,6 @@ fn set_chat_search_loading(app: &mut AppView, host: SessionPickerHost, loading: 
         }
     }
 }
-fn session_picker_entry_source<'a>(app: &'a AppView, session_id: &str) -> Option<&'a str> {
-    use crate::views::modal::ActiveModal;
-    if let Some(agent) = get_active_agent(app)
-        && let Some(ActiveModal::SessionPicker {
-            entries: Some(entries),
-            ..
-        }) = agent.active_modal.as_ref()
-        && let Some(e) = entries.iter().find(|e| e.id == session_id)
-    {
-        return Some(e.source.as_str());
-    }
-    app.session_picker_entries
-        .as_ref()
-        .and_then(|entries| entries.iter().find(|e| e.id == session_id))
-        .map(|entry| entry.source.as_str())
-}
 pub(in crate::app::dispatch) fn session_picker_external_filter_active(app: &AppView) -> bool {
     use crate::views::modal::ActiveModal;
     if let Some(agent) = get_active_agent(app)
@@ -1012,12 +973,10 @@ pub(in crate::app::dispatch) fn session_picker_external_filter_active(app: &AppV
     }
     app.session_picker_source_filter == crate::views::session_picker::SourceFilter::External
 }
-/// Whether the picker row with `session_id` is a backend conversation.
-pub(in crate::app::dispatch) fn session_picker_entry_is_conversation(
-    app: &AppView,
-    session_id: &str,
-) -> bool {
-    session_picker_entry_source(app, session_id) == Some("conversation")
+/// A local content hit and a backend conversation may share an opaque ID.
+fn content_pick_is_conversation(app: &AppView, session_id: &str) -> bool {
+    session_picker_entry_matches(app, "conversation", session_id)
+        && !session_picker_entry_matches(app, "local", session_id)
 }
 pub(in crate::app::dispatch) fn session_picker_entry_matches(
     app: &AppView,
@@ -1060,7 +1019,7 @@ pub(in crate::app::dispatch) fn dispatch_pick_content_session(
     if session_picker_external_filter_active(app) {
         return vec![];
     }
-    let chat_kind = session_picker_entry_is_conversation(app, &session_id);
+    let chat_kind = content_pick_is_conversation(app, &session_id);
     app.session_picker_entries = None;
     app.session_picker_loading = false;
     app.session_picker_state.reset();
@@ -1551,15 +1510,12 @@ pub(in crate::app::dispatch) fn handle_session_search_debounce_expired(
         return vec![];
     }
     if chat_mode {
-        vec![Effect::FetchSessionList {
-            host: request.host,
-            cwd_override: None,
-            generation: request.generation,
-            query: (!query.is_empty()).then_some(query),
-            seq: request.seq,
-            kind_filter: super::foreign::welcome_history_kind_filter(app),
-            headless_policy,
-        }]
+        first_session_list_page(
+            app,
+            request.host,
+            (!query.is_empty()).then_some(query),
+            None,
+        )
     } else {
         vec![Effect::DeepSearchSessions {
             host: request.host,
@@ -1739,6 +1695,7 @@ pub(in crate::app::dispatch) fn dispatch_show_session_picker(app: &mut AppView) 
 pub(in crate::app::dispatch) fn exhaustive_resume_fetch(effects: &mut [Effect], argument: &str) {
     for effect in effects {
         if let Effect::FetchSessionList {
+            cursor: None,
             host,
             cwd_override,
             generation,
@@ -1810,7 +1767,7 @@ pub(in crate::app::dispatch) fn dispatch_pick_content_session_in_worktree(
     if session_picker_external_filter_active(app) {
         return vec![];
     }
-    if session_picker_entry_is_conversation(app, &session_id) {
+    if content_pick_is_conversation(app, &session_id) {
         app.show_toast("Chat conversations can't be resumed in a worktree");
         return vec![];
     }

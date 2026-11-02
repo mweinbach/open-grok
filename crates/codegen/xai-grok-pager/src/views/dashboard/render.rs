@@ -316,6 +316,10 @@ pub fn render_dashboard(
                 sessions: surface.entries.as_deref(),
                 cwd: &state.cwd,
                 loading: surface.loading,
+                page_control: crate::views::session_picker_surface::SessionPageControl::for_picker(
+                    &surface.lanes,
+                    surface.source_filter,
+                ),
                 pending_hint: None,
                 shortcuts_area: None,
                 content_results: None,

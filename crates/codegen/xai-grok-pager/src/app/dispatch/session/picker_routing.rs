@@ -74,6 +74,41 @@ pub(in crate::app::dispatch) fn accept_picker_result<'a>(
     Some(target)
 }
 
+/// A page that finishes while its modal is in the background must remain
+/// retryable when the user returns. Only its originating request is released.
+pub(in crate::app::dispatch) fn abandon_picker_continuation(
+    app: &mut AppView,
+    request: PickerRequest,
+    cursor: Option<&str>,
+) {
+    let Some(cursor) = cursor else { return };
+    let lanes = match request.host {
+        SessionPickerHost::AgentModal => app
+            .agents
+            .values_mut()
+            .flat_map(|agent| {
+                std::iter::once(&mut agent.active_modal).chain(
+                    agent
+                        .subagent_views
+                        .values_mut()
+                        .map(|child| &mut child.active_modal),
+                )
+            })
+            .find_map(|modal| match modal {
+                Some(ActiveModal::SessionPicker {
+                    generation, lanes, ..
+                }) if *generation == request.generation => Some(lanes),
+                _ => None,
+            }),
+        host => picker_for_host(app, host)
+            .filter(|target| target.generation == request.generation)
+            .map(|target| target.lanes),
+    };
+    if let Some(lanes) = lanes {
+        lanes.pagination.abandon(request.seq, cursor);
+    }
+}
+
 /// Mutable view of one host's picker storage plus the freshness values a result must match.
 /// Generation and the list/deep-search seqs are by-value copies.
 /// Result handlers only read them (producers bump the real counters before the handler borrows the storage).
@@ -161,7 +196,11 @@ pub(in crate::app::dispatch) fn picker_for_host(
         }
         SessionPickerHost::Dashboard => {
             let surface = app.dashboard_session_picker.as_mut()?;
-            let current_repo = repo_name_from_cwd(&app.cwd.to_string_lossy());
+            let cwd = app
+                .dashboard
+                .as_ref()
+                .map_or(&app.cwd, |dashboard| &dashboard.cwd);
+            let current_repo = repo_name_from_cwd(&cwd.to_string_lossy());
             Some(PickerTarget {
                 entries: &mut surface.entries,
                 loading: &mut surface.loading,
@@ -233,7 +272,9 @@ impl PickerTarget<'_> {
         } else {
             crate::app::foreign_sessions::replace_native_entries(self.entries, sessions);
         }
-        if (is_search || self.source_filter.is_active()) && self.entries.is_none() {
+        if (is_search || self.source_filter.is_active() || self.lanes.pagination.has_more())
+            && self.entries.is_none()
+        {
             *self.entries = Some(Vec::new());
         }
         let notice = if self.entries.is_none() && !is_search {
@@ -254,6 +295,52 @@ impl PickerTarget<'_> {
         };
         self.restore_selection(anchor);
         notice
+    }
+
+    pub(in crate::app::dispatch) fn append_native_page(
+        &mut self,
+        sessions: Vec<SessionPickerEntry>,
+    ) {
+        use crate::views::session_picker::CONTENT_EXPAND_OFFSET;
+        use std::collections::{HashMap, HashSet};
+
+        let anchor = self.capture_selection();
+        let mut expanded = std::mem::take(&mut self.state.expanded);
+        let entries = self.entries.as_deref().unwrap_or_default();
+        let mut expanded_cards = HashMap::<String, HashSet<String>>::new();
+        // Native-only pages append in place. When foreign rows interleave by recency,
+        // their backing indices can move; the separate content search hits stay in place.
+        if !expanded.is_empty()
+            && entries
+                .iter()
+                .any(|entry| crate::app::is_foreign_picker_source(&entry.source))
+        {
+            expanded.retain(|&index| {
+                if index >= CONTENT_EXPAND_OFFSET {
+                    return true;
+                }
+                if let Some(entry) = entries.get(index) {
+                    expanded_cards
+                        .entry(entry.source.clone())
+                        .or_default()
+                        .insert(entry.id.clone());
+                }
+                false
+            });
+        }
+        crate::app::foreign_sessions::append_native_entries(self.entries, sessions);
+        self.restore_selection(anchor);
+        if !expanded_cards.is_empty() {
+            for (index, entry) in self.entries.iter().flatten().enumerate() {
+                if expanded_cards
+                    .get(&entry.source)
+                    .is_some_and(|ids| ids.contains(&entry.id))
+                {
+                    expanded.insert(index);
+                }
+            }
+        }
+        self.state.expanded = expanded;
     }
 
     pub(in crate::app::dispatch) fn native_failed(
@@ -293,6 +380,10 @@ impl PickerTarget<'_> {
     ) -> Option<String> {
         let anchor = self.capture_selection();
         crate::app::foreign_sessions::replace_foreign_entries(self.entries, scanned);
+        // A page may contain no displayable rows but still have a continuation.
+        if self.lanes.pagination.has_more() && self.entries.is_none() {
+            *self.entries = Some(Vec::new());
+        }
         self.lanes.foreign_loading = false;
         let notice = self.lanes.take_ready_notice(self.entries.is_some());
         self.restore_selection(anchor);
