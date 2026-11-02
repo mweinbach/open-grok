@@ -117,7 +117,8 @@ pub(crate) fn copy_parallel(
 
             // Check if this file should be skipped (already copied or explicitly skipped).
             if let Some(ref skip) = config.skip_files
-                && skip.contains(&rel_path)
+                && (skip.contains(&rel_path)
+                    || tracked.is_some_and(|indexed| skip.contains(indexed)))
             {
                 files_skipped.fetch_add(1, Ordering::Relaxed);
                 if config.respect_gitignore {
@@ -156,7 +157,7 @@ pub(crate) fn copy_parallel(
             let _ = senders[shard].send(CopyEntry {
                 rel_path,
                 kind,
-                tracked,
+                tracked: tracked.is_some(),
             });
 
             WalkState::Continue

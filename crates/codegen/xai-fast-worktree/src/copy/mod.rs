@@ -1,6 +1,7 @@
 //! Filesystem replication engine used by fast worktree creation.
 
 pub(crate) mod cow;
+mod disk_spelling;
 pub(crate) mod engine;
 pub(crate) mod gitdir;
 pub(crate) mod shard;

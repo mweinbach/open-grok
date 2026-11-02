@@ -1,6 +1,5 @@
 //! Worker logic for replicating a single filesystem entry.
 
-use std::collections::HashSet;
 use std::fs::Metadata;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,8 +7,28 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::{DashMap, DashSet};
 
-use crate::copy::cow;
 use crate::copy::types::{CopyEntry, CopyEntryKind};
+
+#[cfg(unix)]
+#[path = "destination_unix.rs"]
+mod destination;
+#[cfg(windows)]
+#[path = "destination_windows.rs"]
+mod destination;
+use destination::Destination;
+
+#[derive(Debug)]
+struct DestinationConflict;
+impl std::fmt::Display for DestinationConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("refusing to copy through a destination link or incompatible entry")
+    }
+}
+impl std::error::Error for DestinationConflict {}
+
+#[cfg(test)]
+#[path = "destination_tests.rs"]
+mod confined_copy_tests;
 
 pub(crate) struct WorkerCtx {
     pub source: PathBuf,
@@ -26,7 +45,7 @@ pub(crate) fn run_worker(
     rx: crossbeam::channel::Receiver<CopyEntry>,
     ctx: WorkerCtx,
 ) -> anyhow::Result<()> {
-    let mut created_dirs = HashSet::new();
+    let mut destination = Destination::open(&ctx.dest)?;
     let mut fatal = None;
     for entry in rx {
         // Drain the bounded queue even on failure, so the producer can finish
@@ -34,13 +53,16 @@ pub(crate) fn run_worker(
         if fatal.is_some() {
             continue;
         }
-        match process_entry(&entry, &ctx, &mut created_dirs) {
+        match process_entry(&entry, &ctx, &mut destination) {
             Ok(()) => {
                 ctx.handled_paths.insert(entry.rel_path);
             }
             Err(error) => {
                 let error = error.context(format!("copy {}", entry.rel_path.display()));
-                if entry.tracked || crate::api::is_out_of_disk(&error) {
+                if entry.tracked
+                    || error.is::<DestinationConflict>()
+                    || crate::api::is_out_of_disk(&error)
+                {
                     fatal = Some(error);
                 } else {
                     ctx.issues.lock().unwrap().push(format!("{error:#}"));
@@ -54,31 +76,22 @@ pub(crate) fn run_worker(
 fn process_entry(
     entry: &CopyEntry,
     ctx: &WorkerCtx,
-    created_dirs: &mut HashSet<PathBuf>,
+    destination: &mut Destination,
 ) -> anyhow::Result<()> {
     let src = ctx.source.join(&entry.rel_path);
-    let dst = ctx.dest.join(&entry.rel_path);
-    if let Some(parent) = dst.parent()
-        && !parent.as_os_str().is_empty()
-        && created_dirs.insert(parent.to_path_buf())
-    {
-        std::fs::create_dir_all(parent)?;
-    }
     match entry.kind {
         CopyEntryKind::Dir => {
-            std::fs::create_dir_all(&dst)?;
+            destination.create_dir(&entry.rel_path)?;
             ctx.dirs_created.fetch_add(1, Ordering::Relaxed);
         }
         CopyEntryKind::Symlink => {
-            cow::replace_symlink(&std::fs::read_link(&src)?, &dst)?;
+            destination.symlink(&std::fs::read_link(&src)?, &entry.rel_path)?;
             ctx.symlinks_copied.fetch_add(1, Ordering::Relaxed);
         }
         CopyEntryKind::File => {
-            cow::clone_file(&src, &dst)?;
+            let metadata = destination.copy_file(&src, &entry.rel_path)?;
             ctx.files_copied.fetch_add(1, Ordering::Relaxed);
-            if let Ok(metadata) = std::fs::metadata(&dst) {
-                ctx.file_metadata.insert(entry.rel_path.clone(), metadata);
-            }
+            ctx.file_metadata.insert(entry.rel_path.clone(), metadata);
         }
     }
     Ok(())

@@ -1,10 +1,10 @@
 //! Skip logic for copy operations (gitignore + additional patterns).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
 /// Build a globset matcher for skip patterns.
@@ -34,7 +34,7 @@ fn git_paths(source: &Path, flags: &[&str]) -> Result<Vec<PathBuf>> {
         .stdout
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
-        .map(|s| Ok(source.join(gix::path::try_from_byte_slice(s)?)))
+        .map(|s| Ok(gix::path::try_from_byte_slice(s)?.to_owned()))
         .collect()
 }
 
@@ -45,7 +45,7 @@ pub(crate) fn walk_copy_entries(
     source: &Path,
     parallelism: usize,
     respect_gitignore: bool,
-    visit: impl Fn(DirEntry, bool) -> WalkState + Sync,
+    visit: impl Fn(DirEntry, Option<&Path>) -> WalkState + Sync,
 ) -> Result<()> {
     let mut walker = WalkBuilder::new(source);
     walker
@@ -56,21 +56,38 @@ pub(crate) fn walk_copy_entries(
         .git_exclude(false)
         .threads(parallelism);
 
-    let mut missing = DashSet::new();
+    let missing = DashMap::new();
     let mut ignored = HashSet::new();
     if respect_gitignore
         && std::path::absolute(source)?
             .ancestors()
             .any(|p| p.join(".git").exists())
     {
-        missing.extend(git_paths(source, &["--cached"])?);
+        let mut spellings = super::disk_spelling::DiskSpellings::new(source)?;
+        for indexed in git_paths(source, &["--cached"])? {
+            if let Some(physical) = spellings.resolve(&indexed)? {
+                let entry = missing
+                    .entry(source.join(physical))
+                    .or_insert_with(|| indexed.clone());
+                anyhow::ensure!(
+                    *entry == indexed,
+                    "two Git index paths resolve to one physical worktree entry: {} and {}",
+                    entry.display(),
+                    indexed.display()
+                );
+            }
+        }
         // Let Git resolve effective repository, info and global excludes.
         // --directory collapses wholly ignored subtrees, while a directory
         // with indexed children is represented by its ignored siblings.
-        ignored.extend(git_paths(
+        for excluded in git_paths(
             source,
             &["--others", "--ignored", "--exclude-standard", "--directory"],
-        )?);
+        )? {
+            if let Some(physical) = spellings.resolve(&excluded)? {
+                ignored.insert(source.join(physical));
+            }
+        }
     }
     walker
         .filter_entry(move |entry| entry.file_name() != ".git" && !ignored.contains(entry.path()));
@@ -79,20 +96,25 @@ pub(crate) fn walk_copy_entries(
             let Ok(entry) = result else {
                 return WalkState::Continue;
             };
-            let tracked = respect_gitignore && missing.remove(entry.path()).is_some();
-            visit(entry, tracked)
+            let tracked = missing.remove(entry.path());
+            visit(
+                entry,
+                tracked.as_ref().map(|(_, indexed)| indexed.as_path()),
+            )
         })
     });
 
     if !missing.is_empty() {
         // A .gitignore or .ignore can prune tracked entries. Walk just their
         // physical parent directories, enqueueing existing indexed leaves.
-        let leaves: HashSet<_> = missing.into_iter().collect();
+        let leaves: HashMap<_, _> = missing.into_iter().collect();
         let parents: HashSet<_> = leaves
-            .iter()
+            .keys()
             .flat_map(|path| path.ancestors().skip(1).map(Path::to_owned))
             .collect();
         let failure = std::sync::Mutex::new(None);
+        let leaves = std::sync::Arc::new(leaves);
+        let indexed = std::sync::Arc::clone(&leaves);
         WalkBuilder::new(source)
             .standard_filters(false)
             .threads(parallelism)
@@ -100,13 +122,14 @@ pub(crate) fn walk_copy_entries(
                 entry.file_name() != ".git"
                     && (parents.contains(entry.path())
                         && entry.file_type().is_some_and(|t| t.is_dir())
-                        || leaves.contains(entry.path()))
+                        || indexed.contains_key(entry.path()))
             })
             .build_parallel()
             .run(|| {
                 Box::new(|result| match result {
                     Ok(entry) if !entry.file_type().is_some_and(|t| t.is_dir()) => {
-                        visit(entry, true)
+                        let index_path = leaves.get(entry.path()).map(PathBuf::as_path);
+                        visit(entry, index_path)
                     }
                     Ok(_) => WalkState::Continue,
                     Err(error) => {
@@ -142,6 +165,90 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use xai_test_utils::git::{git_commit_all, init_git_repo};
+
+    #[test]
+    fn tracked_files_use_physical_spelling_without_copying_hardlink_aliases() {
+        use crate::copy::{ParallelCopyConfig, copy_parallel};
+        use std::ffi::OsStr;
+        use tokio_util::sync::CancellationToken;
+        use xai_test_utils::git::run_git;
+
+        xai_test_utils::require_git!();
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        let dest = temp.path().join("dest");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&dest).unwrap();
+        init_git_repo(&repo);
+        run_git(&repo, &["config", "core.precomposeunicode", "true"]);
+        std::fs::create_dir(repo.join("Dir")).unwrap();
+        let nfc = "caf\u{e9}.txt";
+        let nfd = "cafe\u{301}.txt";
+        std::fs::write(repo.join("Dir/lower.txt"), "old").unwrap();
+        std::fs::write(repo.join("Dir").join(nfc), "old").unwrap();
+        git_commit_all(&repo, "indexed names");
+
+        std::fs::rename(repo.join("Dir"), repo.join("tmp-name")).unwrap();
+        std::fs::rename(repo.join("tmp-name"), repo.join("DIR")).unwrap();
+        let dir = repo.join("DIR");
+        for (old, new) in [("lower.txt", "LOWER.txt"), (nfc, nfd)] {
+            std::fs::rename(dir.join(old), dir.join("tmp-name")).unwrap();
+            std::fs::rename(dir.join("tmp-name"), dir.join(new)).unwrap();
+            std::fs::write(dir.join(new), "working edit").unwrap();
+        }
+        std::fs::hard_link(dir.join("LOWER.txt"), dir.join("alias.txt")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "Dir/\nDIR/\n").unwrap();
+        let config = ParallelCopyConfig {
+            respect_gitignore: true,
+            num_workers: 2,
+            channel_buffer: 16,
+            ..Default::default()
+        };
+        copy_parallel(&repo, &dest, config.clone(), CancellationToken::new()).unwrap();
+
+        if !repo.join("Dir/lower.txt").exists() {
+            // On a case-sensitive volume these are genuinely deleted index
+            // entries with new, ignored untracked names.
+            assert!(!dest.join("DIR").exists());
+            return;
+        }
+        let copied: HashSet<_> = std::fs::read_dir(dest.join("DIR"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(copied.contains(OsStr::new("LOWER.txt")));
+        assert_eq!(
+            copied.contains(OsStr::new(nfd)),
+            repo.join("Dir").join(nfc).exists(),
+            "the filesystem determines whether NFC and NFD name the same entry"
+        );
+        assert!(!copied.contains(OsStr::new("alias.txt")));
+        assert!(
+            std::fs::read_dir(&dest)
+                .unwrap()
+                .any(|entry| entry.unwrap().file_name() == "DIR")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("DIR/LOWER.txt")).unwrap(),
+            "working edit"
+        );
+        std::fs::write(dest.join("DIR/LOWER.txt"), "destination edit").unwrap();
+        crate::WorktreeBuilder::new(&repo, &dest)
+            .parallelism(2)
+            .copy_ignored_only()
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dest.join("DIR/LOWER.txt")).unwrap(),
+            "destination edit"
+        );
+
+        // The ordinary walk also needs to classify a case-changed file as
+        // tracked. A failed write must abort even without any ignore rule.
+        std::fs::remove_file(repo.join(".gitignore")).unwrap();
+        std::fs::remove_file(dest.join("DIR/LOWER.txt")).unwrap();
+        std::fs::create_dir(dest.join("DIR/LOWER.txt")).unwrap();
+        assert!(copy_parallel(&repo, &dest, config, CancellationToken::new()).is_err());
+    }
 
     #[cfg(unix)]
     #[test]
