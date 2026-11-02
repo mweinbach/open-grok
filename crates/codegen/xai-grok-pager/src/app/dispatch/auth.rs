@@ -8,8 +8,7 @@ use crate::app::actions::{Action, CodexLoginPurpose, Effect, ProviderSessionTarg
 use crate::app::agent::AgentId;
 use crate::app::agent_view::AgentView;
 use crate::app::app_view::{
-    ActiveView, AppView, AuthMode, AuthState, CODEX_STARTUP_MODEL_ID, PrimaryProvider, TrustState,
-    XAI_STARTUP_MODEL_ID,
+    ActiveView, AppView, AuthMode, AuthState, PrimaryProvider, TrustState, XAI_STARTUP_MODEL_ID,
 };
 use crate::scrollback::block::RenderBlock;
 use crate::scrollback::blocks::SessionEvent;
@@ -156,16 +155,19 @@ pub(super) fn dispatch_antigravity_auth(app: &mut AppView, logout: bool) -> Vec<
 fn select_startup_model(
     app: &mut AppView,
     provider: PrimaryProvider,
-    preferred: &str,
-    allow_provider_fallback: bool,
+    default_id: Option<&str>,
 ) -> Result<Option<Effect>, String> {
-    let preferred_id = agent_client_protocol::ModelId::new(preferred.to_owned());
-    let model_id = if PrimaryProvider::for_model(&app.models, &preferred_id) == Some(provider) {
-        Some(preferred_id)
-    } else if allow_provider_fallback {
-        provider.startup_model(&app.models, preferred)
-    } else {
-        None
+    let belongs_to_provider = |id: &agent_client_protocol::ModelId| {
+        PrimaryProvider::for_model(&app.models, id) == Some(provider)
+    };
+    let model_id = match app.cli_model_override.as_ref() {
+        Some(requested) => belongs_to_provider(requested).then(|| requested.clone()),
+        None => app
+            .startup_model_override
+            .clone()
+            .or_else(|| default_id.map(agent_client_protocol::ModelId::new))
+            .filter(belongs_to_provider)
+            .or_else(|| provider.first_visible_model(&app.models)),
     };
     let Some(model_id) = model_id else {
         app.startup_model_override = None;
@@ -183,12 +185,13 @@ fn select_startup_model(
             PrimaryProvider::Gemini => "Google Gemini",
             PrimaryProvider::OpenRouter => "OpenRouter",
         };
-        return Err(if allow_provider_fallback {
-            format!("No visible {provider_name} model is available. Check model filters and retry.")
-        } else {
+        return Err(if let Some(requested) = app.cli_model_override.as_ref() {
             format!(
-                "Requested {provider_name} model '{preferred}' is not visible. Check model filters and retry."
+                "Requested {provider_name} model '{}' is not visible. Check model filters and retry.",
+                requested.0
             )
+        } else {
+            format!("No visible {provider_name} model is available. Check model filters and retry.")
         });
     };
     let previous = app
@@ -360,18 +363,7 @@ pub(super) fn handle_codex_startup_complete(
     // this completion is normally handled. If the selected provider still has
     // no visible model (for example because an allowlist filtered all of them),
     // return to the chooser instead of fabricating Sol or selecting xAI.
-    let requested_model = app
-        .cli_model_override
-        .as_ref()
-        .or(app.startup_model_override.as_ref())
-        .map(|model| model.0.to_string());
-    let preferred_model = requested_model.as_deref().unwrap_or(CODEX_STARTUP_MODEL_ID);
-    let startup_model_effect = match select_startup_model(
-        app,
-        PrimaryProvider::Codex,
-        preferred_model,
-        app.cli_model_override.is_none(),
-    ) {
+    let startup_model_effect = match select_startup_model(app, PrimaryProvider::Codex, None) {
         Ok(effect) => effect,
         Err(error) => {
             app.startup_codex_account = Some(account);
@@ -840,18 +832,7 @@ pub(super) fn handle_auth_complete(
             if let Some(models) = response_models {
                 app.models = Some(models).into();
             }
-            let requested_model = app
-                .cli_model_override
-                .as_ref()
-                .or(app.startup_model_override.as_ref())
-                .map(|model| model.0.to_string());
-            let preferred_model = requested_model.as_deref().unwrap_or(XAI_STARTUP_MODEL_ID);
-            match select_startup_model(
-                app,
-                PrimaryProvider::Xai,
-                preferred_model,
-                app.cli_model_override.is_none(),
-            ) {
+            match select_startup_model(app, PrimaryProvider::Xai, Some(XAI_STARTUP_MODEL_ID)) {
                 Ok(effect) => {
                     app.startup_provider_selection = None;
                     effect

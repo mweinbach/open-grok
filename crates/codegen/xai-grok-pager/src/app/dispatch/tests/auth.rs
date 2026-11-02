@@ -950,17 +950,23 @@ fn startup_codex_choice_reuses_fresh_cached_account_without_browser_login() {
 }
 
 #[test]
-fn startup_codex_success_selects_sol_and_drains_without_xai_effects() {
+fn startup_codex_selects_first_listed_codex_model_and_drains_without_xai_effects() {
     let mut app = test_app();
     app.auth_state = AuthState::ProviderChoice { error: None };
     app.deferred_startup.new_session = true;
     let _ = dispatch(Action::ChooseStartupCodex, &mut app);
-    let model_id = acp::ModelId::new("gpt-5.6-sol");
-    let mut meta = acp::Meta::new();
-    meta.insert("provider".to_string(), serde_json::json!("codex"));
+    let row = |id: &str, provider: &str| {
+        let mut meta = acp::Meta::new();
+        meta.insert("provider".into(), serde_json::json!(provider));
+        acp::ModelInfo::new(acp::ModelId::new(id), id.to_owned()).meta(Some(meta))
+    };
     let refreshed_models = acp::SessionModelState::new(
-        model_id.clone(),
-        vec![acp::ModelInfo::new(model_id, "GPT-5.6 Sol".to_string()).meta(Some(meta))],
+        acp::ModelId::new("existing-xai"),
+        vec![
+            row("existing-xai", "xai"),
+            row("account-preferred", "codex"),
+            row("gpt-5.6-sol", "codex"),
+        ],
     );
 
     let effects = dispatch(
@@ -981,7 +987,7 @@ fn startup_codex_success_selects_sol_and_drains_without_xai_effects() {
     assert_eq!(app.primary_provider, PrimaryProvider::Codex);
     assert_eq!(
         app.startup_model_override.as_ref().map(|id| id.0.as_ref()),
-        Some("gpt-5.6-sol")
+        Some("account-preferred")
     );
     assert!(effects.iter().any(|effect| matches!(
         effect,
@@ -989,14 +995,14 @@ fn startup_codex_success_selects_sol_and_drains_without_xai_effects() {
             key: "default_model",
             value: crate::settings::SettingValue::String(value),
             ..
-        } if value == "gpt-5.6-sol"
+        } if value == "account-preferred"
     )));
     assert!(effects.iter().any(|effect| matches!(
         effect,
         Effect::CreateSession {
             model_id: Some(model),
             ..
-        } if model.0.as_ref() == "gpt-5.6-sol"
+        } if model.0.as_ref() == "account-preferred"
     )));
     assert!(
         !effects.iter().any(|effect| matches!(
@@ -1125,6 +1131,28 @@ fn startup_codex_without_a_visible_codex_model_returns_to_chooser() {
             if error.contains("No visible ChatGPT Codex model")
     ));
     assert!(app.deferred_startup.new_session);
+}
+
+#[test]
+fn startup_codex_refuses_to_replace_an_unavailable_cli_model() {
+    let mut app = test_app();
+    add_provider_model(&mut app, "available", "codex");
+    app.cli_model_override = Some(acp::ModelId::new("requested"));
+    app.auth_state = AuthState::ProviderChoice { error: None };
+    app.startup_codex_account = Some(xai_grok_shell::codex_auth::CodexAccountSummary {
+        email: None,
+        account_id: Some("acct".into()),
+        plan_type: None,
+    });
+
+    let effects = dispatch(Action::ChooseStartupCodex, &mut app);
+
+    assert!(effects.is_empty());
+    assert!(matches!(
+        &app.auth_state,
+        AuthState::ProviderChoice { error: Some(error) } if error.contains("'requested' is not visible")
+    ));
+    assert!(app.startup_model_override.is_none());
 }
 
 #[test]

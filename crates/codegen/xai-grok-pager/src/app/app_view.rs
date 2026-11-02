@@ -357,7 +357,6 @@ pub enum PrimaryProvider {
     OpenRouter,
 }
 
-pub const CODEX_STARTUP_MODEL_ID: &str = "gpt-5.6-sol";
 pub const XAI_STARTUP_MODEL_ID: &str = "grok-build";
 
 impl PrimaryProvider {
@@ -446,21 +445,8 @@ impl PrimaryProvider {
         Self::from_provider_name(provider)
     }
 
-    /// Pick a provider-owned model from the already-filtered ACP catalog.
-    ///
-    /// `ModelState::available` is the visible projection after authentication,
-    /// allow/deny lists, and hidden-model filtering. Prefer the product default
-    /// only when that exact visible entry also advertises this provider; then
-    /// fall back to the first visible model owned by the same provider.
-    pub(crate) fn startup_model(
-        self,
-        models: &ModelState,
-        preferred: &str,
-    ) -> Option<acp::ModelId> {
-        let preferred = acp::ModelId::new(preferred);
-        if Self::for_model(models, &preferred) == Some(self) {
-            return Some(preferred);
-        }
+    /// The shell supplies visible Codex entries in catalog priority order.
+    pub(crate) fn first_visible_model(self, models: &ModelState) -> Option<acp::ModelId> {
         models
             .available
             .keys()
