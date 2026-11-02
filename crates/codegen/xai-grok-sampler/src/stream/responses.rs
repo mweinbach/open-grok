@@ -1040,7 +1040,8 @@ pub(crate) fn stream_responses_tracked<'a>(
                 _ => None,
             })
             .collect();
-        if response.output.is_empty() && !completed_output_items.is_empty() {
+        let has_terminal_output = !response.output.is_empty();
+        if !has_terminal_output {
             response.output = completed_output_items.into_values().collect();
         }
         if response.status == Status::Incomplete {
@@ -1059,7 +1060,10 @@ pub(crate) fn stream_responses_tracked<'a>(
             });
         }
 
-        for (output_index, item) in response.output.iter().enumerate() {
+        // Streamed done items already emitted completion at their original
+        // output index. After a partial stream, their indexes can have gaps.
+        let terminal_output = if has_terminal_output { response.output.as_slice() } else { &[] };
+        for (output_index, item) in terminal_output.iter().enumerate() {
             let Ok(output_index) = u32::try_from(output_index) else {
                 continue;
             };

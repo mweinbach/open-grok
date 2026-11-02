@@ -125,6 +125,15 @@ fn deserialize_response_event_for_tools(
 ) -> Result<rs::ResponseStreamEvent> {
     let codex_data = if adapter.provider() == ModelProvider::Codex {
         let mut value: serde_json::Value = serde_json::from_str(data)?;
+        // Codex reports attempted output in an incomplete terminal frame for
+        // diagnostics. Only output_item.done frames can contribute durable
+        // items to that response, including executable function/custom calls.
+        if value["type"] == "response.incomplete"
+            && let Some(output) = value.pointer_mut("/response/output")
+            && let Some(items) = output.as_array_mut()
+        {
+            items.clear();
+        }
         if !native_multi_agent && has_encrypted_function_calls(&value) {
             return Err(SamplingError::InvalidConfiguration(
                 "Encrypted agent arguments require advertised native collaboration tools",
@@ -6841,6 +6850,93 @@ mod tests {
             assert_eq!(call.id, "call_custom_2");
             assert_eq!(call.name, "code");
             assert_eq!(call.input, "println!(\"hello\");");
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_incomplete_only_salvages_streamed_done_items() {
+        use crate::events::SamplingEvent;
+        use serde_json::json;
+
+        let function = json!({
+            "type": "function_call", "id": "fc", "call_id": "function", "name": "read",
+            "arguments": "{}", "status": "completed"
+        });
+        let custom = json!({
+            "type": "custom_tool_call", "id": "ct", "call_id": "custom", "name": "exec",
+            "input": "text(1)"
+        });
+        let mut terminal_function = function.clone();
+        terminal_function["arguments"] = json!(r#"{"terminal":true}"#);
+        let mut terminal_custom = custom.clone();
+        terminal_custom["input"] = json!("text(2)");
+
+        for (provider, status, done) in [
+            (ModelProvider::Codex, "incomplete", false),
+            (ModelProvider::Codex, "incomplete", true),
+            (ModelProvider::Codex, "completed", false),
+            (ModelProvider::Xai, "incomplete", true),
+            (ModelProvider::Custom, "incomplete", true),
+        ] {
+            let mut wire = vec![json!({
+                "type": "response.output_item.added", "output_index": 0, "sequence_number": 0,
+                "item": {"type":"function_call", "id":"unused", "call_id":"unfinished",
+                         "name":"other", "arguments":"", "status":"in_progress"}
+            })];
+            if done {
+                // The gap at index zero must not synthesize a completion for the unfinished call.
+                for (index, item) in [(1, &function), (2, &custom)] {
+                    wire.push(json!({
+                        "type": "response.output_item.done", "output_index": index,
+                        "sequence_number": index, "item": item
+                    }));
+                }
+            }
+            wire.push(json!({
+                "type": format!("response.{status}"), "sequence_number": 3,
+                "response": {
+                    "id":"r", "object":"response", "created_at":0, "model":"test", "status":status,
+                    "output":[terminal_function, terminal_custom]
+                }
+            }));
+            let decoded = wire.into_iter().map(|frame| {
+                deserialize_response_event_for_adapter(
+                    &frame.to_string(),
+                    provider_adapter(provider),
+                )
+            });
+            let events: Vec<_> = crate::stream::stream_responses_with_client_custom_tools(
+                futures_util::stream::iter(decoded).boxed(),
+                None,
+                crate::types::RequestId::from("partial"),
+                std::time::Duration::from_secs(10),
+                None,
+                vec!["exec".into()],
+            )
+            .collect()
+            .await;
+            let Some(SamplingEvent::Completed { response, .. }) = events.last() else {
+                panic!("expected completion for {provider:?} {status}, got {events:?}");
+            };
+            let args: Vec<_> = response
+                .tool_calls()
+                .iter()
+                .map(|call| call.arguments.as_ref())
+                .collect();
+            if provider == ModelProvider::Codex && status == "incomplete" {
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, SamplingEvent::ToolCallArgumentsComplete { .. }))
+                );
+                if done {
+                    assert_eq!(args, ["{}", "text(1)"]);
+                } else {
+                    assert!(args.is_empty());
+                }
+            } else {
+                assert_eq!(args, [r#"{"terminal":true}"#, "text(2)"]);
+            }
         }
     }
 
