@@ -13,6 +13,7 @@ use crate::types::tool_metadata::shared_resources;
 
 pub const WEB_RUN_TOOL_NAME: &str = "web__run";
 const WEB_RUN_DESCRIPTION: &str = include_str!("web_run_description.md");
+const MAX_SEARCH_ERROR_BYTES: usize = 1_024;
 
 fn schema_is_null_only(value: &JsonValue) -> bool {
     let Some(object) = value.as_object() else {
@@ -409,10 +410,15 @@ impl xai_tool_runtime::Tool for WebRunTool {
                 .clone()
         };
         let output = backend.search(commands).await.map_err(|error| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new(WEB_RUN_TOOL_NAME).expect("valid tool id"),
-                error,
-            )
+            let message = if error.len() > MAX_SEARCH_ERROR_BYTES {
+                const SUFFIX: &str = "… [truncated]";
+                let prefix =
+                    crate::util::truncate_str(&error, MAX_SEARCH_ERROR_BYTES - SUFFIX.len());
+                format!("{prefix}{SUFFIX}")
+            } else {
+                error
+            };
+            xai_tool_runtime::ToolError::execution(self.id(), message)
         })?;
         Ok(WebRunOutput { output })
     }
@@ -551,5 +557,46 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(output.output, "result for Open Grok");
+    }
+
+    #[tokio::test]
+    async fn tool_bounds_backend_errors_in_utf8_bytes() {
+        #[derive(Debug)]
+        struct FailingBackend(String);
+
+        impl StandaloneWebSearchBackend for FailingBackend {
+            fn search<'a>(&'a self, _: SearchCommands) -> StandaloneWebSearchFuture<'a> {
+                Box::pin(async { Err(self.0.clone()) })
+            }
+        }
+
+        let suffix = "… [truncated]";
+        let prefix_bytes = 1_024 - suffix.len();
+        for (error, expected) in [
+            ("search failed".to_string(), "search failed".to_string()),
+            ("x".repeat(1_024), "x".repeat(1_024)),
+            (
+                "x".repeat(1_025),
+                format!("{}{suffix}", "x".repeat(prefix_bytes)),
+            ),
+            (
+                "🦀".repeat(512),
+                format!("{}{suffix}", "🦀".repeat(prefix_bytes / 4)),
+            ),
+        ] {
+            let mut resources = Resources::new();
+            resources.insert(StandaloneWebSearchBackendResource(Arc::new(
+                FailingBackend(error),
+            )));
+            let failure = xai_tool_runtime::Tool::run(
+                &WebRunTool,
+                test_ctx_with_call_id(resources.into_shared(), "web-run-call"),
+                SearchCommands::default(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(failure.kind, xai_tool_runtime::ToolErrorKind::Execution);
+            assert_eq!(failure.detail, expected);
+        }
     }
 }
