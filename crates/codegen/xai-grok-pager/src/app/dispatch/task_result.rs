@@ -2898,6 +2898,86 @@ pub(crate) fn deliver_doctor_message(app: &mut AppView, preferred: AgentId, mess
 }
 /// Handle a completed async task result.
 pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec<Effect> {
+    use xai_grok_tools::types::SessionMode;
+    let (result, applied_mode) = match result {
+        TaskResult::StartupSessionModeCompleted {
+            agent_id,
+            session_id,
+            binding_epoch,
+            mode,
+            result,
+        } => {
+            if !app.agents.get(&agent_id).is_some_and(|agent| {
+                agent.session_binding_epoch == binding_epoch
+                    && agent
+                        .pending_session_id
+                        .as_ref()
+                        .is_none_or(|id| id == &session_id)
+                    && agent
+                        .session
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| id == &session_id)
+            }) {
+                // The tab closed or rebound while the mode RPC was in flight.
+                // Its stale success and failure must both leave the new binding alone.
+                return vec![];
+            }
+            if matches!(*result, TaskResult::SessionLoadFailed { .. })
+                && let Some(agent) = app.agents.get_mut(&agent_id)
+            {
+                agent.session_starting_since = None;
+                agent.mcp_init_progress = None;
+                agent.session_new_phase = None;
+                agent.pending_session_id = None;
+            }
+            (*result, Some(mode))
+        }
+        result => (result, None),
+    };
+    // Neither ordinary sends nor queued startup prompts can run until the
+    // normal session-ready handler binds the new ID or finishes load replay.
+    if let TaskResult::SessionCreated {
+        agent_id,
+        session_id,
+        ..
+    }
+    | TaskResult::WorktreeSessionCreated {
+        agent_id,
+        session_id,
+        ..
+    }
+    | TaskResult::SessionLoaded {
+        agent_id,
+        session_id,
+        ..
+    } = &result
+        && let Some(agent) = app.agents.get_mut(agent_id)
+    {
+        let desired = agent
+            .deferred_session_mode
+            .as_ref()
+            .unwrap_or(&SessionMode::Default);
+        if applied_mode
+            .as_ref()
+            .map_or(desired.is_plan(), |applied| applied != desired)
+        {
+            // A mode choice made while the first request is pending wins.
+            return vec![Effect::SetStartupSessionMode {
+                agent_id: *agent_id,
+                session_id: session_id.clone(),
+                binding_epoch: agent.session_binding_epoch,
+                mode: desired.clone(),
+                ready: Box::new(result),
+            }];
+        }
+        if let Some(mode) = applied_mode {
+            agent.plan_mode_active = mode.is_plan();
+            agent.session_mode = mode;
+            agent.plan_mode_pending = None;
+            agent.deferred_session_mode = None;
+        }
+    }
     if result.ends_startup() {
         app.finish_startup(xai_grok_telemetry::startup::StartupOutcome::Ok);
     }
@@ -2909,6 +2989,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
         crate::app::workspace_sync::request(app);
     }
     match result {
+        TaskResult::StartupSessionModeCompleted { .. } => {
+            unreachable!("unwrapped startup mode result")
+        }
         TaskResult::ActiveSessionRegistrationWarning {
             session_id,
             message,

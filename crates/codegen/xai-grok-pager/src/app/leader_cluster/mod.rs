@@ -155,6 +155,7 @@ impl ClusterClient {
     /// The event loop's `process_effects`, minus terminal/auth-handle wiring
     /// (that fn is event_loop-private; this mirrors its body).
     fn process_effects(&mut self, effs: Vec<super::actions::Effect>) {
+        super::event_loop::stage_cli_plan_mode(&mut self.app, &effs);
         let flags = effects::SessionFlags {
             plan_mode: self.app.plan_mode,
             subagents: self.app.subagents,

@@ -1255,6 +1255,21 @@ pub async fn run_single_turn(
             anyhow::bail!("{msg}");
         }
     };
+    // Mode is session state. Wait for the shell's acknowledgement before a
+    // prompt on either a new or a resumed session can dispatch its first tool.
+    if options.permission_mode_flag.as_deref() == Some("plan")
+        && let Err(error) = crate::app::set_startup_session_mode(
+            &acp_tx,
+            &session_id,
+            &xai_grok_tools::types::SessionMode::Plan,
+        )
+        .await
+    {
+        PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Error);
+        let message = format!("Couldn't start in plan mode: {error}");
+        emitter.on_error(&message, None);
+        anyhow::bail!("{message}");
+    }
     PendingStartup::finish_held(&mut pending_startup, crate::acp::StartupOutcome::Ok);
     tracing::debug!(
         elapsed_ms = t_session.elapsed().as_millis() as u64,

@@ -45,6 +45,19 @@ use xai_grok_shell::kimi_models::KimiApiEndpoint;
 use xai_grok_shell::sampling::error::http_status_from_error;
 use xai_grok_shell::session::{ExtMethodResult, SessionInfoResponse};
 
+pub(crate) async fn set_startup_session_mode(
+    tx: &xai_acp_lib::AcpAgentTx,
+    session_id: &acp::SessionId,
+    mode: &xai_grok_tools::types::SessionMode,
+) -> Result<(), helpers::SessionRpcError> {
+    let request = acp::SetSessionModeRequest::new(
+        session_id.clone(),
+        acp::SessionModeId::new(mode.as_id()),
+    );
+    helpers::acp_send_bounded(request, tx, "Setting startup session mode").await?;
+    Ok(())
+}
+
 fn apply_permission_mode_override(
     meta: &mut Option<acp::Meta>,
     permission_mode_override: Option<actions::PermissionModeKind>,
@@ -4457,6 +4470,38 @@ pub(crate) fn execute(
                     tracing::warn!("Failed to send swarm_mode_changed notification: {e}");
                 }
                 TaskResult::CancelComplete
+            });
+        }
+        Effect::SetStartupSessionMode {
+            agent_id,
+            session_id,
+            binding_epoch,
+            mode,
+            ready,
+        } => {
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let result = match set_startup_session_mode(&tx, &session_id, &mode).await {
+                    Ok(()) => ready,
+                    Err(error) => {
+                        // The session already exists. Keep the tab and its held
+                        // draft for recovery. An ID-only close could cancel a peer
+                        // that has since attached to the same session.
+                        let mut error = format!(
+                            "Couldn't set startup session mode for {session_id}: {}. Resume it with `open-grok --permission-mode {} --resume {session_id}`.",
+                            sanitize_user_error(&error.to_string()), mode.as_id()
+                        );
+                        if let TaskResult::WorktreeSessionCreated { worktree_path, .. } = &*ready {
+                            error.push_str(&format!(" Worktree: {}", worktree_path.display()));
+                        }
+                        Box::new(TaskResult::SessionLoadFailed {
+                            agent_id, session_id: session_id.clone(), error,
+                        })
+                    }
+                };
+                TaskResult::StartupSessionModeCompleted {
+                    agent_id, session_id, binding_epoch, mode, result,
+                }
             });
         }
         Effect::SetSessionMode { session_id, mode_id } => {

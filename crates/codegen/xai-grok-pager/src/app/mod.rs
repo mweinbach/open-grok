@@ -32,6 +32,7 @@ mod dispatch;
 /// Display-refresh probe + motion cadence + terminal telemetry at startup.
 mod display_refresh_startup;
 mod effects;
+pub(crate) use effects::set_startup_session_mode;
 pub(crate) mod error_display;
 pub mod roster;
 pub mod session_startup;

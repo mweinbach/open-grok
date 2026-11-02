@@ -1123,7 +1123,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
         agent.bind_created_session_id(session_id);
         agent.scheduler_background_loops = scheduler_background_loops;
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
-        let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
         if deferred.is_some() {
             agent.session.model_switch_pending = true;
@@ -1182,12 +1181,6 @@ pub(in crate::app::dispatch) fn handle_session_created(
                 effort: switch.effort,
                 service_tier: None,
                 prev_model_id: switch.prev_model_id,
-            });
-        }
-        if let Some(mode) = deferred_mode {
-            effects.push(Effect::SetSessionMode {
-                session_id: session_id_clone.clone(),
-                mode_id: acp::SessionModeId::new(mode.as_id()),
             });
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)
@@ -1246,7 +1239,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
             worktree_path.display()
         )));
         let deferred = apply_deferred_model_switch(agent, app.cli_effort_token.as_deref());
-        let deferred_mode = agent.deferred_session_mode.take();
         let cwd = agent.session.cwd.clone();
         if deferred.is_some() {
             agent.session.model_switch_pending = true;
@@ -1305,12 +1297,6 @@ pub(in crate::app::dispatch) fn handle_worktree_session_created(
                 effort: switch.effort,
                 service_tier: None,
                 prev_model_id: switch.prev_model_id,
-            });
-        }
-        if let Some(mode) = deferred_mode {
-            effects.push(Effect::SetSessionMode {
-                session_id: session_id_clone.clone(),
-                mode_id: acp::SessionModeId::new(mode.as_id()),
             });
         }
         if std::mem::take(&mut agent.pending_extensions_fetch)

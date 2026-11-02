@@ -1098,6 +1098,8 @@ pub struct AppView {
     pub cli_effort_token: Option<String>,
     /// Default YOLO for new sessions, seeded at startup from `effective_yolo_for_launch`.
     pub default_yolo: bool,
+    /// One-shot CLI request for the first root session this pager opens.
+    pub start_in_plan_mode: bool,
     /// Soft-default still owns the mode: settings/update may rewrite UI +
     /// `default_yolo`. Cleared on user Shift+Tab / settings / CLI claim.
     /// Not inferred from the rendered permission string.
@@ -2088,6 +2090,7 @@ impl AppView {
             cli_model_override: None,
             cli_effort_token: None,
             default_yolo: false,
+            start_in_plan_mode: false,
             permission_mode_from_soft_default: true,
             auto_mode_gate: xai_grok_shell::util::config::auto_permission_mode_enabled_from_disk(),
             yolo_policy_block: None,
@@ -6707,6 +6710,7 @@ pub(crate) mod tests {
             cli_model_override: None,
             cli_effort_token: None,
             default_yolo: false,
+            start_in_plan_mode: false,
             permission_mode_from_soft_default: true,
             auto_mode_gate: true,
             yolo_policy_block: None,

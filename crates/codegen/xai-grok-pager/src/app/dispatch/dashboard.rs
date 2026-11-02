@@ -108,7 +108,9 @@ fn configure_dashboard_state(app: &mut AppView) {
             .sync_acp_commands(&bootstrap_commands, None, &models);
         d.models = models;
         d.pending_model = None;
-        d.pending_mode = if default_yolo {
+        d.pending_mode = if app.start_in_plan_mode {
+            crate::views::dashboard::DashboardDispatchMode::Plan
+        } else if default_yolo {
             crate::views::dashboard::DashboardDispatchMode::AlwaysApprove
         } else if default_auto {
             crate::views::dashboard::DashboardDispatchMode::Auto

@@ -2356,6 +2356,14 @@ pub enum Effect {
         session_id: acp::SessionId,
         mode_id: acp::SessionModeId,
     },
+    /// Hold the successful session open until the shell confirms its requested mode.
+    SetStartupSessionMode {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        binding_epoch: u32,
+        mode: xai_grok_tools::types::SessionMode,
+        ready: Box<TaskResult>,
+    },
     /// Fire-and-forget swarm state notification to the shell.
     NotifySwarmMode {
         session_id: acp::SessionId,
@@ -3321,6 +3329,14 @@ pub enum TaskResult {
         /// predates the key. See
         /// [`crate::app::effects::parse_session_scheduler_background_loops`].
         scheduler_background_loops: Option<bool>,
+    },
+    /// The held create/load completion can be published after checking for newer UI intent.
+    StartupSessionModeCompleted {
+        agent_id: AgentId,
+        session_id: acp::SessionId,
+        binding_epoch: u32,
+        mode: xai_grok_tools::types::SessionMode,
+        result: Box<TaskResult>,
     },
     /// Session creation failed.
     SessionFailed {

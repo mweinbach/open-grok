@@ -1184,6 +1184,7 @@ pub(crate) async fn run(
         remote_permission_mode,
     );
     app.default_yolo = launch_yolo.yolo;
+    app.start_in_plan_mode = args.permission_mode_flag.as_deref() == Some("plan");
     // Gated launch-auto (CLI `--permission-mode auto` or config). Hoisted so it can
     // be re-applied after `load_initial_ui_config()` replaces `current_ui` below.
     let launch_auto = xai_grok_shell::util::config::effective_auto_for_launch(
@@ -4501,6 +4502,41 @@ pub(crate) fn session_create_or_load(effs: &[super::actions::Effect]) -> bool {
     })
 }
 
+/// Bind the one-shot request to the opening tab before any create/load RPC
+/// starts. Concurrent completions cannot take another tab's startup mode.
+pub(super) fn stage_cli_plan_mode(app: &mut AppView, effects: &[super::actions::Effect]) {
+    use super::actions::Effect;
+    use xai_grok_tools::types::SessionMode;
+
+    if !app.start_in_plan_mode {
+        return;
+    }
+    for effect in effects {
+        let (id, explicit_mode) = match effect {
+            Effect::CreateSession {
+                agent_id,
+                permission_mode_override,
+                ..
+            }
+            | Effect::CreateWorktreeSession {
+                agent_id,
+                permission_mode_override,
+                ..
+            } => (*agent_id, permission_mode_override.is_some()),
+            Effect::LoadSession { agent_id, .. } => (*agent_id, false),
+            _ => continue,
+        };
+        if let Some(agent) = app.agents.get_mut(&id) {
+            if !explicit_mode && agent.plan_mode_pending.is_none() {
+                agent.deferred_session_mode = Some(SessionMode::Plan);
+                agent.plan_mode_pending = Some(true);
+            }
+            app.start_in_plan_mode = false;
+            break;
+        }
+    }
+}
+
 /// Shared [`SessionFlags`] builder (interactive loop + leader-cluster).
 pub(crate) fn session_flags_for_effects(
     app: &mut AppView,
@@ -4564,6 +4600,7 @@ fn process_effects(
     app: &mut AppView,
     progress_tx: &tokio::sync::mpsc::UnboundedSender<effects::RestoreProgressMsg>,
 ) -> bool {
+    stage_cli_plan_mode(app, &effs);
     let flags = session_flags_for_effects(app, &effs);
     let mut effs = effs.into_iter().peekable();
     while let Some(eff) = effs.next() {

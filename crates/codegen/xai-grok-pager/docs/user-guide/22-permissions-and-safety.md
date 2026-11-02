@@ -34,7 +34,7 @@ ACP clients can set `"_meta": { "yoloMode": true }` on `session/new`. See [Agent
 | ---- | ------------------------ | -------- |
 | `default` (**ask**) | Read-only tools and built-in read-only shell commands | Interactive day-to-day use |
 | `acceptEdits` | File edits without a prompt | Local coding while you review diffs later |
-| `plan` | Accepted for compatibility; use [plan mode](19-plan-mode.md) for gated planning | Claude-compatible settings |
+| `plan` | `--permission-mode plan` opens the CLI session in [plan mode](19-plan-mode.md). File-edit tools may write only the session plan. Reads, Bash and MCP still follow normal permission rules. | Starting a planning session interactively or headlessly |
 | `auto` | Work the safety check allows; other calls are blocked or escalated | Interactive sessions that want fewer prompts |
 | `dontAsk` | Only pre-approved tools and built-in read-only handling | Strict CI allowlists |
 | `bypassPermissions` (**always-approve**) | Tool calls in general (`deny` rules, hooks, and some shell `ask` rules still apply) | Trusted automation and agent servers |

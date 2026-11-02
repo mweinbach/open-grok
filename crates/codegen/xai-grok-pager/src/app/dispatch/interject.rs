@@ -10,6 +10,23 @@ use crate::app::agent_view::AgentView;
 use crate::app::app_view::{ActiveView, AppView};
 use crate::scrollback::block::RenderBlock;
 
+/// Already-consumed Send Now/interjection payloads must survive startup and
+/// route changes just like ordinary queued prompts.
+fn held_prompt_notice(agent: &AgentView) -> Option<&'static str> {
+    if agent.session.loading_replay
+        || (agent.session.session_id.is_none()
+            && (agent.session_starting_since.is_some() || agent.pending_session_id.is_some()))
+    {
+        Some("Session is starting; prompt queued")
+    } else if agent.session.model_switch_pending || agent.session.pending_context_switch.is_some() {
+        Some("Model change in progress; prompt queued")
+    } else if agent.session.provider_rebind_pending {
+        Some("Kimi service update in progress; prompt queued")
+    } else {
+        None
+    }
+}
+
 fn requeue_consumed_prompt(
     agent: &mut AgentView,
     text: &str,
@@ -100,16 +117,7 @@ fn dispatch_interject_on_inner(
         agent.release_hook_block_hold();
     }
 
-    // A Kimi service/key change invalidates the sampler that owns this
-    // session. Preserve the already-consumed payload locally until the
-    // automatic rebind finishes instead of letting an explicit interject use
-    // the stale credential.
-    if agent.session.provider_rebind_pending || agent.session.pending_context_switch.is_some() {
-        let notice = if agent.session.pending_context_switch.is_some() {
-            "Model change in progress; prompt queued"
-        } else {
-            "Kimi service update in progress; prompt queued"
-        };
+    if let Some(notice) = held_prompt_notice(agent) {
         requeue_consumed_prompt(agent, &text, images, notice);
         return vec![];
     }
@@ -197,17 +205,12 @@ pub(super) fn dispatch_send_prompt_now(
     // Mid-outage guard (mirrors the plain prompt path): the producers already
     // consumed the payload (composer text / queue row), so requeue it locally
     // instead of firing into a dead channel and losing the message.
-    if reconnect_pending
-        || agent.session.provider_rebind_pending
-        || agent.session.pending_context_switch.is_some()
-    {
-        let toast = if reconnect_pending {
-            "Reconnecting, please wait..."
-        } else if agent.session.pending_context_switch.is_some() {
-            "Model change in progress; prompt queued"
-        } else {
-            "Kimi service update in progress; prompt queued"
-        };
+    let hold = if reconnect_pending {
+        Some("Reconnecting, please wait...")
+    } else {
+        held_prompt_notice(agent)
+    };
+    if let Some(toast) = hold {
         requeue_consumed_prompt(agent, &text, images, toast);
         return vec![];
     }
@@ -264,6 +267,28 @@ mod tests {
     use crate::app::dispatch::tests::test_app_with_agent;
     use agent_client_protocol as acp;
 
+    #[test]
+    fn send_now_and_interject_hold_unready_sessions_and_model_switches() {
+        for stage in ["create", "load", "model"] {
+            let mut app = test_app_with_agent();
+            let id = AgentId(0);
+            let agent = app.agents.get_mut(&id).unwrap();
+            match stage {
+                "create" => {
+                    agent.session.session_id = None;
+                    agent.session_starting_since = Some(std::time::Instant::now());
+                }
+                "load" => agent.session.loading_replay = true,
+                _ => agent.session.model_switch_pending = true,
+            }
+            let send = super::dispatch_send_prompt_now(&mut app, "send now".into(), vec![], None);
+            let steer = super::dispatch_interject(&mut app, "steer".into(), vec![]);
+            assert!(send.is_empty() && steer.is_empty(), "{stage}");
+            let rows = &app.agents[&id].session.pending_prompts;
+            assert!(rows.iter().any(|row| row.text == "send now"), "{stage}");
+            assert!(rows.iter().any(|row| row.text == "steer"), "{stage}");
+        }
+    }
     /// Composer-clear ownership: dispatch NEVER touches the composer. The
     /// only composer-text producer (the InterjectPrompt registry arm) clears
     /// it at the call site; every other producer (Send now, edit-interject,

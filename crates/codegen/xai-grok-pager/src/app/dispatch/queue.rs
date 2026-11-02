@@ -1295,10 +1295,17 @@ pub(super) fn dispatch_queue_interject_shared(
 ) -> Vec<Effect> {
     if let ActiveView::Agent(agent_id) = app.active_view
         && let Some(agent) = app.agents.get_mut(&agent_id)
-        && (agent.session.provider_rebind_pending || agent.session.pending_context_switch.is_some())
+        && (agent.session.provider_rebind_pending
+            || agent.session.pending_context_switch.is_some()
+            || agent.session.loading_replay
+            || agent.session.model_switch_pending)
     {
-        // Keep the server-owned row in place until its route is resolved.
-        let notice = if agent.session.pending_context_switch.is_some() {
+        // Keep the server-owned row in place until its session and route are ready.
+        let notice = if agent.session.loading_replay {
+            "Session is starting; send now is paused"
+        } else if agent.session.model_switch_pending
+            || agent.session.pending_context_switch.is_some()
+        {
             "Model change in progress; send now is paused"
         } else {
             "Kimi service update in progress; send now is paused"

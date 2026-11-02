@@ -158,7 +158,7 @@ So `allow Bash(git *)` can auto-approve `git status && rm -rf /` if nothing deni
 
 | Mode | Effect |
 | --- | --- |
-| `default` / `plan` | Normal prompt policy (`plan` is **compat only** — real plan mode is shell plan tracker) |
+| `default` / `plan` | Both use the normal permission-manager prompt policy. The interactive and headless CLI additionally enter the shell plan tracker for an explicit `--permission-mode plan`. Session startup waits for ACP `session/set_mode` to succeed before releasing the first prompt. |
 | `acceptEdits` | Synthetic `Allow Edit` rule |
 | `bypassPermissions` | Synthetic catch-all `Allow Any` (unless YOLO pin blocks it) |
 | `dontAsk` | `PromptPolicy::Deny` |

@@ -3049,36 +3049,190 @@ fn dashboard_new_agent_button_carries_auto_permission_override() {
         }
     )));
 }
-/// The deferred plan `SessionMode` is emitted (and cleared) once the
-/// session exists, mirroring the deferred model switch.
+#[test]
+fn cli_plan_mode_on_resume_waits_for_the_latest_choice_before_binding() {
+    use xai_grok_tools::types::SessionMode;
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = acp::SessionId::new("resume-plan");
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = None;
+    agent.session.loading_replay = true;
+    app.start_in_plan_mode = true;
+    crate::app::event_loop::stage_cli_plan_mode(
+        &mut app,
+        &[Effect::LoadSession {
+            agent_id: id,
+            session_id: sid.to_string(),
+            session_cwd: None,
+            chat_kind: false,
+        }],
+    );
+    assert!(!app.start_in_plan_mode);
+    assert_eq!(
+        app.agents[&id].deferred_session_mode,
+        Some(SessionMode::Plan)
+    );
+
+    let ready = TaskResult::SessionLoaded {
+        agent_id: id,
+        session_id: sid,
+        models: None,
+        code_restored: false,
+        restore_summary: None,
+        restore_degree: None,
+        running_prompt_id: None,
+        scheduler_background_loops: None,
+    };
+    let mut effects = dispatch(Action::TaskComplete(ready), &mut app);
+    assert_eq!(effects.len(), 1);
+    let Effect::SetStartupSessionMode {
+        agent_id,
+        session_id,
+        binding_epoch,
+        mode,
+        ready,
+    } = effects.pop().unwrap()
+    else {
+        panic!("expected plan mode request");
+    };
+    assert_eq!(mode, SessionMode::Plan);
+    // A user switches out of Plan before the first RPC confirms it.
+    app.agents.get_mut(&id).unwrap().deferred_session_mode = None;
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::StartupSessionModeCompleted {
+            agent_id,
+            session_id,
+            binding_epoch,
+            mode,
+            result: ready,
+        }),
+        &mut app,
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::SetStartupSessionMode {
+            mode: SessionMode::Default,
+            ..
+        }]
+    ));
+    assert!(app.agents[&id].session.loading_replay);
+}
+
+#[test]
+fn stale_startup_mode_failure_cannot_unbind_a_replaced_session() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let original = acp::SessionId::new("old-session");
+    let replacement = acp::SessionId::new("new-session");
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.bind_session_id(original.clone());
+    let binding_epoch = agent.session_binding_epoch;
+    agent.bind_session_id(replacement.clone());
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::StartupSessionModeCompleted {
+            agent_id: id,
+            binding_epoch,
+            session_id: original.clone(),
+            mode: xai_grok_tools::types::SessionMode::Plan,
+            result: Box::new(TaskResult::SessionLoadFailed {
+                agent_id: id,
+                session_id: original,
+                error: "late rejection".into(),
+            }),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    assert_eq!(
+        app.agents[&id].session.session_id.as_ref(),
+        Some(&replacement)
+    );
+    assert!(!app.agents[&id].load_failed);
+}
+
+#[test]
+fn startup_mode_failure_restores_a_fresh_sessions_unsent_draft() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    let sid = acp::SessionId::new("created-but-unbound");
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = None;
+    agent.pending_session_id = Some(sid.clone());
+    agent.session_starting_since = Some(std::time::Instant::now());
+    agent.session.enqueue_prompt("keep my task".into());
+    let binding_epoch = agent.session_binding_epoch;
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::StartupSessionModeCompleted {
+            agent_id: id,
+            binding_epoch,
+            session_id: sid.clone(),
+            mode: xai_grok_tools::types::SessionMode::Plan,
+            result: Box::new(TaskResult::SessionLoadFailed {
+                agent_id: id,
+                session_id: sid,
+                error: "rejected".into(),
+            }),
+        }),
+        &mut app,
+    );
+    assert!(effects.is_empty());
+    let agent = &app.agents[&id];
+    assert!(agent.load_failed && agent.session.session_id.is_none());
+    assert!(agent.pending_session_id.is_none() && agent.session_starting_since.is_none());
+    assert_eq!(agent.prompt.text(), "keep my task");
+}
+/// A queued dashboard prompt cannot be sent before the plan mode acknowledgement.
 #[serial_test::serial(GROK_AGENT_DASHBOARD)]
 #[test]
 fn dashboard_deferred_plan_mode_applied_on_session_created() {
+    use xai_grok_tools::types::SessionMode;
     let mut app = test_app_with_agent();
     let id = AgentId(0);
-    let session_id: acp::SessionId = "new-session".into();
-    app.agents.get_mut(&id).unwrap().session.session_id = None;
-    app.agents.get_mut(&id).unwrap().deferred_session_mode =
-        Some(xai_grok_tools::types::SessionMode::Plan);
-    let effects = dispatch(
+    let sid = acp::SessionId::new("new-session");
+    let agent = app.agents.get_mut(&id).unwrap();
+    agent.session.session_id = None;
+    agent.session.enqueue_prompt("first prompt".into());
+    agent.deferred_session_mode = Some(SessionMode::Plan);
+    let mut effects = dispatch(
         Action::TaskComplete(TaskResult::SessionCreated {
             agent_id: id,
-            session_id: session_id.clone(),
+            session_id: sid.clone(),
             models: None,
             scheduler_background_loops: None,
         }),
         &mut app,
     );
-    assert!(
-        app.agents[&id].deferred_session_mode.is_none(),
-        "deferred mode must be consumed"
+    assert!(app.agents[&id].session.session_id.is_none());
+    assert_eq!(effects.len(), 1);
+    let Effect::SetStartupSessionMode {
+        agent_id,
+        session_id,
+        binding_epoch,
+        mode,
+        ready,
+    } = effects.pop().unwrap()
+    else {
+        panic!("expected the startup mode handshake");
+    };
+    assert_eq!(session_id, sid);
+    assert_eq!(mode, SessionMode::Plan);
+    let effects = dispatch(
+        Action::TaskComplete(TaskResult::StartupSessionModeCompleted {
+            agent_id,
+            session_id,
+            binding_epoch,
+            mode,
+            result: ready,
+        }),
+        &mut app,
     );
-    assert!(
-        effects
-            .iter()
-            .any(|e| matches!(e, Effect::SetSessionMode { session_id: s, .. } if *s == session_id)),
-        "SessionCreated must emit SetSessionMode for the deferred plan mode"
-    );
+    assert!(app.agents[&id].plan_mode_active);
+    assert!(app.agents[&id].deferred_session_mode.is_none());
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::SendPrompt { .. } | Effect::SendPromptBlocks { .. }
+    )));
 }
 /// Any non-empty prompt, even a single character, dispatches a
 /// new session (the old 4-char floor was relaxed to 1 char).

@@ -105,6 +105,37 @@ fn picker_parses_session_kind() {
 }
 
 #[tokio::test]
+async fn declined_startup_plan_mode_never_releases_the_queued_session() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (progress_tx, _) = tokio::sync::mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+    let agent_id = AgentId(1);
+    let session_id = acp::SessionId::new("plan-test");
+    let ready = Box::new(TaskResult::SessionCreated {
+        agent_id, session_id: session_id.clone(), models: None, scheduler_background_loops: None,
+    });
+    execute(
+        Effect::SetStartupSessionMode {
+            agent_id, session_id: session_id.clone(), binding_epoch: 9, mode: xai_grok_tools::types::SessionMode::Plan, ready,
+        },
+        &mut tasks, &tx, Path::new("."), &SessionFlags::default(), &progress_tx,
+    );
+    let Some(xai_acp_lib::AcpAgentMessage::SetSessionMode(request)) = rx.recv().await else {
+        panic!("expected session/set_mode before releasing startup");
+    };
+    assert_eq!(request.request.session_id, session_id);
+    assert_eq!(request.request.mode_id.0.as_ref(), "plan");
+    request.response_tx.send(Err(acp::Error::invalid_params())).unwrap();
+    let TaskResult::StartupSessionModeCompleted { result, binding_epoch: 9, .. } =
+        tasks.join_next().await.unwrap().unwrap() else {
+        panic!("expected a failure tied to the issuing binding");
+    };
+    assert!(matches!(*result, TaskResult::SessionLoadFailed { agent_id: AgentId(1), error, .. }
+        if error.contains("--permission-mode plan --resume plan-test")));
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn fetch_dashboard_sessions_explicitly_excludes_headless() {
     use std::sync::{Arc, Mutex};
     use xai_acp_lib::AcpAgentMessage;

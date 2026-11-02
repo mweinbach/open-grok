@@ -508,6 +508,77 @@ async fn test_headless_json_reports_server_cost() {
 
 #[tokio::test]
 #[ignore] // requires pre-built binary; run with --ignored
+async fn headless_plan_mode_blocks_the_first_workspace_edit() {
+    let model = "plan-edit-test";
+    let server = MockInferenceServer::start_with_models(vec![
+        MockModelEntry::with_agent_type(model, "grok-build").with_api_backend("chat_completions"),
+    ])
+    .await
+    .expect("start inference mock");
+    let workdir = git_workdir();
+    let sentinel = workdir.workspace().join("first-edit.txt");
+    let arguments = serde_json::json!({
+        "file_path": sentinel, "old_string": "", "new_string": "written"
+    });
+    server.enqueue_agent_turn_response(ScriptedResponse::sse(
+        xai_grok_test_support::sse::chat_completions_reasoning_then_tool_call_events(
+            "try the edit",
+            "first-edit",
+            "search_replace",
+            &arguments.to_string(),
+            model,
+        ),
+    ));
+    server.set_response("Plan ready.");
+
+    let result = run_headless(
+        &server,
+        &[
+            "-p",
+            "Plan this edit",
+            "--model",
+            model,
+            "--permission-mode",
+            "plan",
+            "--allow",
+            "Edit",
+            "--max-turns",
+            "3",
+        ],
+        workdir.workspace(),
+    )
+    .await;
+    assert_headless_success(
+        &result,
+        "open-grok -p --permission-mode plan",
+        Some(&server),
+    );
+    assert!(
+        !sentinel.exists(),
+        "Plan mode allowed the first workspace edit"
+    );
+    assert!(
+        server.requests().iter().any(|request| {
+            request
+                .body
+                .as_ref()
+                .and_then(|body| body["messages"].as_array())
+                .into_iter()
+                .flatten()
+                .any(|message| {
+                    message["role"] == "tool"
+                        && message["tool_call_id"] == "first-edit"
+                        && message["content"]
+                            .to_string()
+                            .contains("file edits are not allowed in plan mode")
+                })
+        }),
+        "the model must receive the plan gate's rejection for the first edit"
+    );
+}
+
+#[tokio::test]
+#[ignore] // requires pre-built binary; run with --ignored
 async fn test_headless_json_reports_usage_on_max_turns() {
     let server = single_model_server(CHAT_COMPLETIONS_MODEL, "chat_completions").await;
     server.enqueue_response(
