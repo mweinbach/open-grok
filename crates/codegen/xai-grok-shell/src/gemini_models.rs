@@ -1,16 +1,13 @@
 //! Provider-isolated Google Gemini API (AI Studio) model discovery.
 //!
-//! Gemini's OpenAI-compatible Chat Completions surface lives at
-//! `https://generativelanguage.googleapis.com/v1beta/openai/`. Live `GET /models`
-//! returns the entire Gemini catalog (imagen, TTS, live, embeddings), so Open
-//! Grok treats a curated four-model list as authoritative. A successful
-//! `/models` response may enrich curated context / max-output values but must
-//! never add or remove picker entries.
+//! Discover chat models from Google's paginated native catalog. Inference and
+//! explicitly configured OpenAI-compatible catalog overrides keep their routes.
 
 use crate::agent::config::{EnvKeys, ModelEntry, ModelInfo};
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::time::Duration;
 use url::Url;
@@ -25,6 +22,7 @@ pub const GEMINI_API_BASE_URL_ENV: &str = "OPENGROK_GEMINI_API_BASE_URL";
 pub const GEMINI_API_KEY_ENV: &str = "GEMINI_API_KEY";
 /// Common Google-client alias accepted as a process-level BYOK choice.
 pub const GOOGLE_API_KEY_ENV: &str = "GOOGLE_API_KEY";
+const GEMINI_NATIVE_MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models";
 const GEMINI_MODELS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_CONTEXT_WINDOW: u64 = 1_048_576;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 65_536;
@@ -36,8 +34,7 @@ pub struct CuratedGeminiModel {
     pub description: &'static str,
 }
 
-/// The only Gemini models Open Grok exposes in the picker. A `/models`
-/// response may enrich these entries but can neither add nor remove them.
+/// Offline defaults with known reasoning controls.
 pub const CURATED_GEMINI_MODELS: [CuratedGeminiModel; 4] = [
     CuratedGeminiModel {
         id: "gemini-3.7-flash",
@@ -203,7 +200,7 @@ fn assigned_max_output(wire_max_output: Option<u32>) -> u32 {
         .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
-fn log_catalog_refreshed(entries: &IndexMap<String, ModelEntry>, enriched: bool) {
+fn log_catalog_refreshed(entries: &IndexMap<String, ModelEntry>, live: bool) {
     let models: Vec<serde_json::Value> = entries
         .values()
         .map(|entry| {
@@ -219,37 +216,46 @@ fn log_catalog_refreshed(entries: &IndexMap<String, ModelEntry>, enriched: bool)
         None,
         Some(serde_json::json!({
             "count": entries.len(),
-            "enriched": enriched,
+            "source": if live { "live" } else { "fallback" },
             "models": models,
         })),
     );
 }
 
-fn curated_model_entry(
-    curated: &CuratedGeminiModel,
-    base_url: &str,
-    wire_context: Option<u64>,
-    wire_max_output: Option<u32>,
-) -> ModelEntry {
-    let key = catalog_key(curated.id);
+fn model_entry(id: &str, base_url: &str, wire: Option<&GeminiWireModel>) -> ModelEntry {
+    let key = catalog_key(id);
     let mut info = ModelInfo::fallback(&key);
+    let curated = CURATED_GEMINI_MODELS.iter().find(|model| model.id == id);
     info.id = Some(key);
-    info.model = curated.id.to_owned();
+    info.model = id.to_owned();
     info.base_url = base_url.trim_end_matches('/').to_owned();
-    info.name = Some(curated.name.to_owned());
-    info.description = Some(curated.description.to_owned());
+    info.name = Some(
+        wire.and_then(|m| m.display_name.as_deref())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| curated.map(|m| m.name))
+            .unwrap_or(id)
+            .to_owned(),
+    );
+    info.description = wire
+        .and_then(|m| m.description.clone())
+        .or_else(|| curated.map(|m| m.description.to_owned()));
     info.api_backend = ApiBackend::ChatCompletions;
     info.provider = ModelProvider::Gemini;
     info.tool_mode = Some(ToolMode::Direct);
-    info.context_window = assigned_context_window(wire_context);
-    info.max_completion_tokens = Some(assigned_max_output(wire_max_output));
-    let efforts = gemini_reasoning_efforts(curated.id);
-    info.reasoning_effort = efforts
-        .iter()
-        .find(|option| option.default)
-        .map(|option| option.value);
-    info.reasoning_efforts = efforts;
-    info.supports_reasoning_effort = true;
+    let context = wire.and_then(GeminiWireModel::context_window);
+    let max_output = wire.and_then(GeminiWireModel::max_output);
+    if curated.is_some() {
+        info.context_window = assigned_context_window(context);
+        info.max_completion_tokens = Some(assigned_max_output(max_output));
+        info.reasoning_efforts = gemini_reasoning_efforts(id);
+        info.reasoning_effort = Some(default_reasoning_effort(id));
+        info.supports_reasoning_effort = true;
+    } else {
+        if let Some(limit) = context.and_then(NonZeroU64::new) {
+            info.context_window = limit;
+        }
+        info.max_completion_tokens = max_output;
+    }
     info.supports_backend_search = false;
     info.supports_standalone_web_search = Some(false);
     info.supported_in_api = true;
@@ -262,35 +268,22 @@ fn curated_model_entry(
     }
 }
 
-fn curated_entries(
-    base_url: &str,
-    limits: &IndexMap<String, (Option<u64>, Option<u32>)>,
-) -> IndexMap<String, ModelEntry> {
-    CURATED_GEMINI_MODELS
-        .iter()
-        .map(|curated| {
-            let (context, max_output) = limits.get(curated.id).copied().unwrap_or((None, None));
-            (
-                catalog_key(curated.id),
-                curated_model_entry(curated, base_url, context, max_output),
-            )
-        })
-        .collect()
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct GeminiModelsCatalog {
     entries: IndexMap<String, ModelEntry>,
     credential_fingerprint: String,
-    enriched: bool,
+    live: bool,
 }
 
 impl GeminiModelsCatalog {
     fn curated(base_url: &str, api_key: &str) -> Self {
         Self {
-            entries: curated_entries(base_url, &IndexMap::new()),
+            entries: CURATED_GEMINI_MODELS
+                .iter()
+                .map(|m| (catalog_key(m.id), model_entry(m.id, base_url, None)))
+                .collect(),
             credential_fingerprint: credential_fingerprint(api_key),
-            enriched: false,
+            live: false,
         }
     }
 
@@ -298,21 +291,19 @@ impl GeminiModelsCatalog {
         self.entries.clone()
     }
 
-    pub(crate) fn is_authoritative(&self) -> bool {
-        !self.entries.is_empty()
+    pub(crate) fn is_live(&self) -> bool {
+        self.live
     }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct GeminiModelsClient {
-    http: crate::lazy_http::LazyHttpClient,
     base_url: String,
 }
 
 impl GeminiModelsClient {
     pub(crate) fn new() -> Self {
         Self {
-            http: crate::lazy_http::LazyHttpClient::new(),
             base_url: api_base_url(),
         }
     }
@@ -320,7 +311,6 @@ impl GeminiModelsClient {
     #[cfg(test)]
     fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http: crate::lazy_http::LazyHttpClient::new(),
             base_url: base_url.into(),
         }
     }
@@ -366,67 +356,85 @@ impl GeminiModelsClient {
     }
 
     async fn query_with_key(&self, api_key: &str) -> anyhow::Result<GeminiModelsCatalog> {
-        let url = format!("{}/models", self.base_url.trim_end_matches('/'));
-        let response = self
-            .http
-            .client()
-            .get(&url)
-            .timeout(GEMINI_MODELS_REQUEST_TIMEOUT)
-            .bearer_auth(api_key)
-            .send()
-            .await
-            .with_context(|| format!("Gemini models request to {url} failed"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "Gemini models request returned {status}: {}",
-                safe_error_excerpt(&body, api_key)
-            ));
-        }
-        let wire: GeminiModelsResponse = response
-            .json()
-            .await
-            .context("Gemini models response was invalid")?;
-        let catalog = self.catalog_from_wire(wire, api_key);
-        log_catalog_refreshed(&catalog.entries, catalog.enriched);
-        Ok(catalog)
+        let base = self.base_url.trim_end_matches('/');
+        let native = base == GEMINI_API_BASE_URL;
+        let url = if native {
+            GEMINI_NATIVE_MODELS_URL.to_owned()
+        } else {
+            format!("{base}/models")
+        };
+        tokio::time::timeout(
+            GEMINI_MODELS_REQUEST_TIMEOUT,
+            self.query_pages(&url, native, api_key),
+        )
+        .await
+        .context("Gemini model discovery timed out")?
     }
 
-    /// Project the wire response onto the curated list. Uncurated ids
-    /// (imagen, TTS, live, embeddings, other Gemini slugs) are ignored.
-    fn catalog_from_wire(&self, wire: GeminiModelsResponse, api_key: &str) -> GeminiModelsCatalog {
-        let mut limits = IndexMap::new();
-        for model in wire.data {
-            let id = model.id.trim();
-            let id = id.strip_prefix("models/").unwrap_or(id);
-            if id.is_empty() {
-                continue;
+    async fn query_pages(
+        &self,
+        url: &str,
+        native: bool,
+        api_key: &str,
+    ) -> anyhow::Result<GeminiModelsCatalog> {
+        // A redirect must never forward x-goog-api-key to another host.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut entries = IndexMap::new();
+        let mut next_page = None;
+        let mut seen_tokens = HashSet::new();
+        loop {
+            let request = http.get(url);
+            let mut request = if native {
+                request
+                    .header("x-goog-api-key", api_key)
+                    .query(&[("pageSize", "1000")])
+            } else {
+                request.bearer_auth(api_key)
+            };
+            if let Some(token) = next_page.take() {
+                request = request.query(&[("pageToken", token)]);
             }
-            let context = model
-                .context_window
-                .or(model.context_length)
-                .or(model.input_token_limit)
-                .filter(|&value| value > 0);
-            let max_output = model
-                .max_output_tokens
-                .or(model.output_token_limit)
-                .filter(|&value| value > 0);
-            if context.is_some() || max_output.is_some() {
-                limits.insert(id.to_owned(), (context, max_output));
+            let response = request
+                .send()
+                .await
+                .with_context(|| format!("Gemini models request to {url} failed"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!(
+                    "Gemini models request returned {status}: {}",
+                    safe_error_excerpt(&body, api_key)
+                ));
             }
+            let page: GeminiModelsResponse = response
+                .json()
+                .await
+                .context("Gemini models response was invalid")?;
+            for model in page.models {
+                if let Some(id) = model.chat_model_id(native) {
+                    entries.insert(
+                        catalog_key(id),
+                        model_entry(id, &self.base_url, Some(&model)),
+                    );
+                }
+            }
+            let Some(token) = page.next_page_token.filter(|token| !token.is_empty()) else {
+                break;
+            };
+            anyhow::ensure!(
+                seen_tokens.insert(token.clone()),
+                "Gemini model discovery returned a repeated page token"
+            );
+            next_page = Some(token);
         }
-        let entries = curated_entries(&self.base_url, &limits);
-        let enriched = CURATED_GEMINI_MODELS.iter().any(|curated| {
-            limits
-                .get(curated.id)
-                .is_some_and(|(context, max_output)| context.is_some() || max_output.is_some())
-        });
-        GeminiModelsCatalog {
+        log_catalog_refreshed(&entries, true);
+        Ok(GeminiModelsCatalog {
             entries,
             credential_fingerprint: credential_fingerprint(api_key),
-            enriched,
-        }
+            live: true,
+        })
     }
 }
 
@@ -438,31 +446,100 @@ fn safe_error_excerpt(body: &str, api_key: &str) -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiModelsResponse {
-    #[serde(default)]
-    data: Vec<GeminiWireModel>,
+    #[serde(alias = "data")]
+    models: Vec<GeminiWireModel>,
+    #[serde(alias = "next_page_token")]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GeminiWireModel {
-    id: String,
-    #[serde(default)]
-    context_window: Option<u64>,
-    #[serde(default)]
+    // Google returns `name: "models/<id>"`; compatible endpoints return `id`.
+    id: Option<String>,
+    name: Option<String>,
+    display_name: Option<String>,
+    description: Option<String>,
+    supported_generation_methods: Option<Vec<String>>,
+    #[serde(alias = "supportedOutputModalities")]
+    output_modalities: Option<Vec<String>>,
+    #[serde(rename = "context_window")]
+    context: Option<u64>,
+    #[serde(rename = "context_length")]
     context_length: Option<u64>,
-    #[serde(default)]
+    #[serde(alias = "input_token_limit")]
     input_token_limit: Option<u64>,
-    #[serde(default)]
+    #[serde(rename = "max_output_tokens")]
     max_output_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(alias = "output_token_limit")]
     output_token_limit: Option<u32>,
+}
+
+impl GeminiWireModel {
+    fn chat_model_id(&self, native: bool) -> Option<&str> {
+        let name = self.id.as_deref().or(self.name.as_deref())?.trim();
+        let id = name.strip_prefix("models/").unwrap_or(name);
+        // OpenAI-compatible lists can contain just IDs. Google's native list
+        // identifies generation methods, even on specialized models (e.g. TTS).
+        let can_generate = self
+            .supported_generation_methods
+            .as_ref()
+            .map_or(!native, |methods| {
+                methods.iter().any(|m| m == "generateContent")
+            });
+        let produces_text = self
+            .output_modalities
+            .as_ref()
+            .is_none_or(|modes| modes.iter().any(|m| m.eq_ignore_ascii_case("text")));
+        if !id.starts_with("gemini-")
+            || !can_generate
+            || !produces_text
+            || !id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_'))
+            || id.split(['-', '_']).any(|part| {
+                matches!(
+                    part,
+                    "tts"
+                        | "audio"
+                        | "live"
+                        | "image"
+                        | "embedding"
+                        | "robotics"
+                        | "computer"
+                        | "transcribe"
+                )
+            })
+            || id.starts_with("gemini-nano-banana-")
+            || id.starts_with("gemini-omni-")
+            || id.contains("deep-research")
+        {
+            return None;
+        }
+        Some(id)
+    }
+
+    fn context_window(&self) -> Option<u64> {
+        [self.input_token_limit, self.context, self.context_length]
+            .into_iter()
+            .flatten()
+            .find(|&n| n > 0)
+    }
+
+    fn max_output(&self) -> Option<u32> {
+        [self.output_token_limit, self.max_output_tokens]
+            .into_iter()
+            .flatten()
+            .find(|&n| n > 0)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::State, http::HeaderMap, routing::get};
-    use std::sync::{Arc, Mutex};
+    use axum::{Json, Router, http::HeaderMap, routing::get};
 
     #[test]
     fn trusted_hosts_are_provider_scoped() {
@@ -505,7 +582,7 @@ mod tests {
     #[test]
     fn curated_entries_are_chat_only_with_model_specific_reasoning_menus() {
         let catalog = GeminiModelsCatalog::curated(GEMINI_API_BASE_URL, "catalog-key");
-        assert!(catalog.is_authoritative());
+        assert!(!catalog.is_live());
         let entries = catalog.entries();
         assert_eq!(entries.len(), CURATED_GEMINI_MODELS.len());
         for curated in &CURATED_GEMINI_MODELS {
@@ -607,60 +684,6 @@ mod tests {
     }
 
     #[test]
-    fn wire_metadata_enriches_but_cannot_add_models() {
-        let client = GeminiModelsClient::with_base_url(GEMINI_API_BASE_URL);
-        let catalog = client.catalog_from_wire(
-            GeminiModelsResponse {
-                data: vec![
-                    GeminiWireModel {
-                        id: "models/gemini-3.7-flash".to_owned(),
-                        context_window: Some(2_097_152),
-                        context_length: None,
-                        input_token_limit: None,
-                        max_output_tokens: Some(8_192),
-                        output_token_limit: None,
-                    },
-                    GeminiWireModel {
-                        id: "imagen-4.0-generate-001".to_owned(),
-                        context_window: Some(8_192),
-                        context_length: None,
-                        input_token_limit: None,
-                        max_output_tokens: None,
-                        output_token_limit: None,
-                    },
-                    GeminiWireModel {
-                        id: "gemini-2.5-flash".to_owned(),
-                        context_window: Some(1_000_000),
-                        context_length: None,
-                        input_token_limit: None,
-                        max_output_tokens: None,
-                        output_token_limit: None,
-                    },
-                ],
-            },
-            "catalog-key",
-        );
-        let entries = catalog.entries();
-        assert_eq!(entries.len(), CURATED_GEMINI_MODELS.len());
-        assert_eq!(
-            entries["gemini:gemini-3.7-flash"].info.context_window.get(),
-            2_097_152
-        );
-        assert_eq!(
-            entries["gemini:gemini-3.7-flash"]
-                .info
-                .max_completion_tokens,
-            Some(8_192)
-        );
-        assert!(!entries.keys().any(|key| key.contains("imagen")));
-        assert!(!entries.contains_key("gemini:gemini-2.5-flash"));
-        assert_eq!(
-            entries["gemini:gemini-3.6-flash"].info.context_window.get(),
-            DEFAULT_CONTEXT_WINDOW
-        );
-    }
-
-    #[test]
     fn error_excerpt_redacts_a_reflected_credential() {
         let excerpt = safe_error_excerpt(
             "request rejected for model-query-canary\ntry again",
@@ -670,46 +693,125 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn model_query_uses_bearer_auth_and_preserves_curated_ids() {
-        #[derive(Clone, Default)]
-        struct RequestCapture(Arc<Mutex<Option<String>>>);
+    async fn native_catalog_pages_only_return_text_generation_models() {
+        use axum::extract::Query;
+        use std::collections::HashMap;
 
-        async fn models(
-            State(capture): State<RequestCapture>,
+        async fn page(
             headers: HeaderMap,
+            Query(query): Query<HashMap<String, String>>,
         ) -> Json<serde_json::Value> {
-            *capture.0.lock().expect("capture lock") = headers
-                .get(reqwest::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            Json(serde_json::json!({
-                "object": "list",
-                "data": [
-                    {"id": "gemini-3.6-flash", "context_length": 1_048_576},
-                    {"id": "imagen-4.0-generate-001"}
-                ]
-            }))
+            assert_eq!(headers["x-goog-api-key"], "test-key");
+            assert!(!headers.contains_key("authorization"));
+            assert_eq!(query["pageSize"], "1000");
+            if let Some(token) = query.get("pageToken") {
+                assert_eq!(token, "next+/=");
+                return Json(serde_json::json!({"models": [
+                    {"name":"models/gemini-4-test-preview","displayName":"Gemini test preview",
+                     "inputTokenLimit":2000000,"outputTokenLimit":40000,
+                     "supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/gemini-4-test-preview-tts","supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/gemini-nano-banana-fixture","supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/gemini-omni-fixture","supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/gemini-test-transcribe","supportedGenerationMethods":["generateContent"]},
+                    {"name":"models/gemini-other","supportedGenerationMethods":["embedContent"]},
+                    {"name":"models/gemini-music","supportedGenerationMethods":["generateContent"],"outputModalities":["AUDIO"]}
+                ]}));
+            }
+            Json(serde_json::json!({"nextPageToken":"next+/=","models":[
+                {"name":"models/gemini-3.7-flash","inputTokenLimit":12345,"supportedGenerationMethods":["generateContent"]},
+                {"name":"models/imagen-model","supportedGenerationMethods":["generateContent"]},
+                {"name":"models/gemini-no-methods"}
+            ]}))
         }
-
-        let capture = RequestCapture::default();
-        let app = Router::new()
-            .route("/v1beta/openai/models", get(models))
-            .with_state(capture.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{}/v1beta/models", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/v1beta/models", get(page)))
+                .await
+                .unwrap()
+        });
+        let client = GeminiModelsClient::with_base_url(GEMINI_API_BASE_URL);
+        let catalog = client.query_pages(&url, true, "test-key").await.unwrap();
+        assert_eq!(catalog.entries.len(), 2);
+        let model = &catalog.entries["gemini:gemini-4-test-preview"].info;
+        assert_eq!(model.model, "gemini-4-test-preview");
+        assert_eq!(model.name.as_deref(), Some("Gemini test preview"));
+        assert_eq!(model.provider, ModelProvider::Gemini);
+        assert_eq!(model.api_backend, ApiBackend::ChatCompletions);
+        assert_eq!(model.base_url, GEMINI_API_BASE_URL);
+        assert_eq!(model.context_window.get(), 2_000_000);
+        assert_eq!(model.max_completion_tokens, Some(40_000));
+        assert!(!model.supports_reasoning_effort);
+        let known = &catalog.entries["gemini:gemini-3.7-flash"].info;
+        assert!(known.supports_reasoning_effort);
+        assert_eq!(known.context_window.get(), 12345);
+    }
 
-        let client = GeminiModelsClient::with_base_url(format!("http://{address}/v1beta/openai"));
-        let catalog = client.query_with_key("model-query-canary").await.unwrap();
-        let entries = catalog.entries();
-        assert_eq!(entries.len(), CURATED_GEMINI_MODELS.len());
+    #[tokio::test]
+    async fn compatible_endpoint_discovers_ids_without_capability_metadata() {
+        async fn models(headers: HeaderMap) -> Json<serde_json::Value> {
+            assert_eq!(headers["authorization"], "Bearer test-key");
+            assert!(!headers.contains_key("x-goog-api-key"));
+            Json(serde_json::json!({"object": "list","data":[
+                {"id":"gemini-4-test"}, {"id":"gemini-3.6-flash","context_length":262144},
+                {"id":"gemini-live-test"},{"id":"imagen-4.0-generate-001"}
+            ]}))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1beta/openai", listener.local_addr().unwrap());
+        let app = Router::new().route("/v1beta/openai/models", get(models));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = GeminiModelsClient::with_base_url(&base);
+        let catalog = client.query_with_key("test-key").await.unwrap();
+        assert_eq!(catalog.entries.len(), 2);
+        assert_eq!(catalog.entries["gemini:gemini-4-test"].info.base_url, base);
         assert_eq!(
-            entries["gemini:gemini-3.6-flash"].info.provider,
-            ModelProvider::Gemini
+            catalog.entries["gemini:gemini-3.6-flash"]
+                .info
+                .context_window
+                .get(),
+            262144
         );
-        assert_eq!(
-            capture.0.lock().unwrap().as_deref(),
-            Some("Bearer model-query-canary")
+    }
+
+    #[tokio::test]
+    async fn native_discovery_does_not_forward_the_key_on_redirect() {
+        let app = Router::new()
+            .route(
+                "/models",
+                get(|| async { axum::response::Redirect::temporary("/elsewhere") }),
+            )
+            .route(
+                "/elsewhere",
+                get(|| async { Json(serde_json::json!({"models": []})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/models", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = GeminiModelsClient::with_base_url(GEMINI_API_BASE_URL);
+        assert!(
+            client
+                .query_pages(&url, true, "test-key")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("307")
         );
+    }
+
+    #[tokio::test]
+    async fn repeated_page_token_does_not_publish_a_partial_catalog() {
+        let page =
+            Json(serde_json::json!({"models":[{"id":"gemini-4-test"}],"nextPageToken":"same"}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route("/models", get(move || async move { page }));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = GeminiModelsClient::with_base_url(base);
+        let catalog = client.query_with_fallback("test-key").await;
+        assert!(!catalog.live);
+        assert_eq!(catalog.entries.len(), CURATED_GEMINI_MODELS.len());
+        assert!(!catalog.entries.contains_key("gemini:gemini-4-test"));
     }
 }

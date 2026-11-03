@@ -14,7 +14,13 @@ pub(crate) async fn handle(
     let state = if crate::agent::chat_modes::process_chat_mode_enabled() {
         agent.chat_modes.model_state().await
     } else {
-        agent.models_manager.wait_for_first_catalog().await;
+        let (_, gemini) = tokio::join!(
+            agent.models_manager.wait_for_first_catalog(),
+            agent.models_manager.ensure_gemini_models(),
+        );
+        if let Err(error) = gemini {
+            tracing::warn!(%error, "Gemini model query failed");
+        }
         agent.model_state(None)
     };
     ExtMethodResult::success(state)

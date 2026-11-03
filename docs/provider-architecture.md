@@ -34,7 +34,7 @@ Codex provider does not override an explicit model API key.
 | Wafer AI | Chat | none | client function tools | no | standard only | provider API key | denied |
 | Z AI | Chat | none | client function tools | no | standard only | provider API key | denied |
 | RunInfra | Chat | none | client function tools | no | standard only | provider API key | denied |
-| Google Gemini | Chat | none | client function tools | no | standard only | provider API key | denied |
+| Google Gemini | Chat, Google AI Studio | none | client function tools | no | standard only | provider API key | denied |
 | OpenCode Go | Chat, Messages | none | client function tools | no | standard only | provider API key | denied |
 | OpenRouter | Chat | none | client function tools | no | standard only | provider API key | denied |
 | Custom endpoint | Chat, Responses, Messages | OpenAI (vanilla) | client function tools | no | standard only | user key on the model row | denied |
@@ -100,9 +100,10 @@ search, or xAI export path. Stored keys stay on `https://api.runinfra.ai`.
 
 Google Gemini (AI Studio) supports both OpenAI-compatible Chat Completions
 at `https://generativelanguage.googleapis.com/v1beta/openai/` and native Google AI Studio REST
-inference (`api_backend = "google_ai_studio"`) at `https://generativelanguage.googleapis.com/v1beta/`:
-it uses provider-local API-key auth (`GEMINI_API_KEY` / `GOOGLE_API_KEY`), enriches the
-curated four-model catalog from live `/models`, and exposes standard client function tools.
+inference (`api_backend = "google_ai_studio"`) at `https://generativelanguage.googleapis.com/v1beta/`.
+It uses provider-local API-key auth (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) and standard
+client function tools. Discovery follows Google's paginated `GET /v1beta/models`.
+The picker shows returned Gemini chat models. Offline discovery uses four bundled defaults.
 It supports native thinking tokens and passes keys via `x-goog-api-key`. It has no Responses dialect,
 hosted tools, native web search, or xAI export path. Stored keys stay on
 `https://generativelanguage.googleapis.com`.

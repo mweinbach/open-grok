@@ -219,8 +219,7 @@ struct Inner {
     /// credential. Populated from `/models` when available, else a curated
     /// hosted-model fallback.
     runinfra_catalog: RwLock<Option<RuninfraModelsCatalog>>,
-    /// Provider-isolated Gemini catalog. The curated four-model list is
-    /// authoritative; live `/models` may only enrich those entries.
+    /// Gemini chat models visible to the active credential, or offline defaults.
     gemini_catalog: RwLock<Option<GeminiModelsCatalog>>,
     current_model_id: RwLock<acp::ModelId>,
     current_reasoning_effort: RwLock<Option<ReasoningEffort>>,
@@ -1399,16 +1398,30 @@ impl ModelsManager {
         };
         let manager = self.clone();
         runtime.spawn(async move {
-            if let Err(error) = manager.refresh_gemini_models().await {
+            if let Err(error) = manager.ensure_gemini_models().await {
                 tracing::warn!(%error, "Gemini model query failed; keeping current models");
             }
         });
     }
 
-    pub(crate) async fn refresh_gemini_models(&self) -> anyhow::Result<bool> {
+    pub(crate) async fn ensure_gemini_models(&self) -> anyhow::Result<bool> {
+        self.refresh_gemini_models(false).await
+    }
+
+    async fn refresh_gemini_models(&self, force: bool) -> anyhow::Result<bool> {
         let _refresh_guard = self.inner.gemini_refresh_lock.lock().await;
         let generation = self.inner.gemini_catalog_generation.load(Ordering::Acquire);
         let client = self.inner.gemini_client.clone();
+        let prior_live = self
+            .inner
+            .gemini_catalog
+            .read()
+            .as_ref()
+            .filter(|catalog| client.catalog_matches_current_credential(catalog))
+            .map(GeminiModelsCatalog::is_live);
+        if prior_live.is_some() && !force {
+            return Ok(false);
+        }
         let Some(refreshed) = client.query().await? else {
             tracing::debug!("Gemini model query skipped: no Gemini API key");
             return Ok(false);
@@ -1421,15 +1434,18 @@ impl ModelsManager {
             );
             return Ok(false);
         }
+        if prior_live == Some(true) && !refreshed.is_live() {
+            return Ok(false);
+        }
         let count = refreshed.entries().len();
-        let authoritative = refreshed.is_authoritative();
+        let live = refreshed.is_live();
         *self.inner.gemini_catalog.write() = Some(refreshed);
         let cfg = self.inner.cfg.read().clone();
         let prefetched = self.inner.catalog.read().prefetched.clone();
         self.rebuild(&cfg, prefetched);
         self.reselect_current_model_if_missing(&cfg);
         self.notify_models_updated();
-        tracing::info!(count, authoritative, "Gemini model catalog refreshed");
+        tracing::info!(count, live, "Gemini model catalog refreshed");
         Ok(true)
     }
 
@@ -1448,7 +1464,7 @@ impl ModelsManager {
 
     pub(crate) async fn apply_gemini_credential_change(&self) -> anyhow::Result<bool> {
         if self.inner.gemini_client.has_usable_api_key() {
-            self.refresh_gemini_models().await
+            self.refresh_gemini_models(true).await
         } else {
             self.clear_gemini_models();
             Ok(false)

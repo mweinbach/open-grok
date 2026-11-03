@@ -530,15 +530,13 @@ substitute.
 
 ### Google Gemini
 
-Google Gemini (AI Studio) serves curated Chat Completions models at
-`https://generativelanguage.googleapis.com/v1beta/openai/`. Open Grok keeps
-four curated entries (`gemini-3.7-flash`, `gemini-3.6-flash`,
-`gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`) under catalog keys
-`gemini:{id}`; live `/models` enrich those entries only.
+Set `GEMINI_API_KEY` or `GOOGLE_API_KEY`, or connect your key with `/login gemini`.
+Open Grok lists the Gemini chat models available to that key under `gemini:{id}`.
+It reads every page of Google's model list, including previews that your project
+can access. If discovery fails, four bundled models are available as a fallback.
 
-Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`, or connect it with `/login gemini`)
-and pick one of the curated ids. To add an id that is not curated, use
-Settings or a `[model.*]` table with `provider = "gemini"`:
+To customize a model entry, use Settings or a `[model.*]` table with
+`provider = "gemini"`.
 
 ```toml
 [model.gemini-flash]

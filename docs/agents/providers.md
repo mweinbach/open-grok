@@ -58,7 +58,7 @@ compile and regression-test gates.
 | Wafer AI | Chat | none | client function tools | API key only | **denied** |
 | Z AI | Chat | none | client function tools | API key only | **denied** |
 | RunInfra | Chat | none | client function tools | API key only | **denied** |
-| Google Gemini | Chat | none | client function tools | API key only | **denied** |
+| Google Gemini | Chat, Google AI Studio | none | client function tools | API key only | **denied** |
 | OpenCode Go | Chat, Messages (per model) | none | client function tools | API key only | **denied** |
 | OpenRouter | Chat | none | client function tools | API key only | **denied** |
 
@@ -122,15 +122,15 @@ credentials, private metadata, or xAI-only exports.
 
 ### Google Gemini (AI Studio)
 
-Google Gemini is an isolated, API-key-only OpenAI-compatible Chat Completions
-provider. Its base URL is
-`https://generativelanguage.googleapis.com/v1beta/openai/` (overridable via
-`OPENGROK_GEMINI_API_BASE_URL`). Auth is Bearer (`GEMINI_API_KEY`, alias
-`GOOGLE_API_KEY`). Stored keys are sent only to
-`https://generativelanguage.googleapis.com`. Live `/models` enrich-only updates
-the curated four models (`gemini-3.7-flash`, `gemini-3.6-flash`,
-`gemini-3.5-flash-lite`, `gemini-3.1-pro-preview`); catalog keys use
-`gemini:{id}`. Gemini 3 cannot use reasoning effort `none`. `gemini-3.7-flash`
+Google AI Studio discovery reads every page of `GET /v1beta/models` with
+`x-goog-api-key`. It lists the Gemini text-generation models visible to the key as
+`gemini:{id}` and uses the returned display names and token limits. Discovered models
+use the OpenAI-compatible Chat Completions route. Explicit compatible endpoints
+(`OPENGROK_GEMINI_API_BASE_URL`) use their own `/models` route with Bearer auth.
+Four bundled entries are available when discovery fails. Stored Gemini credentials
+are restricted to `https://generativelanguage.googleapis.com`.
+
+Gemini 3 cannot use reasoning effort `none`. `gemini-3.7-flash`
 and `gemini-3.1-pro-preview` reject `minimal` (menu is low/medium/high);
 `gemini-3.6-flash` and `gemini-3.5-flash-lite` offer minimal/low/medium/high.
 Defaults: 3.7-flash Medium, 3.6-flash Medium, 3.5-flash-lite Minimal,
@@ -232,7 +232,7 @@ RunInfra
   auth/storage.rs                               # runinfra::api_key (generic provider scope)
 
 Google Gemini
-  xai-grok-shell/src/gemini_models.rs           # curated four models + live /models enrich-only, trusted host
+  xai-grok-shell/src/gemini_models.rs           # paginated Gemini catalog, offline defaults, trusted host
   auth/storage.rs                               # gemini::api_key (generic provider scope)
 
 OpenCode Go
@@ -302,7 +302,7 @@ Also isolated:
 9. **OpenCode Go transport is model-owned.** `@ai-sdk/anthropic` entries use Messages + `x-api-key`; OpenAI-compatible entries use Chat Completions + Bearer. Never choose the protocol from the provider alone.
 10. **Wafer AI is API-key-only and provider-local.** `WAFER_API_KEY` is sent only to `https://pass.wafer.ai/v1`; its dynamic `/models` catalog, client function tools, and standard metadata do not inherit xAI behavior. Wafer has no native hosted web search.
 11. **RunInfra is API-key-only and provider-local.** `RUNINFRA_GATEWAY_KEY` / `RUNINFRA_API_KEY` are sent only to `https://api.runinfra.ai`; its live `/models` catalog, client function tools, and standard metadata do not inherit xAI behavior. RunInfra has no native hosted web search and no Responses dialect.
-12. **Google Gemini is API-key-only and provider-local.** `GEMINI_API_KEY` / `GOOGLE_API_KEY` are sent only to `https://generativelanguage.googleapis.com`; its curated catalog (live enrich-only), client function tools, and standard metadata do not inherit xAI behavior. Gemini has no native hosted web search and no Responses dialect.
+12. **Google Gemini is API-key-only and provider-local.** `GEMINI_API_KEY` / `GOOGLE_API_KEY` are sent only to `https://generativelanguage.googleapis.com`; its live chat catalog, client function tools, and standard metadata do not inherit xAI behavior. Gemini has no native hosted web search and no Responses dialect.
 13. **xAI-only services** (relay, some uploads, etc.) close via monotonic export boundary after non-xAI denied profiles. Compatibility field name remains `ever_used_codex` even when the triggering provider is not Codex; subagents mark the parent tree.
 14. **Image generation is explicitly routed.** The default `grok` route uses
     xAI Imagine credentials and remains hidden outside eligible xAI sessions.

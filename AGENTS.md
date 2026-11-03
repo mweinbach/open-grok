@@ -159,7 +159,7 @@ Three independent axes: **`ApiBackend`** × **`ProviderProfile`** × **`AuthSche
 | Wafer AI | `auth.json` scope `wafer::api_key` | Chat Completions; dynamic `/models`; `/login wafer` |
 | Z AI | `auth.json` scope `zai::api_key` | Chat Completions (GLM); dynamic `/models` + curated fallback; Coding Plan endpoint default; `/login zai` |
 | RunInfra | `auth.json` scope `runinfra::api_key` | Chat Completions; live `/models` + curated hosted fallback; `/login runinfra` |
-| Google Gemini | `auth.json` scope `gemini::api_key` | Chat Completions; live `/models` enrich-only + curated four models; `/login gemini` |
+| Google Gemini | `auth.json` scope `gemini::api_key` | Chat Completions and native REST; paginated live chat catalog with offline defaults; `/login gemini` |
 | OpenCode Go | `auth.json` scope `opencode_go::api_key` | Chat or Messages per model; opt-in live catalog; `/login opencode-go` |
 | OpenRouter | `auth.json` scope `openrouter::api_key` | Chat Completions; opt-in live `/models` checklist + efforts; `/login openrouter` |
 | Custom endpoint | `[model.<key>]` `api_key` / `env_key` (no `auth.json` scope) | `/provider` wizard: any server address, user picks Chat Completions / Responses / Messages; never receives built-in credentials |
