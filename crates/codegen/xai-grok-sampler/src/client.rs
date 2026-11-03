@@ -147,27 +147,24 @@ fn deserialize_response_event_for_tools(
         None
     };
     let data = codex_data.as_deref().unwrap_or(data);
-    let mut event = match serde_json::from_str::<rs::ResponseStreamEvent>(data) {
-        Ok(event) => event,
-        Err(first_err) => {
-            // Try sanitizing provider extensions at the typed SDK boundary.
+    let mut event = serde_json::from_str::<rs::ResponseStreamEvent>(data)
+        .or_else(|first_err| {
             if adapter.normalizes_response_events()
                 && let Ok(mut value) = serde_json::from_str::<serde_json::Value>(data)
             {
                 normalize_response_event_compat(&mut value);
-                if let Ok(mut event) = serde_json::from_value::<rs::ResponseStreamEvent>(value) {
-                    apply_terminal_event_overrides(&mut event, data);
-                    return Ok(event);
-                }
+                return serde_json::from_value(value);
             }
+            Err(first_err)
+        })
+        .map_err(|error| {
             tracing::error!(
-                error = %first_err,
+                %error,
                 raw_data = %data,
                 "Failed to deserialize ResponseStreamEvent from stream"
             );
-            return Err(SamplingError::Serialization(first_err));
-        }
-    };
+            SamplingError::Serialization(error)
+        })?;
     apply_terminal_event_overrides(&mut event, data);
     Ok(event)
 }
@@ -314,12 +311,14 @@ fn normalize_response_event_compat(value: &mut serde_json::Value) {
                 normalize_response_output_item(item);
             }
         }
-        "response.created"
+        "response.queued"
+        | "response.created"
         | "response.in_progress"
         | "response.completed"
         | "response.failed"
         | "response.incomplete" => {
             let default_status = match event_type.as_str() {
+                "response.queued" => "queued",
                 "response.completed" => "completed",
                 "response.failed" => "failed",
                 "response.incomplete" => "incomplete",
@@ -404,9 +403,8 @@ fn normalize_response_compat(value: &mut serde_json::Value, default_status: &str
         }
     }
 
-    // The response may echo xAI-only hosted tool declarations such as
-    // `{"type":"x_search"}`. Retain every tool the typed SDK understands and
-    // drop only declarations it cannot represent.
+    // Responses may echo provider-specific declarations such as Codex's
+    // `namespace` or xAI's `x_search`. Keep the declarations the SDK models.
     if let Some(tools) = response
         .get_mut("tools")
         .and_then(serde_json::Value::as_array_mut)
@@ -6355,6 +6353,57 @@ mod tests {
                 .and_then(|reasoning| reasoning.effort),
             Some(rs::ReasoningEffort::Max),
         );
+    }
+
+    #[test]
+    fn codex_queued_response_accepts_echoed_tool_namespace() {
+        let frame = serde_json::json!({
+            "type": "response.queued",
+            "sequence_number": 7,
+            "response": {
+                "id": "resp_queued", "model": "test-model", "object": "response",
+                "created_at": 1, "output": [],
+                "tools": [
+                    {"type": "namespace", "name": "functions", "tools": [
+                        {"type": "custom", "name": "exec", "format": {"type": "text"}}
+                    ]},
+                    {"type": "function", "name": "lookup"}
+                ]
+            }
+        });
+        let event = deserialize_response_event_for_adapter(
+            &frame.to_string(),
+            provider_adapter(ModelProvider::Codex),
+        )
+        .expect("a queued response may echo Codex tool declarations");
+        let rs::ResponseStreamEvent::ResponseQueued(event) = event else {
+            panic!("expected response.queued");
+        };
+        assert_eq!(event.sequence_number, 7);
+        assert_eq!(event.response.status, rs::Status::Queued);
+        assert!(matches!(
+            event.response.tools.as_deref(),
+            Some([rs::Tool::Function(tool)]) if tool.name == "lookup"
+        ));
+    }
+
+    #[test]
+    fn codex_namespace_echo_does_not_mask_malformed_usage() {
+        let frame = serde_json::json!({
+            "type": "response.completed", "sequence_number": 9,
+            "response": {
+                "id": "resp_done", "model": "test-model", "object": "response",
+                "created_at": 1, "status": "completed", "output": [],
+                "tools": [{"type": "namespace", "name": "functions", "tools": []}],
+                "usage": {"input_tokens": "invalid-count"}
+            }
+        });
+        let error = deserialize_response_event_for_adapter(
+            &frame.to_string(),
+            provider_adapter(ModelProvider::Codex),
+        )
+        .expect_err("malformed usage must fail even with an unmodeled tool declaration");
+        assert!(error.to_string().contains("invalid-count"), "{error}");
     }
 
     #[test]
